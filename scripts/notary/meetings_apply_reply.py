@@ -123,6 +123,12 @@ def build_claude_prompt(items: list[dict[str, Any]], rooms: dict[str, Any], repl
         "используй accept_once.\n"
         "- «нет», «не надо», «пропусти», «не сейчас» = reject.\n"
         "- «никогда», «больше не предлагай», «не предлагай эту серию» = ignore_forever.\n"
+        "- **Общий отказ без номеров** («не сейчас», «ни одной», «все нет», «нет, никакие») = "
+        "присвой `action=reject` ВСЕМ номерам из списка предложенных встреч.\n"
+        "- **Общее согласие без номеров** («все да», «пиши все», «согласен») = присвой "
+        "`action=accept_once` ВСЕМ номерам (НЕ accept_series — серию только при явном «и серию»). "
+        "Если у какой-то встречи нет ссылки в событии и Илья не указал переговорку — "
+        "оставь `room: null`, обработчик попросит уточнить.\n"
         "- Поле `room`: владелец может назвать переговорку по имени (`@t11`/`главная`/`в продажах`/...) "
         "или дать прямую ссылку (https://...). Имена переговорок из справочника ниже. Слова-синонимы "
         "сопоставляй по полю `description` («главная» → @t11, «продажи»/«запасная» → ..., «маркетплейсы» → @t22, и т.п.). "
@@ -385,6 +391,13 @@ def main() -> int:
         help=f"Файл-snapshot предложений (default: {SNAPSHOT_FILE}).",
     )
     p.add_argument(
+        "--reply-date",
+        type=int,
+        help="Unix-timestamp поля reply_to_message.date (для hard-проверки "
+             "свежести snapshot — daemon prompt описывает soft-проверку, "
+             "эта опция — последний рубеж).",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Не писать в watched.yaml, только вернуть план.",
@@ -410,6 +423,33 @@ def main() -> int:
     if not items:
         print(json.dumps({"error": "snapshot пуст", "summary_lines": [], "pending_room": []}))
         return 1
+
+    # Hard-проверка свежести: если reply пришёл сильно позже shown_date —
+    # snapshot уже мог быть переписан более новым вечером, номера не те.
+    # Допуск ±1 день — для кейса «дайджест в 23:50, ответ в 00:05»:
+    # snapshot за 26.05, reply за 27.05 — валиден; reply за 28.05 — нет.
+    if args.reply_date and snapshot.get("shown_date"):
+        try:
+            from zoneinfo import ZoneInfo
+
+            reply_dt = datetime.fromtimestamp(args.reply_date, tz=ZoneInfo("Asia/Dubai"))
+            reply_day = reply_dt.date()
+            shown_day = datetime.strptime(snapshot["shown_date"], "%Y-%m-%d").date()
+            delta_days = abs((reply_day - shown_day).days)
+        except Exception:
+            reply_day = None
+            delta_days = None
+        if delta_days is not None and delta_days > 1:
+            print(json.dumps({
+                "error": f"snapshot устарел: shown_date={snapshot['shown_date']}, "
+                         f"reply_date={reply_day.isoformat()} (расхождение {delta_days} дн). "
+                         f"Илья отвечает на чужой день — реестр НЕ трогаю. "
+                         f"Переспроси: «перешли reply на свежее 📅-сообщение или назови встречи словами».",
+                "summary_lines": [],
+                "pending_room": [],
+                "stale_snapshot": True,
+            }, ensure_ascii=False))
+            return 1
 
     rooms = load_rooms()
     expected_ns = {it["n"] for it in items}
@@ -441,6 +481,25 @@ def main() -> int:
         "decisions parsed: %s",
         [{"n": d["n"], "action": d["action"], "has_room": bool(d.get("room"))} for d in decisions],
     )
+
+    if not decisions:
+        # Илья ответил «ок» / «угу» / эмодзи — claude не извлёк решений по номерам.
+        # Возвращаем явный сигнал, чтобы daemon переспросил, а не висел в неопределённости.
+        logger.warning(
+            "no_decisions: claude вернул пустой массив или decisions отфильтрованы "
+            "по expected_ns. reply_len=%d, items=%d",
+            len(reply_text), len(items),
+        )
+        print(json.dumps({
+            "summary_lines": [],
+            "pending_room": [],
+            "applied": 0, "rejected": 0, "ignored_forever": 0,
+            "no_decisions": True,
+            "hint": "В ответе нет понятных решений по номерам. Спроси Илью прямо: "
+                    "«По каким встречам и что делаем? Напр.: 1 да в главной, 2 нет, "
+                    "3 не предлагай эту серию».",
+        }, ensure_ascii=False))
+        return 0
 
     if args.dry_run:
         print(json.dumps({

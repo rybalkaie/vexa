@@ -71,7 +71,6 @@ MEETING_KEYWORDS = [
     "координация",
     "sync",
     "1-на-1",
-    "1-1",
     "one-on-one",
     "meeting",
     "call",
@@ -211,6 +210,17 @@ def esc(text: str) -> str:
 
 
 def main() -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(description="Ф6 вечерний блок встреч.")
+    p.add_argument(
+        "--commit-known",
+        action="store_true",
+        help="Сохранить кэш known-instances. Без флага кэш не пишется — "
+             "защита от потери move/cancelled-детекта, если обёртка не отправит сообщение.",
+    )
+    args = p.parse_args()
+
     setup_logging()
     started_at = datetime.now(timezone.utc)
     horizon_end = started_at + timedelta(days=HORIZON_DAYS)
@@ -228,6 +238,19 @@ def main() -> int:
         creds = load_credentials()
     except GCalAuthError as e:
         logger.error("OAuth credentials недоступны: %s", e)
+        # Тихо «нет блока» = плохая UX: Илья не узнает, что предложения встреч
+        # отвалились. Push с дедупликацией (тот же механизм, что у scheduler Ф5).
+        try:
+            from notary.lib.notify import push  # type: ignore
+
+            push(
+                "Блок 📅 «Встречи и запись» не сформировался: Google Calendar не "
+                "пускает (OAuth refresh-token отозван). Нужен повторный логин Google "
+                "через MCP-сервер.",
+                dedupe=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не смог отправить алерт о смерти OAuth: %s", exc)
         print(json.dumps({"block_text": "", "items": [], "calendars_scanned": [], "error": "auth"}))
         return 0
 
@@ -386,7 +409,8 @@ def main() -> int:
             "series": rec.get("series") or rec.get("id"),
             "recurring_event_id": recurring,
         }
-    save_known(new_known)
+    if args.commit_known:
+        save_known(new_known)
 
     # 6. Сортируем «новые» по start_at; «перенесённые» и «удалённые» — тоже хронологически.
     new_items.sort(key=lambda x: x["start_at_iso"])
