@@ -90,8 +90,17 @@ def main() -> int:
     if not os.path.exists(args.meta_json):
         log.error("meta.json not found: %s", args.meta_json)
         return 2
+    # Минимальная валидация: имя файла должно оканчиваться .meta.json или .json,
+    # иначе пользователь скорее всего ошибся (например, передал .txt или .wav).
+    if not args.meta_json.endswith(".json"):
+        log.error("meta_json должен быть .json файлом, получили: %s", args.meta_json)
+        return 2
     with open(args.meta_json, "r", encoding="utf-8") as fh:
         meta = json.load(fh)
+    # Минимальная sanity на содержимое: должен быть dict с sessionUid и files.wav.
+    if not isinstance(meta, dict) or not meta.get("sessionUid") or not (meta.get("files") or {}).get("wav"):
+        log.error("meta.json не похоже на artifact бота (нужны поля sessionUid + files.wav)")
+        return 2
 
     session_uid = meta.get("sessionUid") or "unknown"
     wav_path = (meta.get("files") or {}).get("wav")

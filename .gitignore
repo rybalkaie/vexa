@@ -166,6 +166,7 @@ test_data/
 # channel") leak into transcripts. See services/vexa-bot/core/src/services/
 # hallucinations/ for the canonical location.
 !services/vexa-bot/core/src/services/hallucinations/*.txt
+!scripts/notary/lib/hallucinations/*.txt
 manifest.csv
 docker-compose.override.yml
 # meeting-notary overlay — наш override закоммичен явно

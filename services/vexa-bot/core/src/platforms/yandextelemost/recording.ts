@@ -68,7 +68,13 @@ function metaJsonPath(sessionUid: string): string {
 function appendTranscript(sessionUid: string, line: string): void {
   try {
     const p = transcriptTxtPath(sessionUid);
+    const existed = fs.existsSync(p);
     fs.appendFileSync(p, line + "\n", "utf8");
+    // ВАЖНО: bot бежит как root в Docker, host post-processing — как dev.
+    // Чтобы dev мог удалять/перезаписывать draft.txt — даём 0666 при создании.
+    if (!existed) {
+      try { fs.chmodSync(p, 0o666); } catch {}
+    }
   } catch (err: any) {
     log(`${LOG_PREFIX} transcript append failed: ${err.message}`);
   }
@@ -116,6 +122,9 @@ class WavStreamWriter {
 
   open(): void {
     this.fd = fs.openSync(this.filePath, "w");
+    // ВАЖНО: bot бежит как root в Docker, host post-processing — как dev.
+    // Чтобы dev мог удалять/перезаписывать WAV — даём 0666.
+    try { fs.chmodSync(this.filePath, 0o666); } catch {}
     // Записываем заголовок с placeholder-длинами (заполним при close).
     // ВАЖНО: fs.writeSync БЕЗ position — иначе file cursor остаётся 0 и
     // следующий write samples перезаписывает header (Node docs:
@@ -399,6 +408,11 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
 
   let endReason = "unknown";
 
+  // Все cleanup'ы в finally — иначе при исключении в main Promise
+  // (например, в setInterval/setupBrowserCapture) WAV-fd останется
+  // открытым в долгоживущем runner-процессе Ф5+ (в Ф3 docker run --rm
+  // умирает и kernel закрывает fd — не утечка, но в Ф5 будет).
+  try {
   // Метрики и завершение работы — Promise, который resolve'ится при окончании встречи.
   await new Promise<void>(async (resolve, reject) => {
     const checkLoop = async () => {
@@ -447,54 +461,68 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       resolve();
     });
   });
+  } finally {
+    // ВАЖНО: cleanup в finally — даже если main Promise бросил.
+    // Порядок: сначала остановить polling (он мог быть в середине открытия панели),
+    // потом stopCapture, потом close WAV.
+    try {
+      participantsPoll.stop();
+    } catch (err: any) {
+      log(`${LOG_PREFIX} participants stop failed: ${err.message}`);
+    }
+    try {
+      await stopCapture();
+    } catch (err: any) {
+      log(`${LOG_PREFIX} stop capture failed: ${err.message}`);
+    }
 
-  await stopCapture();
-  participantsPoll.stop();
+    // Закрываем WAV — обновляются длины в заголовке.
+    let wavStats = { samples: 0, durationS: 0 };
+    try {
+      wavStats = wavWriter.close();
+      logStep("wav_writer_closed", { samples: wavStats.samples, duration_s: wavStats.durationS });
+    } catch (err: any) {
+      log(`${LOG_PREFIX} wav close failed: ${err.message}`);
+    }
 
-  // Закрываем WAV — обновляются длины в заголовке.
-  let wavStats = { samples: 0, durationS: 0 };
-  try {
-    wavStats = wavWriter.close();
-    logStep("wav_writer_closed", { samples: wavStats.samples, duration_s: wavStats.durationS });
-  } catch (err: any) {
-    log(`${LOG_PREFIX} wav close failed: ${err.message}`);
-  }
+    // Пишем meta.json. ВАЖНО: НЕ кладём в meta содержимое транскрипта — только пути.
+    // Это правило конфиденциальности Ф3 «опасной тройки»: транскрипт = личные данные,
+    // metadata = структура. Имена участников — да, они оправдают существование маппинга.
+    const endTs = Date.now();
+    const meta = {
+      sessionUid,
+      botName,
+      meetingUrl: botConfig.meetingUrl || null,
+      nativeMeetingId: (botConfig as any).nativeMeetingId || null,
+      language,
+      startTs: new Date(startTs).toISOString(),
+      endTs: new Date(endTs).toISOString(),
+      durationS: Math.round((endTs - startTs) / 1000),
+      audioDurationS: Math.round(wavStats.durationS),
+      audioSamples: wavStats.samples,
+      sampleRate: SAMPLE_RATE,
+      endReason,
+      participants: participantsPoll.getNames(),
+      files: {
+        wav: wavPath,
+        draftTxt: txtPath,
+        meta: metaPath,
+      },
+    };
+    try {
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
+      // 0666 чтобы dev мог удалить/перезаписать с хоста (см. WavStreamWriter.open).
+      try { fs.chmodSync(metaPath, 0o666); } catch {}
+      logStep("meta_written", { path: metaPath, participants_count: meta.participants.length });
+    } catch (err: any) {
+      log(`${LOG_PREFIX} meta write failed: ${err.message}`);
+    }
 
-  // Пишем meta.json. ВАЖНО: НЕ кладём в meta содержимое транскрипта — только пути.
-  // Это правило конфиденциальности Ф3 «опасной тройки»: транскрипт = личные данные,
-  // metadata = структура. Имена участников — да, они оправдают существование маппинга.
-  const endTs = Date.now();
-  const meta = {
-    sessionUid,
-    botName,
-    meetingUrl: botConfig.meetingUrl || null,
-    nativeMeetingId: (botConfig as any).nativeMeetingId || null,
-    language,
-    startTs: new Date(startTs).toISOString(),
-    endTs: new Date(endTs).toISOString(),
-    durationS: Math.round((endTs - startTs) / 1000),
-    audioDurationS: Math.round(wavStats.durationS),
-    audioSamples: wavStats.samples,
-    sampleRate: SAMPLE_RATE,
-    endReason,
-    participants: participantsPoll.getNames(),
-    files: {
+    logStep("recording_done", {
       wav: wavPath,
-      draftTxt: txtPath,
-      meta: metaPath,
-    },
-  };
-  try {
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
-    logStep("meta_written", { path: metaPath, participants_count: meta.participants.length });
-  } catch (err: any) {
-    log(`${LOG_PREFIX} meta write failed: ${err.message}`);
+      duration_s: wavStats.durationS,
+      end_reason: endReason,
+      participants_count: meta.participants.length,
+    });
   }
-
-  logStep("recording_done", {
-    wav: wavPath,
-    duration_s: wavStats.durationS,
-    end_reason: endReason,
-    participants_count: meta.participants.length,
-  });
 }

@@ -18,3 +18,7 @@ pymorphy3-dicts-ru==2.4.417150.4580142
 
 # LLM-маппинг (опционально, под флагом ENABLE_CLAUDE_NAME_MAPPING).
 anthropic==0.39.0
+
+# Dev-only: TTS для генерации synthetic test sample (см. README в разделе
+# «Тест без HF-токена»). Не нужен в runtime, но без него regenerate невозможен.
+edge-tts==7.2.8

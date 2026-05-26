@@ -245,20 +245,24 @@ export function startParticipantsPolling(
   let domSnapshotDone = false;
 
   const poll = async () => {
-    if (stopped) return;
+    if (stopped || page.isClosed()) return;
     try {
       const opened = await openParticipantsPanel(page);
       if (!opened) {
         logStep("participants_button_not_found");
         return;
       }
+      // На любом шаге между awaits встреча могла закончиться → страница закрылась.
+      // Проверяем перед каждым page-op'ом — иначе unhandled rejection ("page closed").
+      if (stopped || page.isClosed()) return;
       await page.waitForTimeout(PARTICIPANTS_POLL_DELAY_AFTER_CLICK_MS);
+      if (stopped || page.isClosed()) return;
 
-      // На первом успешном открытии — снимаем dump панели для разведки селекторов.
       if (!domSnapshotDone) {
         await snapshotPanelDomForDiscovery(page);
         domSnapshotDone = true;
       }
+      if (stopped || page.isClosed()) return;
 
       const names = await extractNamesFromPanel(page, botName);
       let changed = false;
@@ -279,8 +283,10 @@ export function startParticipantsPolling(
         } catch {}
       }
 
+      if (stopped || page.isClosed()) return;
       await closeParticipantsPanel(page);
     } catch (e: any) {
+      // page closed mid-poll — типично, не fatal. Логируем для диагностики.
       logStep("participants_poll_failed", { error: e.message });
     }
   };

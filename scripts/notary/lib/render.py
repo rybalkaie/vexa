@@ -96,7 +96,10 @@ def render_protocol(
             seen_labels.add(lbl)
             speaker_labels_in_text.append(lbl)
 
-    participants_list = ", ".join(speaker_labels_in_text) if speaker_labels_in_text else "—"
+    # «Спикер ?» (без cluster'а — alignment не нашёл overlap) не отражает участника
+    # встречи — это артефакт; не показываем в шапке.
+    visible_in_header = [lbl for lbl in speaker_labels_in_text if lbl != "Спикер ?"]
+    participants_list = ", ".join(visible_in_header) if visible_in_header else "—"
 
     # Заголовок.
     raw_url = meta.get("meetingUrl") or "—"
