@@ -41,6 +41,8 @@ export async function sendTelegramMessage(
 
   try {
     const url = `${TG_API_BASE}/bot${token}/sendMessage`;
+    // Жёсткий timeout: если Telegram API повис, push не должен залочить admission loop —
+    // мы рискуем упустить abandon-таймаут (см. план Ф2, обработка waiting room).
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -50,6 +52,7 @@ export async function sendTelegramMessage(
         parse_mode: "HTML",
         disable_web_page_preview: true,
       }),
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");

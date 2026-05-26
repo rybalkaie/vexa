@@ -172,11 +172,34 @@ export async function joinYandexTelemost(
   // 3) Mic / camera. ВАЖНО: в Vexa-контейнере браузеру дают permissions автоматом,
   // и Telemost включает микрофон по дефолту (testid становится `turn-off-mic-button`).
   // Бот — наблюдатель, ему вход с открытым мик неприемлем. Кликаем по нему чтобы вырубить.
+  // Та же React-handler проблема как у `enter-conference-button` — Playwright click может
+  // не сработать, нужен JS-fallback с явной верификацией.
+  // Мьютим mic, если он включён. ВАЖНО: один click (Playwright) — иначе двойной
+  // click может вернуть state обратно (toggle). Если после ожидания состояние
+  // не изменилось — пробуем JS-fallback одним вызовом.
   try {
-    const offBtn = page.locator('[data-testid="turn-off-mic-button"]').first();
+    const turnOff = '[data-testid="turn-off-mic-button"]';
+    const offBtn = page.locator(turnOff).first();
     if (await offBtn.isVisible({ timeout: 500 })) {
-      await offBtn.click({ timeout: 2000 });
-      logStep("mic_muted_in_lobby");
+      await offBtn.click({ timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      const stillOn = await page.locator(turnOff).first().isVisible({ timeout: 300 }).catch(() => false);
+      if (stillOn) {
+        // Playwright click не сработал — JS-fallback ровно один раз.
+        await page.evaluate((sel: string) => {
+          const btn = document.querySelector(sel) as HTMLElement | null;
+          if (btn) {
+            btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+            btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+            btn.click();
+          }
+        }, turnOff).catch(() => {});
+        await page.waitForTimeout(500);
+        const stillOnAfterJs = await page.locator(turnOff).first().isVisible({ timeout: 300 }).catch(() => false);
+        logStep("mic_muted_in_lobby", { method: "js_fallback", still_unmuted: stillOnAfterJs });
+      } else {
+        logStep("mic_muted_in_lobby", { method: "playwright_click", still_unmuted: false });
+      }
     } else {
       logStep("mic_already_off");
     }

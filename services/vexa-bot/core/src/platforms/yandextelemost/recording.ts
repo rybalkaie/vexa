@@ -19,16 +19,14 @@
 import { Page } from "playwright";
 import { BotConfig } from "../../types";
 import { log } from "../../utils";
-import { telemostParticipantSelectors } from "./selectors";
+import { isHallucination } from "../../services/hallucination-filter";
 import * as fs from "fs";
 import * as path from "path";
 
 const LOG_PREFIX = "[adapter-telemost]";
 const TRANSCRIPT_DIR = process.env.TELEMOST_TRANSCRIPT_DIR || "/transcripts";
 const SILENCE_END_AFTER_MS = 60_000;
-const NO_PARTICIPANTS_END_AFTER_MS = 30_000;
-const URL_CHECK_INTERVAL_MS = 5_000;
-const PARTICIPANT_CHECK_INTERVAL_MS = 5_000;
+const URL_CHECK_INTERVAL_MS = 3_000;
 
 function logStep(step: string, ctx: Record<string, unknown> = {}): void {
   const ts = new Date().toISOString();
@@ -234,17 +232,31 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   ensureTranscriptDir();
   logStep("recording_start", { session: sessionUid, transcript_path: transcriptPath(sessionUid) });
 
-  const transcriptionUrl = botConfig.transcriptionServiceUrl
-    || process.env.TRANSCRIPTION_SERVICE_URL
-    || "http://172.17.0.1:8083/v1/audio/transcriptions";
+  const explicitUrl = botConfig.transcriptionServiceUrl || process.env.TRANSCRIPTION_SERVICE_URL;
+  const transcriptionUrl = explicitUrl || "http://172.17.0.1:8083/v1/audio/transcriptions";
+  if (!explicitUrl) {
+    log(`${LOG_PREFIX} WARNING: TRANSCRIPTION_SERVICE_URL не задан в env, используем default ${transcriptionUrl}. На другой VPS/маке gateway IP может отличаться — задай явно в .env.notary.`);
+  }
   const transcriptionToken = botConfig.transcriptionServiceToken || process.env.TRANSCRIPTION_SERVICE_TOKEN;
   const language = botConfig.language || "ru";
 
-  // Метрики конца встречи
+  // Метрики конца встречи.
+  // ВАЖНО: silence-таймер стартует только ПОСЛЕ того как мы услышали первый
+  // не-тихий чанк. До этого считается «стартовое ожидание» с лимитом
+  // noOneJoinedTimeout — это не «встреча идёт в тишине», а «встреча ещё не
+  // началась» (план Ф2: «Встреча идёт» = был хотя бы 1 не-тихий аудио-кадр).
+  // Participant-count как сигнал НЕ используем на Ф2: точные DOM-селекторы
+  // participant-тайлов Telemost ещё не разведаны (это задача Ф3 — диарезация).
+  // Аудио — самый надёжный сигнал «кто-то говорит».
+  let meetingStarted = false;
   let lastNonSilenceTs = Date.now();
-  let lastSeenParticipantsTs = Date.now();
-  let knownParticipantCount = 0;
   const startTs = Date.now();
+  const noOneJoinedTimeoutMs = botConfig.automaticLeave?.noOneJoinedTimeout ?? 300_000;
+
+  // FIFO promise-chain: гарантируем, что transcript строки попадают в файл
+  // в том порядке, в котором сэмплировался аудиопоток. Без этого параллельные
+  // transcribeChunk возвращаются вразнобой и таймлайн в файле «прыгает».
+  let transcribeChain: Promise<void> = Promise.resolve();
 
   // Регистрируем exposed function ДО запуска browser-капчи.
   await page.exposeFunction(
@@ -255,24 +267,34 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       const isSilent = rms < RMS_SILENCE_THRESHOLD;
       if (!isSilent) {
         lastNonSilenceTs = nowMs;
+        if (!meetingStarted) {
+          meetingStarted = true;
+          logStep("meeting_started_first_audio");
+        }
       }
       // Транскрибируем только не-тихие чанки — экономия CPU.
       if (isSilent) return;
 
-      try {
-        const bin = Buffer.from(b64, "base64");
-        const samples = new Float32Array(bin.buffer, bin.byteOffset, bin.byteLength / 4);
-        const wav = float32ToWavBuffer(samples, 16000);
-        const text = await transcribeChunk(wav, language, transcriptionUrl, transcriptionToken);
-        if (text) {
-          const elapsedS = Math.round((nowMs - startTs) / 1000);
-          const line = `[${new Date(nowMs).toISOString()}] (+${elapsedS}s) ${text}`;
-          appendTranscript(sessionUid, line);
-          log(`${LOG_PREFIX} [telemost-transcript] ${line}`);
+      transcribeChain = transcribeChain.then(async () => {
+        try {
+          const bin = Buffer.from(b64, "base64");
+          const samples = new Float32Array(bin.buffer, bin.byteOffset, bin.byteLength / 4);
+          const wav = float32ToWavBuffer(samples, 16000);
+          const text = await transcribeChunk(wav, language, transcriptionUrl, transcriptionToken);
+          if (text) {
+            if (isHallucination(text)) {
+              log(`${LOG_PREFIX} [telemost-transcript] hallucination filtered: ${text.substring(0, 60)}`);
+              return;
+            }
+            const elapsedS = Math.round((nowMs - startTs) / 1000);
+            const line = `[${new Date(nowMs).toISOString()}] (+${elapsedS}s) ${text}`;
+            appendTranscript(sessionUid, line);
+            log(`${LOG_PREFIX} [telemost-transcript] ${line}`);
+          }
+        } catch (err: any) {
+          log(`${LOG_PREFIX} chunk handle failed: ${err.message}`);
         }
-      } catch (err: any) {
-        log(`${LOG_PREFIX} chunk handle failed: ${err.message}`);
-      }
+      });
     }
   );
 
@@ -286,48 +308,32 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         const now = Date.now();
         const url = page.url();
 
-        // URL change check
+        // URL change — всегда работает (включая ложноположительный passport-redirect,
+        // если Yandex решит проверить бота. Риск принят владельцем на Ф2).
         if (!url.includes("telemost.yandex.ru")) {
           logStep("end_url_changed", { url });
           clearInterval(timer);
           return resolve();
         }
 
-        // Silence check
+        // До «начала встречи» работает только noOneJoinedTimeout.
+        if (!meetingStarted) {
+          if (now - startTs >= noOneJoinedTimeoutMs) {
+            logStep("end_no_one_joined", { elapsed_ms: now - startTs, timeout_ms: noOneJoinedTimeoutMs });
+            clearInterval(timer);
+            return resolve();
+          }
+          return;
+        }
+
+        // Silence check (только после meetingStarted)
         if (now - lastNonSilenceTs >= SILENCE_END_AFTER_MS) {
           logStep("end_silence_60s", { silent_for_ms: now - lastNonSilenceTs });
           clearInterval(timer);
           return resolve();
         }
-
-        // Participant count — каждые N секунд
-        if (now - lastSeenParticipantsTs > PARTICIPANT_CHECK_INTERVAL_MS) {
-          let cnt = 0;
-          try {
-            cnt = await page.evaluate((selectors: string[]) => {
-              const seen = new Set<string>();
-              for (const sel of selectors) {
-                document.querySelectorAll(sel).forEach((el, idx) => {
-                  const key = el.getAttribute("data-testid") || `${sel}-${idx}`;
-                  seen.add(key);
-                });
-              }
-              return seen.size;
-            }, telemostParticipantSelectors);
-          } catch (e: any) {
-            // page может закрыться при leave — игнорируем
-          }
-          if (cnt > 0) {
-            knownParticipantCount = cnt;
-            lastSeenParticipantsTs = now;
-          } else if (knownParticipantCount > 0 && now - lastSeenParticipantsTs >= NO_PARTICIPANTS_END_AFTER_MS) {
-            logStep("end_no_participants_30s", { last_known: knownParticipantCount });
-            clearInterval(timer);
-            return resolve();
-          }
-        }
-      } catch (err: any) {
-        // page may be closed during leave; not fatal
+      } catch {
+        // page может закрыться — не fatal
       }
     };
 
