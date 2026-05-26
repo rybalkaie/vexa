@@ -18,6 +18,7 @@ eggs/
 lib/
 !services/dashboard/src/lib/
 !tests3/lib/
+!scripts/notary/lib/
 lib64/
 parts/
 sdist/

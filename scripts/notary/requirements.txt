@@ -1,0 +1,20 @@
+# Post-processing pipeline для meeting-notary (Ф3+).
+#
+# Версии пиннованные. После любого major-upgrade нужно прогнать тестовый
+# протокол на референс-WAV (см. README.md этой папки).
+
+requests==2.32.3
+soundfile==0.12.1
+numpy>=1.24.0,<2.0.0
+
+# Диарезация (требует HF_TOKEN).
+pyannote.audio==3.3.2
+torch==2.4.1
+torchaudio==2.4.1
+
+# Морфология русского для маппинга имён.
+pymorphy3==2.0.2
+pymorphy3-dicts-ru==2.4.417150.4580142
+
+# LLM-маппинг (опционально, под флагом ENABLE_CLAUDE_NAME_MAPPING).
+anthropic==0.39.0

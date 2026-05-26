@@ -3,6 +3,10 @@
 // стабильные data-testid из дизайн-системы Orb.
 //
 // Если Telemost обновит фронт — менять здесь, не размазывать по всему адаптеру.
+//
+// История изменений:
+// - Ф3 (2026-05-26): закреплены реальные in-meeting testid'ы из DOM-dump
+//   прогона Ф2 (handoff п.5).
 
 // Промежуточный экран «Вы подключаетесь к видеовстрече» с одной кнопкой.
 // ВАЖНО: `to-home-screen-button` — это кнопка «На главную» (стрелка-крест в углу),
@@ -57,32 +61,77 @@ export const telemostRejectionIndicators: string[] = [
 ];
 
 // In-meeting: панель/тулбар встречи (виден когда мы в комнате).
-// Предположение основано на Orb naming convention — уточним из логов.
+// Источник: DOM-dump прогона Ф2 (2026-05-26).
 export const telemostInMeetingIndicators: string[] = [
-  '[data-testid*="leave-conference"]',
-  '[data-testid*="leave-call"]',
-  '[data-testid*="meeting-toolbar"]',
-  '[data-testid*="conference-toolbar"]',
+  '[data-testid="end-call-alt-button"]',
+  '[data-testid="mute-audio"]',
+  '[aria-label*="Выйти из встречи"]',
   '[aria-label*="Выйти"]',
-  'button[aria-label*="ыйти"]',
 ];
 
-// In-meeting: кнопка выхода. Логировать все потенциальные совпадения.
+// In-meeting: кнопка выхода. Точный testid из DOM-dump Ф2.
 export const telemostLeaveButtonSelectors: string[] = [
-  '[data-testid="leave-conference-button"]',
-  '[data-testid="leave-call-button"]',
-  '[data-testid*="leave"]',
+  '[data-testid="end-call-alt-button"]',
   'button[aria-label*="Выйти из встречи"]',
   'button[aria-label*="Выйти"]',
   'button:has-text("Выйти")',
 ];
 
-// In-meeting: участники / тайлы видео. Гипотеза — уточним из логов.
-export const telemostParticipantSelectors: string[] = [
+// In-meeting: кнопки управления mic/camera в meeting (отличаются от lobby).
+export const telemostInMeetingMicButtonSelectors: string[] = [
+  '[data-testid="mute-audio"]',
+  '[data-testid="turn-on-mic-button"]',
+  '[data-testid="turn-off-mic-button"]',
+];
+
+export const telemostInMeetingCameraButtonSelectors: string[] = [
+  '[data-testid="turn-on-camera-button"]',
+  '[data-testid="turn-off-camera-button"]',
+];
+
+// Кнопка «Поднять руку» — пока не используется, но подтверждена в DOM-dump.
+export const telemostRaiseHandButtonSelectors: string[] = [
+  '[data-testid="hand-up-button"]',
+];
+
+// Кнопка «Демонстрация» — пока не используется.
+export const telemostShareScreenButtonSelectors: string[] = [
+  '[data-testid="start-demonstration-button"]',
+];
+
+// Кнопка открытия панели участников — ВХОД ДЛЯ МАППИНГА ИМЁН В Ф3.
+// Клик откроет панель, далее polling её DOM для списка имён.
+export const telemostParticipantsButtonSelectors: string[] = [
+  '[data-testid="participants-button"]',
+  'button[aria-label*="частник"]',
+  'button[aria-label*="part"]',
+];
+
+// Кнопка чата — пока не используется.
+export const telemostChatButtonSelectors: string[] = [
+  '[data-testid="chat-alt-button"]',
+];
+
+// In-meeting: participant tiles. Хайпотезы — точные селекторы будут разведаны
+// на первом боевом прогоне через polling-метод.
+// Известно из DOM-dump Ф2: на прогоне с одним говорящим тайлов других участников
+// не было, точные тайл-селекторы не зафиксированы. Оставляем гипотезы +
+// добавляем fallback на video-элементы внутри meeting-области.
+export const telemostParticipantTileSelectors: string[] = [
   '[data-testid*="participant-tile"]',
-  '[data-testid*="participant"]',
+  '[data-testid*="participant"]:not([data-testid="participants-button"])',
   '[data-testid*="video-tile"]',
   '[data-testid*="user-tile"]',
+];
+
+// In-meeting: панель участников после клика по participants-button.
+// Имена будут где-то внутри списка — селекторы участника-в-списке тоже гипотезы.
+// В participants.ts polling будет дампить DOM панели для разведки на первом прогоне.
+export const telemostParticipantsPanelSelectors: string[] = [
+  '[data-testid="participants-panel"]',
+  '[data-testid*="participants-list"]',
+  '[role="dialog"]',
+  '[class*="participants"]',
 ];
 
 // Indicators ошибки/удаления из встречи.

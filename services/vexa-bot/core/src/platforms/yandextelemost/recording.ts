@@ -1,25 +1,30 @@
 // Yandex Telemost: запись и транскрипция.
 //
-// Архитектура Ф2 (диарезация — Ф3, не делаем):
+// Архитектура Ф2 (stream-режим, draft-транскрипт):
 //   1) Browser-сторона:
 //        - Найти все <audio>/<video> элементы на странице.
 //        - Свести их MediaStream в один combinedStream (без per-speaker).
 //        - ScriptProcessor 16kHz mono → Float32 chunks ~3s длиной.
 //        - Передавать чанки в Node.js через exposed function __vexaTelemostAudio.
 //   2) Node.js-сторона:
-//        - Каждый чанк → WAV → POST в TRANSCRIPTION_SERVICE_URL → текст.
-//        - Текст с таймкодом писать в /transcripts/<sessionUid>.txt (bind-mount).
-//        - Дублировать в stdout (с пометкой «[telemost-transcript]» — для VPS-логов).
-//   3) Метрики конца встречи:
-//        - 60s полной тишины (RMS < threshold по всем чанкам) → завершение.
-//        - URL ушёл с telemost.yandex.ru/j/... → завершение.
-//        - 0 видимых participant-тайлов в течение 30s → завершение (стартовый
-//          alone-timeout — берём из botConfig.automaticLeave).
+//        - Каждый чанк → WAV → POST в TRANSCRIPTION_SERVICE_URL → текст
+//          (draft, для real-time мониторинга).
+//        - Текст с таймкодом писать в /transcripts/<sessionUid>.txt.
+//
+// Архитектура Ф3 (добавлено — для финального протокола):
+//   3) Параллельно стриму копим ВСЕ Float32-сэмплы в один большой буфер
+//      и в конце встречи пишем непрерывный WAV /transcripts/<sessionUid>.wav.
+//      Этот WAV идёт в post-processing (whisper полный + pyannote диарезация
+//      + name mapping + markdown protocol) — см. scripts/finalize-meeting.py.
+//   4) Параллельно polling списка участников Telemost (participants.ts).
+//   5) В конце встречи пишем meta.json с (sessionUid, startTs, endTs,
+//      participants[], meetingUrl, botName, duration_s, wav_path, txt_path).
 
 import { Page } from "playwright";
 import { BotConfig } from "../../types";
 import { log } from "../../utils";
 import { isHallucination } from "../../services/hallucination-filter";
+import { startParticipantsPolling } from "./participants";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -27,6 +32,7 @@ const LOG_PREFIX = "[adapter-telemost]";
 const TRANSCRIPT_DIR = process.env.TELEMOST_TRANSCRIPT_DIR || "/transcripts";
 const SILENCE_END_AFTER_MS = 60_000;
 const URL_CHECK_INTERVAL_MS = 3_000;
+const SAMPLE_RATE = 16000;
 
 function logStep(step: string, ctx: Record<string, unknown> = {}): void {
   const ts = new Date().toISOString();
@@ -43,14 +49,25 @@ function ensureTranscriptDir(): void {
   }
 }
 
-function transcriptPath(sessionUid: string): string {
-  const date = new Date().toISOString().split("T")[0];
-  return path.join(TRANSCRIPT_DIR, `${date}-${sessionUid}.txt`);
+function dateStamp(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+function transcriptTxtPath(sessionUid: string): string {
+  return path.join(TRANSCRIPT_DIR, `${dateStamp()}-${sessionUid}.txt`);
+}
+
+function transcriptWavPath(sessionUid: string): string {
+  return path.join(TRANSCRIPT_DIR, `${dateStamp()}-${sessionUid}.wav`);
+}
+
+function metaJsonPath(sessionUid: string): string {
+  return path.join(TRANSCRIPT_DIR, `${dateStamp()}-${sessionUid}.meta.json`);
 }
 
 function appendTranscript(sessionUid: string, line: string): void {
   try {
-    const p = transcriptPath(sessionUid);
+    const p = transcriptTxtPath(sessionUid);
     fs.appendFileSync(p, line + "\n", "utf8");
   } catch (err: any) {
     log(`${LOG_PREFIX} transcript append failed: ${err.message}`);
@@ -88,6 +105,61 @@ function float32ToWavBuffer(samples: Float32Array, sampleRate = 16000): Buffer {
   return buf;
 }
 
+// Стримовая запись WAV: открываем файл, пишем заголовок placeholder,
+// потом по мере прихода чанков дописываем 16-bit PCM сэмплы, в финале
+// возвращаемся в заголовок и обновляем длины.
+class WavStreamWriter {
+  private fd: number | null = null;
+  private samplesWritten = 0;
+
+  constructor(private readonly filePath: string, private readonly sampleRate = SAMPLE_RATE) {}
+
+  open(): void {
+    this.fd = fs.openSync(this.filePath, "w");
+    // Записываем заголовок с placeholder-длинами (заполним при close).
+    const header = float32ToWavBuffer(new Float32Array(0), this.sampleRate).subarray(0, 44);
+    fs.writeSync(this.fd, header, 0, 44, 0);
+  }
+
+  writeSamples(samples: Float32Array): void {
+    if (this.fd === null) return;
+    const bytesPerSample = 2;
+    const buf = Buffer.alloc(samples.length * bytesPerSample);
+    let off = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      buf.writeInt16LE(s < 0 ? s * 0x8000 : s * 0x7fff, off);
+      off += 2;
+    }
+    fs.writeSync(this.fd, buf, 0, buf.length);
+    this.samplesWritten += samples.length;
+  }
+
+  close(): { samples: number; durationS: number } {
+    if (this.fd === null) return { samples: 0, durationS: 0 };
+    const dataLength = this.samplesWritten * 2;
+    const riffSize = 36 + dataLength;
+    // Обновляем RIFF size (offset 4) и data size (offset 40).
+    const riffSizeBuf = Buffer.alloc(4);
+    riffSizeBuf.writeUInt32LE(riffSize, 0);
+    fs.writeSync(this.fd, riffSizeBuf, 0, 4, 4);
+    const dataSizeBuf = Buffer.alloc(4);
+    dataSizeBuf.writeUInt32LE(dataLength, 0);
+    fs.writeSync(this.fd, dataSizeBuf, 0, 4, 40);
+    fs.closeSync(this.fd);
+    this.fd = null;
+    return { samples: this.samplesWritten, durationS: this.samplesWritten / this.sampleRate };
+  }
+
+  isOpen(): boolean {
+    return this.fd !== null;
+  }
+
+  get path(): string {
+    return this.filePath;
+  }
+}
+
 async function transcribeChunk(
   wav: Buffer,
   language: string,
@@ -96,7 +168,6 @@ async function transcribeChunk(
 ): Promise<string | null> {
   try {
     const form = new FormData();
-    // Cast to Uint8Array — Node Buffer<ArrayBufferLike> isn't directly BlobPart-compatible in TS DOM types.
     const wavBlob = new Blob([new Uint8Array(wav)], { type: "audio/wav" });
     form.append("file", wavBlob, "chunk.wav");
     form.append("model", "Systran/faster-whisper-medium");
@@ -230,7 +301,12 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
 export async function startYandexTelemostRecording(page: Page, botConfig: BotConfig): Promise<void> {
   const sessionUid = botConfig.connectionId || `tm-${Date.now()}`;
   ensureTranscriptDir();
-  logStep("recording_start", { session: sessionUid, transcript_path: transcriptPath(sessionUid) });
+
+  const wavPath = transcriptWavPath(sessionUid);
+  const txtPath = transcriptTxtPath(sessionUid);
+  const metaPath = metaJsonPath(sessionUid);
+
+  logStep("recording_start", { session: sessionUid, txt: txtPath, wav: wavPath, meta: metaPath });
 
   const explicitUrl = botConfig.transcriptionServiceUrl || process.env.TRANSCRIPTION_SERVICE_URL;
   const transcriptionUrl = explicitUrl || "http://172.17.0.1:8083/v1/audio/transcriptions";
@@ -239,23 +315,27 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   }
   const transcriptionToken = botConfig.transcriptionServiceToken || process.env.TRANSCRIPTION_SERVICE_TOKEN;
   const language = botConfig.language || "ru";
+  const botName = botConfig.botName || "Бот";
+
+  // Full WAV writer — пишем все сэмплы непрерывным потоком.
+  const wavWriter = new WavStreamWriter(wavPath, SAMPLE_RATE);
+  wavWriter.open();
+  logStep("wav_writer_opened", { path: wavPath });
+
+  // Participants polling — параллельно встрече.
+  const participantsPoll = startParticipantsPolling(page, botName);
 
   // Метрики конца встречи.
   // ВАЖНО: silence-таймер стартует только ПОСЛЕ того как мы услышали первый
   // не-тихий чанк. До этого считается «стартовое ожидание» с лимитом
   // noOneJoinedTimeout — это не «встреча идёт в тишине», а «встреча ещё не
   // началась» (план Ф2: «Встреча идёт» = был хотя бы 1 не-тихий аудио-кадр).
-  // Participant-count как сигнал НЕ используем на Ф2: точные DOM-селекторы
-  // participant-тайлов Telemost ещё не разведаны (это задача Ф3 — диарезация).
-  // Аудио — самый надёжный сигнал «кто-то говорит».
   let meetingStarted = false;
   let lastNonSilenceTs = Date.now();
   const startTs = Date.now();
   const noOneJoinedTimeoutMs = botConfig.automaticLeave?.noOneJoinedTimeout ?? 300_000;
 
-  // FIFO promise-chain: гарантируем, что transcript строки попадают в файл
-  // в том порядке, в котором сэмплировался аудиопоток. Без этого параллельные
-  // transcribeChunk возвращаются вразнобой и таймлайн в файле «прыгает».
+  // FIFO promise-chain для draft-транскрипции (порядок строк в .txt).
   let transcribeChain: Promise<void> = Promise.resolve();
 
   // Регистрируем exposed function ДО запуска browser-капчи.
@@ -265,6 +345,20 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       const RMS_SILENCE_THRESHOLD = 0.003;
       const nowMs = Date.now();
       const isSilent = rms < RMS_SILENCE_THRESHOLD;
+
+      // 1) Декодируем сэмплы СРАЗУ — нужны и для WAV-стрима, и для транскрипции.
+      const bin = Buffer.from(b64, "base64");
+      const samples = new Float32Array(bin.buffer, bin.byteOffset, bin.byteLength / 4);
+
+      // 2) Пишем в полный WAV ВСЕ сэмплы — и тихие, и шумные. Без этого
+      //    pyannote-диарезация смотрит обрезанное аудио и таймкоды поедут.
+      try {
+        wavWriter.writeSamples(samples);
+      } catch (err: any) {
+        log(`${LOG_PREFIX} wav write failed: ${err.message}`);
+      }
+
+      // 3) Метрики «встреча идёт».
       if (!isSilent) {
         lastNonSilenceTs = nowMs;
         if (!meetingStarted) {
@@ -272,14 +366,13 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           logStep("meeting_started_first_audio");
         }
       }
-      // Транскрибируем только не-тихие чанки — экономия CPU.
+
+      // 4) Стримовая транскрипция (draft) — только не-тихие чанки.
       if (isSilent) return;
 
       transcribeChain = transcribeChain.then(async () => {
         try {
-          const bin = Buffer.from(b64, "base64");
-          const samples = new Float32Array(bin.buffer, bin.byteOffset, bin.byteLength / 4);
-          const wav = float32ToWavBuffer(samples, 16000);
+          const wav = float32ToWavBuffer(samples, SAMPLE_RATE);
           const text = await transcribeChunk(wav, language, transcriptionUrl, transcriptionToken);
           if (text) {
             if (isHallucination(text)) {
@@ -301,6 +394,8 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const stopCapture = await setupBrowserCapture(page);
   logStep("browser_capture_initialized");
 
+  let endReason = "unknown";
+
   // Метрики и завершение работы — Promise, который resolve'ится при окончании встречи.
   await new Promise<void>(async (resolve, reject) => {
     const checkLoop = async () => {
@@ -308,9 +403,9 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         const now = Date.now();
         const url = page.url();
 
-        // URL change — всегда работает (включая ложноположительный passport-redirect,
-        // если Yandex решит проверить бота. Риск принят владельцем на Ф2).
+        // URL change.
         if (!url.includes("telemost.yandex.ru")) {
+          endReason = "url_changed";
           logStep("end_url_changed", { url });
           clearInterval(timer);
           return resolve();
@@ -319,6 +414,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         // До «начала встречи» работает только noOneJoinedTimeout.
         if (!meetingStarted) {
           if (now - startTs >= noOneJoinedTimeoutMs) {
+            endReason = "no_one_joined";
             logStep("end_no_one_joined", { elapsed_ms: now - startTs, timeout_ms: noOneJoinedTimeoutMs });
             clearInterval(timer);
             return resolve();
@@ -328,6 +424,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
 
         // Silence check (только после meetingStarted)
         if (now - lastNonSilenceTs >= SILENCE_END_AFTER_MS) {
+          endReason = "silence_60s";
           logStep("end_silence_60s", { silent_for_ms: now - lastNonSilenceTs });
           clearInterval(timer);
           return resolve();
@@ -341,6 +438,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
 
     // Если page закрылся — выходим.
     page.on("close", () => {
+      endReason = "page_closed";
       logStep("end_page_closed");
       clearInterval(timer);
       resolve();
@@ -348,5 +446,52 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   });
 
   await stopCapture();
-  logStep("recording_done", { transcript: transcriptPath(sessionUid) });
+  participantsPoll.stop();
+
+  // Закрываем WAV — обновляются длины в заголовке.
+  let wavStats = { samples: 0, durationS: 0 };
+  try {
+    wavStats = wavWriter.close();
+    logStep("wav_writer_closed", { samples: wavStats.samples, duration_s: wavStats.durationS });
+  } catch (err: any) {
+    log(`${LOG_PREFIX} wav close failed: ${err.message}`);
+  }
+
+  // Пишем meta.json. ВАЖНО: НЕ кладём в meta содержимое транскрипта — только пути.
+  // Это правило конфиденциальности Ф3 «опасной тройки»: транскрипт = личные данные,
+  // metadata = структура. Имена участников — да, они оправдают существование маппинга.
+  const endTs = Date.now();
+  const meta = {
+    sessionUid,
+    botName,
+    meetingUrl: botConfig.meetingUrl || null,
+    nativeMeetingId: (botConfig as any).nativeMeetingId || null,
+    language,
+    startTs: new Date(startTs).toISOString(),
+    endTs: new Date(endTs).toISOString(),
+    durationS: Math.round((endTs - startTs) / 1000),
+    audioDurationS: Math.round(wavStats.durationS),
+    audioSamples: wavStats.samples,
+    sampleRate: SAMPLE_RATE,
+    endReason,
+    participants: participantsPoll.getNames(),
+    files: {
+      wav: wavPath,
+      draftTxt: txtPath,
+      meta: metaPath,
+    },
+  };
+  try {
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
+    logStep("meta_written", { path: metaPath, participants_count: meta.participants.length });
+  } catch (err: any) {
+    log(`${LOG_PREFIX} meta write failed: ${err.message}`);
+  }
+
+  logStep("recording_done", {
+    wav: wavPath,
+    duration_s: wavStats.durationS,
+    end_reason: endReason,
+    participants_count: meta.participants.length,
+  });
 }
