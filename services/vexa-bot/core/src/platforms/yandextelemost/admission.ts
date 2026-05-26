@@ -181,22 +181,32 @@ export async function waitForYandexTelemostAdmission(
     if (elapsedS % 10 === 0) {
       logStep("admission_polling", { elapsed_s: elapsedS, waiting_room: inWaiting });
     }
+    // Каждые 30s — periodic DOM dump (для диагностики, когда нашими селекторами
+    // не виден ни lobby, ни waiting, ни in-meeting indicator).
+    if (elapsedS > 0 && elapsedS % 30 === 0 && !domDumped) {
+      await dumpInMeetingDom(page);
+      domDumped = true; // one-shot до admission_timeout_dump_starting
+    }
 
     await page.waitForTimeout(POLL_INTERVAL_MS);
   }
 
-  // Финальная проверка
+  // Финал — обязательно делаем dom dump, что бы ни случилось.
+  // Без этого Ф2 заведомо непродиагностируем на следующем прогоне.
+  logStep("admission_timeout_dump_starting");
+  await dumpInMeetingDom(page);
+
   if (await checkForTelemostAdmissionIndicators(page)) {
     return true;
   }
 
-  // Если ни lobby, ни waiting, ни rejection — возможно мы в комнате,
-  // просто наши in-meeting селекторы не сработали. Делаем дамп и считаем admitted.
+  // Если ни lobby, ни waiting — считаем admitted и продолжаем
+  // (возможно в комнате, но in-meeting indicators не сработали).
   const lobbyStill = await isLobbyStillVisible(page);
   const waitingStill = await checkForTelemostWaitingRoom(page);
+  logStep("admission_final_state", { lobby_still: lobbyStill, waiting_still: waitingStill });
   if (!lobbyStill && !waitingStill) {
     logStep("admitted_by_elimination", { reason: "no lobby, no waiting, no rejection — assume in meeting" });
-    await dumpInMeetingDom(page);
     return true;
   }
 

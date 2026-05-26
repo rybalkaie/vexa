@@ -118,7 +118,7 @@ export async function joinYandexTelemost(
   logStep("page_loaded", { url: page.url() });
 
   try {
-    await page.screenshot({ path: "/app/storage/screenshots/telemost-00-after-navigation.png", fullPage: true });
+    await page.screenshot({ path: "/app/vexa-bot/storage/screenshots/telemost-00-after-navigation.png", fullPage: true });
   } catch {}
 
   await callJoiningCallback(botConfig).catch((e: any) => log(`[telemost] joining-callback failed (non-fatal): ${e.message}`));
@@ -169,18 +169,21 @@ export async function joinYandexTelemost(
     throw new Error("Lobby: поле ввода имени не найдено в Telemost");
   }
 
-  // 3) Mic / camera — НЕ кликаем. По дефолту они «выключены» (кнопки «Включить...»).
-  // Проверка наличия — для лога / самопроверки.
-  for (const sel of telemostMicButtonSelectors) {
-    try {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 300 })) {
-        const label = await loc.getAttribute("data-testid").catch(() => null);
-        logStep("mic_button_state", { testid: label });
-        break;
-      }
-    } catch {}
+  // 3) Mic / camera. ВАЖНО: в Vexa-контейнере браузеру дают permissions автоматом,
+  // и Telemost включает микрофон по дефолту (testid становится `turn-off-mic-button`).
+  // Бот — наблюдатель, ему вход с открытым мик неприемлем. Кликаем по нему чтобы вырубить.
+  try {
+    const offBtn = page.locator('[data-testid="turn-off-mic-button"]').first();
+    if (await offBtn.isVisible({ timeout: 500 })) {
+      await offBtn.click({ timeout: 2000 });
+      logStep("mic_muted_in_lobby");
+    } else {
+      logStep("mic_already_off");
+    }
+  } catch (e: any) {
+    logStep("mic_mute_failed", { error: e.message });
   }
+  // Камера для лога — не кликаем (по дефолту off).
   for (const sel of telemostCameraButtonSelectors) {
     try {
       const loc = page.locator(sel).first();
@@ -199,7 +202,7 @@ export async function joinYandexTelemost(
   }
 
   try {
-    await page.screenshot({ path: "/app/storage/screenshots/telemost-02-after-join-click.png", fullPage: true });
+    await page.screenshot({ path: "/app/vexa-bot/storage/screenshots/telemost-02-after-join-click.png", fullPage: true });
   } catch {}
 
   logStep("join_done");
