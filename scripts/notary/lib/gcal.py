@@ -167,6 +167,41 @@ def list_instances(
     return items, creds
 
 
+def list_events(
+    creds: Credentials,
+    calendar_id: str,
+    time_min: datetime,
+    time_max: datetime,
+    *,
+    max_results: int = 250,
+) -> tuple[list[dict[str, Any]], Credentials]:
+    """events.list с singleEvents=true — разворачивает recurring в отдельные instances.
+
+    Используется ежевечерним скан-блоком Ф6 для перебора всех событий на 7 дней.
+    Возвращает (events, updated_credentials).
+    """
+    creds = _ensure_fresh(creds)
+    url = f"{CAL_API_BASE}/calendars/{requests.utils.quote(calendar_id, safe='@.')}/events"
+    params = {
+        "timeMin": _iso_utc(time_min),
+        "timeMax": _iso_utc(time_max),
+        "maxResults": max_results,
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "showDeleted": "false",
+    }
+    headers = {"Authorization": f"Bearer {creds.access_token}"}
+    resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+    if resp.status_code == 401:
+        creds = refresh_access_token(creds)
+        headers = {"Authorization": f"Bearer {creds.access_token}"}
+        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+    if not resp.ok:
+        raise GCalAPIError(f"Calendar API HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    return data.get("items", []), creds
+
+
 def get_event(
     creds: Credentials,
     calendar_id: str,
