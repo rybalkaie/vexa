@@ -133,10 +133,18 @@ def main() -> int:
         logger.warning("Vexa уже запущена — primary пропущен")
         return 0
 
-    _launch_bot(primary, now)
+    launched_ok = _launch_bot(primary, now)
 
-    if primary.get("type") == "one-off":
+    if launched_ok and primary.get("type") == "one-off":
         _auto_disable_one_off(primary["meeting_id"])
+    elif not launched_ok and primary.get("type") == "one-off":
+        logger.info(
+            "auto-disable пропущен: one-off %s не стартовал успешно (rc!=0) — "
+            "запись остаётся enabled. ПРЕДУПРЕЖДЕНИЕ: state-файл уже занял "
+            "event_id на 12ч TTL — повторный запуск ЭТОГО event_id блокируется. "
+            "Чтобы попробовать снова в окне старта: почисти `.state.json` руками.",
+            primary["meeting_id"],
+        )
     return 0
 
 
@@ -191,8 +199,11 @@ def _safe_session_uid(meeting_id: str, start_at: str) -> str:
     return f"auto-{meeting_id}-{_SAFE_ID_RE.sub('_', raw_start)}"
 
 
-def _launch_bot(item: dict[str, Any], now: datetime) -> None:
-    """Дёрнуть docker run на VPS. Не блокируется — запускаем в фоне."""
+def _launch_bot(item: dict[str, Any], now: datetime) -> bool:
+    """Дёрнуть docker run на VPS. Не блокируется — запускаем в фоне.
+
+    Возвращает True если ssh+docker run отработали успешно (rc=0).
+    """
     url = item["url"]
     series = item.get("series") or item["meeting_id"]
     start_at = item["start_at"]
@@ -251,8 +262,9 @@ def _launch_bot(item: dict[str, Any], now: datetime) -> None:
                 dedupe=False,
             )
             logger.error("ssh docker run rc=%d, см. %s", proc.returncode, log_file)
-        else:
-            logger.info("ssh docker run OK")
+            return False
+        logger.info("ssh docker run OK")
+        return True
     except subprocess.TimeoutExpired:
         push(
             f"Не смог запустить бот «{series}» (start {start_at}): "
@@ -260,12 +272,14 @@ def _launch_bot(item: dict[str, Any], now: datetime) -> None:
             dedupe=False,
         )
         logger.error("ssh timeout для %s", item["meeting_id"])
+        return False
     except Exception as e:  # noqa: BLE001
         push(
             f"Не смог запустить бот «{series}» (start {start_at}): {e}",
             dedupe=False,
         )
         logger.exception("Запуск упал: %s", e)
+        return False
 
 
 def _auto_disable_one_off(meeting_id: str) -> None:

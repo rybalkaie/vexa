@@ -27,6 +27,24 @@ def _dedupe_key(message: str) -> Path:
     return DEDUP_DIR / f".tg-dedupe-{h}"
 
 
+def _gc_old_markers(now: float) -> None:
+    """Удалить dedupe-маркеры старше 24ч (дольше DEDUP_WINDOW_SEC=6ч).
+
+    Без этого папка обрастает мусором — каждое уникальное сообщение
+    оставляет файл-маркер, через год может набежать десятки тысяч.
+    """
+    cutoff = 24 * 3600
+    try:
+        for p in DEDUP_DIR.glob(".tg-dedupe-*"):
+            try:
+                if (now - p.stat().st_mtime) > cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def push(message: str, *, dedupe: bool = True, silent: bool = False) -> bool:
     """Отправить push в Telegram через tg-send. Возвращает True если отправили.
 
@@ -38,8 +56,9 @@ def push(message: str, *, dedupe: bool = True, silent: bool = False) -> bool:
 
     if dedupe:
         DEDUP_DIR.mkdir(parents=True, exist_ok=True)
-        marker = _dedupe_key(message)
         now = time.time()
+        _gc_old_markers(now)
+        marker = _dedupe_key(message)
         if marker.exists():
             age = now - marker.stat().st_mtime
             if age < DEDUP_WINDOW_SEC:

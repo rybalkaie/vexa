@@ -200,11 +200,28 @@ def _iso_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def extract_meeting_url(event: dict[str, Any]) -> str | None:
-    """Достать ссылку на видеосвязь из события: conferenceData → hangoutLink → location.
+VIDEO_CALL_HOSTS = (
+    "telemost.yandex.ru",
+    "telemost.360.yandex.ru",
+    "meet.google.com",
+    "zoom.us",
+    "teams.microsoft.com",
+    "teams.live.com",
+)
 
-    Возвращает первую найденную ссылку https:// (Telemost / Meet / Zoom — без фильтра здесь,
-    фильтрация по платформе — в эвристике scheduler-а).
+
+def _is_video_call_url(url: str) -> bool:
+    return any(host in url for host in VIDEO_CALL_HOSTS)
+
+
+def extract_meeting_url(event: dict[str, Any]) -> str | None:
+    """Достать ссылку на видеосвязь из события: conferenceData → hangoutLink → location/description.
+
+    conferenceData/hangoutLink — Google гарантирует, что это реальная видеосвязь
+    (там Telemost-add-on или Meet), не фильтруем.
+
+    Для location/description — фильтр по списку известных видео-хостов, чтобы
+    не подхватить случайную ссылку из текста («подробности тут: https://confluence/…»).
     """
     cd = event.get("conferenceData") or {}
     for ep in cd.get("entryPoints", []):
@@ -214,17 +231,14 @@ def extract_meeting_url(event: dict[str, Any]) -> str | None:
     hangout = event.get("hangoutLink")
     if hangout and hangout.startswith("https://"):
         return hangout
-    loc = event.get("location") or ""
-    # Простейший поиск ссылки в location.
     import re
 
-    m = re.search(r"https?://\S+", loc)
-    if m:
-        return m.group(0)
-    desc = event.get("description") or ""
-    m = re.search(r"https?://\S+", desc)
-    if m:
-        return m.group(0)
+    for field in ("location", "description"):
+        text = event.get(field) or ""
+        for m in re.finditer(r"https?://\S+", text):
+            url = m.group(0).rstrip(").,;]")
+            if _is_video_call_url(url):
+                return url
     return None
 
 

@@ -165,20 +165,36 @@ def _finalize_and_collect(session_uid: str) -> None:
     if target_md.exists():
         target_md = target_dir / f"{date_str}-{session_uid}.md"
 
+    # Атомарный scp через tmp + rename — обрыв соединения не оставит частичный .md.
+    tmp_md = target_md.with_suffix(target_md.suffix + ".part")
     scp_cmd = [
         "scp",
         f"{SSH_HOST}:{md_path}",
-        str(target_md),
+        str(tmp_md),
     ]
     try:
         scp = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         push(f"scp .md «{session_uid}» — timeout. Файл на VPS: {md_path}")
         logger.error("scp timeout: %s", session_uid)
+        try:
+            tmp_md.unlink()
+        except FileNotFoundError:
+            pass
         return
     if scp.returncode != 0:
         logger.error("scp rc=%d stderr=%s", scp.returncode, scp.stderr.strip()[:400])
         push(f"scp «{session_uid}» упал: rc={scp.returncode}. Лог в collector.log")
+        try:
+            tmp_md.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    try:
+        os.replace(tmp_md, target_md)
+    except OSError as e:
+        logger.error("os.replace %s → %s упал: %s", tmp_md, target_md, e)
+        push(f"Не смог переименовать .md «{session_uid}»: {e}")
         return
     logger.info("✓ Протокол: %s", target_md)
 
