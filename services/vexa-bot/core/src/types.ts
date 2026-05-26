@@ -1,5 +1,5 @@
 export type BotConfig = {
-  platform: "google_meet" | "zoom" | "teams",
+  platform: "google_meet" | "zoom" | "teams" | "yandex_telemost",
   meetingUrl: string | null,
   botName: string,
   token: string,  // MeetingToken (HS256 JWT)

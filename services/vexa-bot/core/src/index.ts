@@ -6,6 +6,7 @@ import { chromium } from "playwright-extra";
 import { handleGoogleMeet, leaveGoogleMeet } from "./platforms/googlemeet";
 import { handleMicrosoftTeams, leaveMicrosoftTeams } from "./platforms/msteams";
 import { handleZoom, leaveZoom, leaveZoomWeb } from "./platforms/zoom";
+import { handleYandexTelemost, leaveYandexTelemost } from "./platforms/yandextelemost";
 import { reconfigureZoomWebRecording } from "./platforms/zoom/web/recording";
 import { getZoomSpeakerEvents } from "./platforms/zoom/strategies/recording";
 import { browserArgs, getBrowserArgs, getAuthenticatedBrowserArgs, userAgent } from "./constans";
@@ -39,7 +40,7 @@ let currentTask: string | null | undefined = 'transcribe'; // Default task
 let currentRedisUrl: string | null = null;
 let currentConnectionId: string | null = null;
 let meetingApiCallbackUrl: string | null = null; // ADDED: To store callback URL
-let currentPlatform: "google_meet" | "zoom" | "teams" | undefined;
+let currentPlatform: "google_meet" | "zoom" | "teams" | "yandex_telemost" | undefined;
 let page: Page | null = null; // Initialize page, will be set in runBot
 
 // --- ADDED: Flag to prevent multiple shutdowns ---
@@ -685,6 +686,8 @@ async function performGracefulLeave(
          platformLeaveSuccess = await leaveGoogleMeet(page, currentBotConfig ?? undefined);
       } else if (currentPlatform === "teams") {
          platformLeaveSuccess = await leaveMicrosoftTeams(page, currentBotConfig ?? undefined);
+      } else if (currentPlatform === "yandex_telemost") {
+         platformLeaveSuccess = await leaveYandexTelemost(page, currentBotConfig ?? undefined);
       } else {
          log(`[Graceful Leave] No platform-specific leave defined for ${currentPlatform}. Page will be closed.`);
          platformLeaveSuccess = true;
@@ -2571,6 +2574,8 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
       await handleZoom(botConfig, page, performGracefulLeave);
     } else if (botConfig.platform === "teams") {
       await handleMicrosoftTeams(botConfig, page, performGracefulLeave);
+    } else if (botConfig.platform === "yandex_telemost") {
+      await handleYandexTelemost(botConfig, page, performGracefulLeave);
     } else {
       log(`Unknown platform: ${botConfig.platform}`);
       await performGracefulLeave(page, 1, "unknown_platform");

@@ -1,0 +1,76 @@
+name: vexa
+
+# Override от meeting-notary. Лежит в форке Vexa, докручивает upstream-compose
+# двумя вещами:
+#   1. logging driver json-file с ротацией 10 МБ × 5 файлов на каждый сервис
+#      (без этого через год логи съедят гигабайты).
+#   2. env_file подключает overlay-секреты meeting-notary (см. .env.notary
+#      в корне форка). На Ф1 эти переменные читают будущие наши сервисы
+#      (адаптер Telemost в Ф2, runner в Ф5); upstream-сервисы их игнорируют.
+#
+# Подхватывается автоматически, если запускать compose из этой папки:
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+# Их Makefile пока override не использует (COMPOSE_FILE прибит к одному файлу) —
+# для Ф1 это нормально, smoke-test делаем через их make; ротацию проверяем
+# отдельным compose-запуском.
+#
+# Ф2 (адаптер Telemost): bot-контейнер запускается через `docker run` напрямую
+# (vexa-bot в архитектуре Vexa — динамически поднимаемый контейнер на встречу,
+# не compose-сервис). Bind-mount транскриптов и подключение .env.notary делаются
+# в команде docker run — шаблон в:
+#   services/vexa-bot/core/src/platforms/yandextelemost/README.md
+
+x-meeting-notary-logging: &mn-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-meeting-notary-env: &mn-env
+  - path: ../../.env.notary
+    required: false
+
+services:
+  redis:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  postgres:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  minio:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  minio-init:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  admin-api:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  runtime-api:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  api-gateway:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  meeting-api:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  mcp:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  dashboard:
+    logging: *mn-logging
+    env_file: *mn-env
+
+  tts-service:
+    logging: *mn-logging
+    env_file: *mn-env

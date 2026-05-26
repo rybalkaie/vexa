@@ -93,6 +93,9 @@ celerybeat-schedule
 env/
 !deploy/env-example
 venv/
+# meeting-notary overlay — реальные секреты
+.env.notary
+!.env.notary.example
 ENV/
 env.bak/
 venv.bak/
@@ -164,6 +167,8 @@ test_data/
 !services/vexa-bot/core/src/services/hallucinations/*.txt
 manifest.csv
 docker-compose.override.yml
+# meeting-notary overlay — наш override закоммичен явно
+!deploy/compose/docker-compose.override.yml
 .env.test
 hub
 test.log
