@@ -119,17 +119,26 @@ def map_from_speech_regex(
         text_lower = turn.text.lower()
 
         # Найдём имена (любая форма), упомянутые в этой реплике.
-        mentioned: list[tuple[str, bool]] = []  # (name, is_vocative_in_beginning)
+        # Уровни уверенности:
+        #   2.0 — vocative-strict: «Михаил, ...» / «Михаил! ...» (знак после имени).
+        #   1.0 — name-at-beginning: «Михаил рад тебя видеть.» — Whisper-medium
+        #         иногда теряет запятую после vocative, но имя в начале реплики
+        #         почти всегда означает обращение.
+        #   0.5 — name-anywhere: упоминание имени в середине/конце.
+        mentioned: list[tuple[str, float]] = []  # (name, vote_weight)
         for name, forms in name_forms.items():
+            best_weight = 0.0
             for form in forms:
-                # vocative: имя в начале реплики + запятая или восклицание.
                 if re.match(rf"^\s*{re.escape(form)}\s*[,!\?\-—:]", text_lower):
-                    mentioned.append((name, True))
+                    best_weight = max(best_weight, 2.0)
                     break
-                # обычное упоминание: имя как отдельное слово в реплике.
+                if re.match(rf"^\s*{re.escape(form)}\b", text_lower):
+                    best_weight = max(best_weight, 1.0)
+                    # не break — может оказаться и vocative-strict для другой формы
                 if re.search(rf"\b{re.escape(form)}\b", text_lower):
-                    mentioned.append((name, False))
-                    break
+                    best_weight = max(best_weight, 0.5)
+            if best_weight > 0:
+                mentioned.append((name, best_weight))
 
         if not mentioned:
             continue
@@ -144,12 +153,12 @@ def map_from_speech_regex(
                 next_cluster = turns[j].speaker
                 break
 
-        for name, is_vocative in mentioned:
-            weight = 1.0 if is_vocative else 0.5
-            # speaker_cluster — НЕ это имя.
+        for name, weight in mentioned:
+            # speaker_cluster — НЕ это имя (с весом всегда).
             anti_votes[(speaker_cluster, name)] = anti_votes.get((speaker_cluster, name), 0.0) + weight
-            # vocative и следующий cluster есть — это имя.
-            if is_vocative and next_cluster:
+            # Vocative-сигнал (weight >= 1) — следующий cluster = это имя.
+            # Mention-only (weight < 1) — не назначаем имя, только anti-vote.
+            if weight >= 1.0 and next_cluster:
                 votes[(next_cluster, name)] = votes.get((next_cluster, name), 0.0) + weight
 
     # Greedy назначение.
