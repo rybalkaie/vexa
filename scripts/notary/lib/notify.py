@@ -18,7 +18,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 TG_SEND_BIN = Path(os.path.expanduser("~/.local/bin/tg-send"))
-DEDUP_DIR = Path(os.path.expanduser("~/Library/Logs/meeting-notary"))
+DEDUP_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+))
 DEDUP_WINDOW_SEC = 6 * 3600
 
 

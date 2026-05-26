@@ -82,7 +82,9 @@ DISPLAY_TZ = ZoneInfo("Asia/Dubai")
 STATE_DIR = Path(os.path.expanduser("~/.local/state"))
 KNOWN_CACHE_FILE = STATE_DIR / "meetings-known-instances.json"
 
-LOG_DIR = Path(os.path.expanduser("~/Library/Logs/meeting-notary"))
+LOG_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+))
 LOG_FILE = LOG_DIR / "meetings-evening-block.log"
 
 

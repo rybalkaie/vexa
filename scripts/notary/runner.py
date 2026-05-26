@@ -49,7 +49,9 @@ from notary.lib.state import (  # noqa: E402
     state_acquire,
 )
 
-LOG_DIR = Path(os.path.expanduser("~/Library/Logs/meeting-notary"))
+LOG_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+))
 LOG_FILE = LOG_DIR / "runner.log"
 RUNS_DIR = LOG_DIR / "runs"  # per-meeting stdout/stderr
 

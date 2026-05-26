@@ -16,7 +16,9 @@ from typing import Any
 
 import yaml
 
-DEFAULT_REGISTRY_DIR = Path(os.path.expanduser("~/Projects/me/встречи"))
+DEFAULT_REGISTRY_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_REGISTRY_DIR", "~/Projects/me/встречи")
+))
 ROOMS_FILE = DEFAULT_REGISTRY_DIR / "rooms.yaml"
 WATCHED_FILE = DEFAULT_REGISTRY_DIR / "watched.yaml"
 PAUSE_FILE = DEFAULT_REGISTRY_DIR / ".pause-until"

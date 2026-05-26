@@ -58,10 +58,14 @@ from notary.cli.registry import (  # noqa: E402
 STATE_DIR = Path(os.path.expanduser("~/.local/state"))
 SNAPSHOT_FILE = STATE_DIR / "meetings-shown.last.json"
 
-LOG_DIR = Path(os.path.expanduser("~/Library/Logs/meeting-notary"))
+LOG_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+))
 LOG_FILE = LOG_DIR / "meetings-apply-reply.log"
 
-CLAUDE_BIN = os.path.expanduser("~/.npm-global/bin/claude")
+CLAUDE_BIN = os.path.expanduser(os.environ.get(
+    "CLAUDE_BIN", "~/.npm-global/bin/claude"
+))
 CLAUDE_TIMEOUT_S = 90
 
 VALID_ACTIONS = {"accept_once", "accept_series", "reject", "ignore_forever"}

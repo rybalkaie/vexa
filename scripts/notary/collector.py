@@ -38,7 +38,9 @@ sys.path.insert(0, str(THIS_DIR.parent))
 
 from notary.lib.notify import push  # noqa: E402
 
-LOG_DIR = Path(os.path.expanduser("~/Library/Logs/meeting-notary"))
+LOG_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+))
 LOG_FILE = LOG_DIR / "collector.log"
 
 SSH_HOST = "meeting-notary"
