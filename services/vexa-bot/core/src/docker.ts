@@ -22,7 +22,7 @@ const BrowserSessionConfigSchema = z.object({
 // Meeting mode schema — requires platform, meetingUrl, botName
 export const BotConfigSchema = z.object({
   mode: z.enum(["meeting", "browser_session"]).default("meeting"),
-  platform: z.enum(["google_meet", "zoom", "teams"]),
+  platform: z.enum(["google_meet", "zoom", "teams", "yandex_telemost"]),
   meetingUrl: z.string().url().nullable(),
   botName: z.string(),
   token: z.string().optional(),
