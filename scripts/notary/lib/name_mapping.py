@@ -210,43 +210,41 @@ def map_from_claude_haiku(
     turns: list[AlignedTurn],
     participants: list[str],
     already_mapped: dict[str, str],
-    api_key: Optional[str] = None,
-    model: str = "claude-haiku-4-5-20251001",
-    max_tokens: int = 200,
+    api_key: Optional[str] = None,  # kept for API compat; не используется
+    model: str = "claude-haiku-4-5-20251001",  # kept for API compat; не используется
+    max_tokens: int = 200,  # kept for API compat; не используется
 ) -> dict[str, str]:
-    """LLM-добивка через Claude Haiku для непривязанных кластеров.
+    """LLM-добивка через `claude` CLI (подписка владельца, без отдельного API ключа).
 
-    Дисциплина:
+    В Ф4 решено не заводить ANTHROPIC_API_KEY — `claude --print` ходит через
+    ту же подписку Claude Code, что и интерактивный режим. Минус — задержка
+    5-10s на запуск CLI; запускается после транскрипции, до встречи не доходит.
+
+    Дисциплина «Опасной тройки» (см. CLAUDE.md проекта):
       - В промпте только непривязанные кластеры + их короткие реплики +
         список оставшихся имён.
-      - Логируем только metadata (число кластеров, число имён, статус).
-      - Не сохраняем сырой ответ Claude — только результат map.
+      - Логируем только метаданные (число кластеров, число имён, статус).
+      - Не сохраняем сырой ответ — только результат {cluster: name | None}.
     """
+    import subprocess
+    import shutil
+
     enabled = os.environ.get("ENABLE_CLAUDE_NAME_MAPPING", "0").strip().lower() in ("1", "true", "yes")
     if not enabled:
-        logger.info("Source 3 (Claude Haiku): disabled by ENABLE_CLAUDE_NAME_MAPPING")
+        logger.info("Source 3 (Claude CLI): disabled by ENABLE_CLAUDE_NAME_MAPPING")
         return {}
 
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        logger.info("Source 3 (Claude Haiku): ANTHROPIC_API_KEY not set, skipping")
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        logger.warning("Source 3 (Claude CLI): `claude` not in PATH — пропускаем")
         return {}
 
     unresolved_clusters = sorted({t.speaker for t in turns if t.speaker and t.speaker not in already_mapped})
     available_names = [p for p in participants if p not in already_mapped.values()]
     if not unresolved_clusters or not available_names:
-        logger.info("Source 3 (Claude Haiku): nothing to resolve")
+        logger.info("Source 3 (Claude CLI): nothing to resolve")
         return {}
 
-    try:
-        import anthropic  # type: ignore
-    except ImportError:
-        logger.warning("anthropic SDK not installed — Source 3 skipped")
-        return {}
-
-    # Готовим компактный transcript-фрагмент: для каждого непривязанного кластера
-    # берём до 5 его реплик. Этого достаточно для контекста и не сливает весь
-    # текст наружу.
     cluster_to_lines: dict[str, list[str]] = {c: [] for c in unresolved_clusters}
     for turn in turns:
         if turn.speaker in cluster_to_lines and turn.text.strip():
@@ -261,47 +259,55 @@ def map_from_claude_haiku(
         parts.append(f"{c}: {body}")
     transcript_block = "\n".join(parts)
 
-    user_prompt = (
-        f"Список имён участников встречи: {', '.join(available_names)}\n\n"
-        f"Реплики спикеров:\n{transcript_block}"
+    full_prompt = (
+        CLAUDE_MAPPING_SYSTEM_PROMPT
+        + "\n\n"
+        + f"Список имён участников встречи: {', '.join(available_names)}\n\n"
+        + f"Реплики спикеров:\n{transcript_block}"
     )
 
     logger.info(
-        "Source 3 (Claude Haiku): %d clusters × %d names, total reply lines=%d",
+        "Source 3 (Claude CLI): %d clusters × %d names, total reply lines=%d",
         len(unresolved_clusters), len(available_names),
         sum(len(v) for v in cluster_to_lines.values()),
     )
 
     try:
-        client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=CLAUDE_MAPPING_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
+        result = subprocess.run(
+            [claude_bin, "--print"],
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
-        # Конфиденциальность: не логируем resp целиком, только метаданные.
-        usage = getattr(resp, "usage", None)
-        in_tok = getattr(usage, "input_tokens", "?") if usage else "?"
-        out_tok = getattr(usage, "output_tokens", "?") if usage else "?"
-        logger.info("Claude response received (in=%s, out=%s tokens)", in_tok, out_tok)
-
-        # Берём текст из первого text block'а.
-        text_blocks = [b for b in resp.content if getattr(b, "type", None) == "text"]
-        if not text_blocks:
-            logger.warning("Claude returned no text blocks")
+        if result.returncode != 0:
+            logger.warning(
+                "Source 3 (Claude CLI): exit=%d, stderr=%s",
+                result.returncode, result.stderr.strip()[:200],
+            )
             return {}
-        raw = text_blocks[0].text.strip()
-        # Иногда модель оборачивает в ```json ... ``` — отрежем.
+        raw = (result.stdout or "").strip()
+        if not raw:
+            logger.warning("Source 3 (Claude CLI): пустой ответ")
+            return {}
+        # Иногда модель оборачивает в ```json … ``` или говорит лишнее.
+        # Сначала вырежем markdown fence, затем найдём первый JSON-объект.
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.warning("Claude returned invalid JSON: %s", e)
+        m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if not m:
+            logger.warning("Source 3 (Claude CLI): не нашли JSON в ответе")
+            return {}
+        parsed = json.loads(m.group(0))
+    except subprocess.TimeoutExpired:
+        logger.warning("Source 3 (Claude CLI): timeout 60s — пропуск")
         return {}
-    except Exception as e:
-        logger.warning("Claude call failed: %s", e)
+    except json.JSONDecodeError as e:
+        logger.warning("Source 3 (Claude CLI): invalid JSON: %s", e)
+        return {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Source 3 (Claude CLI) failed: %s", e)
         return {}
 
     # Валидируем: ключ должен быть в unresolved_clusters, значение — из available_names.

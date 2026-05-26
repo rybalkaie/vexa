@@ -39,7 +39,7 @@ DURATION_RE = re.compile(r"^(\d+)([dhm])$", re.IGNORECASE)
 BOT_IMAGE = "vexa-bot:notarius-telemost"
 DOCKER_NETWORK = "vexa_vexa"
 TRANSCRIPTION_URL = "http://172.17.0.1:8083/v1/audio/transcriptions"
-TRANSCRIPTS_VOLUME = "~/meeting-notary/_tmp/transcripts:/transcripts"
+TRANSCRIPTS_VOLUME = "/home/dev/meeting-notary/_tmp/transcripts:/transcripts"
 SSH_HOST = "meeting-notary"
 
 
