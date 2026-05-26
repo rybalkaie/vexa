@@ -195,10 +195,25 @@ export async function joinYandexTelemost(
     } catch {}
   }
 
-  // 4) Клик «Подключиться»
+  // 4) Клик «Подключиться» — с JS fallback (как у интерстициала, тот же баг).
   const joined = await tryClickFirstVisible(page, telemostJoinButtonSelectors, "join_clicked", 15000);
   if (!joined) {
     throw new Error("Lobby: кнопка «Подключиться» не найдена в Telemost");
+  }
+  await jsClickByText(page, "Подключиться", "join_clicked");
+  // Доп. подстраховка — если есть data-testid="enter-conference-button", дёргаем явно через JS.
+  try {
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid="enter-conference-button"]') as HTMLElement | null;
+      if (btn) {
+        btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+        btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+        btn.click();
+      }
+    });
+    logStep("join_testid_jsclicked");
+  } catch (e: any) {
+    logStep("join_testid_jsclick_failed", { error: e.message });
   }
 
   try {
