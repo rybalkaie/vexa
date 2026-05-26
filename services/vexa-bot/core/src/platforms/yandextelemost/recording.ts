@@ -117,8 +117,11 @@ class WavStreamWriter {
   open(): void {
     this.fd = fs.openSync(this.filePath, "w");
     // Записываем заголовок с placeholder-длинами (заполним при close).
+    // ВАЖНО: fs.writeSync БЕЗ position — иначе file cursor остаётся 0 и
+    // следующий write samples перезаписывает header (Node docs:
+    // "If position is an integer, the file position will remain unchanged").
     const header = float32ToWavBuffer(new Float32Array(0), this.sampleRate).subarray(0, 44);
-    fs.writeSync(this.fd, header, 0, 44, 0);
+    fs.writeSync(this.fd, header, 0, 44);
   }
 
   writeSamples(samples: Float32Array): void {
