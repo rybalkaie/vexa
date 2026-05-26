@@ -98,7 +98,9 @@ async function transcribeChunk(
 ): Promise<string | null> {
   try {
     const form = new FormData();
-    form.append("file", new Blob([wav], { type: "audio/wav" }), "chunk.wav");
+    // Cast to Uint8Array — Node Buffer<ArrayBufferLike> isn't directly BlobPart-compatible in TS DOM types.
+    const wavBlob = new Blob([new Uint8Array(wav)], { type: "audio/wav" });
+    form.append("file", wavBlob, "chunk.wav");
     form.append("model", "Systran/faster-whisper-medium");
     if (language) form.append("language", language);
     form.append("response_format", "json");
