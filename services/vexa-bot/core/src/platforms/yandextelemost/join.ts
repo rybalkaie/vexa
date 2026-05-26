@@ -105,10 +105,27 @@ export async function joinYandexTelemost(
   }
 
   // 2) Lobby — ждём появления поля имени.
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3000);
+
+  // Диагностика: дамп state — URL, title, testids, видимый текст.
   try {
-    await page.screenshot({ path: "/app/storage/screenshots/telemost-01-lobby.png", fullPage: true });
-  } catch {}
+    const diag = await page.evaluate(() => {
+      const testids = Array.from(document.querySelectorAll("[data-testid]"))
+        .slice(0, 40)
+        .map((el) => ({
+          testid: el.getAttribute("data-testid"),
+          tag: el.tagName,
+          text: ((el as HTMLElement).innerText || "").trim().substring(0, 50),
+        }));
+      const visibleText = (document.body.innerText || "").substring(0, 600);
+      return { url: location.href, title: document.title, testids, visibleText };
+    });
+    logStep("post_interstitial_state", { url: diag.url, title: diag.title });
+    log(`${LOG_PREFIX} post_interstitial_testids ${JSON.stringify(diag.testids)}`);
+    log(`${LOG_PREFIX} post_interstitial_visible_text ${JSON.stringify(diag.visibleText)}`);
+  } catch (e: any) {
+    logStep("post_interstitial_diag_failed", { error: e.message });
+  }
 
   const nameOk = await fillNameInput(page, botName);
   if (!nameOk) {
