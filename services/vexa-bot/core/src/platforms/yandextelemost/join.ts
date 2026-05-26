@@ -48,6 +48,38 @@ async function tryClickFirstVisible(page: Page, selectors: string[], stepName: s
   return false;
 }
 
+/**
+ * JS-level click через page.evaluate — обходит overlay-protection и
+ * срабатывает в случаях, когда обычный Playwright click отрабатывает
+ * визуально, но не триггерит реактивный handler (мы видели такое
+ * на интерстициале «Продолжить в браузере» в Telemost).
+ */
+async function jsClickByText(page: Page, text: string, stepName: string): Promise<boolean> {
+  try {
+    const ok = await page.evaluate((needle: string) => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const target = buttons.find(
+        (b) => ((b as HTMLElement).innerText || "").trim() === needle ||
+               ((b as HTMLElement).innerText || "").trim().includes(needle)
+      ) as HTMLElement | undefined;
+      if (!target) return false;
+      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      target.click();
+      return true;
+    }, text);
+    if (ok) {
+      logStep(`${stepName}_jsclicked`, { text });
+    } else {
+      logStep(`${stepName}_jsclick_target_missing`, { text });
+    }
+    return ok;
+  } catch (e: any) {
+    logStep(`${stepName}_jsclick_failed`, { error: e.message });
+    return false;
+  }
+}
+
 async function fillNameInput(page: Page, name: string, timeoutMs = 20000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -100,7 +132,11 @@ export async function joinYandexTelemost(
     "interstitial_continue",
     8000
   );
-  if (!interstitialClicked) {
+  if (interstitialClicked) {
+    // Дополнительно дёргаем JS-клик: Playwright click в Telemost иногда
+    // не триггерит React handler (видели на VPS — URL остаётся прежним).
+    await jsClickByText(page, "Продолжить в браузере", "interstitial_continue");
+  } else {
     logStep("interstitial_skipped", { reason: "not_visible_or_already_past" });
   }
 

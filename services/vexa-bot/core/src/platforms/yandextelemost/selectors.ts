@@ -5,8 +5,10 @@
 // Если Telemost обновит фронт — менять здесь, не размазывать по всему адаптеру.
 
 // Промежуточный экран «Вы подключаетесь к видеовстрече» с одной кнопкой.
+// ВАЖНО: `to-home-screen-button` — это кнопка «На главную» (стрелка-крест в углу),
+// она НЕ ведёт в lobby. Игнорируем её. Реальная «Продолжить в браузере» —
+// один из orb-button BUTTON; ищем по тексту.
 export const telemostInterstitialContinueSelectors: string[] = [
-  '[data-testid="to-home-screen-button"]',
   'button:has-text("Продолжить в браузере")',
 ];
 
