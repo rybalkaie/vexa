@@ -48,25 +48,28 @@ async function tryClickFirstVisible(page: Page, selectors: string[], stepName: s
   return false;
 }
 
-async function fillNameInput(page: Page, name: string): Promise<boolean> {
-  for (const sel of telemostNameInputSelectors) {
-    try {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 1000 })) {
-        await loc.click({ timeout: 2000 });
-        // Reliable clear-and-fill: select all, type new value
-        await page.keyboard.press("Control+A").catch(() => {});
-        await page.keyboard.press("Meta+A").catch(() => {});
-        await page.keyboard.press("Delete").catch(() => {});
-        await loc.fill(name, { timeout: 5000 });
-        logStep("name_filled", { selector: sel, name });
-        return true;
+async function fillNameInput(page: Page, name: string, timeoutMs = 20000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const sel of telemostNameInputSelectors) {
+      try {
+        const loc = page.locator(sel).first();
+        if (await loc.isVisible({ timeout: 500 })) {
+          await loc.click({ timeout: 2000 });
+          await page.keyboard.press("Control+A").catch(() => {});
+          await page.keyboard.press("Meta+A").catch(() => {});
+          await page.keyboard.press("Delete").catch(() => {});
+          await loc.fill(name, { timeout: 5000 });
+          logStep("name_filled", { selector: sel, name, waited_ms: Date.now() - start });
+          return true;
+        }
+      } catch {
+        continue;
       }
-    } catch {
-      continue;
     }
+    await page.waitForTimeout(500);
   }
-  logStep("name_input_not_found", { tried_selectors: telemostNameInputSelectors });
+  logStep("name_input_not_found", { tried_selectors: telemostNameInputSelectors, waited_ms: Date.now() - start });
   return false;
 }
 
