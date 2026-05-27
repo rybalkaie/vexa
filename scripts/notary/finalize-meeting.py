@@ -4,21 +4,33 @@
 Использование:
     python3 finalize-meeting.py <meta.json>
 
-Пример:
-    python3 finalize-meeting.py /transcripts/2026-05-26-test-1.meta.json
+Pipeline (определяется env STT_BACKEND, default `whisper_pyannote`):
 
-Pipeline:
-    1. Прочитать meta.json (path к WAV, participants[], meetingUrl, …).
-    2. Транскрибировать ВЕСЬ WAV через transcription-service (faster-whisper).
-    3. Диарезация через pyannote-audio (требует HF_TOKEN).
-    4. Alignment Whisper-сегментов с pyannote-кластерами.
-    5. Merge подряд идущих реплик одного спикера.
-    6. Маппинг имён: source 1 (Telemost) + source 2 (regex+pymorphy3) +
-       source 3 (Claude Haiku, под флагом ENABLE_CLAUDE_NAME_MAPPING).
-    7. Рендер markdown по templates/meeting-protocol.md.
-    8. Записать в --output-dir (default: $TELEMOST_PROTOCOL_DIR или
-       /opt/meeting-notary/_tmp/protocols/).
-    9. Если keep_audio в meta != true и --keep-audio не передан — удалить WAV.
+    STT_BACKEND=whisper_pyannote (default):
+        1. Прочитать meta.json (path к WAV, participants[], meetingUrl, …).
+        2. transcribe_wav через transcription-service (faster-whisper).
+        3. diarize_wav через pyannote 3.1 (требует HF_TOKEN).
+        4. assign_speakers (alignment) + merge_consecutive_same_speaker.
+        5. Маппинг имён (source 1 Telemost / source 2 regex+pymorphy3 /
+           source 3 Claude Haiku под флагом).
+        6. Рендер markdown и запись в --output-dir.
+
+    STT_BACKEND=speechmatics:
+        1. Прочитать meta.json.
+        2. speechmatics_client.transcribe_diarize_wav → TranscriptionResult
+           (utterances + audio_duration + lang + raw_json + job_id).
+        3. to_aligned_turns → AlignedTurn'ы → merge_consecutive_same_speaker.
+        4. Маппинг имён (тот же).
+        5. Рендер markdown + сохранение _transcripts/<date>.{json,txt} +
+           ссылка-строка в шапке .md. Все три артефакта пишутся атомарно:
+           сначала .part-файлы, потом os.replace() ТОЛЬКО на успехе всего
+           pipeline — либо все три есть, либо ни одного.
+        6. При SpeechmaticsError/SpeechmaticsRejectedError аудио + meta
+           уходит в `_failed/<sid>.*` для retry-очереди, в Telegram идёт
+           push. WAV из _tmp НЕ удаляется до успешной финализации.
+
+Pipeline-инвариант: name_mapping (Claude Haiku) и render_protocol работают
+поверх AlignedTurn в обеих ветках без изменений.
 
 Конфиденциальность («Опасная тройка» Ф3):
     - НЕ логируем содержимое транскрипта.
@@ -32,7 +44,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -40,9 +54,6 @@ from pathlib import Path
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from lib.transcribe import transcribe_wav  # noqa: E402
-from lib.diarize import diarize_wav  # noqa: E402
-from lib.align import assign_speakers, merge_consecutive_same_speaker  # noqa: E402
 from lib.name_mapping import map_all, apply_mapping  # noqa: E402
 from lib.render import render_protocol  # noqa: E402
 
@@ -54,6 +65,326 @@ def setup_logging(verbose: bool) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+
+def _stt_backend() -> str:
+    """Читает STT_BACKEND из env. Поддерживается `whisper_pyannote` (default) и `speechmatics`."""
+    raw = (os.environ.get("STT_BACKEND") or "").strip().lower()
+    if not raw or raw == "whisper_pyannote":
+        return "whisper_pyannote"
+    if raw == "speechmatics":
+        return "speechmatics"
+    raise SystemExit(
+        f"STT_BACKEND={raw!r} — недопустимое значение. "
+        "Допустимо: 'whisper_pyannote' (default) или 'speechmatics'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ветка whisper+pyannote (старая, default до cutover в Ф4)
+# ---------------------------------------------------------------------------
+
+def _run_whisper_pyannote(
+    args, meta: dict, wav_path: str, language: str, log: logging.Logger
+):
+    """Старая ветка: transcribe_wav + diarize_wav + assign_speakers + merge.
+
+    Возвращает (turns, extra) — где `extra` это словарь с полями для финального
+    JSON-отчёта (whisper_segments / diarization_segments / detected_language).
+    """
+    # Импорт внутри ветки — чтобы STT_BACKEND=speechmatics не тащил pyannote/torch.
+    from lib.transcribe import transcribe_wav  # noqa
+    from lib.diarize import diarize_wav  # noqa
+    from lib.align import assign_speakers, merge_consecutive_same_speaker  # noqa
+
+    log.info("Step 1/5 — Transcribe full WAV (whisper)")
+    api_token = os.environ.get("TRANSCRIPTION_SERVICE_TOKEN")
+    _full_text, detected_lang, whisper_segments = transcribe_wav(
+        wav_path,
+        service_url=args.transcription_service_url,
+        model=args.asr_model,
+        language=language,
+        api_token=api_token,
+    )
+    if not whisper_segments:
+        log.warning("Whisper returned 0 segments — записанный WAV похож на тишину")
+
+    log.info("Step 2/5 — Diarization via pyannote-audio")
+    diarization_segments = diarize_wav(
+        wav_path,
+        num_speakers=args.num_speakers,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
+        device="cpu",
+    )
+
+    log.info("Step 3/5 — Align + merge")
+    aligned = assign_speakers(whisper_segments, diarization_segments)
+    turns = merge_consecutive_same_speaker(aligned, max_gap_s=1.5)
+    extra = {
+        "detected_language": detected_lang,
+        "whisper_segments": len(whisper_segments),
+        "diarization_segments": len(diarization_segments),
+        "speakers_detected": len({s.speaker for s in diarization_segments}),
+        "stt_label": "whisper+pyannote",
+    }
+    return turns, extra
+
+
+# ---------------------------------------------------------------------------
+# Ветка Speechmatics (новая, Ф2)
+# ---------------------------------------------------------------------------
+
+def _run_speechmatics(wav_path: str, log: logging.Logger):
+    """Speechmatics-ветка: один HTTP-запрос вместо whisper+pyannote.
+
+    Возвращает (turns, extra, sm_result) — `sm_result` это TranscriptionResult
+    с raw_json/job_id/duration/lang — используется выше для сохранения в
+    _transcripts/<date>.{json,txt}.
+
+    HF_TOKEN явно удаляется из env: Speechmatics его не использует, и нечего
+    случайно его таскать в дочерние процессы (типа Claude Haiku подпроцесса,
+    хотя там он тоже не нужен — но дисциплина дороже).
+    """
+    from lib.speechmatics_client import transcribe_diarize_wav, to_aligned_turns
+    from lib.align import merge_consecutive_same_speaker  # noqa
+
+    os.environ.pop("HF_TOKEN", None)
+
+    log.info("Step 1/3 — Speechmatics submit + transcribe + diarize (один запрос)")
+    sm_result = transcribe_diarize_wav(wav_path)
+    log.info(
+        "Speechmatics: %d utterances, %d спикеров, %.1f сек аудио, lang=%s, job=%s",
+        len(sm_result.utterances),
+        len({u.speaker for u in sm_result.utterances}),
+        sm_result.audio_duration_s,
+        sm_result.detected_language,
+        sm_result.job_id,
+    )
+
+    log.info("Step 2/3 — Adapter Utterance → AlignedTurn + merge_consecutive")
+    aligned = to_aligned_turns(sm_result.utterances)
+    # merge_consecutive_same_speaker оставлен идемпотентным: Speechmatics уже
+    # склеивает подряд идущие реплики одного спикера, поэтому на практике
+    # шаг no-op (см. эмпирическую проверку в плане Ф2). Не убираем — защита
+    # на случай нестандартных стыков (короткое перебивание + продолжение).
+    turns = merge_consecutive_same_speaker(aligned, max_gap_s=1.5)
+
+    extra = {
+        "detected_language": sm_result.detected_language,
+        "audio_duration_s": sm_result.audio_duration_s,
+        "speechmatics_job_id": sm_result.job_id,
+        "utterances_raw": len(sm_result.utterances),
+        "speakers_detected": len({u.speaker for u in sm_result.utterances}),
+        "stt_label": "speechmatics-enhanced",
+    }
+    return turns, extra, sm_result
+
+
+# ---------------------------------------------------------------------------
+# _failed/ — retry-очередь при сбое Speechmatics
+# ---------------------------------------------------------------------------
+
+def _failed_dir() -> Path:
+    """`_failed/` рядом с output-dir; default `/srv/meeting-notary/_failed/`."""
+    return Path(os.environ.get("MEETING_NOTARY_FAILED_DIR") or "/srv/meeting-notary/_failed")
+
+
+def _push_telegram(message: str, *, silent: bool = False) -> None:
+    """Тонкая обёртка над `/srv/meeting-notary/bin/tg-send` (он сам читает .env.notary).
+
+    На маке отсутствует — там используется `~/.local/bin/tg-send`. Финализатор
+    штатно работает только на VPS, поэтому ищем сначала VPS-путь.
+    """
+    log = logging.getLogger("finalize-meeting")
+    candidates = [
+        "/srv/meeting-notary/bin/tg-send",
+        os.path.expanduser("~/.local/bin/tg-send"),
+    ]
+    tg = next((p for p in candidates if os.access(p, os.X_OK)), None)
+    if not tg:
+        # logger.error (не warning) — это значит ВЛАДЕЛЕЦ НЕ УЗНАЕТ о сбое
+        # Speechmatics / финализации через Telegram. Должен орать в journal,
+        # чтобы при разборе очевидно было «alert silenced». См. У6 цикла Ф2.
+        log.error("tg-send не найден в %s — push НЕ ОТПРАВЛЕН: %s", candidates, message[:120])
+        return
+    import subprocess
+    cmd = [tg]
+    if silent:
+        cmd.append("--silent")
+    cmd.append(message)
+    try:
+        subprocess.run(cmd, check=True, timeout=15)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        log.warning("tg-send failed: %s — %s", e, message[:80])
+
+
+def _stash_into_failed(
+    sid: str,
+    wav_path: str,
+    meta_path: str,
+    *,
+    rejected: bool,
+    err_repr: str,
+) -> Path:
+    """Скопировать WAV+meta в `_failed/<sid>.*` и создать retry-state.
+
+    Если `rejected=True` (конфиг-ошибка Speechmatics: формат/lang/audio) —
+    выставляем `attempts=99` чтобы retry-timer не пробовал; ручной разбор
+    нужен. Это решение из плана Ф2 (защита от бесполезных retry).
+    """
+    log = logging.getLogger("finalize-meeting")
+    failed = _failed_dir()
+    failed.mkdir(parents=True, exist_ok=True)
+
+    wav_dst = failed / f"{sid}.wav"
+    meta_dst = failed / f"{sid}.meta.json"
+    state_dst = failed / f"{sid}.retry-state.json"
+
+    if not wav_dst.exists() and os.path.exists(wav_path):
+        shutil.copy2(wav_path, wav_dst)
+    # meta в _failed/ должна указывать на WAV в _failed/, иначе retry попробует
+    # обработать исходник из _tmp/, который к этому моменту может быть удалён
+    # collector'ом / следующей итерацией финализатора.
+    if not meta_dst.exists() and os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta_for_retry = json.load(fh)
+        files = (meta_for_retry.get("files") or {}).copy()
+        files["wav"] = str(wav_dst)
+        meta_for_retry["files"] = files
+        meta_dst.write_text(
+            json.dumps(meta_for_retry, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    # Защита от дубля submit в Speechmatics (У1+У2 из цикла Ф2): после stash
+    # удаляем исходные meta/WAV из _tmp/ — иначе listener/collector на следующем
+    # тике подберёт meta повторно и оплатит второй submit ($1/час). Источник
+    # истины теперь — копия в _failed/.
+    if str(Path(wav_path).resolve()) != str(wav_dst.resolve()) and os.path.exists(wav_path):
+        try:
+            os.unlink(wav_path)
+            log.info("Исходный WAV в _tmp/ удалён, источник истины — _failed/%s.wav", sid)
+        except OSError as e:
+            log.warning("Не смог удалить исходный WAV %s: %s", wav_path, e)
+    if str(Path(meta_path).resolve()) != str(meta_dst.resolve()) and os.path.exists(meta_path):
+        try:
+            os.unlink(meta_path)
+            log.info("Исходный meta в _tmp/ удалён, источник истины — _failed/%s.meta.json", sid)
+        except OSError as e:
+            log.warning("Не смог удалить исходный meta %s: %s", meta_path, e)
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    state = {
+        "session_uid": sid,
+        "first_failed_at": now_iso,
+        "attempts": 99 if rejected else 0,
+        "last_attempt_at": None,
+        "rejected": rejected,
+        "last_error": err_repr[:500],
+        "original_meta_path": meta_path,
+        "original_wav_path": wav_path,
+    }
+    state_dst.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    log.info("Stashed into %s (rejected=%s)", failed, rejected)
+    return failed
+
+
+# ---------------------------------------------------------------------------
+# Атомарность артефактов: .part → os.replace()
+# ---------------------------------------------------------------------------
+
+class _AtomicBundle:
+    """Запись 3 артефактов (JSON / TXT / MD) одним атомарным коммитом.
+
+    Использование:
+        bundle = _AtomicBundle()
+        bundle.add(json_path, json_str)
+        bundle.add(txt_path, txt_str)
+        bundle.add(md_path, md_str)
+        bundle.commit()   # на этом моменте всё или ничего
+
+    На любой exception между add() и commit() — bundle.abort() убирает .part'ы;
+    .commit() атомарно переименовывает все .part в финальные имена через
+    os.replace(). Если os.replace одного из них упадёт посередине — частично
+    переименованные откатываем по-best-effort, но это редкий edge-case (две
+    записи на одной локальной FS обычно либо обе ОК, либо обе падают).
+    """
+
+    def __init__(self) -> None:
+        self._parts: list[tuple[Path, Path]] = []  # [(final, part), ...]
+
+    def add(self, final_path: Path, content: str | bytes) -> None:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path = final_path.with_suffix(final_path.suffix + ".part")
+        mode = "wb" if isinstance(content, (bytes, bytearray)) else "w"
+        encoding = None if isinstance(content, (bytes, bytearray)) else "utf-8"
+        with open(part_path, mode, encoding=encoding) as fh:
+            fh.write(content)
+        self._parts.append((final_path, part_path))
+
+    def commit(self) -> None:
+        renamed: list[Path] = []
+        try:
+            for final_path, part_path in self._parts:
+                os.replace(part_path, final_path)
+                renamed.append(final_path)
+        except Exception:
+            # Откатываем уже переименованные финальные файлы,
+            # И отдельно сметаем оставшиеся .part'ы — иначе на FS остаётся
+            # мусор после частичного commit'а (Н1 цикла Ф2).
+            for f in renamed:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            for _, part_path in self._parts:
+                try:
+                    if part_path.exists():
+                        part_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def abort(self) -> None:
+        for _, part_path in self._parts:
+            try:
+                if part_path.exists():
+                    part_path.unlink()
+            except OSError:
+                pass
+        self._parts.clear()
+
+
+def _format_transcript_txt(utterances) -> str:
+    """`[HH:MM:SS] Speaker S1: текст`. По одной реплике на строку."""
+    lines = []
+    for u in utterances:
+        total = int(u.start)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        ts = f"{h:02d}:{m:02d}:{s:02d}"
+        lines.append(f"[{ts}] Speaker {u.speaker}: {u.text}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _output_dir_for_meta(args, meta: dict) -> tuple[Path, str, str]:
+    """Решает, куда писать .md. Возвращает (series_dir, date_part, md_name).
+
+    Серия `<series>` берётся из meta; если её нет — кладём в подпапку с
+    sessionUid (legacy-поведение `<date>-<sid>.md`).
+    """
+    date_part = (meta.get("startTs") or datetime.now().isoformat())[:10]
+    series = (meta.get("series") or "").strip()
+    sid = meta.get("sessionUid") or "unknown"
+    base = Path(args.output_dir)
+    if series:
+        return base / series, date_part, f"{date_part}.md"
+    # legacy fallback (как было): один .md в корне output-dir, без серии.
+    return base, date_part, f"{date_part}-{sid}.md"
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Финализирует встречу в Markdown-протокол")
@@ -81,23 +412,28 @@ def main() -> int:
     parser.add_argument("--min-speakers", type=int, default=None)
     parser.add_argument("--max-speakers", type=int, default=None)
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--_test-fail-after-stt",
+        action="store_true",
+        help="ВНУТРЕННЕЕ: симулировать exception ПОСЛЕ STT для smoke-теста атомарности",
+    )
     args = parser.parse_args()
 
     setup_logging(args.verbose)
     log = logging.getLogger("finalize-meeting")
 
+    backend = _stt_backend()
+    log.info("STT_BACKEND=%s", backend)
+
     # 1. Читаем meta.
     if not os.path.exists(args.meta_json):
         log.error("meta.json not found: %s", args.meta_json)
         return 2
-    # Минимальная валидация: имя файла должно оканчиваться .meta.json или .json,
-    # иначе пользователь скорее всего ошибся (например, передал .txt или .wav).
     if not args.meta_json.endswith(".json"):
         log.error("meta_json должен быть .json файлом, получили: %s", args.meta_json)
         return 2
     with open(args.meta_json, "r", encoding="utf-8") as fh:
         meta = json.load(fh)
-    # Минимальная sanity на содержимое: должен быть dict с sessionUid и files.wav.
     if not isinstance(meta, dict) or not meta.get("sessionUid") or not (meta.get("files") or {}).get("wav"):
         log.error("meta.json не похоже на artifact бота (нужны поля sessionUid + files.wav)")
         return 2
@@ -108,79 +444,130 @@ def main() -> int:
         log.error("WAV not found (meta.files.wav=%s)", wav_path)
         return 3
     participants = meta.get("participants") or []
+    expected = meta.get("expectedParticipants") or []
+    expanded_expected: list[str] = []
+    for full in expected:
+        if not full:
+            continue
+        if full not in expanded_expected:
+            expanded_expected.append(full)
+        first_word = full.split()[0] if full.split() else ""
+        if first_word and first_word not in expanded_expected:
+            expanded_expected.append(first_word)
+    participants_union: list[str] = list(dict.fromkeys(participants + expanded_expected))
     language = meta.get("language") or "ru"
 
-    log.info("Session %s — wav=%s, %d participants, lang=%s",
-             session_uid, wav_path, len(participants), language)
+    log.info("Session %s — wav=%s, %d participants (panel) + %d expected → %d union, lang=%s",
+             session_uid, wav_path, len(participants), len(expected), len(participants_union), language)
 
-    # 2. Транскрипция полного WAV.
-    log.info("Step 1/5 — Transcribe full WAV")
-    api_token = os.environ.get("TRANSCRIPTION_SERVICE_TOKEN")
+    # 2. STT + диаризация (зависит от backend).
+    sm_result = None  # заполняется только в speechmatics-ветке
     try:
-        _full_text, detected_lang, whisper_segments = transcribe_wav(
-            wav_path,
-            service_url=args.transcription_service_url,
-            model=args.asr_model,
-            language=language,
-            api_token=api_token,
-        )
+        if backend == "speechmatics":
+            turns, extra, sm_result = _run_speechmatics(wav_path, log)
+        else:
+            turns, extra = _run_whisper_pyannote(args, meta, wav_path, language, log)
     except Exception as e:
-        log.error("Transcription failed: %s", e)
+        # Импорт здесь, чтобы whisper_pyannote-ветка не тянула httpx-исключения.
+        if backend == "speechmatics":
+            from lib.speechmatics_client import SpeechmaticsError, SpeechmaticsRejectedError
+            if isinstance(e, (SpeechmaticsError, SpeechmaticsRejectedError)):
+                rejected = isinstance(e, SpeechmaticsRejectedError)
+                log.error("Speechmatics %s: %s", "rejected" if rejected else "failed", e)
+                _stash_into_failed(
+                    session_uid, wav_path, args.meta_json,
+                    rejected=rejected, err_repr=f"{type(e).__name__}: {e}",
+                )
+                series_label = meta.get("series") or session_uid
+                date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
+                if rejected:
+                    _push_telegram(
+                        f"⛔ Speechmatics отверг встречу `{series_label} {date_label}` "
+                        f"(rejected), retry НЕ запущен — нужен ручной разбор. "
+                        f"WAV+meta в `_failed/{session_uid}.*`. Причина: {type(e).__name__}: {str(e)[:200]}"
+                    )
+                else:
+                    _push_telegram(
+                        f"⚠️ Speechmatics упал на встрече `{series_label} {date_label}`. "
+                        f"Аудио в `_failed/{session_uid}.*`, retry-расписание (24ч) запущено. "
+                        f"Причина: {type(e).__name__}: {str(e)[:200]}"
+                    )
+                return 4
+        log.exception("STT/диаризация упала: %s", e)
         return 4
 
-    if not whisper_segments:
-        log.warning("Whisper returned 0 segments — записанный WAV похож на тишину")
+    # 2.1. Smoke-точка отказа для теста атомарности: симулируем сбой ПОСЛЕ STT.
+    if getattr(args, "_test_fail_after_stt", False):
+        raise RuntimeError("smoke: симуляция exception после STT (тест атомарности)")
 
-    # 3. Диарезация.
-    log.info("Step 2/5 — Diarization via pyannote-audio")
-    try:
-        diarization_segments = diarize_wav(
-            wav_path,
-            num_speakers=args.num_speakers,
-            min_speakers=args.min_speakers,
-            max_speakers=args.max_speakers,
-            device="cpu",
-        )
-    except Exception as e:
-        log.error("Diarization failed: %s", e)
-        log.error("Если ошибка про HF_TOKEN — получите токен на huggingface.co/settings/tokens "
-                  "и примите условия pyannote/speaker-diarization-3.1.")
-        return 5
-
-    # 4. Alignment + merge.
-    log.info("Step 3/5 — Align + merge")
-    aligned = assign_speakers(whisper_segments, diarization_segments)
-    turns = merge_consecutive_same_speaker(aligned, max_gap_s=1.5)
-
-    # 5. Маппинг имён.
+    # 3. Маппинг имён.
     log.info("Step 4/5 — Name mapping (3 sources)")
-    mapping_result = map_all(turns, participants)
+    mapping_result = map_all(turns, participants_union)
     turns = apply_mapping(turns, mapping_result.cluster_to_name)
     log.info("Mapping done — sources=%s, mapped=%d, unresolved=%d",
              mapping_result.sources_used,
              len(mapping_result.cluster_to_name),
              len(mapping_result.unresolved_clusters))
 
-    # 6. Рендер.
+    # 4. Рендер + атомарная запись.
     log.info("Step 5/5 — Render markdown")
+    series_dir, date_part, md_name = _output_dir_for_meta(args, meta)
+
+    transcript_relpath = None
+    transcripts_dir = series_dir / "_transcripts"
+    transcripts_json_path = transcripts_dir / f"{date_part}.json"
+    transcripts_txt_path = transcripts_dir / f"{date_part}.txt"
+    if backend == "speechmatics" and sm_result is not None:
+        # Относительный путь от папки серии — рендер кладёт его в шапку .md.
+        transcript_relpath = f"_transcripts/{date_part}.txt"
+
+    asr_label = "speechmatics-enhanced" if backend == "speechmatics" else args.asr_model
+    diar_label = "speechmatics-enhanced" if backend == "speechmatics" else "pyannote/speaker-diarization-3.1"
+
     markdown = render_protocol(
         template_path=args.template,
         turns=turns,
         meta=meta,
         sources_used=mapping_result.sources_used,
-        asr_model=args.asr_model,
+        asr_model=asr_label,
+        diarization_model=diar_label,
+        transcript_relpath=transcript_relpath,
     )
 
-    # 7. Записываем в output-dir.
-    os.makedirs(args.output_dir, exist_ok=True)
-    date_part = (meta.get("startTs") or datetime.now().isoformat())[:10]
-    out_filename = f"{date_part}-{session_uid}.md"
-    out_path = os.path.join(args.output_dir, out_filename)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(markdown)
-    log.info("Protocol written → %s", out_path)
+    md_path = series_dir / md_name
+    bundle = _AtomicBundle()
+    try:
+        # 4a. JSON/TXT — только для speechmatics-ветки.
+        if backend == "speechmatics" and sm_result is not None:
+            archive_json = {
+                "session_uid": session_uid,
+                "series": meta.get("series"),
+                "date": date_part,
+                "speechmatics_job_id": sm_result.job_id,
+                "audio_duration_s": sm_result.audio_duration_s,
+                "detected_language": sm_result.detected_language,
+                "raw_json": sm_result.raw_json,
+            }
+            bundle.add(
+                transcripts_json_path,
+                json.dumps(archive_json, ensure_ascii=False, indent=2),
+            )
+            bundle.add(
+                transcripts_txt_path,
+                _format_transcript_txt(sm_result.utterances),
+            )
+        # 4b. .md — всегда.
+        bundle.add(md_path, markdown)
+        # 4c. Атомарный commit — на этом моменте все три (или один в legacy) — на диске.
+        bundle.commit()
+    except Exception:
+        bundle.abort()
+        raise
+    log.info("Protocol written → %s", md_path)
+    if backend == "speechmatics":
+        log.info("Transcripts archive → %s, %s", transcripts_json_path, transcripts_txt_path)
 
-    # 8. keep_audio.
+    # 5. keep_audio.
     keep_audio_from_meta = bool(meta.get("keepAudio") or meta.get("keep_audio"))
     if args.keep_audio or keep_audio_from_meta:
         log.info("keep_audio=true — WAV сохраняется")
@@ -191,20 +578,56 @@ def main() -> int:
         except Exception as e:
             log.warning("Не удалось удалить WAV %s: %s", wav_path, e)
 
-    # 9. Печатаем краткий результат.
-    print(json.dumps({
+    # 5.1. Если этот sid был в _failed/ — успешная финализация значит retry прошёл.
+    sid_files = list(_failed_dir().glob(f"{session_uid}.*")) if _failed_dir().exists() else []
+    if sid_files:
+        attempts_count = None
+        state_path = _failed_dir() / f"{session_uid}.retry-state.json"
+        if state_path.exists():
+            try:
+                attempts_count = json.loads(state_path.read_text(encoding="utf-8")).get("attempts")
+            except Exception:
+                pass
+        for f in sid_files:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        series_label = meta.get("series") or session_uid
+        n = (attempts_count or 0) + 1
+        _push_telegram(
+            f"✅ Встреча `{series_label} {date_part}` обработана после {n} попыток (Speechmatics)."
+        )
+
+    # 6. Краткий результат.
+    result_json = {
         "ok": True,
         "session_uid": session_uid,
-        "protocol_path": out_path,
+        "series": meta.get("series"),
+        "protocol_path": str(md_path),
         "wav_kept": args.keep_audio or keep_audio_from_meta,
-        "language_detected": detected_lang,
-        "whisper_segments": len(whisper_segments),
-        "diarization_segments": len(diarization_segments),
-        "speakers_detected": len({s.speaker for s in diarization_segments}),
+        "stt_backend": backend,
+        "sources": {"stt": extra.get("stt_label")},
+        "language_detected": extra.get("detected_language"),
+        "speakers_detected": extra.get("speakers_detected"),
         "speakers_named": len(mapping_result.cluster_to_name),
         "name_mapping_sources": mapping_result.sources_used,
         "unresolved_clusters": mapping_result.unresolved_clusters,
-    }, ensure_ascii=False, indent=2))
+    }
+    if backend == "speechmatics":
+        result_json.update({
+            "audio_duration_s": extra.get("audio_duration_s"),
+            "speechmatics_job_id": extra.get("speechmatics_job_id"),
+            "utterances_raw": extra.get("utterances_raw"),
+            "transcripts_archive_json": str(transcripts_json_path),
+            "transcripts_archive_txt": str(transcripts_txt_path),
+        })
+    else:
+        result_json.update({
+            "whisper_segments": extra.get("whisper_segments"),
+            "diarization_segments": extra.get("diarization_segments"),
+        })
+    print(json.dumps(result_json, ensure_ascii=False, indent=2))
     return 0
 
 
