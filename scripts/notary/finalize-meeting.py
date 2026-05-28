@@ -752,6 +752,25 @@ def main() -> int:
                 log.warning("[delivery] failed (non-fatal): %s", e)
                 delivery_result = {"status": "error", "error": str(e)}
 
+    # 4.0.4. Ф7: обновление INDEX.md в корне ~/Projects/me/встречи/.
+    # Без LLM, простой os.walk. Best-effort: не валим финализацию из-за индекса.
+    # Гейт ENABLE_VSTRECHI_INDEX (дефолт ON).
+    try:
+        from lib.vstrechi_index import update_vstrechi_index, is_enabled as _index_enabled
+        if _index_enabled():
+            # INDEX живёт там же, где transcript на этой машине — корень MEETINGS_DIR.
+            # На VPS (LOCAL_FINALIZE=1) индекс не нужен — данные потом mirror'ятся на мак.
+            if os.environ.get("MEETING_NOTARY_LOCAL_FINALIZE") != "1":
+                # Корень — DEFAULT_ROOT модуля (~/Projects/me/встречи).
+                # md_path.parent.parent даёт _one-off для one-off, не подходит.
+                idx_stats = update_vstrechi_index()
+                log.info(
+                    "[vstrechi-index] updated: %d series, total bytes=%d",
+                    idx_stats["series_count"], idx_stats["total_bytes"],
+                )
+    except Exception as e:  # noqa: BLE001
+        log.warning("[vstrechi-index] update failed (non-fatal): %s", e)
+
     # 4.1. Ф3 clarify-trigger: если есть unresolved cluster'ы (LLM сдался)
     # или low-confidence (LLM ответил, но неуверенно) — отправляем Илье
     # уведомление с inline keyboard и пишем `_pending_clarification/<sid>.json`.

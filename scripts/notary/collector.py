@@ -37,6 +37,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
 from notary.lib.notify import push  # noqa: E402
+from notary.lib.paths import _target_path  # noqa: E402
 
 LOG_DIR = Path(os.path.expanduser(
     os.environ.get("MEETING_NOTARY_LOG_DIR") or "~/Library/Logs/meeting-notary"
@@ -53,6 +54,40 @@ VPS_PROTOCOLS = "~/meeting-notary/_tmp/protocols"
 VPS_VENV = "~/meeting-notary/venv"  # venv с pyannote/torch/whisper (создан в Ф3)
 
 LOCAL_FINALIZE = os.environ.get("MEETING_NOTARY_LOCAL_FINALIZE") == "1"
+
+
+def _target_md_for_session(series: str, date_str: str, session_uid: str) -> Path:
+    """Единая точка вычисления пути к .md (Ф7 синхронизация на _target_path).
+
+    Пустая series → _target_path кладёт в `_one-off/<date>-<id>/<date>.md`,
+    непустая → `<root>/<series>/<date>.md`. session_uid нужен только для one-off.
+
+    Fallback (Н6 цикла Ф7): если `date_str` или производное не пройдут
+    валидации `_target_path` (regex YYYY-MM-DD, _validate_path_component),
+    откатываемся на старую logic `MEETINGS_DIR/<series>/<date>.md` —
+    лучше «битый путь» чем умершая orphan-обработка.
+    """
+    try:
+        return _target_path(
+            {"series": series, "date": date_str, "sessionUid": session_uid},
+            root=MEETINGS_DIR,
+            kind="transcript",
+        )
+    except (ValueError, TypeError) as e:
+        logger.warning(
+            "_target_path упал на series=%r date=%r sid=%r: %s; "
+            "fallback на legacy путь",
+            series, date_str, session_uid, e,
+        )
+        # НОВ2+РЕГ3 цикла Ф7: пустая series раньше клала в корень MEETINGS_DIR/<date>.md.
+        # После Ф7 миграции корень содержит только INDEX.md + директории. Кладём
+        # one-off fallback в `_one-off/<date>-<sid>/<date>.md` руками — структура
+        # та же, что у _target_path успешного пути. Sid может быть «странным» (Н6),
+        # но в имени папки нам важна только уникальность.
+        if not series:
+            safe_sid = (session_uid or "unknown").replace("/", "_").replace("\\", "_")
+            return MEETINGS_DIR / "_one-off" / f"{date_str}-{safe_sid}" / f"{date_str}.md"
+        return MEETINGS_DIR / series / f"{date_str}.md"
 
 # Где собирать готовый .md. На маке — тащим scp с VPS в ~/Projects/me/встречи/.
 # На VPS (LOCAL_FINALIZE=1) — кладём в /srv/meeting-notary/protocols/<series>/,
@@ -200,9 +235,8 @@ def _pickup_orphans() -> None:
             series, date_str = series_from_meta, _date_from_filename_uid(sid)
         else:
             series, date_str = _series_and_date(sid)
-        target_dir = MEETINGS_DIR / series
-        target_md = target_dir / f"{date_str}.md"
-        if target_md.exists() or (target_dir / f"{date_str}-{sid}.md").exists():
+        target_md = _target_md_for_session(series, date_str, sid)
+        if target_md.exists() or target_md.with_name(f"{date_str}-{sid}.md").exists():
             continue
         logger.info("Orphan pickup: %s → %s", sid, target_md)
         _copy_only(sid, series, date_str)
@@ -247,15 +281,14 @@ def _read_series_from_meta(filename_uid: str) -> str | None:
 
 def _copy_only(session_uid: str, series: str, date_str: str) -> None:
     """Только копирование готового .md, без finalize. Аналог хвоста _finalize_and_collect."""
-    target_dir = MEETINGS_DIR / series
+    target_md = _target_md_for_session(series, date_str, session_uid)
     try:
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_md.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        logger.error("mkdir %s упал: %s", target_dir, e)
+        logger.error("mkdir %s упал: %s", target_md.parent, e)
         return
-    target_md = target_dir / f"{date_str}.md"
     if target_md.exists():
-        target_md = target_dir / f"{date_str}-{session_uid}.md"
+        target_md = target_md.with_name(f"{date_str}-{session_uid}.md")
     tmp_md = target_md.with_suffix(target_md.suffix + ".part")
     src_md = Path(os.path.expanduser(f"~/meeting-notary/_tmp/protocols/{session_uid}.md"))
     try:
@@ -328,16 +361,15 @@ def _finalize_and_collect(session_uid: str) -> None:
     else:
         series, date_str = _series_and_date(session_uid)
         logger.info("Series из имени файла (fallback): %s (date %s)", series, date_str)
-    target_dir = MEETINGS_DIR / series
+    target_md = _target_md_for_session(series, date_str, session_uid)
     try:
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_md.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        logger.error("mkdir %s упал: %s", target_dir, e)
+        logger.error("mkdir %s упал: %s", target_md.parent, e)
         return
 
-    target_md = target_dir / f"{date_str}.md"
     if target_md.exists():
-        target_md = target_dir / f"{date_str}-{session_uid}.md"
+        target_md = target_md.with_name(f"{date_str}-{session_uid}.md")
 
     tmp_md = target_md.with_suffix(target_md.suffix + ".part")
 

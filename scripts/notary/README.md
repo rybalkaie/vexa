@@ -493,6 +493,66 @@ p.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
 #    .md и потом следующий finalize пушнёт).
 ```
 
+## Ф7 — Миграция файловой структуры + INDEX.md (мак)
+
+Целевой стандарт `~/Projects/me/встречи/`:
+
+```
+встречи/
+    INDEX.md                       # автогенерация, lib/vstrechi_index.py
+    <series>/                      # регулярные series без даты в имени
+        YYYY-MM-DD.md
+        YYYY-MM-DD-protokol.md
+        _versions/                 # ротация версий после correction Ф6
+    _one-off/
+        YYYY-MM-DD-tm-<id>/
+            YYYY-MM-DD.md
+            YYYY-MM-DD-protokol.md
+    _archive/
+        YYYY/<tag>/                # _archive/2026/pre-vps-migration/
+    _test/
+    _config/
+```
+
+**Скрипт миграции:** [`~/Projects/me/plans/scripts/migrate-vstrechi-structure.py`](../../../../me/plans/scripts/migrate-vstrechi-structure.py) — `--dry-run`/`--apply`/`--rollback`/`--update-index`. Бэкап делается перед `--apply` автоматически, манифест с checksum'ами SHA-256 + mtime пишется рядом со скриптом.
+
+**Ран-бук (мак):**
+
+```bash
+# 1. Деплой collector.py на VPS ДО миграции (иначе collector на следующем тике
+#    запишет старый путь поверх новой структуры).
+cd ~/Projects/meeting-notary && make deploy-notary
+
+# 2. Mirror остановить (если активен — `launchctl list | grep meeting-notary.mirror`).
+launchctl unload ~/Library/LaunchAgents/com.ilarybalka.meeting-notary.mirror.plist
+
+# 3. Dry-run (можно прогонять сколько угодно раз).
+python3 ~/Projects/me/plans/scripts/migrate-vstrechi-structure.py --dry-run
+
+# 4. Apply (создаёт бэкап + манифест в plans/scripts/).
+python3 ~/Projects/me/plans/scripts/migrate-vstrechi-structure.py --apply
+
+# 5. Если что-то пошло не так — rollback по манифесту.
+python3 ~/Projects/me/plans/scripts/migrate-vstrechi-structure.py --rollback \
+    ~/Projects/me/plans/scripts/migrate-manifest-YYYYMMDD-HHMMSS.json
+
+# 6. Mirror поднять обратно (если останавливал на шаге 2).
+launchctl load -w ~/Library/LaunchAgents/com.ilarybalka.meeting-notary.mirror.plist
+
+# 7. INDEX.md обновляется автоматически в конце финализации. Принудительно:
+python3 ~/Projects/me/plans/scripts/migrate-vstrechi-structure.py --update-index
+# или
+python3 -m notary.lib.vstrechi_index
+```
+
+**Что делает collector.py после Ф7:** хардкод путей `MEETINGS_DIR / series / <date>.md` заменён на `_target_path` из [`lib/paths.py`](lib/paths.py). One-off (пустая `series`) → `_one-off/<date>-<id>/<date>.md`, регулярная series → `<series>/<date>.md`. Коллизия по имени → fallback `<date>-<sessionUid>.md` в той же папке.
+
+**INDEX.md:** автогенерируется в конце финализации без LLM ([`lib/vstrechi_index.py`](lib/vstrechi_index.py)). Сортировка series по дате последней встречи DESC, под каждой — 3 последние даты. На VPS (`MEETING_NOTARY_LOCAL_FINALIZE=1`) не обновляется — данные уезжают на мак, INDEX живёт только там. Гейт `ENABLE_VSTRECHI_INDEX=1` (дефолт ON).
+
+**Восстановление при сбое:**
+- `--rollback` падает на конфликтах (свежий файл в src, mtime/checksum не сошлись) — список пропущенных в `migrate-rollback-conflicts-<ts>.json` рядом с манифестом. Ручной merge с backup-папкой `~/Projects/me/встречи.backup-<ts>` (полная копия снимается перед `--apply`).
+- Если совсем «всё сломалось» — `rm -rf ~/Projects/me/встречи && mv ~/Projects/me/встречи.backup-<ts> ~/Projects/me/встречи` (но потеряются изменения, сделанные после миграции).
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция
