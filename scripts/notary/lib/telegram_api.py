@@ -186,6 +186,76 @@ def get_updates(
     return []
 
 
+def split_long_message(text: str, max_len: int = 3500) -> list[str]:
+    """Делит длинное сообщение на части ≤ `max_len` символов (Telegram лимит 4096).
+
+    Стратегия:
+      1. Если text ≤ max_len — возвращает `[text]` без маркера.
+      2. Иначе режет по логическим границам:
+         - сначала пытаемся по разделителю `---` (тематические границы протокола);
+         - если получившаяся часть всё ещё > max_len — добиваем по `\\n\\n`;
+         - если и так слишком длинно — рубим по `\\n` или жёстким срезом.
+      3. Каждая часть префиксится `(N/M) ` чтобы получатель видел порядок.
+
+    Используется Ф4 (Telegram-команда генерации протокола в DM) и
+    унаследуется Ф6 (доставка протокола в группу).
+    """
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+
+    prefix_overhead = 8  # запас на «(99/99) »
+    effective_max = max_len - prefix_overhead
+
+    def _chunk_by(sep: str, body: str) -> list[str]:
+        out: list[str] = []
+        current = ""
+        for piece in body.split(sep):
+            piece_with_sep = (sep if current else "") + piece
+            if len(current) + len(piece_with_sep) <= effective_max:
+                current += piece_with_sep
+            else:
+                if current:
+                    out.append(current)
+                # piece сам может быть > effective_max — он будет пере-резан ниже.
+                current = piece
+        if current:
+            out.append(current)
+        return out
+
+    # Шаг 1: режем по `---` (горизонтальный разделитель в markdown).
+    parts = _chunk_by("\n---\n", text)
+
+    # Шаг 2: для частей, которые всё ещё слишком длинные, режем по `\n\n`.
+    refined: list[str] = []
+    for part in parts:
+        if len(part) <= effective_max:
+            refined.append(part)
+            continue
+        refined.extend(_chunk_by("\n\n", part))
+
+    # Шаг 3: для остатков, которые всё ещё длиннее лимита — режем по `\n`.
+    twice_refined: list[str] = []
+    for part in refined:
+        if len(part) <= effective_max:
+            twice_refined.append(part)
+            continue
+        twice_refined.extend(_chunk_by("\n", part))
+
+    # Шаг 4: жёсткий fallback — если кусок без переводов строки, просто рубим.
+    final: list[str] = []
+    for part in twice_refined:
+        if len(part) <= effective_max:
+            final.append(part)
+            continue
+        for i in range(0, len(part), effective_max):
+            final.append(part[i:i + effective_max])
+
+    total = len(final)
+    return [f"({idx}/{total}) {chunk}" for idx, chunk in enumerate(final, start=1)]
+
+
 def build_inline_keyboard(rows: list[list[dict]]) -> dict:
     """Конструктор `reply_markup` для `InlineKeyboardMarkup`.
 

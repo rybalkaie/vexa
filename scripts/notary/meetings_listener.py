@@ -183,6 +183,191 @@ def _clarify_pending_root() -> Path | None:
         return None
 
 
+# Дедуп Telegram-команд «протокол <series> <date>». Илья диктует через
+# Wispr Flow, повторы реальны (CLAUDE.md прямо предупреждает). Без дедупа:
+# 2 sendMessage + 2 subprocess'а claude за одну команду. С дедупом — окно
+# 30 сек по ключу (series, date); повтор в окне → короткий «уже запустил».
+_protocol_command_recent: dict[tuple[str, str], float] = {}
+_PROTOCOL_COMMAND_DEDUPE_WINDOW_S = 30.0
+
+
+def _protocol_command_is_dupe(series: str, date_str: str) -> bool:
+    """True если такая команда уже запускалась < 30 сек назад. Side-effect:
+    при False — отмечает запуск, при True — оставляет старый timestamp.
+    Чистим устаревшие записи лениво (нет cron, словарь живёт в RAM)."""
+    now = time.monotonic()
+    key = (series, date_str)
+    # Лениво вычищаем старые записи (не разрастаемся).
+    stale = [k for k, t in _protocol_command_recent.items()
+             if now - t > _PROTOCOL_COMMAND_DEDUPE_WINDOW_S]
+    for k in stale:
+        _protocol_command_recent.pop(k, None)
+    last = _protocol_command_recent.get(key)
+    if last is not None and now - last < _PROTOCOL_COMMAND_DEDUPE_WINDOW_S:
+        return True
+    _protocol_command_recent[key] = now
+    return False
+
+
+def _protokol_root() -> Path:
+    """Корень папки встреч. На VPS можно переопределить env'ом, дефолт — мак-путь.
+
+    На VPS финализация уже пишет в `~/Projects/me/встречи/` через mirror;
+    listener живёт там же. Если структура иная — `MEETING_NOTARY_PROTOCOLS_DIR`
+    в .env.notary переопределит.
+    """
+    raw = os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR") or "~/Projects/me/встречи"
+    return Path(os.path.expanduser(raw))
+
+
+def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
+    """Если сообщение Ильи — команда «протокол <series> <date>», запускаем
+    регенерацию и шлём результат текстом обратно.
+
+    Возвращает True если команда распарсилась и обработана (caller должен
+    выйти из process_message без вызова apply_reply). False иначе.
+
+    Если parse OK, но сгенерировать не удалось — отправляем Илье сообщение об
+    ошибке и всё равно True (сообщение «обработано», просто негативно).
+    """
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+    try:
+        from notary.lib.protocol_command import parse_protocol_command  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("protocol_command import failed: %s", e)
+        return False
+    parsed = parse_protocol_command(text)
+    if parsed is None:
+        return False
+    series, date_str = parsed
+
+    # Дедуп: повтор той же команды в окне 30 сек (Wispr Flow диктовка).
+    if _protocol_command_is_dupe(series, date_str):
+        send_message(
+            token, chat_id,
+            f"⏳ Уже запустил `{series} {date_str}` меньше 30 сек назад — жду.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    # Сначала валидируем что transcript есть — иначе ack «✏️ Генерирую…»
+    # запутает Илью (получит «работаю» и сразу следом «не нашёл», думая что
+    # бот сошёл с ума). Один осмысленный ответ за раз.
+    root = _protokol_root()
+    if not root.is_dir():
+        send_message(
+            token, chat_id,
+            f"❌ Папка встреч `{root}` не найдена. Проверь MEETING_NOTARY_PROTOCOLS_DIR.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    # Резолвим transcript: сначала новая структура, потом legacy.
+    new_layout = root / series / f"{date_str}.md"
+    legacy_layout = root / f"{series}-{date_str}" / f"{date_str}.md"
+    if new_layout.is_file():
+        transcript_path = new_layout
+    elif legacy_layout.is_file():
+        transcript_path = legacy_layout
+    else:
+        send_message(
+            token, chat_id,
+            f"❌ Транскрипт не найден ни по `{series}/{date_str}.md`, "
+            f"ни по `{series}-{date_str}/{date_str}.md`. "
+            f"Проверь имя series.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+    protocol_path = transcript_path.parent / f"{date_str}-protokol.md"
+
+    # Транскрипт найден — теперь ack. Sonnet может думать 15-60s, без ack
+    # пользователь не понимает, что бот вообще услышал.
+    send_message(
+        token, chat_id,
+        f"✏️ Генерирую протокол `{series}` `{date_str}`… Sonnet 4.6, обычно 15-60 сек.",
+        reply_to=msg.get("message_id"),
+    )
+
+    try:
+        from notary.lib.llm_postprocess import (  # noqa: PLC0415
+            ProtocolGenerationError,
+            regenerate_protocol_for_meeting,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("import llm_postprocess failed: %s", e)
+        send_message(
+            token, chat_id,
+            f"❌ Не смог загрузить генератор протоколов: {type(e).__name__}",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    meta = {
+        "series": series,
+        "date": date_str,
+        "transcript_filename": transcript_path.name,
+    }
+    try:
+        regenerate_protocol_for_meeting(
+            transcript_path=transcript_path,
+            protocol_path=protocol_path,
+            meeting_meta=meta,
+            meeting_sid=f"tg-cmd-{series}-{date_str}",
+        )
+    except ProtocolGenerationError as e:
+        send_message(
+            token, chat_id,
+            f"❌ Генерация упала: {str(e)[:300]}\nФайл: `{protocol_path}` не обновлён.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.exception("protocol generation unexpected error: %s", e)
+        send_message(
+            token, chat_id,
+            f"❌ Неожиданная ошибка: {type(e).__name__}: {str(e)[:200]}",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    # Файл готов — пушим результат текстом. Если > лимита — split на части.
+    try:
+        body = protocol_path.read_text(encoding="utf-8")
+    except OSError as e:
+        send_message(
+            token, chat_id,
+            f"✅ Файл сгенерирован → `{protocol_path}`\n⚠️ Прочесть для отправки не смог: {e}",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    try:
+        from notary.lib.telegram_api import split_long_message  # noqa: PLC0415
+        chunks = split_long_message(body, max_len=3500)
+    except Exception as e:  # noqa: BLE001
+        # Если split-helper упал (циклический импорт / неожиданная ошибка) —
+        # не молчим: лог + отправляем сообщение Илье, чтобы он узнал что
+        # протокол на диске, но в Telegram не дошёл. НЕ режем `[:max_len]`
+        # незаметно — это была бы тихая потеря данных (РИСК2-стиль).
+        logger.exception("split_long_message failed: %s", e)
+        send_message(
+            token, chat_id,
+            f"✅ Файл сгенерирован → `{protocol_path}`\n"
+            f"⚠️ Не смог разбить длинный текст для отправки в Telegram: {type(e).__name__}. "
+            f"Открой файл на диске.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    header = f"✅ Готово: `{series} {date_str}` → `{protocol_path}`"
+    send_message(token, chat_id, header, reply_to=msg.get("message_id"))
+    for chunk in chunks:
+        send_message(token, chat_id, chunk)
+    return True
+
+
 def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
     """Если есть pending/timed_out clarify-state — передаёт msg в clarify_worker.
 
@@ -241,6 +426,13 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     cid = chat.get("id")
     if cid != allowed_chat:
         logger.info("skip: chat_id=%s ≠ allowed=%s", cid, allowed_chat)
+        return
+
+    # Сначала — Ф4 команда «протокол <series> <date>». Это явная команда
+    # с фиксированным синтаксисом, проверяется до clarify/apply_reply.
+    # Защита от ложноположительных встроена в parse_protocol_command:
+    # нужны и series, и дата, и глагол/слово-маркер, и пустой хвост.
+    if maybe_route_to_protocol_command(token, cid, msg):
         return
 
     # Reply-привязка опциональна. Reply на сообщение бота:

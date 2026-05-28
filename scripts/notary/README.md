@@ -203,6 +203,109 @@ smoke на маке** (env `TELEGRAM_NOTARIUS_BOT_TOKEN`). В проде на VP
 | `TELEGRAM_NOTARIUS_CHAT_ID` / `TELEGRAM_CHAT_ID` | _из .env.notary_ | chat_id Ильи (число). Один из двух обязателен. |
 | `MEETING_NOTARY_PENDING_DIR` | авто | Где хранить state-файлы. |
 
+## Ф4: LLM-генератор протокола встречи (`generate_protocol`)
+
+После того как транскрипт записан и (опц.) ушёл clarify, finalize-meeting.py
+автоматически генерирует `<series>/<date>-protokol.md` рядом с транскриптом
+через Claude Sonnet 4.6. Промт собирается из:
+- системной части (`GENERATE_PROTOCOL_BASE_PROMPT`);
+- содержимого метод-файла `kak-delat-protokol-vstrechi.md` — читается с диска
+  в момент генерации (правки метода применяются сразу).
+
+### Где живёт метод-файл
+
+- **На маке (источник истины):** `~/Projects/me/methods/kak-delat-protokol-vstrechi.md`.
+- **На VPS (рабочая копия):** `/opt/meeting-notary/_methods/kak-delat-protokol-vstrechi.md`
+  — копируется launchd-агентом `com.ilarybalka.meeting-notary.methods-push`
+  раз в час (см. ниже).
+- Каталог задаётся env'ом `MEETING_NOTARY_METHODS_DIR` в `.env.notary`
+  (на VPS) или дефолтится в путь мака.
+
+### Cron rsync метода (push с мака на VPS)
+
+Чтобы правки метода доезжали до VPS в течение часа:
+
+1. **Скрипт push:** `~/.local/bin/meeting-notary-methods-push.sh`
+   (rsync `~/Projects/me/methods/` → `meeting-notary:/opt/meeting-notary/_methods/`,
+    SSH alias `meeting-notary`, `--include='*.md' --exclude='*' --delete`).
+2. **launchd-агент:** `~/Library/LaunchAgents/com.ilarybalka.meeting-notary.methods-push.plist`
+   (`StartInterval=3600`, `RunAtLoad=true`).
+3. **Лог:** `~/Library/Logs/meeting-notary/methods-push.log`.
+
+Установка / переустановка:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.ilarybalka.meeting-notary.methods-push.plist 2>/dev/null
+launchctl load -w ~/Library/LaunchAgents/com.ilarybalka.meeting-notary.methods-push.plist
+launchctl list | grep meeting-notary.methods-push   # должно появиться
+~/.local/bin/meeting-notary-methods-push.sh         # ручной прогон для проверки
+ssh meeting-notary 'ls -la /opt/meeting-notary/_methods/'  # верификация на VPS
+```
+
+End-to-end smoke (правка доедет за секунды при ручном прогоне):
+
+```bash
+echo "TEST $(date +%s)" >> ~/Projects/me/methods/kak-delat-protokol-vstrechi.md
+~/.local/bin/meeting-notary-methods-push.sh
+ssh meeting-notary 'tail -1 /opt/meeting-notary/_methods/kak-delat-protokol-vstrechi.md'
+# удалить тестовую строку и повторить push
+```
+
+Direction обоснован: push с мака не требует SSH-ключа от VPS на мак
+(не расширяет attack surface). Минус — если мак выключен > 1 часа,
+правки запаздывают; для одного редактора (Илья) это приемлемо.
+
+### Ручная регенерация
+
+CLI `tools/regenerate-protocol.py <series> <date>` — оборачивает
+`regenerate_protocol_for_meeting`. Используется для backfill архивных
+транскриптов и для отладки промта.
+
+```bash
+# На VPS (под production-venv):
+cd /home/dev/meeting-notary && venv/bin/python vexa/scripts/notary/tools/regenerate-protocol.py sales-quality 2026-05-27
+
+# На маке (под venv-cli — без pyannote/torch, того что нужно для генерации):
+cd ~/Projects/meeting-notary && .venv-cli/bin/python vexa/scripts/notary/tools/regenerate-protocol.py sales-quality 2026-05-27 --duration 21 --participants "Илья Рыбалка,Михаил Саргин,Дарья Набережная,Михаил Еремеев"
+
+# Backfill sales-quality рядом с эталоном:
+... regenerate-protocol.py sales-quality-2026-05-27 2026-05-27 --out 2026-05-27-protokol-auto.md ...
+```
+
+### Telegram-команда «протокол <series> <date>»
+
+В `@ilya_protocol_meeting_bot` Илья пишет в личку команду, бот находит
+транскрипт, прогоняет генерацию, отправляет результат текстом + перезаписывает
+файл на диске. Распознаются формы (регистронезависимо):
+
+- «протокол sales-quality 2026-05-27»
+- «сгенерируй протокол sales-quality 2026-05-27»
+- «перегенерируй sales-quality 2026-05-27»
+- «обнови протокол anzhee-direktorat 2026-06-01»
+
+Парсер: `lib/protocol_command.py::parse_protocol_command`. Реализация
+команды — `meetings_listener.maybe_route_to_protocol_command` (роутится
+ДО clarify, имеет высший приоритет).
+
+Если файл > 3500 символов — `lib/telegram_api.split_long_message` разрезает
+по `---` (тематическим границам протокола) с маркером `(N/M)`.
+
+### Env-флаги Ф4
+
+| Env | Дефолт | Назначение |
+|-----|--------|------------|
+| `ENABLE_PROTOCOL_GENERATION` | `1` | `0`/`false`/`no` отключает автогенерацию в finalize. CLI и Telegram-команда работают всегда. |
+| `MEETING_NOTARY_METHODS_DIR` | `/opt/meeting-notary/_methods` (VPS) / `~/Projects/me/methods` (мак) | Где искать `kak-delat-protokol-vstrechi.md`. |
+| `MEETING_NOTARY_PROTOCOLS_DIR` | `~/Projects/me/встречи` | Корень для Telegram-команды (поиск transcript-файла). |
+
+### Hook от clarify в protocol
+
+После `clarify_worker._apply_resolution` (резолв или late-answer) hook
+автоматически перегенерирует `<date>-protokol.md` рядом с обновлённым
+транскриптом. Лог: `[protocol] regenerated meeting=<sid> via=clarify_resolved|clarify_late`.
+Группу не уведомляем — Ф6 (доставка) сам решит что отправить с учётом
+поля `delivered` в `meta.json`.
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция

@@ -43,6 +43,7 @@ def call_claude_print(
     *,
     system: Optional[str] = None,
     timeout: int = 60,
+    model: Optional[str] = None,
 ) -> str:
     """Запускает `claude --print` через stdin, возвращает stdout (stripped).
 
@@ -52,6 +53,9 @@ def call_claude_print(
               два перевода строки (CLI `--print` поддерживает только plain
               stdin без отдельного system-канала).
       timeout: секунды на выполнение subprocess.
+      model: опциональный явный выбор модели (например, `claude-sonnet-4-6`
+             или `sonnet`/`opus` алиас). None → дефолт CLI (того, кто
+             залогинен). Прокидывается в subprocess как `--model <value>`.
 
     Возвращает: stripped stdout. На любую ошибку — ClaudeCliError-подкласс.
 
@@ -64,10 +68,14 @@ def call_claude_print(
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
 
+    cmd = [claude_bin, "--print"]
+    if model:
+        cmd += ["--model", model]
+
     started = time.monotonic()
     try:
         result = subprocess.run(
-            [claude_bin, "--print"],
+            cmd,
             input=full_prompt,
             capture_output=True,
             text=True,
@@ -91,7 +99,7 @@ def call_claude_print(
             f"claude --print вернул пустой stdout (elapsed={elapsed:.1f}s)"
         )
     logger.debug(
-        "claude --print ok: prompt_len=%d, output_len=%d, elapsed=%.1fs",
-        len(full_prompt), len(raw), elapsed,
+        "claude --print ok: model=%s prompt_len=%d output_len=%d elapsed=%.1fs",
+        model or "(default)", len(full_prompt), len(raw), elapsed,
     )
     return raw

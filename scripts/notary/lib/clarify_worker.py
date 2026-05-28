@@ -138,6 +138,56 @@ def _apply_resolution(
         transcript_path, label_to_name,
     )
 
+    # Ф4 re-trigger: после atomic-перезаписи transcript'а перегенерируем
+    # `<date>-protokol.md` рядом с ним. Делаем и для resolved (Илья нажал
+    # кнопку в окне таймаута), и для late_answer (нажал после таймаута) —
+    # план фиксирует, что поздний ответ обновляет файл на диске.
+    # В Telegram-группу повторно не шлём (этим займётся / откажется Ф6).
+    protocol_regenerated = False
+    if file_updated and transcript_path.exists():
+        # Имя протокола живёт рядом: `<date>-protokol.md` (тот же паттерн,
+        # что в finalize-meeting.py). transcript_path.stem = `<date>`
+        # (например `2026-05-27`); если в имени окажется не дата —
+        # generate_protocol всё равно возьмёт дату из meta.
+        try:
+            protocol_path = transcript_path.parent / f"{transcript_path.stem}-protokol.md"
+            meta_block = state.get("meta") or {}
+            regen_meta = {
+                "series": meta_block.get("series") or "",
+                "date": meta_block.get("date") or "",
+                # sessionUid не критичен для генерации, но передаём для лога.
+                "sessionUid": meta_block.get("sessionUid"),
+                # expected/participants для шапки берём из name_pool
+                # (state хранит итоговый pool, передаваемый Илье в clarify).
+                "expectedParticipants": state.get("name_pool", []),
+                "participants": [],
+                "transcript_filename": transcript_path.name,
+            }
+            llm_postprocess.regenerate_protocol_for_meeting(
+                transcript_path=transcript_path,
+                protocol_path=protocol_path,
+                meeting_meta=regen_meta,
+                meeting_sid=state.get("meeting_id"),
+            )
+            protocol_regenerated = True
+            logger.info(
+                "[protocol] regenerated meeting=%s via=%s",
+                state.get("meeting_id"),
+                "clarify_late" if is_late else "clarify_resolved",
+            )
+        except llm_postprocess.ProtocolGenerationError as e:
+            # Не валим clarify: transcript уже обновлён, протокол просто
+            # остался устаревший до следующего ручного `regenerate-protocol.py`.
+            logger.warning(
+                "[protocol] regen failed (non-fatal) meeting=%s: %s",
+                state.get("meeting_id"), e,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception(
+                "[protocol] regen unexpected error meeting=%s: %s",
+                state.get("meeting_id"), e,
+            )
+
     new_status = state.get("status")
     extra = {
         "resolved_via": via,
@@ -157,8 +207,9 @@ def _apply_resolution(
     )
     label = "late_answer" if is_late else "resolved"
     logger.info(
-        "[clarify] %s meeting=%s via=%s applied=%d file_updated=%s delivered_unchanged=%s",
+        "[clarify] %s meeting=%s via=%s applied=%d file_updated=%s protocol_regen=%s delivered_unchanged=%s",
         label, state["meeting_id"], via, len(mapping), file_updated,
+        protocol_regenerated,
         # late_answer не отправляет в группу повторно (см. план «Поздний ответ»).
         "true" if is_late else "n/a",
     )

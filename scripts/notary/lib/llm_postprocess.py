@@ -11,9 +11,14 @@
     Илье при низком confidence / нерешённых cluster'ах (Ф3 того же плана).
   - `parse_clarify_callback_data`, `parse_clarify_text_answer`,
     `apply_clarify_mapping` — парсеры + applier ответа Ильи (Ф3).
+  - `generate_protocol` — Claude Sonnet 4.6 рендерит структурированный
+    протокол из транскрипта по методичке (Ф4 того же плана).
+  - `regenerate_protocol_for_meeting` — обёртка: читает transcript с диска,
+    зовёт `generate_protocol`, atomic-write `<date>-protokol.md`. Переиспользуется
+    CLI `tools/regenerate-protocol.py`, Telegram-командой и hook'ом из
+    clarify-worker.
 
 Будущий состав (по фазам того же плана):
-  - Ф4: `generate_protocol` — структурированный протокол по методичке.
   - Ф5: `extract_tasks` / `route_tasks` — извлечение задач + маршрутизация.
   - Ф6: `deliver_protocol` — доставка в Telegram + идемпотентность.
 
@@ -952,3 +957,314 @@ def clarify_speakers_via_telegram(
         meeting_id, len(unclear), message_id, saved_path.name,
     )
     return saved_path
+
+
+# ---------- Ф4: генератор протокола встречи ------------------------------
+
+# Модель для генерации протокола. Sonnet 4.6 — компромисс между качеством
+# (структура, формулировки) и латентностью (на 21-минутном sales-quality
+# ответ приходит за ~15-30 сек). Передаётся в `call_claude_print(model=...)`,
+# который прокидывает `--model claude-sonnet-4-6` в subprocess.
+PROTOCOL_GEN_MODEL = "claude-sonnet-4-6"
+
+# Имя файла метода на диске (общий для мака и VPS). На маке живёт в
+# `~/Projects/me/methods/`, на VPS — копируется через cron rsync (см.
+# README раздел «Cron rsync метода»).
+METHOD_FILE_NAME = "kak-delat-protokol-vstrechi.md"
+
+# Дефолтные корни поиска метод-файла:
+# - мак: `~/Projects/me/methods/` (там же, где живёт сам метод).
+# - VPS: `/opt/meeting-notary/_methods/` (куда cron его кладёт).
+# Можно переопределить env-переменной `MEETING_NOTARY_METHODS_DIR` (на VPS
+# unit-файл задаёт её через EnvironmentFile=/srv/meeting-notary/.env.notary).
+_METHODS_DIR_DEFAULTS = (
+    os.path.expanduser("~/Projects/me/methods"),
+    "/opt/meeting-notary/_methods",
+)
+
+
+GENERATE_PROTOCOL_BASE_PROMPT = """Ты редактор протокола встречи.
+
+На вход тебе дан:
+1. Стандарт оформления (ниже — секция «Метод» в формате markdown).
+2. Транскрипт встречи (в пользовательском сообщении) — последовательность реплик в формате `**[ts] Имя:**` (либо `**[ts] Спикер N:**` если имя не известно).
+3. Метаданные встречи (series, дата, длительность, участники) — в пользовательском сообщении.
+
+Твоя задача: сгенерировать готовый .md-файл протокола строго по стандарту из секции «Метод».
+
+Правила:
+- НЕ выдумывай факты. Если в транскрипте чего-то нет — не пиши этого в протоколе.
+- Если в транскрипте нет принятых решений по теме — НЕ пиши блок «Решения», пропусти его.
+- Задачи (блок «Задачи») извлекай ТОЛЬКО те, что явно прозвучали как договорённости («сделаю X», «пришлю Y», «договорились что Z к пятнице»). Не додумывай задачи из общего смысла.
+- Имена в задачах и решениях бери ровно как они в транскрипте. Если в транскрипте «Спикер 3» — оставь «Спикер 3» (не выдумывай имя).
+- Темы (## 1) ... ## 2) ...) группируй по СМЫСЛУ, а не по хронологии транскрипта.
+- Длина: компактнее транскрипта в 5–10 раз.
+- Каждый буллет тематического блока — на отдельной строке с ПУСТОЙ строкой между буллетами (иначе они склеятся в один параграф).
+- Эмодзи-маркеры — только функциональные из стандарта (▪️ ▫️ 🔸 🟠). Никаких декоративных.
+
+Шапка протокола:
+- Первая строка: `#протоколвстречи DD.MM.YYYY` (дата из метаданных, формат DD.MM.YYYY).
+- Поля `**Встреча:**`, `**Длительность:**`, `**Участники:**`, `**Транскрипт:**`.
+- Поле `**Транскрипт:**` — относительная markdown-ссылка `[<date>.md](<date>.md)` (имя файла транскрипта из метаданных).
+- После шапки — горизонтальный разделитель `---`.
+
+Ответь СТРОГО готовым markdown-файлом протокола — без markdown-обёртки ```markdown ... ```, без префиксов «вот протокол:», без объяснений. Только сам файл от первой строки `#протоколвстречи` до последней строки.
+
+Метод (стандарт оформления):
+
+"""
+
+
+class ProtocolGenerationError(RuntimeError):
+    """Сбой генерации протокола (CLI/Claude/IO)."""
+
+
+def _load_method_text(*, override_dir: Optional[str] = None) -> str:
+    """Читает метод-файл `kak-delat-protokol-vstrechi.md`.
+
+    Порядок поиска:
+      1. `override_dir` (если задан) — для тестов.
+      2. env `MEETING_NOTARY_METHODS_DIR` — для VPS / кастомных сетапов.
+      3. `_METHODS_DIR_DEFAULTS` (мак → VPS-каталог) — первый существующий.
+
+    `ProtocolGenerationError` если файл не найден ни в одном кандидате.
+    """
+    candidates: list[str] = []
+    if override_dir:
+        candidates.append(override_dir)
+    env_dir = (os.environ.get("MEETING_NOTARY_METHODS_DIR") or "").strip()
+    if env_dir:
+        candidates.append(os.path.expanduser(env_dir))
+    candidates.extend(_METHODS_DIR_DEFAULTS)
+
+    tried: list[str] = []
+    for d in candidates:
+        p = Path(d) / METHOD_FILE_NAME
+        tried.append(str(p))
+        if p.is_file():
+            try:
+                return p.read_text(encoding="utf-8")
+            except OSError as e:
+                raise ProtocolGenerationError(
+                    f"method-файл найден ({p}) но не читается: {e}"
+                ) from e
+    raise ProtocolGenerationError(
+        "method-файл `%s` не найден. Проверял: %s. "
+        "На VPS нужен cron rsync `~/Projects/me/methods/` → "
+        "`/opt/meeting-notary/_methods/` (см. README раздел «Cron rsync метода»)."
+        % (METHOD_FILE_NAME, ", ".join(tried))
+    )
+
+
+def _format_protocol_user_prompt(
+    transcript_md: str,
+    meeting_meta: dict,
+) -> str:
+    """Собирает user-prompt: метаданные + транскрипт.
+
+    Метаданные специально дублируют шапку транскрипта (Sonnet не должен полагаться
+    на её парсинг — там может не быть `Длительность`, если STT-pipeline её не положил).
+    """
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+    # Парсим в DD.MM.YYYY для подсказки модели (она всё равно сама форматирует
+    # шапку, но дадим готовый формат, чтобы не было «27.5.2026»).
+    date_dmy = date
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        y, m, d = date.split("-")
+        date_dmy = f"{d}.{m}.{y}"
+
+    duration = meeting_meta.get("duration") or meeting_meta.get("durationMin")
+    duration_str = ""
+    if duration is not None:
+        duration_str = f"{duration} мин" if not str(duration).endswith("мин") else str(duration)
+
+    expected = meeting_meta.get("expectedParticipants") or []
+    participants = meeting_meta.get("participants") or []
+    # Слияние без дублей с сохранением порядка (expected first).
+    seen: set[str] = set()
+    merged: list[str] = []
+    for n in list(expected) + list(participants):
+        if isinstance(n, str) and n and n not in seen:
+            seen.add(n)
+            merged.append(n)
+    participants_str = ", ".join(merged) if merged else "—"
+
+    transcript_filename = meeting_meta.get("transcript_filename") or f"{date}.md"
+
+    meta_block = [
+        "Метаданные встречи:",
+        f"- series: {series}",
+        f"- date: {date} (для шапки используй формат DD.MM.YYYY → {date_dmy})",
+    ]
+    if duration_str:
+        meta_block.append(f"- duration: {duration_str}")
+    meta_block.append(f"- participants: {participants_str}")
+    meta_block.append(f"- transcript_filename: {transcript_filename}")
+
+    return "\n".join(meta_block) + "\n\nТранскрипт:\n\n" + transcript_md
+
+
+def _is_protocol_generation_enabled() -> bool:
+    """Гейт `ENABLE_PROTOCOL_GENERATION` (дефолт ON; `0/false/no` → OFF)."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_GENERATION") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def generate_protocol(
+    transcript_md: str,
+    meeting_meta: dict,
+    *,
+    method_text: Optional[str] = None,
+    timeout: int = 180,
+    meeting_sid: Optional[str] = None,
+) -> str:
+    """Генерирует .md-файл протокола встречи из транскрипта через Claude Sonnet 4.6.
+
+    Параметры:
+      transcript_md: содержимое финального транскрипта (с применёнными именами).
+      meeting_meta: dict с полями `series` (str|None), `date` (YYYY-MM-DD),
+        `duration` или `durationMin`, `expectedParticipants` (list[str]),
+        `participants` (list[str]), `transcript_filename` (опц., имя файла .md
+        транскрипта; дефолт `<date>.md`).
+      method_text: содержимое метод-файла. None → читаем с диска через
+        `_load_method_text()` (это default-путь; явный текст нужен только тестам).
+      timeout: timeout subprocess `claude --print` (default 180s — генерация
+        протокола занимает 15–60s, запас на медленные ответы).
+      meeting_sid: для structured-лога.
+
+    Возвращает: готовый markdown-текст протокола (от строки `#протоколвстречи`).
+
+    Бросает `ProtocolGenerationError` если: CLI недоступен, claude вернул
+    пустой/невалидный ответ, метод-файл не найден.
+
+    Не делает atomic write — caller (finalize-meeting.py, regenerate-CLI,
+    clarify hook) решает куда писать и через какой механизм.
+    """
+    if method_text is None:
+        method_text = _load_method_text()
+
+    system_prompt = GENERATE_PROTOCOL_BASE_PROMPT + method_text
+    user_prompt = _format_protocol_user_prompt(transcript_md, meeting_meta)
+
+    started = time.monotonic()
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=system_prompt,
+            timeout=timeout,
+            model=PROTOCOL_GEN_MODEL,
+        )
+    except ClaudeCliNotInstalled as e:
+        raise ProtocolGenerationError(
+            "`claude` CLI не найден в PATH — генерация протокола невозможна"
+        ) from e
+    except ClaudeCliError as e:
+        logger.warning(
+            "[protocol] failed meeting=%s error=%s retry=0",
+            meeting_sid or "?", str(e)[:200],
+        )
+        raise ProtocolGenerationError(f"claude --print: {e}") from e
+    elapsed = time.monotonic() - started
+
+    text = raw.strip()
+    # Срезаем markdown-fence на случай если Sonnet всё-таки обернул ответ.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:markdown|md)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    if not text.startswith("#протоколвстречи"):
+        # Терпимо: модель могла начать с «Вот протокол:» — обрезаем всё до
+        # шапки. Якорь — `#протоколвстречи` (точное соответствие методичке),
+        # НЕ просто `^#` (иначе «# Здравствуйте! ...» в начале попадёт в файл).
+        m = re.search(r"^#протоколвстречи\b", text, flags=re.MULTILINE)
+        if m:
+            text = text[m.start():]
+        else:
+            logger.warning(
+                "[protocol] failed meeting=%s error=output-without-header retry=0",
+                meeting_sid or "?",
+            )
+            raise ProtocolGenerationError(
+                "Sonnet вернул ответ без шапки протокола (`#протоколвстречи`)"
+            )
+
+    logger.info(
+        "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s",
+        meeting_sid or "?", elapsed, len(system_prompt) + len(user_prompt),
+        len(text), PROTOCOL_GEN_MODEL,
+    )
+    return text
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomic write через `tempfile + os.rename` в той же директории.
+
+    Тот же паттерн, что `apply_clarify_mapping_to_transcript` — гарантирует,
+    что параллельная финализация другой встречи не увидит полу-файла.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.rename(tmp, path)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def regenerate_protocol_for_meeting(
+    transcript_path: Path,
+    protocol_path: Path,
+    meeting_meta: dict,
+    *,
+    method_text: Optional[str] = None,
+    meeting_sid: Optional[str] = None,
+) -> Path:
+    """Высокоуровневая обёртка: читает transcript → генерирует → atomic write.
+
+    Переиспользуется:
+      - CLI `tools/regenerate-protocol.py <series> <date>` (backfill / отладка).
+      - Telegram-команда «протокол <series> <date>» в meetings_listener'е.
+      - Hook из `clarify_worker._apply_resolution` после resolved-mapping'а.
+
+    `meeting_meta` должен содержать минимум `date` (или `startTs`). Имя файла
+    транскрипта подставляется автоматически — `transcript_path.name`.
+
+    Возвращает `protocol_path` (на успех). Бросает `ProtocolGenerationError`
+    при сбое чтения transcript'а или генерации.
+    """
+    if not transcript_path.is_file():
+        raise ProtocolGenerationError(
+            f"transcript-файл не найден: {transcript_path}"
+        )
+    try:
+        transcript_md = transcript_path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ProtocolGenerationError(
+            f"transcript-файл не читается ({transcript_path}): {e}"
+        ) from e
+    if not transcript_md.strip():
+        raise ProtocolGenerationError(
+            f"transcript-файл пустой: {transcript_path}"
+        )
+
+    enriched_meta = dict(meeting_meta)
+    enriched_meta.setdefault("transcript_filename", transcript_path.name)
+
+    protocol_text = generate_protocol(
+        transcript_md,
+        enriched_meta,
+        method_text=method_text,
+        meeting_sid=meeting_sid,
+    )
+    _atomic_write_text(protocol_path, protocol_text)
+    return protocol_path

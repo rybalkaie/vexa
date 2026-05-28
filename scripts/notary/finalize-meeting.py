@@ -55,7 +55,12 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from lib.name_mapping import map_all, apply_mapping  # noqa: E402
-from lib.llm_postprocess import map_speaker_names, clarify_speakers_via_telegram  # noqa: E402
+from lib.llm_postprocess import (  # noqa: E402
+    ProtocolGenerationError,
+    clarify_speakers_via_telegram,
+    map_speaker_names,
+    regenerate_protocol_for_meeting,
+)
 from lib.render import render_protocol  # noqa: E402
 
 
@@ -65,6 +70,12 @@ def setup_logging(verbose: bool) -> None:
         level=level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+
+def _is_protocol_enabled() -> bool:
+    """Гейт `ENABLE_PROTOCOL_GENERATION` (Ф4). Дефолт ON; `0/false/no` → OFF."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_GENERATION") or "").strip().lower()
+    return raw not in ("0", "false", "no")
 
 
 def _stt_backend() -> str:
@@ -584,13 +595,52 @@ def main() -> int:
         raise
     log.info("Protocol written → %s", md_path)
 
+    # 4.0.1. Ф4: LLM-генерация протокола Sonnet 4.6 по методичке.
+    # Порядок: протокол ДО clarify. Если clarify сработает — hook в
+    # clarify_worker._apply_resolution перегенерирует протокол на обновлённом
+    # транскрипте (так же atomic). Поэтому в Telegram-группу позже (Ф6) уходит
+    # уже актуальная версия. До Ф6 — файл просто лежит на диске.
+    #
+    # Путь: рядом с transcript'ом (`md_path.parent`). `_target_path` сейчас
+    # отдал бы НОВУЮ структуру (`<series>/<date>-protokol.md`), а transcript
+    # лежит по LEGACY-пути от `_output_dir_for_meta` (`<series>-<date>/...`).
+    # Класть протокол в новую папку = разорвать transcript↔protocol. После
+    # Ф7 миграции collector синхронизируется на `_target_path`, пути совпадут.
+    # Сейчас же — самый надёжный путь «<transcript-dir>/<date>-protokol.md».
+    protocol_path = md_path.parent / f"{date_part}-protokol.md"
+    if _is_protocol_enabled():
+        protocol_meta = dict(meta)
+        protocol_meta["date"] = date_part
+        protocol_meta["expectedParticipants"] = expected
+        protocol_meta["participants"] = participants
+        protocol_meta["transcript_filename"] = md_name
+        try:
+            regenerate_protocol_for_meeting(
+                transcript_path=md_path,
+                protocol_path=protocol_path,
+                meeting_meta=protocol_meta,
+                meeting_sid=session_uid,
+            )
+            log.info("Protocol generated → %s", protocol_path)
+        except ProtocolGenerationError as e:
+            # Best-effort: финализация не валится. Файл транскрипта уже на
+            # диске; протокол можно перегенерировать через
+            # `tools/regenerate-protocol.py <series> <date>` или через
+            # Telegram-команду «протокол <series> <date>».
+            log.warning(
+                "[protocol] generation failed (non-fatal) meeting=%s: %s",
+                session_uid, e,
+            )
+    else:
+        log.info("[protocol] disabled by ENABLE_PROTOCOL_GENERATION=0 — skip")
+
     # 4.1. Ф3 clarify-trigger: если есть unresolved cluster'ы (LLM сдался)
     # или low-confidence (LLM ответил, но неуверенно) — отправляем Илье
     # уведомление с inline keyboard и пишем `_pending_clarification/<sid>.json`.
     # Поток НЕ блокируется: финализация уже записала транскрипт «как есть»
-    # (с «Спикер N» для unresolved). Worker подберёт ответ позже и
-    # переразметит файл атомарно. План — фаза 3 meeting-notary-llm.
-    # TODO Ф4: re-trigger generate_protocol после applied clarify-mapping.
+    # (с «Спикер N» для unresolved). Worker подберёт ответ позже,
+    # переразметит файл атомарно И перегенерирует протокол (Ф4 hook в
+    # clarify_worker._apply_resolution).
     try:
         clarify_meta = dict(meta)
         # передаём в clarify дату — она нужна для формирования сообщения и
