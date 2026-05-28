@@ -7,6 +7,10 @@ requests==2.32.3
 soundfile==0.12.1
 numpy>=1.24.0,<2.0.0
 
+# Speechmatics Batch API client (Ф1 — lib/speechmatics_client.py, заменяет
+# whisper+pyannote в Ф4-Ф5, см. plans/2026-05-27-meeting-notary-speechmatics.md).
+httpx==0.28.1
+
 # Диарезация (требует HF_TOKEN).
 pyannote.audio==3.3.2
 torch==2.4.1
@@ -16,8 +20,10 @@ torchaudio==2.4.1
 pymorphy3==2.0.2
 pymorphy3-dicts-ru==2.4.417150.4580142
 
-# LLM-маппинг (опционально, под флагом ENABLE_CLAUDE_NAME_MAPPING).
-anthropic==0.39.0
+# LLM-постпроцессинг (маппинг имён + Ф4 протокол + Ф5 задачи) идёт через
+# `claude --print` CLI (подписка Claude Code), а не Anthropic SDK — решение
+# Ильи 2026-05-28. ANTHROPIC_API_KEY не нужен. Гейт включения LLM-маппинга:
+# ENABLE_LLM_NAME_MAPPING (дефолт on).
 
 # Dev-only: TTS для генерации synthetic test sample (см. README в разделе
 # «Тест без HF-токена»). Не нужен в runtime, но без него regenerate невозможен.

@@ -55,6 +55,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from lib.name_mapping import map_all, apply_mapping  # noqa: E402
+from lib.llm_postprocess import map_speaker_names  # noqa: E402
 from lib.render import render_protocol  # noqa: E402
 
 
@@ -422,6 +423,7 @@ def main() -> int:
     setup_logging(args.verbose)
     log = logging.getLogger("finalize-meeting")
 
+    t_start = time.time()
     backend = _stt_backend()
     log.info("STT_BACKEND=%s", backend)
 
@@ -500,14 +502,31 @@ def main() -> int:
     if getattr(args, "_test_fail_after_stt", False):
         raise RuntimeError("smoke: симуляция exception после STT (тест атомарности)")
 
-    # 3. Маппинг имён.
-    log.info("Step 4/5 — Name mapping (3 sources)")
+    # 3. Маппинг имён: детерминированные S1+S2, затем LLM-добивка для остатка.
+    log.info("Step 4/5 — Name mapping (S1+S2 deterministic, then LLM)")
     mapping_result = map_all(turns, participants_union)
-    turns = apply_mapping(turns, mapping_result.cluster_to_name)
+    cluster_to_name: dict[str, str] = dict(mapping_result.cluster_to_name)
+    sources_used: list[str] = list(mapping_result.sources_used)
+    speaker_confidence: dict[str, float] = {}
+    if mapping_result.unresolved_clusters:
+        llm_decided = map_speaker_names(
+            turns,
+            expected_participants=expected,
+            panel_participants=participants,
+            already_mapped=cluster_to_name,
+            meeting_sid=session_uid,
+        )
+        if llm_decided:
+            for cluster, (name, conf) in llm_decided.items():
+                cluster_to_name[cluster] = name
+                speaker_confidence[cluster] = conf
+            sources_used.append("llm-postprocess")
+    turns = apply_mapping(turns, cluster_to_name)
+    unresolved_after = [c for c in mapping_result.unresolved_clusters if c not in cluster_to_name]
     log.info("Mapping done — sources=%s, mapped=%d, unresolved=%d",
-             mapping_result.sources_used,
-             len(mapping_result.cluster_to_name),
-             len(mapping_result.unresolved_clusters))
+             sources_used,
+             len(cluster_to_name),
+             len(unresolved_after))
 
     # 4. Рендер + атомарная запись.
     log.info("Step 5/5 — Render markdown")
@@ -528,7 +547,7 @@ def main() -> int:
         template_path=args.template,
         turns=turns,
         meta=meta,
-        sources_used=mapping_result.sources_used,
+        sources_used=sources_used,
         asr_model=asr_label,
         diarization_model=diar_label,
         transcript_relpath=transcript_relpath,
@@ -566,6 +585,20 @@ def main() -> int:
     log.info("Protocol written → %s", md_path)
     if backend == "speechmatics":
         log.info("Transcripts archive → %s, %s", transcripts_json_path, transcripts_txt_path)
+        # Append в bench-speechmatics-prod.log — Ф4 семидневный мониторинг.
+        # Формат: <iso_ts> <series> <date> wav=<sec> finalize=<sec> job=<id>
+        try:
+            bench_path = "/srv/meeting-notary/logs/bench-speechmatics-prod.log"
+            series_label = meta.get("series") or session_uid
+            audio_sec = round(sm_result.audio_duration_s, 1) if sm_result else 0.0
+            finalize_sec = round(time.time() - t_start, 1)
+            job_id = sm_result.job_id if sm_result else "n/a"
+            iso_ts = datetime.utcnow().isoformat() + "Z"
+            line = f"{iso_ts} {series_label} {date_part} wav={audio_sec} finalize={finalize_sec} job={job_id}\n"
+            with open(bench_path, "a", encoding="utf-8") as bf:
+                bf.write(line)
+        except Exception as e:
+            log.warning("bench-prod log write failed: %s", e)
 
     # 5. keep_audio.
     keep_audio_from_meta = bool(meta.get("keepAudio") or meta.get("keep_audio"))
@@ -610,9 +643,10 @@ def main() -> int:
         "sources": {"stt": extra.get("stt_label")},
         "language_detected": extra.get("detected_language"),
         "speakers_detected": extra.get("speakers_detected"),
-        "speakers_named": len(mapping_result.cluster_to_name),
-        "name_mapping_sources": mapping_result.sources_used,
-        "unresolved_clusters": mapping_result.unresolved_clusters,
+        "speakers_named": len(cluster_to_name),
+        "name_mapping_sources": sources_used,
+        "unresolved_clusters": unresolved_after,
+        "speaker_confidence": speaker_confidence,
     }
     if backend == "speechmatics":
         result_json.update({

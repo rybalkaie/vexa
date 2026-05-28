@@ -284,11 +284,21 @@ def _finalize_and_collect(session_uid: str) -> None:
         # из-за чего finalize-meeting.py использовал устаревшую версию после deploy
         # (Ф2-обнаружение: цикл-проверки У3).
         f"cd /srv/meeting-notary/vexa/scripts/notary; "
-        # Загружаем .env.notary — там HF_TOKEN для pyannote, TRANSCRIPTION_SERVICE_URL и т.п.
-        f"set -a; source ~/meeting-notary/vexa/.env.notary; set +a; "
-        # ENABLE_CLAUDE_NAME_MAPPING оставляем включённым: claude CLI установлен
-        # и залогинен на VPS (Ф2 блок 2.4, 2026-05-27). Source 3 LLM-маппинга
-        # имён работает прямо здесь, не отключаем.
+        # Загружаем .env.notary. С Ф4 (2026-05-28) источник истины — /srv/meeting-notary/.env.notary
+        # (там SPEECHMATICS_API_KEY, STT_BACKEND и рабочие ключи). Сначала source'им legacy
+        # (~/meeting-notary/vexa/.env.notary) — оттуда нужны HF_TOKEN, TRANSCRIPTION_SERVICE_URL
+        # для LEGACY-ветки STT_BACKEND=whisper_pyannote, и ENABLE_LLM_NAME_MAPPING. Затем
+        # source /srv/.env.notary перетирает дубли — новый файл побеждает.
+        f"set -a; "
+        # `{{ ...; }} || true` — group command (не subshell), env пробрасывается
+        # в родительский shell. Защищает от битого legacy-файла (синтаксис в .env.notary):
+        # не валим всю финализацию из-за legacy, источник истины ниже всё равно загрузится.
+        f"[ -f ~/meeting-notary/vexa/.env.notary ] && {{ source ~/meeting-notary/vexa/.env.notary; }} || true; "
+        f"source /srv/meeting-notary/.env.notary; "
+        f"set +a; "
+        # ENABLE_LLM_NAME_MAPPING оставляем включённым (дефолт on): claude CLI
+        # установлен и залогинен на VPS (Ф2 блок 2.4, 2026-05-27). LLM-маппинг
+        # имён (lib/llm_postprocess.map_speaker_names) работает прямо здесь.
         f"unset FAKE_DIARIZATION_PATH; "  # HF-токен есть, real pyannote
         f"{VPS_VENV}/bin/python finalize-meeting.py {shlex.quote(meta_path)}"
     )

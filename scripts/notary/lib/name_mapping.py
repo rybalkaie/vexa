@@ -1,21 +1,20 @@
-"""Маппинг имён спикеров: три источника по убывающей надёжности.
+"""Маппинг имён спикеров: детерминированные источники S1+S2.
 
 Источник 1 — Telemost participants list (точная информация: кто был в комнате).
 Источник 2 — regex + pymorphy3 по транскрипту (vocative: «Михаил, посмотри»).
-Источник 3 — Claude Haiku (LLM-добивка для непривязанных «Спикер N»).
+
+LLM-добивка (бывший Source 3 / Claude Haiku) живёт отдельно в
+`lib/llm_postprocess.py::map_speaker_names`. Из `map_all` она НЕ
+вызывается — это делает `finalize-meeting.py` после `map_all`, чтобы
+получить confidence-per-cluster для Ф3 clarify-flow.
 
 Дисциплина «Опасной тройки» (CLAUDE.md проекта meeting-notary):
   - НЕ логируем текст реплик (только число реплик, число имён).
-  - В промпт Claude — ТОЛЬКО непривязанные кластеры + список имён, без
-    лишнего контекста.
-  - НЕ сохраняем сырой ответ Claude — только результат {cluster: name | None}.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MappingResult:
     cluster_to_name: dict[str, str]  # SPEAKER_00 → «Илья»; пустой если ничего не уверены
-    sources_used: list[str]          # подмножество из ["telemost_list", "regex_pymorphy3", "claude_haiku"]
+    sources_used: list[str]          # подмножество из ["telemost_list", "regex_pymorphy3"]
     unresolved_clusters: list[str]   # кластеры, которым не нашли имя
 
 
@@ -189,156 +188,18 @@ def map_from_speech_regex(
     return result
 
 
-# ---------- Источник 3: Claude Haiku ----------
-
-CLAUDE_MAPPING_SYSTEM_PROMPT = """Ты помогаешь определить, кто из участников встречи какой реплики говорил.
-Тебе дан список имён участников встречи и реплики кластеров SPEAKER_00, SPEAKER_01 и т.д.
-Назначь каждому кластеру имя из списка по контексту речи.
-
-Правила:
-- Используй только имена из списка. Не придумывай новые.
-- Если ты не уверен про конкретный кластер — поставь null.
-- Один кластер — одно имя. Одно имя — один кластер.
-- Ключи в JSON используй РОВНО как указано (SPEAKER_00 заглавными с подчёркиванием).
-
-Ответь ТОЛЬКО валидным JSON в формате:
-{"SPEAKER_00": "Имя_или_null", "SPEAKER_01": "Имя_или_null", ...}
-Без markdown, без объяснений, без префиксов."""
-
-
-def map_from_claude_haiku(
-    turns: list[AlignedTurn],
-    participants: list[str],
-    already_mapped: dict[str, str],
-    api_key: Optional[str] = None,  # kept for API compat; не используется
-    model: str = "claude-haiku-4-5-20251001",  # kept for API compat; не используется
-    max_tokens: int = 200,  # kept for API compat; не используется
-) -> dict[str, str]:
-    """LLM-добивка через `claude` CLI (подписка владельца, без отдельного API ключа).
-
-    В Ф4 решено не заводить ANTHROPIC_API_KEY — `claude --print` ходит через
-    ту же подписку Claude Code, что и интерактивный режим. Минус — задержка
-    5-10s на запуск CLI; запускается после транскрипции, до встречи не доходит.
-
-    Дисциплина «Опасной тройки» (см. CLAUDE.md проекта):
-      - В промпте только непривязанные кластеры + их короткие реплики +
-        список оставшихся имён.
-      - Логируем только метаданные (число кластеров, число имён, статус).
-      - Не сохраняем сырой ответ — только результат {cluster: name | None}.
-    """
-    import subprocess
-    import shutil
-
-    enabled = os.environ.get("ENABLE_CLAUDE_NAME_MAPPING", "0").strip().lower() in ("1", "true", "yes")
-    if not enabled:
-        logger.info("Source 3 (Claude CLI): disabled by ENABLE_CLAUDE_NAME_MAPPING")
-        return {}
-
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        logger.warning("Source 3 (Claude CLI): `claude` not in PATH — пропускаем")
-        return {}
-
-    unresolved_clusters = sorted({t.speaker for t in turns if t.speaker and t.speaker not in already_mapped})
-    available_names = [p for p in participants if p not in already_mapped.values()]
-    if not unresolved_clusters or not available_names:
-        logger.info("Source 3 (Claude CLI): nothing to resolve")
-        return {}
-
-    cluster_to_lines: dict[str, list[str]] = {c: [] for c in unresolved_clusters}
-    for turn in turns:
-        if turn.speaker in cluster_to_lines and turn.text.strip():
-            if len(cluster_to_lines[turn.speaker]) < 5:
-                cluster_to_lines[turn.speaker].append(turn.text.strip())
-
-    parts = []
-    for c, lines in cluster_to_lines.items():
-        if not lines:
-            continue
-        body = " | ".join(lines)
-        parts.append(f"{c}: {body}")
-    transcript_block = "\n".join(parts)
-
-    full_prompt = (
-        CLAUDE_MAPPING_SYSTEM_PROMPT
-        + "\n\n"
-        + f"Список имён участников встречи: {', '.join(available_names)}\n\n"
-        + f"Реплики спикеров:\n{transcript_block}"
-    )
-
-    logger.info(
-        "Source 3 (Claude CLI): %d clusters × %d names, total reply lines=%d",
-        len(unresolved_clusters), len(available_names),
-        sum(len(v) for v in cluster_to_lines.values()),
-    )
-
-    try:
-        result = subprocess.run(
-            [claude_bin, "--print"],
-            input=full_prompt,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "Source 3 (Claude CLI): exit=%d, stderr=%s",
-                result.returncode, result.stderr.strip()[:200],
-            )
-            return {}
-        raw = (result.stdout or "").strip()
-        if not raw:
-            logger.warning("Source 3 (Claude CLI): пустой ответ")
-            return {}
-        # Иногда модель оборачивает в ```json … ``` или говорит лишнее.
-        # Сначала вырежем markdown fence, затем найдём первый JSON-объект.
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
-        if not m:
-            logger.warning("Source 3 (Claude CLI): не нашли JSON в ответе")
-            return {}
-        parsed = json.loads(m.group(0))
-    except subprocess.TimeoutExpired:
-        logger.warning("Source 3 (Claude CLI): timeout 60s — пропуск")
-        return {}
-    except json.JSONDecodeError as e:
-        logger.warning("Source 3 (Claude CLI): invalid JSON: %s", e)
-        return {}
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Source 3 (Claude CLI) failed: %s", e)
-        return {}
-
-    # Валидируем: ключ должен быть в unresolved_clusters, значение — из available_names.
-    result: dict[str, str] = {}
-    used_names: set[str] = set()
-    for cluster, name in parsed.items():
-        if not isinstance(cluster, str) or cluster not in unresolved_clusters:
-            continue
-        if name is None or not isinstance(name, str):
-            continue
-        if name not in available_names:
-            continue
-        if name in used_names:
-            continue
-        result[cluster] = name
-        used_names.add(name)
-
-    if result:
-        logger.info("Source 3 (Claude Haiku): mapped %d clusters", len(result))
-    else:
-        logger.info("Source 3 (Claude Haiku): no confident matches")
-    return result
-
-
 # ---------- Оркестрация ----------
 
 def map_all(
     turns: list[AlignedTurn],
     participants: list[str],
 ) -> MappingResult:
-    """Прогоняет все три источника по очереди. Накапливает результат."""
+    """Прогоняет детерминированные источники S1+S2 по очереди.
+
+    LLM-добивка (бывший Source 3 / Claude Haiku) вынесена в
+    `lib/llm_postprocess.py::map_speaker_names` и вызывается отдельно из
+    `finalize-meeting.py` для unresolved'ов после S1+S2.
+    """
     clusters = sorted({t.speaker for t in turns if t.speaker})
     cluster_to_name: dict[str, str] = {}
     sources_used: list[str] = []
@@ -357,12 +218,6 @@ def map_all(
     if delta:
         cluster_to_name.update(delta)
         sources_used.append("regex_pymorphy3")
-
-    # 3) Claude Haiku
-    delta = map_from_claude_haiku(turns, participants, cluster_to_name)
-    if delta:
-        cluster_to_name.update(delta)
-        sources_used.append("claude_haiku")
 
     unresolved = [c for c in clusters if c not in cluster_to_name]
     return MappingResult(

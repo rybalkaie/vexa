@@ -47,8 +47,10 @@ pip install -r requirements.txt
 - **TRANSCRIPTION_SERVICE_URL** — URL Vexa transcription-service
   (default: `http://127.0.0.1:8083/v1/audio/transcriptions`).
 - **TRANSCRIPTION_SERVICE_TOKEN** — если у сервиса включён API_TOKEN.
-- **ANTHROPIC_API_KEY** — опционально, для Source 3 маппинга имён.
-  Включается переменной `ENABLE_CLAUDE_NAME_MAPPING=1`.
+- **`claude` CLI** (подписка Claude Code) — для LLM-маппинга имён
+  `lib/llm_postprocess.map_speaker_names`. Включён по умолчанию; гейт —
+  `ENABLE_LLM_NAME_MAPPING` (set to `0`/`false`/`no` чтобы выключить).
+  Anthropic API ключ НЕ требуется (вызов идёт через `claude --print`).
 
 ## Использование
 
@@ -57,8 +59,7 @@ pip install -r requirements.txt
 python3 finalize-meeting.py /opt/meeting-notary/_tmp/transcripts/2026-05-26-<uid>.meta.json
 
 # С явными параметрами.
-ENABLE_CLAUDE_NAME_MAPPING=1 \
-ANTHROPIC_API_KEY=sk-ant-... \
+ENABLE_LLM_NAME_MAPPING=1 \
 HF_TOKEN=hf_... \
 python3 finalize-meeting.py \
     /opt/meeting-notary/_tmp/transcripts/2026-05-26-<uid>.meta.json \
@@ -76,9 +77,67 @@ python3 finalize-meeting.py \
    participants). Если ровно 1 кластер диарезации = 1 имя → прямое назначение.
 2. **`regex_pymorphy3`** — vocative-обращения «Михаил, …» в репликах. Все
    падежные формы через pymorphy3. Бесплатно, локально, ~80% покрытия.
-3. **`claude_haiku`** — LLM-добивка для непривязанных «Спикер N». Включается
-   `ENABLE_CLAUDE_NAME_MAPPING=1`. Конфиденциальность транскрипта в Anthropic
-   принята владельцем 2026-05-26 (план п.9).
+3. **`llm-postprocess`** — LLM-добивка для непривязанных «Спикер N» через
+   `lib/llm_postprocess.map_speaker_names` (Claude Haiku 4.5 через
+   `claude --print`). Возвращает `{cluster: (name, confidence)}` — confidence
+   используется в Ф3 для clarify-flow. Гейт: `ENABLE_LLM_NAME_MAPPING`
+   (дефолт ON; `0`/`false`/`no` чтобы выключить).
+
+   **При правке `MAP_SPEAKER_NAMES_SYSTEM_PROMPT`** (промт в
+   `lib/llm_postprocess.py`) — обязательно прогоняй smoke до коммита:
+   ```bash
+   # Из корня репо ~/Projects/meeting-notary/:
+   .venv-cli/bin/python vexa/scripts/notary/tools/smoke_map_speaker_names.py
+   ```
+   Целевой результат: `2/2 правильных, оба confidence ≥ 0.85`. Без этого
+   тюнинг тихо ломает прод (LLM начнёт занижать confidence → Ф3 clarify
+   запускается на каждой встрече).
+
+## Speechmatics client (`lib/speechmatics_client.py`)
+
+Замена локальной связки `transcribe.py` (Whisper) + `diarize.py` (pyannote)
+одним облачным вызовом. Закрывает узкое место CPU CCX13 (60–90 мин обработки
+на час встречи → 15–30 сек). Интеграция в `finalize-meeting.py` — Ф2;
+полный план: [`~/Projects/me/plans/2026-05-27-meeting-notary-speechmatics.md`](../../../../me/plans/2026-05-27-meeting-notary-speechmatics.md).
+
+**Endpoint:** `POST https://asr.api.speechmatics.com/v2/jobs` (Batch API,
+регион EU1). Полный цикл: submit → poll `/v2/jobs/<id>` каждые 5 сек до
+`status=done` → fetch `/v2/jobs/<id>/transcript?format=json-v2`.
+
+**Конфиг job'а:** `{language: "ru", diarization: "speaker", operating_point: "enhanced"}`.
+
+**Формат ответа (json-v2):** массив `results[]` с двумя типами элементов:
+- `type=word` — обычное слово, `alternatives[0].speaker` ("S1", "S2", …),
+  `start_time`/`end_time` в секундах float;
+- `type=punctuation` — знак препинания, **клеится к предыдущему слову без
+  пробела** (естественная русская типографика). Парсер открывает новую
+  реплику только при смене speaker'а на `type=word`; punctuation не триггерит
+  смену.
+
+**Контракт модуля** (фиксирован Ф1, см. `Utterance` в файле):
+```python
+Utterance = NamedTuple(speaker: str, start: float, end: float, text: str)
+def transcribe_diarize_wav(wav_path: str | Path) -> list[Utterance]
+def to_aligned_turns(utterances) -> list[AlignedTurn]   # adapter для Ф2
+```
+
+**Retry policy (Ф1, для smoke):** на 5xx/timeout — 1 быстрый retry через
+30 сек, иначе raise. На `rejected` job → сразу raise (конфиг-ошибка). Полное
+24-часовое retry-расписание — Ф2, на уровне `finalize-meeting.py` +
+systemd-timer `meeting-notary-retry-failed.timer`.
+
+**Smoke-команда (на VPS):**
+```bash
+sudo -u dev bash -c '
+  cd /srv/meeting-notary/vexa/scripts
+  set -a; source /srv/meeting-notary/.env.notary; set +a
+  /home/dev/meeting-notary/venv/bin/python -m notary.lib.speechmatics_client <wav>
+'
+```
+Выведет первые 10 реплик в формате `[start–end] Speaker S1: текст`.
+
+**ADR (почему именно Speechmatics):**
+[`~/Projects/anzhee-dealer-360/decisions/2026-05-27-stt-speechmatics.md`](../../../../anzhee-dealer-360/decisions/2026-05-27-stt-speechmatics.md).
 
 ## Дисциплина «Опасной тройки» (Ф3)
 
