@@ -306,6 +306,78 @@ cd ~/Projects/meeting-notary && .venv-cli/bin/python vexa/scripts/notary/tools/r
 Группу не уведомляем — Ф6 (доставка) сам решит что отправить с учётом
 поля `delivered` в `meta.json`.
 
+## Ф5 — Извлечение задач из протокола + маршрутизация
+
+После генерации протокола (Ф4) и до доставки в группу (Ф6) finalize-meeting
+извлекает задачи через Claude Sonnet 4.6 и распределяет их:
+
+- **owner=Илья** → `~/Projects/me/tasks.md`, раздел `## 📥 Актуальные`,
+  atomic append через tempfile+rename. Формат строки — стандарт из
+  [`~/Projects/me/methods/как-работать-с-системой-задач.md`](../../../../me/methods/как-работать-с-системой-задач.md).
+- **owner=<имя_стейкхолдера>** И встреча 1:1 (`expectedParticipants` ровно 2:
+  Илья + один из реестра) → его трек `companies/<co>/совещания/<slug>-otkrytye-voprosy.md`
+  через `~/.local/bin/stakeholder-track.sh append <file> <section> <stdin>`.
+  Подсекция `### 📋 Из встречи YYYY-MM-DD` — одна на встречу; первой строкой —
+  ссылка на протокол.
+- **owner=Спикер N** (имя не было смаплено) → `tasks.md` с маркером `[?]` +
+  отдельное сводное уведомление Илье «N задач с нераспознанным владельцем».
+- **owner=<имя> НЕ из реестра** или **встреча НЕ 1:1** → лог, skip (вне скоупа).
+
+### Анти-галлюцинация задач
+
+Порог по длительности встречи:
+
+| Длительность | Порог задач |
+|---|---|
+| < 60 мин | > 7 |
+| 60–120 мин | > 12 |
+| > 120 мин | > 20 |
+
+При превышении бот через `@ilya_protocol_meeting_bot` шлёт Илье список и
+ждёт `CLARIFY_TIMEOUT=420 сек` (7 минут). Ответы: «оставить все» / «убрать 3,5,7».
+Без ответа — оставляем все (поведение «лучше шум, чем потеря»).
+
+### Clarification дедлайнов
+
+Задачи Ильи без срока → отдельное сообщение «1=2026-06-05, 2=на этой неделе,
+3=без срока». Парсер понимает: ISO даты, «сегодня/завтра», «на этой/следующей
+неделе», «к понедельнику/.../воскресенью», «без срока».
+
+Поздний ответ (после таймаута) обновляет строки в tasks.md (atomic write);
+в группу повторно ничего не уходит (тот же контракт, что у Ф3).
+
+### Реестр стейкхолдеров
+
+Источник правды — [`~/Projects/me-dashboard/stakeholders.py`](../../../../me-dashboard/stakeholders.py).
+На VPS дублируется как `stakeholders.json` в `_methods/`. Push через тот же
+launchd-агент, что и методички (`meeting-notary-methods-push.sh` теперь
+делает два rsync'а — методички и `stakeholders.json`).
+
+`lib/stakeholders.py::load_stakeholders()` ищет JSON в env-пути → дефолтных
+кандидатах → fallback на прямой `.py` import.
+
+### Env-флаги Ф5
+
+| Env | Дефолт | Назначение |
+|-----|--------|------------|
+| `ENABLE_TASK_EXTRACTION` | `1` | Выключить = `extract_tasks` всегда `[]`. |
+| `ENABLE_TASK_ROUTING` | `1` | Выключить = задачи извлекаются, но не пишутся (дебаг промта). |
+| `MEETING_NOTARY_TASKS_MD` | `~/Projects/me/tasks.md` | Целевой файл записи задач Ильи. |
+| `MEETING_NOTARY_STAKEHOLDERS_JSON` | — | Явный путь к JSON-реестру. |
+| `CLARIFY_TIMEOUT` | `420` (общий с Ф3) | Таймаут ответа на clarification по задачам. |
+
+### Structured-лог Ф5
+
+```
+[extract_tasks] meeting=<sid> count=N elapsed=Xs threshold=K filtered=M model=claude-sonnet-4-6
+[route_tasks] meeting=<sid> ilia=N others=M unknown=K pending_deadline=Q errors=E
+[task-clarify] sent meeting=<sid> type=task_filter|task_deadlines tasks=N
+[task-clarify] resolved meeting=<sid> type=... applied=Y
+```
+
+В финальный stdout finalize-meeting добавляется поле
+`tasks_extracted: {ilia, others, pending_deadline, unknown_owner}`.
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция

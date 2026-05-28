@@ -368,6 +368,25 @@ def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any
     return True
 
 
+def maybe_route_to_task_clarify_text(token: str, msg: dict[str, Any]) -> bool:
+    """Ф5: если есть pending task_filter / task_deadlines — передаёт msg туда.
+
+    Возвращает True если task_clarify_worker обработал сообщение (caller выходит).
+    False — caller продолжает (clarify спикеров / apply_reply).
+    """
+    pending_root = _clarify_pending_root()
+    if pending_root is None or not pending_root.exists():
+        return False
+    try:
+        from notary.lib import task_clarify_worker  # noqa: PLC0415
+        if not task_clarify_worker.has_any_pending_task_clarify(pending_root):
+            return False
+        return task_clarify_worker.process_text_message(msg, pending_root, token)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("task_clarify text routing failed: %s", e)
+        return False
+
+
 def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
     """Если есть pending/timed_out clarify-state — передаёт msg в clarify_worker.
 
@@ -389,7 +408,12 @@ def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
 
 
 def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -> None:
-    """Inline-кнопка от Ф3 clarify. Если есть pending — применяем."""
+    """Inline-кнопка от Ф3 (clarify спикеров) или Ф5 (task_filter).
+
+    Порядок: сначала task_clarify_worker (новый, Ф5), потом clarify_worker (Ф3).
+    Сами по себе callback'и идемпотентны — но Ф5-кнопка имеет жёсткий префикс
+    (`tf:`/`td:`), не пересекается с Ф3 (`cl:`).
+    """
     # Sender check (chat_id для callback внутри сообщения).
     msg = cbq.get("message") or {}
     chat = msg.get("chat") or {}
@@ -401,6 +425,17 @@ def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -
     if pending_root is None:
         logger.warning("callback received but clarify lib unavailable")
         return
+
+    # Ф5 task_clarify (task_filter/task_deadlines)
+    try:
+        from notary.lib import task_clarify_worker  # noqa: PLC0415
+        handled = task_clarify_worker.process_callback(cbq, pending_root, token)
+        if handled:
+            return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("task_clarify_worker.process_callback failed: %s", e)
+
+    # Ф3 clarify спикеров
     try:
         from notary.lib import clarify_worker  # noqa: PLC0415
         clarify_worker.process_callback(cbq, pending_root, token)
@@ -419,6 +454,14 @@ def sweep_clarify_timeouts() -> None:
             logger.info("clarify sweep: marked %d as timed_out", n)
     except Exception as e:  # noqa: BLE001
         logger.exception("clarify sweep failed: %s", e)
+    # Ф5 task_clarify sweep — отдельный модуль, отдельные state-файлы.
+    try:
+        from notary.lib import task_clarify_worker  # noqa: PLC0415
+        n2 = task_clarify_worker.sweep_timeouts(pending_root)
+        if n2:
+            logger.info("task-clarify sweep: marked %d as timed_out", n2)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("task_clarify sweep failed: %s", e)
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
@@ -439,8 +482,9 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     #   • начинается с 📅 → блок встреч → apply_reply flow (ниже).
     #   • начинается с 🎙 → clarify-уведомление Ф3 → роутинг в clarify_worker.
     #   • что-то ещё → игнор (Илья ответил на чужую служебку бота).
-    # Если Reply нет — Илья просто написал в DM. Если есть pending clarify —
-    # передаём ему; иначе старый apply_reply flow к последнему snapshot.
+    # Если Reply нет — Илья просто написал в DM. Сначала пробуем Ф5 task-clarify
+    # (формат «1=2026-06-05» или «убрать 3,5,7»), потом Ф3 clarify спикеров,
+    # иначе apply_reply flow к последнему snapshot.
     reply_to = msg.get("reply_to_message")
     if reply_to:
         orig_text = (reply_to.get("text") or "").strip()
@@ -454,6 +498,9 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
         if not orig_text.startswith(TRIGGER_PREFIX):
             return
     else:
+        # Ф5 task-clarify имеет приоритет: формат «N=...» / «убрать N» уникальные.
+        if maybe_route_to_task_clarify_text(token, msg):
+            return
         if maybe_route_to_clarify_text(token, msg):
             return
 

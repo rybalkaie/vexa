@@ -58,8 +58,13 @@ from lib.name_mapping import map_all, apply_mapping  # noqa: E402
 from lib.llm_postprocess import (  # noqa: E402
     ProtocolGenerationError,
     clarify_speakers_via_telegram,
+    extract_tasks,
     map_speaker_names,
+    maybe_clarify_pending_deadlines,
+    maybe_clarify_task_count,
+    notify_unknown_owners,
     regenerate_protocol_for_meeting,
+    route_tasks,
 )
 from lib.render import render_protocol  # noqa: E402
 
@@ -634,6 +639,82 @@ def main() -> int:
     else:
         log.info("[protocol] disabled by ENABLE_PROTOCOL_GENERATION=0 — skip")
 
+    # 4.0.2. Ф5: извлечение задач + маршрутизация в tasks.md / треки.
+    # Делаем ДО clarify спикеров (см. 4.1) и ДО доставки в группу (Ф6).
+    # Best-effort: на сбой LLM/IO — warning, finalize не валится.
+    tasks_extracted_meta = {
+        "ilia": 0,
+        "others": 0,
+        "pending_deadline": 0,
+        "unknown_owner": 0,
+    }
+    if protocol_path.is_file():
+        try:
+            protocol_md_text = protocol_path.read_text(encoding="utf-8")
+        except OSError as e:
+            log.warning("[extract_tasks] protocol read failed: %s", e)
+            protocol_md_text = ""
+        if protocol_md_text.strip():
+            task_meta = dict(meta)
+            task_meta["date"] = date_part
+            task_meta["expectedParticipants"] = expected
+            task_meta["participants"] = participants
+            # audioDurationS для расчёта порога анти-галлюцинации.
+            if sm_result is not None:
+                task_meta["audioDurationS"] = sm_result.audio_duration_s
+            try:
+                tasks = extract_tasks(
+                    protocol_md_text,
+                    task_meta,
+                    meeting_sid=session_uid,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[extract_tasks] failed (non-fatal): %s", e)
+                tasks = []
+
+            if tasks:
+                # Анти-галлюцинация (асинхронная, не блокирует запись).
+                try:
+                    maybe_clarify_task_count(session_uid, tasks, task_meta)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[task-clarify] count clarify failed (non-fatal): %s", e)
+
+                try:
+                    route_result = route_tasks(
+                        tasks,
+                        task_meta,
+                        meeting_sid=session_uid,
+                    )
+                    tasks_extracted_meta["ilia"] = route_result.get("ilia", 0)
+                    tasks_extracted_meta["others"] = route_result.get("others", 0)
+                    tasks_extracted_meta["pending_deadline"] = route_result.get("pending_deadline", 0)
+                    tasks_extracted_meta["unknown_owner"] = route_result.get("unknown_owner", 0)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("[route_tasks] failed (non-fatal): %s", e)
+                    route_result = {}
+
+                # Clarification дедлайнов задач Ильи без срока.
+                ilia_no_deadline = [
+                    t for t in tasks
+                    if (t.get("owner") or "").lower().startswith("илья")
+                    and not t.get("deadline")
+                ]
+                if ilia_no_deadline:
+                    try:
+                        maybe_clarify_pending_deadlines(session_uid, ilia_no_deadline, task_meta)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("[task-clarify] deadlines clarify failed (non-fatal): %s", e)
+
+                # Сводное уведомление по [?]-задачам.
+                unk = tasks_extracted_meta.get("unknown_owner", 0)
+                if unk > 0:
+                    try:
+                        notify_unknown_owners(session_uid, unk, task_meta)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("[task-clarify] unknown-notify failed (non-fatal): %s", e)
+    else:
+        log.info("[extract_tasks] протокол не сгенерирован — пропуск задач")
+
     # 4.1. Ф3 clarify-trigger: если есть unresolved cluster'ы (LLM сдался)
     # или low-confidence (LLM ответил, но неуверенно) — отправляем Илье
     # уведомление с inline keyboard и пишем `_pending_clarification/<sid>.json`.
@@ -724,6 +805,7 @@ def main() -> int:
         "name_mapping_sources": sources_used,
         "unresolved_clusters": unresolved_after,
         "speaker_confidence": speaker_confidence,
+        "tasks_extracted": tasks_extracted_meta,
     }
     if backend == "speechmatics":
         result_json.update({

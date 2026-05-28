@@ -1268,3 +1268,1075 @@ def regenerate_protocol_for_meeting(
     )
     _atomic_write_text(protocol_path, protocol_text)
     return protocol_path
+
+
+# ---------- Ф5: извлечение задач + маршрутизация ------------------------
+
+# Закрытый список сфер из методички tasks.md (раздел «Правила работы» →
+# «Сферы (тэги) — закрытый список»). Дублируется здесь, потому что промт
+# должен явно перечислять допустимые значения — иначе Sonnet «галлюцинирует»
+# свои. Источник правды — `~/Projects/me/tasks.md`. При расширении списка —
+# обновить ОБЕ копии (тут и в tasks.md).
+TASK_SPHERES_CLOSED_LIST = (
+    "anzhee",
+    "мпервый",
+    "envyton",
+    "сценалогия",
+    "личное",
+    "здоровье",
+    "семья",
+    "дубай",
+    "дом",
+    "me-clone",
+    "процессы-ai",
+    "обучение",
+    "новый-доход",
+)
+
+TASK_EXTRACTION_MODEL = "claude-sonnet-4-6"
+TASK_PARSE_FALLBACK_MODEL = "claude-haiku-4-5-20251001"
+
+# Порог анти-галлюцинации задач по длительности встречи (Идея2 + РИСК3
+# в плане). Длительность в минутах из meta.audioDurationS / meta.durationS.
+_TASK_THRESHOLD_BY_DURATION = (
+    (60, 7),    # < 60 мин → > 7 задач = подозрительно
+    (120, 12),  # 60–120 мин → > 12
+    (10**9, 20),  # > 120 мин → > 20
+)
+
+
+class TaskExtractionError(RuntimeError):
+    """Сбой `extract_tasks` (LLM/parse/IO)."""
+
+
+EXTRACT_TASKS_SYSTEM_PROMPT = """Ты помогаешь извлечь задачи из протокола встречи.
+
+На вход:
+1. Финальный markdown-протокол встречи (имена спикеров уже подставлены, может встретиться «Спикер N» если имя не было известно).
+2. Метаданные встречи (series, дата, длительность, участники).
+3. Закрытый список сфер задач — выбирать ровно из него.
+
+Твоя задача: найти все конкретные ДОГОВОРЁННОСТИ — где один человек обязался что-то сделать («сделаю X», «пришлю Y», «договорились что Z к пятнице», «возьмёшь на себя», «отправлю до завтра»).
+
+Правила:
+- НЕ выдумывай задачи. Если в протоколе нет договорённости — не возвращай её.
+- Цитата `source_quote` ОБЯЗАТЕЛЬНА — 1–2 предложения из протокола, где задача прозвучала. Точная цитата (можно сократить «...» в середине), не пересказ.
+- `owner` — ровно как в протоколе. Если протокол говорит «Илья», верни «Илья». Если «Михаил Саргин» — верни «Михаил Саргин». Если «Спикер 3» — верни «Спикер 3». НЕ выдумывай имя для «Спикера N».
+- `text` — формулировка задачи одним предложением в форме повелительного наклонения или «<глагол>+что» («прислать звонки», «оформить документ»). Без водных слов вроде «нужно бы», «не забыть».
+- `deadline`: только если срок ЯВНО прозвучал. Если «к пятнице» — посчитай относительно даты встречи (день недели) и верни ISO YYYY-MM-DD. Если «к концу недели» — пятница недели встречи. Если «к понедельнику» — ближайший понедельник. Если «после X» / «когда будет время» / «потом» / срок не упоминался — верни null. Лучше пропустить срок чем выдумать.
+- `sphere`: выбери одну сферу из переданного `spheres` списка по СМЫСЛУ задачи. Если задача про продажи на маркетплейсах / категорию товаров (проекторы / караоке / т.п. для бренда МПервый) → `мпервый`. Если про дилеров Anzhee, аудио-оборудование, B2B-портал, дилер-360, локализацию YME, неликвид, продукт-и-цены Anzhee → `anzhee`. Если про ENVYTON (отдельный B2C-бренд проекторов) → `envyton`. Если про Сценалогию (хищение 6 млн) → `сценалогия`. Если про здоровье/врачей/операцию ахилла → `здоровье`. Если про переезд в Дубай / квартиры / арендодателей → `дубай`. Если про детей / маму / семью → `семья`. Если про инструменты Ильи (бот-нотариус, бот-почта, дашборд) → `me-clone`. Если про AI-автоматизацию бизнес-процессов компаний (Anzhee/Мпервый ботами/CRM/AI) → `процессы-ai`. Если про обучение Миллера / курсы → `обучение`. Если про новые источники дохода → `новый-доход`. Иначе если про дом/быт → `дом`. Иначе → `личное`. ИЗ ПЕРЕДАННОГО СПИСКА; НЕ ПРИДУМЫВАЙ НОВЫХ.
+- Если сильно не уверен в сфере — поставь `sphere: null` и `confidence_sphere: 0.0..0.5` (мы переспросим Илью).
+- `confidence_sphere`: 0.0..1.0 — насколько уверен в выбранной сфере. 0.85+ — несколько сходящихся сигналов; 0.5..0.85 — один умеренный; ниже — лучше null.
+
+Формат ответа — СТРОГО валидный JSON-массив (без markdown-обёртки, без объяснений, без префиксов):
+[
+  {
+    "owner": "Илья",
+    "text": "прислать тестовые звонки",
+    "deadline": "2026-06-05",
+    "sphere": "anzhee",
+    "source_quote": "Илья: пришлю тебе тестовые звонки до пятницы.",
+    "confidence_sphere": 0.85
+  },
+  ...
+]
+Если задач нет — верни `[]`.
+"""
+
+
+def _meeting_duration_minutes(meta: dict) -> Optional[int]:
+    """Минуты встречи из meta. Возвращает None если поля нет/невалидно."""
+    raw = meta.get("durationMin") or meta.get("duration")
+    if isinstance(raw, (int, float)) and raw > 0:
+        return int(raw)
+    audio_s = meta.get("audioDurationS") or meta.get("durationS")
+    if isinstance(audio_s, (int, float)) and audio_s > 0:
+        return max(1, int(round(audio_s / 60)))
+    return None
+
+
+def _task_threshold_for_duration(minutes: Optional[int]) -> int:
+    """Анти-галлюцинация: при > порога задач отправляем clarify Илье."""
+    if minutes is None or minutes <= 0:
+        # Без длительности применяем средний порог (60–120 мин).
+        return 12
+    for upper, threshold in _TASK_THRESHOLD_BY_DURATION:
+        if minutes <= upper:
+            return threshold
+    return 20
+
+
+def _parse_iso_date(s: Optional[str]) -> Optional[str]:
+    """Валидация ISO-даты `YYYY-MM-DD`. None для невалидной/пустой."""
+    if not isinstance(s, str):
+        return None
+    s = s.strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return s
+    except ValueError:
+        return None
+
+
+def _parse_extract_tasks_response(
+    raw: str,
+    *,
+    spheres: tuple[str, ...],
+) -> list[dict]:
+    """Парсит JSON-массив задач из ответа Sonnet.
+
+    Валидации:
+      - JSON-массив (markdown-fence срезаем).
+      - Каждый элемент — dict с owner/text/source_quote (обязательно).
+      - sphere ∈ spheres или null.
+      - deadline — валидная ISO-дата или null.
+      - confidence_sphere — float 0..1 или null.
+    """
+    raw = _strip_markdown_fence(raw)
+    start = raw.find("[")
+    if start < 0:
+        raise TaskExtractionError("ответ Sonnet не содержит JSON-массив")
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(raw[start:])
+    except json.JSONDecodeError as e:
+        raise TaskExtractionError(f"невалидный JSON: {e}") from e
+    if not isinstance(parsed, list):
+        raise TaskExtractionError(
+            f"ожидался массив, получили {type(parsed).__name__}"
+        )
+
+    out: list[dict] = []
+    allowed_spheres = set(spheres)
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("owner")
+        text = item.get("text")
+        source_quote = item.get("source_quote") or item.get("quote")
+        if not isinstance(owner, str) or not owner.strip():
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        # source_quote — обязательное поле (защита от галлюцинации).
+        if not isinstance(source_quote, str) or not source_quote.strip():
+            continue
+        deadline = _parse_iso_date(item.get("deadline"))
+        sphere = item.get("sphere")
+        if isinstance(sphere, str):
+            sphere = sphere.strip().lower().lstrip("[").rstrip("]")
+            if sphere not in allowed_spheres:
+                sphere = None
+        else:
+            sphere = None
+        conf_raw = item.get("confidence_sphere")
+        try:
+            conf = float(conf_raw) if conf_raw is not None else None
+        except (TypeError, ValueError):
+            conf = None
+        if conf is not None:
+            conf = max(0.0, min(1.0, conf))
+        out.append({
+            "owner": owner.strip(),
+            "text": text.strip(),
+            "deadline": deadline,
+            "sphere": sphere,
+            "source_quote": source_quote.strip(),
+            "confidence_sphere": conf,
+        })
+    return out
+
+
+def extract_tasks(
+    protocol_md: str,
+    meeting_meta: dict,
+    *,
+    method_text: Optional[str] = None,  # сохраняется для совместимости с сигнатурой плана
+    model: str = TASK_EXTRACTION_MODEL,
+    timeout: int = 180,
+    meeting_sid: Optional[str] = None,
+) -> list[dict]:
+    """Извлекает задачи из протокола через Claude Sonnet 4.6.
+
+    Возвращает: `list[dict]` со схемой `{owner, text, deadline, sphere,
+    source_quote, confidence_sphere}` — см. `_parse_extract_tasks_response`.
+
+    Гейт: env `ENABLE_TASK_EXTRACTION` (дефолт ON). Если OFF — `[]`.
+
+    На сбой LLM/parse возвращает `[]` + warning (finalize не валится).
+
+    `method_text` зарезервирован под склеивание методички tasks.md в промт,
+    если в будущем понадобится — сейчас Sonnet получает только закрытый
+    список сфер.
+    """
+    if not _is_task_extraction_enabled():
+        logger.info("[extract_tasks] disabled by ENABLE_TASK_EXTRACTION=0")
+        return []
+    if not protocol_md or not protocol_md.strip():
+        logger.info("[extract_tasks] meeting=%s протокол пустой — пропуск", meeting_sid or "?")
+        return []
+
+    spheres_str = ", ".join(TASK_SPHERES_CLOSED_LIST)
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+    duration_min = _meeting_duration_minutes(meeting_meta)
+    duration_str = f"{duration_min} мин" if duration_min else "—"
+    expected = meeting_meta.get("expectedParticipants") or []
+    participants = meeting_meta.get("participants") or []
+    merged: list[str] = []
+    seen: set[str] = set()
+    for n in list(expected) + list(participants):
+        if isinstance(n, str) and n and n not in seen:
+            seen.add(n)
+            merged.append(n)
+
+    user_prompt = (
+        f"spheres: {spheres_str}\n\n"
+        f"Метаданные встречи:\n"
+        f"- series: {series}\n"
+        f"- date: {date}\n"
+        f"- duration: {duration_str}\n"
+        f"- participants: {', '.join(merged) if merged else '—'}\n\n"
+        f"Протокол:\n\n{protocol_md.strip()}"
+    )
+
+    started = time.monotonic()
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=EXTRACT_TASKS_SYSTEM_PROMPT,
+            timeout=timeout,
+            model=model,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning("[extract_tasks] `claude` не в PATH — извлечение пропущено")
+        return []
+    except ClaudeCliError as e:
+        logger.warning("[extract_tasks] meeting=%s CLI error: %s", meeting_sid or "?", e)
+        return []
+    elapsed = time.monotonic() - started
+
+    try:
+        tasks = _parse_extract_tasks_response(raw, spheres=TASK_SPHERES_CLOSED_LIST)
+    except TaskExtractionError as e:
+        logger.warning("[extract_tasks] meeting=%s parse error: %s", meeting_sid or "?", e)
+        return []
+
+    threshold = _task_threshold_for_duration(duration_min)
+    logger.info(
+        "[extract_tasks] meeting=%s count=%d elapsed=%.1fs threshold=%d filtered=%d model=%s",
+        meeting_sid or "?", len(tasks), elapsed, threshold, 0, model,
+    )
+    return tasks
+
+
+def _is_task_extraction_enabled() -> bool:
+    raw = (os.environ.get("ENABLE_TASK_EXTRACTION") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def _is_task_routing_enabled() -> bool:
+    raw = (os.environ.get("ENABLE_TASK_ROUTING") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+# --- route_tasks: маршрутизация в tasks.md / трек стейкхолдера ---------
+
+# Имя «Илья» в разных формах. LLM может вернуть «Илья», «Илья Рыбалка»,
+# «И. Рыбалка». Нормализуем до first-word для матча.
+ILYA_NAMES = ("Илья", "Илья Рыбалка", "Рыбалка")
+
+# Спикеры без имени — формат render.py: «Спикер N» (1-based).
+_SPEAKER_LABEL_RE = re.compile(r"^Спикер\s*\d+$", re.IGNORECASE)
+
+
+def _owner_kind(owner: str, stakeholders: list[dict]) -> tuple[str, Optional[dict]]:
+    """Классифицирует owner:
+      - ("ilia", None)            — Илья (в любой форме).
+      - ("stakeholder", <stk>)    — найден в реестре.
+      - ("unknown_owner", None)   — «Спикер N».
+      - ("other", None)           — конкретный человек, но не Илья и не в реестре.
+    """
+    if not owner:
+        return ("other", None)
+    raw = owner.strip()
+    raw_low = raw.lower()
+    # Илья — точное / first-word совпадение.
+    for nm in ILYA_NAMES:
+        if raw_low == nm.lower() or raw.split()[:1] == nm.split()[:1]:
+            return ("ilia", None)
+    if _SPEAKER_LABEL_RE.match(raw):
+        return ("unknown_owner", None)
+    from . import stakeholders as stk_lib  # lazy: тесты могут не иметь me-dashboard
+    found = stk_lib.find_stakeholder_by_name(raw, stakeholders)
+    if found:
+        return ("stakeholder", found)
+    return ("other", None)
+
+
+def _is_one_on_one_meeting(meeting_meta: dict, stakeholder: dict) -> bool:
+    """1:1 встреча со стейкхолдером.
+
+    Критерий: `expectedParticipants` содержит ровно 2 имени, одно из которых —
+    Илья (по first-word), второе — этот стейкхолдер (по имени или first-word).
+    """
+    expected = meeting_meta.get("expectedParticipants") or []
+    if not isinstance(expected, list) or len(expected) != 2:
+        return False
+    expected_low = [str(p).strip().lower() for p in expected if isinstance(p, str)]
+    if len(expected_low) != 2:
+        return False
+    has_ilia = any(
+        p.startswith("илья") or p == "рыбалка" or "рыбалка" in p.split()
+        for p in expected_low
+    )
+    stk_name = (stakeholder.get("name") or "").strip().lower()
+    stk_first = stk_name.split()[0] if stk_name.split() else ""
+    has_stk = any(
+        p == stk_name or (stk_first and stk_first in p.split())
+        for p in expected_low
+    )
+    return has_ilia and has_stk
+
+
+def _default_start_for_deadline(deadline: Optional[str], *, is_large: bool = True) -> Optional[str]:
+    """Дефолт `с <старт>` по правилам tasks.md: крупная — `до − 7`, мелкая — `до − 3`."""
+    if not deadline:
+        return None
+    try:
+        dt = datetime.strptime(deadline, "%Y-%m-%d")
+    except ValueError:
+        return None
+    delta = 7 if is_large else 3
+    return (dt - timedelta(days=delta)).strftime("%Y-%m-%d")
+
+
+def _format_sphere_tag(sphere: Optional[str]) -> str:
+    """`anzhee` → `[anzhee]`; None / пусто → `[личное]` дефолтная сфера."""
+    if not sphere:
+        return "[личное]"
+    return f"[{sphere}]"
+
+
+def _format_task_line(task: dict, *, created: str, series: str, date: str, marker: Optional[str] = None) -> str:
+    """Форматирует строку задачи под `tasks.md`.
+
+    `marker`: опциональный префикс к owner (например `[?]` для unknown_owner).
+    """
+    deadline = task.get("deadline") or "—"
+    start = task.get("start") or _default_start_for_deadline(task.get("deadline")) or "—"
+    sphere = _format_sphere_tag(task.get("sphere"))
+    text = (task.get("text") or "").strip()
+    quote = (task.get("source_quote") or "").strip().replace("\n", " ")
+    if marker:
+        text = f"{marker} {text}"
+    context = f"контекст: протокол {series} {date}"
+    if quote:
+        # Сокращаем цитату до 160 символов, чтобы строка не разрослась.
+        if len(quote) > 160:
+            quote = quote[:159].rstrip() + "…"
+        context += f", цитата: «{quote}»"
+    return (
+        f"- {created} | до {deadline} | с {start} | {sphere} | {text} | {context}"
+    )
+
+
+def _task_already_exists(tasks_md_path: Path, owner_marker: str, text: str, series: str, date: str) -> bool:
+    """Грубая защита от дублей: ищем строку с похожим текстом + ссылкой на этот протокол.
+
+    `owner_marker` — строка-маркер для unknown_owner (например `[?]`) или пусто для Ильи.
+    Сравниваем по первым 30 символам text + наличию `протокол <series> <date>`.
+    """
+    if not tasks_md_path.is_file():
+        return False
+    try:
+        raw = tasks_md_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    needle_text = text[:30].lower()
+    needle_ctx = f"протокол {series} {date}".lower()
+    for line in raw.splitlines():
+        ln_low = line.lower()
+        if needle_text and needle_text in ln_low and needle_ctx in ln_low:
+            return True
+    return False
+
+
+def _append_to_tasks_md(tasks_md_path: Path, new_lines: list[str]) -> int:
+    """Дописывает строки в раздел `## 📥 Актуальные (живые задачи)` через atomic write.
+
+    Возвращает число записанных строк.
+    Если файл не найден — возвращает 0 + warning.
+    """
+    if not tasks_md_path.is_file():
+        logger.warning("[route_tasks] tasks.md не найден: %s", tasks_md_path)
+        return 0
+    if not new_lines:
+        return 0
+    try:
+        raw = tasks_md_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[route_tasks] tasks.md не читается: %s", e)
+        return 0
+
+    lines = raw.split("\n")
+    # Ищем заголовок «## 📥 Актуальные (живые задачи)».
+    actual_idx = None
+    next_h2_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("## 📥 Актуальные"):
+            actual_idx = i
+            break
+    if actual_idx is None:
+        logger.warning("[route_tasks] раздел '## 📥 Актуальные' не найден в tasks.md")
+        return 0
+    for i in range(actual_idx + 1, len(lines)):
+        if lines[i].startswith("## "):
+            next_h2_idx = i
+            break
+    if next_h2_idx is None:
+        next_h2_idx = len(lines)
+
+    # Точка вставки — в конец блока «📥 Актуальные», перед next_h2_idx,
+    # пропустив висячие пустые строки.
+    insert_at = next_h2_idx
+    while insert_at > actual_idx + 1 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+
+    inject: list[str] = []
+    # Гарантируем пустую строку отделения от предыдущего контента.
+    if insert_at > 0 and lines[insert_at - 1].strip() != "":
+        inject.append("")
+    inject.extend(new_lines)
+
+    new_lines_total = list(lines)
+    new_lines_total[insert_at:insert_at] = inject
+    new_text = "\n".join(new_lines_total)
+
+    _atomic_write_text(tasks_md_path, new_text)
+    return len(new_lines)
+
+
+def _append_to_stakeholder_track(
+    file_path: Path,
+    section_title: str,
+    bullet_block: str,
+) -> bool:
+    """Зовёт `stakeholder-track.sh append` для атомарной дописи в накопитель.
+
+    Возвращает True на успех. False на сбой (rc != 0).
+    """
+    import subprocess
+    script = os.path.expanduser("~/.local/bin/stakeholder-track.sh")
+    if not os.path.isfile(script):
+        logger.warning("[route_tasks] stakeholder-track.sh не найден: %s", script)
+        return False
+    try:
+        proc = subprocess.run(
+            [script, "append", str(file_path), section_title],
+            input=bullet_block,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("[route_tasks] stakeholder-track.sh failed: %s", e)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "[route_tasks] stakeholder-track.sh rc=%d stderr=%s",
+            proc.returncode, proc.stderr.strip()[:200],
+        )
+        return False
+    return True
+
+
+def route_tasks(
+    tasks: list[dict],
+    meeting_meta: dict,
+    *,
+    tasks_md_path: Optional[Path] = None,
+    stakeholders_override: Optional[list[dict]] = None,
+    meeting_sid: Optional[str] = None,
+) -> dict:
+    """Маршрутизирует задачи:
+      - owner=Илья → tasks.md (atomic).
+      - owner=<stakeholder> И 1:1 встреча → его трек через stakeholder-track.sh.
+      - owner=Спикер N → tasks.md с маркером `[?]`.
+      - owner=other → лог + skip.
+
+    Возвращает dict с метриками:
+      {"ilia": N, "others": M, "pending_deadline": K,
+       "unknown_owner": U, "errors": [...]}.
+
+    Не падает при отсутствии tasks.md / реестра — просто записывает в errors.
+    """
+    result = {
+        "ilia": 0,
+        "others": 0,
+        "pending_deadline": 0,
+        "unknown_owner": 0,
+        "errors": [],
+    }
+
+    if not _is_task_routing_enabled():
+        logger.info("[route_tasks] disabled by ENABLE_TASK_ROUTING=0")
+        return result
+    if not tasks:
+        return result
+
+    if tasks_md_path is None:
+        env_tasks = os.environ.get("MEETING_NOTARY_TASKS_MD")
+        if env_tasks:
+            tasks_md_path = Path(os.path.expanduser(env_tasks))
+        else:
+            me_dir = os.environ.get("ME_DIR") or os.path.expanduser("~/Projects/me")
+            tasks_md_path = Path(me_dir) / "tasks.md"
+
+    from . import stakeholders as stk_lib  # lazy
+    stakeholders = (
+        stakeholders_override
+        if stakeholders_override is not None
+        else stk_lib.load_stakeholders()
+    )
+
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Делим задачи на корзины.
+    ilia_lines: list[str] = []
+    unknown_lines: list[str] = []
+    stakeholder_groups: dict[str, list[dict]] = {}  # slug → [tasks]
+    stakeholder_map: dict[str, dict] = {}  # slug → stakeholder
+
+    for task in tasks:
+        owner = (task.get("owner") or "").strip()
+        kind, stk = _owner_kind(owner, stakeholders)
+
+        if kind == "ilia":
+            line = _format_task_line(task, created=created, series=series, date=date)
+            if _task_already_exists(tasks_md_path, "", task.get("text", ""), series, date):
+                logger.info("[route_tasks] skip-dup ilia text=%r", (task.get("text") or "")[:60])
+                continue
+            ilia_lines.append(line)
+            result["ilia"] += 1
+            if not task.get("deadline"):
+                result["pending_deadline"] += 1
+            continue
+
+        if kind == "unknown_owner":
+            marker = f"[?] {owner}:"
+            line = _format_task_line(task, created=created, series=series, date=date, marker=marker)
+            if _task_already_exists(tasks_md_path, "[?]", task.get("text", ""), series, date):
+                logger.info("[route_tasks] skip-dup unknown text=%r", (task.get("text") or "")[:60])
+                continue
+            unknown_lines.append(line)
+            result["unknown_owner"] += 1
+            continue
+
+        if kind == "stakeholder":
+            assert stk is not None
+            if not _is_one_on_one_meeting(meeting_meta, stk):
+                logger.info(
+                    "[route_tasks] meeting=%s owner=%r stakeholder %s но встреча не 1:1 — skip (вне скоупа)",
+                    meeting_sid or "?", owner, stk.get("slug"),
+                )
+                continue
+            stakeholder_groups.setdefault(stk["slug"], []).append(task)
+            stakeholder_map[stk["slug"]] = stk
+            result["others"] += 1
+            continue
+
+        # other: имя есть, не Илья, не в реестре, не «Спикер N».
+        logger.info(
+            "[route_tasks] meeting=%s owner=%r неизвестный участник — skip (вне скоупа)",
+            meeting_sid or "?", owner,
+        )
+
+    # Запись в tasks.md (Илья + неопределённые).
+    all_md_lines = list(ilia_lines) + list(unknown_lines)
+    if all_md_lines:
+        written = _append_to_tasks_md(tasks_md_path, all_md_lines)
+        if written == 0 and all_md_lines:
+            result["errors"].append(f"tasks.md write failed ({tasks_md_path})")
+
+    # Запись в треки стейкхолдеров (только для 1:1).
+    section_title = f"📋 Из встречи {date}"
+    for slug, group in stakeholder_groups.items():
+        stk = stakeholder_map[slug]
+        track_path = stk_lib.stakeholder_abs_track_path(stk)
+        if track_path is None or not track_path.is_file():
+            result["errors"].append(f"track-missing:{slug}")
+            logger.warning(
+                "[route_tasks] трек стейкхолдера %s не найден: %s",
+                slug, track_path,
+            )
+            continue
+        bullet_lines = _build_stakeholder_bullet_block(group, meeting_meta)
+        ok = _append_to_stakeholder_track(track_path, section_title, "\n".join(bullet_lines))
+        if not ok:
+            result["errors"].append(f"track-append-failed:{slug}")
+
+    logger.info(
+        "[route_tasks] meeting=%s ilia=%d others=%d unknown=%d pending_deadline=%d errors=%d",
+        meeting_sid or "?", result["ilia"], result["others"],
+        result["unknown_owner"], result["pending_deadline"], len(result["errors"]),
+    )
+    return result
+
+
+def _build_stakeholder_bullet_block(tasks: list[dict], meeting_meta: dict) -> list[str]:
+    """Собирает блок для добавления в трек стейкхолдера.
+
+    Первой строкой — ссылка на протокол. Далее — задачи как `- [ ]` пункты.
+    """
+    series = meeting_meta.get("series") or ""
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or ""
+    lines: list[str] = []
+    # Ссылка на протокол: трек живёт в `companies/<co>/совещания/`, протокол —
+    # в `встречи/<series>/<date>-protokol.md`. Относительный путь = `../../../встречи/<series>/<date>-protokol.md`.
+    if series and date:
+        lines.append(
+            f"- [протокол встречи](../../../встречи/{series}/{date}-protokol.md)"
+        )
+    for task in tasks:
+        text = (task.get("text") or "").strip()
+        quote = (task.get("source_quote") or "").strip().replace("\n", " ")
+        if len(quote) > 200:
+            quote = quote[:199].rstrip() + "…"
+        deadline = task.get("deadline")
+        suffix = ""
+        if deadline:
+            suffix = f" (до {deadline})"
+        line = f"- [ ] **{text}**{suffix}"
+        if quote:
+            line += f" контекст: «{quote}»"
+        lines.append(line)
+    return lines
+
+
+# --- Анти-галлюцинация: clarification к Илье ----------------------------
+
+CLARIFY_TASK_FILTER_CALLBACK_PREFIX = "tf:"
+CLARIFY_TASK_DEADLINES_CALLBACK_PREFIX = "td:"
+
+
+def maybe_clarify_task_count(
+    meeting_id: str,
+    tasks: list[dict],
+    meeting_meta: dict,
+) -> Optional[Path]:
+    """Если задач больше порога — шлём Илье сообщение «подтверди или вычеркни».
+
+    Возвращает Path сохранённого state-файла (или None если порог не превышен /
+    bot/chat не сконфигурированы / гейт OFF).
+
+    State хранится отдельно от clarify спикеров: `_pending_clarification/
+    <meeting_id>-tasks.json`. Listener распознаёт его по callback-префиксу `tf:`.
+    """
+    if not tasks:
+        return None
+    duration_min = _meeting_duration_minutes(meeting_meta)
+    threshold = _task_threshold_for_duration(duration_min)
+    if len(tasks) <= threshold:
+        return None
+
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    chat_id_raw = (
+        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
+    if not bot_token or not chat_id_raw:
+        logger.warning(
+            "[task-clarify] meeting=%s tasks=%d > threshold=%d, "
+            "но TELEGRAM_NOTARIUS_BOT_TOKEN/CHAT_ID не заданы — пропуск",
+            meeting_id, len(tasks), threshold,
+        )
+        return None
+    try:
+        chat_id = int(chat_id_raw)
+    except ValueError:
+        logger.warning("[task-clarify] meeting=%s TELEGRAM_CHAT_ID не число", meeting_id)
+        return None
+
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+
+    lines: list[str] = [
+        f"⚠️ Протокол «{series}» {date}: вижу {len(tasks)} задач "
+        f"(порог для встречи {duration_min or '?'} мин = {threshold}). "
+        f"Это много — подтверди или вычеркни.",
+        "",
+    ]
+    for idx, t in enumerate(tasks, start=1):
+        owner = (t.get("owner") or "—")
+        text = (t.get("text") or "").strip()
+        lines.append(f"{idx}) {owner}: {text}")
+    lines.append("")
+    lines.append("Ответом: «оставить все» / «убрать 3,5,7».")
+    text = "\n".join(lines)
+
+    rows = [
+        [{"text": "✅ Оставить все", "callback_data": f"{CLARIFY_TASK_FILTER_CALLBACK_PREFIX}{_short_id(meeting_id)}:keep"}],
+    ]
+    reply_markup = telegram_api.build_inline_keyboard(rows)
+
+    try:
+        result = telegram_api.send_message(bot_token, chat_id, text, reply_markup=reply_markup)
+    except telegram_api.TelegramApiError as e:
+        logger.warning("[task-clarify] meeting=%s send failed: %s", meeting_id, e)
+        return None
+
+    try:
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+    except ValueError:
+        timeout_s = 420
+    sent_at = datetime.now(timezone.utc)
+    deadline = sent_at + timedelta(seconds=timeout_s)
+    state = {
+        "meeting_id": meeting_id,
+        "kind": "task_filter",
+        "tasks": tasks,
+        "meta": {"series": series, "date": date},
+        "chat_id": chat_id,
+        "message_id": int(result.get("message_id") or 0),
+        "sent_at": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "deadline_at": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timeout_s": timeout_s,
+        "status": "pending",
+    }
+    pending_root = clarify_state.resolve_pending_dir()
+    pending_root.mkdir(parents=True, exist_ok=True)
+    target = pending_root / f"{_validate_meeting_id_for_task(meeting_id)}-tasks.json"
+    _atomic_write_text(target, json.dumps(state, ensure_ascii=False, indent=2))
+    logger.info(
+        "[task-clarify] sent meeting=%s type=task_filter tasks=%d threshold=%d",
+        meeting_id, len(tasks), threshold,
+    )
+    return target
+
+
+def _validate_meeting_id_for_task(meeting_id: str) -> str:
+    """Тот же inline-pattern, что у clarify_state, но без import цикла.
+
+    `meeting_id` — попадает в имя файла, защита от path traversal.
+    """
+    if not isinstance(meeting_id, str) or not meeting_id:
+        raise ValueError("meeting_id must be a non-empty string")
+    if not re.match(r"^[A-Za-z0-9._\-]+$", meeting_id):
+        raise ValueError(f"meeting_id invalid chars: {meeting_id!r}")
+    if meeting_id in (".", "..") or "/" in meeting_id or "\\" in meeting_id:
+        raise ValueError(f"meeting_id path traversal: {meeting_id!r}")
+    return meeting_id
+
+
+def maybe_clarify_pending_deadlines(
+    meeting_id: str,
+    ilia_tasks_no_deadline: list[dict],
+    meeting_meta: dict,
+) -> Optional[Path]:
+    """Если есть задачи Ильи без срока — шлём Илье «какие даты ставим?».
+
+    State: `_pending_clarification/<meeting_id>-deadlines.json`. Listener
+    обрабатывает callback с префиксом `td:` либо текстовый ответ.
+
+    Возвращает Path state'а или None.
+    """
+    if not ilia_tasks_no_deadline:
+        return None
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    chat_id_raw = (
+        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
+    if not bot_token or not chat_id_raw:
+        logger.warning(
+            "[task-clarify] meeting=%s deadlines=%d, но bot/chat не заданы — пропуск",
+            meeting_id, len(ilia_tasks_no_deadline),
+        )
+        return None
+    try:
+        chat_id = int(chat_id_raw)
+    except ValueError:
+        return None
+
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+    lines: list[str] = [
+        f"📅 Протокол «{series}» {date}: "
+        f"{len(ilia_tasks_no_deadline)} задач Ильи без срока.",
+        "",
+    ]
+    for idx, t in enumerate(ilia_tasks_no_deadline, start=1):
+        lines.append(f"{idx}) {(t.get('text') or '').strip()}")
+    lines.append("")
+    lines.append(
+        "Какие даты ставим? Ответ форматом «1=2026-06-05, 2=на этой неделе, 3=без срока». "
+        "Поддерживаю: ISO-даты, «сегодня/завтра», «на этой/следующей неделе», "
+        "«к понедельнику/вторнику/...», «без срока»."
+    )
+    text = "\n".join(lines)
+
+    try:
+        result = telegram_api.send_message(bot_token, chat_id, text)
+    except telegram_api.TelegramApiError as e:
+        logger.warning("[task-clarify] meeting=%s deadlines send failed: %s", meeting_id, e)
+        return None
+
+    try:
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+    except ValueError:
+        timeout_s = 420
+    sent_at = datetime.now(timezone.utc)
+    deadline = sent_at + timedelta(seconds=timeout_s)
+    state = {
+        "meeting_id": meeting_id,
+        "kind": "task_deadlines",
+        "tasks": ilia_tasks_no_deadline,
+        "meta": {"series": series, "date": date},
+        "chat_id": chat_id,
+        "message_id": int(result.get("message_id") or 0),
+        "sent_at": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "deadline_at": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timeout_s": timeout_s,
+        "status": "pending",
+    }
+    pending_root = clarify_state.resolve_pending_dir()
+    pending_root.mkdir(parents=True, exist_ok=True)
+    target = pending_root / f"{_validate_meeting_id_for_task(meeting_id)}-deadlines.json"
+    _atomic_write_text(target, json.dumps(state, ensure_ascii=False, indent=2))
+    logger.info(
+        "[task-clarify] sent meeting=%s type=task_deadlines tasks=%d",
+        meeting_id, len(ilia_tasks_no_deadline),
+    )
+    return target
+
+
+def notify_unknown_owners(
+    meeting_id: str,
+    count: int,
+    meeting_meta: dict,
+) -> bool:
+    """Сводное уведомление Илье о задачах с `[?]` owner. Без ответа — Илья сам поправит.
+
+    Возвращает True если отправили; False на сбой/конфиг.
+    """
+    if count <= 0:
+        return False
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    chat_id_raw = (
+        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
+    if not bot_token or not chat_id_raw:
+        return False
+    try:
+        chat_id = int(chat_id_raw)
+    except ValueError:
+        return False
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+    text = (
+        f"❓ Протокол «{series}» {date}: {count} задач с нераспознанным владельцем "
+        f"(в tasks.md помечены `[?]`). Поправь руками когда увидишь."
+    )
+    try:
+        telegram_api.send_message(bot_token, chat_id, text)
+    except telegram_api.TelegramApiError as e:
+        logger.warning("[task-clarify] meeting=%s unknown-notify failed: %s", meeting_id, e)
+        return False
+    return True
+
+
+# --- Парсер ответа на task_deadlines clarification ---------------------
+
+def parse_task_deadlines_answer(
+    text: str,
+    *,
+    meeting_date: str,
+    n_tasks: int,
+) -> dict[int, Optional[str]]:
+    """Парсит ответ «1=2026-06-05, 2=на этой неделе, 3=без срока».
+
+    Возвращает `{task_idx_1based: ISO-дата или None для "без срока"}`. Если
+    идекса нет в ответе — он отсутствует в результате (caller интерпретирует
+    как «не трогать»).
+
+    Поддерживает:
+      - ISO `YYYY-MM-DD`
+      - «сегодня», «завтра», «послезавтра»
+      - «на этой неделе» → пятница недели встречи
+      - «на следующей неделе» → пятница следующей недели
+      - «к понедельнику/вторнику/...» → ближайший день недели после встречи
+      - «без срока» → None (явный сигнал)
+    """
+    out: dict[int, Optional[str]] = {}
+    if not text or not text.strip():
+        return out
+    try:
+        base = datetime.strptime(meeting_date, "%Y-%m-%d")
+    except ValueError:
+        base = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Регулярка: число = что-то (значение до запятой / конца строки / следующего «N=»).
+    pattern = re.compile(r"(\d+)\s*[=:]\s*([^,;\n]+?)(?=\s*\d+\s*[=:]|[,;\n]|$)", re.IGNORECASE)
+    for m in pattern.finditer(text):
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            continue
+        if idx < 1 or idx > n_tasks:
+            continue
+        value = m.group(2).strip().lower()
+        if not value:
+            continue
+        # «без срока»
+        if re.match(r"^(без\s+срока|пропусти|не\s+знаю)$", value):
+            out[idx] = None
+            continue
+        # ISO
+        iso = _parse_iso_date(value)
+        if iso:
+            out[idx] = iso
+            continue
+        # «сегодня / завтра / послезавтра»
+        if value == "сегодня":
+            out[idx] = base.strftime("%Y-%m-%d")
+            continue
+        if value == "завтра":
+            out[idx] = (base + timedelta(days=1)).strftime("%Y-%m-%d")
+            continue
+        if value == "послезавтра":
+            out[idx] = (base + timedelta(days=2)).strftime("%Y-%m-%d")
+            continue
+        # «на этой неделе» / «к концу недели» → пятница недели встречи
+        if re.search(r"(на\s+этой\s+неделе|к\s+концу\s+недели|до\s+конца\s+недели)", value):
+            weekday = base.weekday()  # понедельник = 0, пятница = 4
+            delta = 4 - weekday if weekday <= 4 else 4 + 7 - weekday
+            out[idx] = (base + timedelta(days=delta)).strftime("%Y-%m-%d")
+            continue
+        # «на следующей неделе» → пятница следующей недели
+        if re.search(r"(на\s+следующей\s+неделе|следующая\s+неделя)", value):
+            weekday = base.weekday()
+            delta = (4 - weekday) + 7
+            out[idx] = (base + timedelta(days=delta)).strftime("%Y-%m-%d")
+            continue
+        # «к понедельнику / вторнику / ...»
+        day_match = re.search(
+            r"к\s+(понедельник|вторник|сред|четверг|пятниц|суббот|воскресен)",
+            value,
+        )
+        if day_match:
+            target_map = {
+                "понедельник": 0,
+                "вторник": 1,
+                "сред": 2,
+                "четверг": 3,
+                "пятниц": 4,
+                "суббот": 5,
+                "воскресен": 6,
+            }
+            tgt = target_map.get(day_match.group(1))
+            if tgt is not None:
+                weekday = base.weekday()
+                delta = (tgt - weekday) % 7
+                if delta == 0:
+                    delta = 7
+                out[idx] = (base + timedelta(days=delta)).strftime("%Y-%m-%d")
+                continue
+        # Не распознали — пропуск (caller увидит, что idx нет в out).
+    return out
+
+
+def apply_deadlines_to_tasks_md(
+    tasks_md_path: Path,
+    meeting_meta: dict,
+    task_texts: list[str],
+    deadlines: dict[int, Optional[str]],
+) -> int:
+    """Обновляет дедлайны строк в tasks.md по результату clarification.
+
+    `task_texts` — упорядоченный список текстов задач (как в clarify-сообщении,
+    1-based индексирование). `deadlines` — `{idx: ISO|None}` от парсера.
+
+    Логика: для каждой пары находим строку с этим текстом + контекстом
+    `протокол <series> <date>`, заменяем `до —` на `до <date>` и `с —` на
+    `с <date − 7>`. Если задача уже имеет дедлайн — не трогаем.
+
+    Возвращает число применённых правок.
+    """
+    if not deadlines or not tasks_md_path.is_file():
+        return 0
+    try:
+        raw = tasks_md_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[task-deadlines] read failed: %s", e)
+        return 0
+
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or "—"
+    ctx_needle = f"протокол {series} {date}".lower()
+
+    lines = raw.split("\n")
+    applied = 0
+    for idx_1, new_deadline in deadlines.items():
+        if new_deadline is None:
+            continue
+        if idx_1 < 1 or idx_1 > len(task_texts):
+            continue
+        text = task_texts[idx_1 - 1].strip()
+        text_low = text[:30].lower()
+        new_start = _default_start_for_deadline(new_deadline) or new_deadline
+        for i, line in enumerate(lines):
+            ln_low = line.lower()
+            if (
+                text_low in ln_low
+                and ctx_needle in ln_low
+                and " | до — " in line
+                and " | с — " in line
+            ):
+                new_line = line.replace(" | до — ", f" | до {new_deadline} ", 1)
+                new_line = new_line.replace(" | с — ", f" | с {new_start} ", 1)
+                lines[i] = new_line
+                applied += 1
+                break
+
+    if applied:
+        _atomic_write_text(tasks_md_path, "\n".join(lines))
+    return applied
+
+
+def parse_task_filter_answer(text: str, n_tasks: int) -> Optional[list[int]]:
+    """Парсит ответ «оставить все» / «убрать 3,5,7» / «3,5,7».
+
+    Возвращает:
+      - `None` если «оставить все» / пусто / нераспознано (фоллбэк: оставляем все).
+      - `list[int]` 1-based индексов к УДАЛЕНИЮ (например `[3, 5, 7]`).
+    """
+    if not text or not text.strip():
+        return None
+    low = text.strip().lower()
+    if re.search(r"оставить\s+(все|всё)", low):
+        return []
+    # «убрать N,M,...» или просто «N,M,...»
+    m = re.search(r"(?:убрать|удалить|выкинь|вычеркни)?\s*([\d\s,;\-]+)", low)
+    if not m:
+        return None
+    body = m.group(1)
+    indices: list[int] = []
+    for tok in re.split(r"[,;\s]+", body):
+        if not tok:
+            continue
+        if tok.isdigit():
+            v = int(tok)
+            if 1 <= v <= n_tasks and v not in indices:
+                indices.append(v)
+    if not indices:
+        return None
+    return indices
+
