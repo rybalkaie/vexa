@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 DEFAULT_REGISTRY_DIR = Path(os.path.expanduser(
-    os.environ.get("MEETING_NOTARY_REGISTRY_DIR", "~/Projects/me/встречи")
+    os.environ.get("MEETING_NOTARY_REGISTRY_DIR") or "~/Projects/me/встречи"
 ))
 ROOMS_FILE = DEFAULT_REGISTRY_DIR / "rooms.yaml"
 WATCHED_FILE = DEFAULT_REGISTRY_DIR / "watched.yaml"
@@ -251,7 +251,50 @@ def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[
             resolve_room_to_url(room, rooms)
         except SystemExit as e:
             errors.append(str(e))
+    # Ф6: telegram_chat_id — опционально, int (отрицательный для группы).
+    raw_chat = rec.get("telegram_chat_id")
+    if raw_chat is not None:
+        if isinstance(raw_chat, bool) or not isinstance(raw_chat, int):
+            errors.append(f"telegram_chat_id={raw_chat!r}: должно быть целым числом (отрицательное для группы)")
     return errors
+
+
+# ----- Ф6: helper'ы для telegram_chat_id привязок -----
+
+
+def get_telegram_chat_id_for_series(series: str, watched: dict[str, Any]) -> int | None:
+    """Возвращает первый встреченный `telegram_chat_id` среди записей с этой series.
+
+    Если несколько записей одной series имеют разные chat_id — берётся первый
+    (это аномалия, должна быть одна привязка на series; писатель её не плодит).
+    """
+    if not series:
+        return None
+    for w in watched.get("watched", []):
+        if w.get("series") != series:
+            continue
+        cid = w.get("telegram_chat_id")
+        if isinstance(cid, int) and not isinstance(cid, bool):
+            return cid
+    return None
+
+
+def set_telegram_chat_id_for_series(series: str, chat_id: int, watched: dict[str, Any]) -> int:
+    """Проставляет `telegram_chat_id=<chat_id>` всем записям с этой series.
+
+    Возвращает число обновлённых записей. Caller обязан после этого вызвать
+    `save_watched(watched)` (atomic + flock уже встроены в save_watched).
+    """
+    if not series:
+        return 0
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+        raise ValueError(f"chat_id must be int, got {type(chat_id).__name__}")
+    n = 0
+    for w in watched.get("watched", []):
+        if w.get("series") == series:
+            w["telegram_chat_id"] = chat_id
+            n += 1
+    return n
 
 
 def pause_until() -> str | None:

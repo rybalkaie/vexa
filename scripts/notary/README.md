@@ -378,6 +378,121 @@ launchd-агент, что и методички (`meeting-notary-methods-push.s
 В финальный stdout finalize-meeting добавляется поле
 `tasks_extracted: {ilia, others, pending_deadline, unknown_owner}`.
 
+## Ф6 — Доставка протокола в Telegram-группу + correction flow
+
+После генерации протокола (Ф4) и извлечения задач (Ф5) `finalize-meeting.py`
+вызывает `deliver_protocol(...)` из `lib/llm_postprocess.py` — идемпотентная
+отправка `.md` в Telegram-группу через `@ilya_protocol_meeting_bot`.
+
+**Поток доставки:**
+
+1. **chat_id** берётся из (а) явного `target_chat_id` параметра, (б)
+   `meta.telegram_chat_id` если есть, (в) `watched.yaml` по
+   `meeting_meta.series` через `cli.registry.get_telegram_chat_id_for_series`.
+2. **Идемпотентность (УПУ1):** до отправки читает `meta.delivered` из
+   `meta.json` финализированной встречи. Если `delivered.chat_id == target` и
+   `len(delivered.message_ids) == expected_parts_count` → пропуск
+   (`status="skipped"`), лог `[delivery] idempotent skip`.
+3. **Split:** через `telegram_api.split_long_message` (Ф4), max 3500 символов.
+   Каждая часть префиксится `(N/M)`.
+4. **Отправка по частям:** после каждого успешного `send_message` →
+   `meta.delivered.message_ids` обновляется atomic (`tempfile + os.rename`).
+   Если упало на середине — частичный `delivered.decision="partial-failure"`,
+   на следующей финализации idempotent skip пропустит уже отправленные.
+
+**Если `telegram_chat_id` неизвестен:** `ask_delivery_destination(...)` шлёт
+Илье в личку вопрос с inline keyboard («🚫 Не отправлять», «💬 В личку»);
+state `_pending_clarification/<meeting_id>-delivery.json`. Listener
+(`meetings_listener.maybe_route_to_delivery_text`) подбирает текстовый ответ:
+
+- **chat_id (число)** → отправка + `_persist_telegram_chat_id(series, cid)`
+  пишет привязку в `watched.yaml` через atomic upsert.
+- **t.me/c/-ссылка** → парсер вычисляет `chat_id = -1000000000000 - <internal>`.
+- **«в личку»** → отправка Илье в DM, привязка НЕ сохраняется.
+- **«никуда»** → `delivered.decision="skip"`, ничего не шлём.
+- **Таймаут** (`CLARIFY_TIMEOUT=420s`, общий с Ф3/Ф5) → `decision="skip-timeout"`.
+
+**Correction flow** (команды в личке боту):
+
+- `«удали задачу N из <series> <date>»` — точечный edit, удаляет N-ю
+  bullet-задачу из секции `## Задачи` в `.md` (без LLM).
+- `«поправь протокол <series> <date>: <инструкция>»` — структурная правка
+  через `generate_protocol` с prompt-инъекцией инструкции.
+- `«<series> <date>: задачу X не было»` — структурная правка.
+
+Поток коррекции:
+
+1. **Версия:** копия текущего `.md` → `_versions/<date>-protokol-vN.md`
+   (atomic, N инкрементальный).
+2. **Apply:** либо точечный, либо `generate_protocol`. Atomic write нового
+   `.md`.
+3. **In-group отправка:** если `(now − delivered.at) < 48ч` →
+   `bot.delete_message` для каждого старого `message_id` → send новой
+   версии (split). Если ≥48ч → отправляем новую с предупреждением «старая
+   версия выше осталась — Telegram запрещает удалять старше 48ч».
+4. **Summary «было/стало»:** Claude Haiku 4.5 (`call_claude_print(model=
+   "claude-haiku-4-5-20251001")`) по `difflib.unified_diff` (5–10 строк
+   русского текста, не дублирует протокол).
+5. **History:** новая запись в `meta.delivered.history: [{at, chat_id,
+   message_ids, reason: "correction"}]`. `meta.delivered.message_ids`
+   замещаются новыми.
+
+**Env-гейты:** `ENABLE_PROTOCOL_DELIVERY=1` (дефолт ON). Когда OFF —
+`deliver_protocol` логирует `disabled` и возвращает `{status: "disabled"}`,
+finalize не падает.
+
+**Schema `meta.delivered` в meta.json:**
+
+```json
+{
+  "chat_id": -1001234567890,
+  "message_ids": [42, 43],
+  "at": "2026-05-28T19:55:12Z",
+  "decision": "skip" | "skip-timeout" | "partial-failure" | null,
+  "history": [
+    {"at": "2026-05-28T20:30:00Z", "chat_id": -1001234567890,
+     "message_ids": [42, 43], "reason": "correction"}
+  ]
+}
+```
+
+**Structured лог:**
+
+```
+[delivery] sent meeting=<sid> chat_id=<id> parts=N message_ids=[...] elapsed=Xs
+[delivery] idempotent skip meeting=<sid> chat_id=<id> parts=N
+[delivery] disabled by ENABLE_PROTOCOL_DELIVERY=0
+[delivery] asked meeting=<sid> reason=no_binding
+[delivery] skipped meeting=<sid> reason=user-skip|user-skip-text|skip-timeout
+[correction] applied meeting=<sid> kind=targeted_remove|structural version=N
+[correction] in-group meeting=<sid> deleted_old=K sent_new=M summary_sent=true
+```
+
+В финальный stdout `finalize-meeting.py` добавлено поле `delivery:
+{status, chat_id, message_ids, parts_count, at, elapsed_s}`.
+
+**Разблокировка после `partial-failure`:** если сетка упала посреди многочастной
+доставки и `meta.delivered.decision="partial-failure"` — повторная финализация
+`idempotent skip` пропускает (чтобы не отправить дубль уже доставленных частей).
+Чтобы переотправить с нуля:
+
+```bash
+# 1) Очистить meta.delivered (вручную, после удаления частично-доставленных
+#    сообщений из группы — если они там нежелательны):
+python3 -c '
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+m = json.loads(p.read_text(encoding="utf-8"))
+m.pop("delivered", None)
+p.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+' /path/to/meta.json
+
+# 2) Повторить finalize-meeting (или triggered correction command, или
+#    Telegram-команда «протокол <series> <date>» в Ф4 — она перегенерирует
+#    .md и потом следующий finalize пушнёт).
+```
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция

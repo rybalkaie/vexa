@@ -387,6 +387,168 @@ def maybe_route_to_task_clarify_text(token: str, msg: dict[str, Any]) -> bool:
         return False
 
 
+def maybe_route_to_delivery_text(token: str, msg: dict[str, Any]) -> bool:
+    """Ф6: текстовый ответ Ильи на «куда отправить протокол».
+
+    Возвращает True если delivery_worker обработал сообщение.
+    """
+    pending_root = _clarify_pending_root()
+    if pending_root is None or not pending_root.exists():
+        return False
+    try:
+        from notary.lib import delivery_worker  # noqa: PLC0415
+        if not delivery_worker.has_any_pending_delivery(pending_root):
+            return False
+        return delivery_worker.process_text_message(msg, pending_root, token)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("delivery text routing failed: %s", e)
+        return False
+
+
+# Дедуп correction-команд (тот же паттерн что у protocol_command):
+# 30-секундное окно по (series, date, instruction-hash). Wispr Flow повторы
+# реальны, повторный вызов = повторный subprocess + второй раунд delete/send.
+_correction_command_recent: dict[tuple[str, str, str], float] = {}
+_CORRECTION_COMMAND_DEDUPE_WINDOW_S = 30.0
+
+
+def _correction_command_is_dupe(series: str, date_str: str, instruction: str) -> bool:
+    """Н7 (цикл5/ход1): окно дедупа сокращено до 5 сек для команд «удали задачу
+    N» — после успешного удаления нумерация сдвигается, и Илья может законно
+    хотеть удалить «новую задачу 1» сразу. Для structural правок остаётся 30 сек
+    (там настоящий duplicate-risk от Wispr Flow повторов).
+    """
+    import re as _re
+    now = time.monotonic()
+    is_remove_task = bool(_re.search(r"(?i)\bудали(?:ть)?\s+задачу\s+\d+", instruction))
+    window = 5.0 if is_remove_task else _CORRECTION_COMMAND_DEDUPE_WINDOW_S
+    key = (series, date_str, instruction[:120])
+    stale = [k for k, t in _correction_command_recent.items()
+             if now - t > _CORRECTION_COMMAND_DEDUPE_WINDOW_S]
+    for k in stale:
+        _correction_command_recent.pop(k, None)
+    last = _correction_command_recent.get(key)
+    if last is not None and now - last < window:
+        return True
+    _correction_command_recent[key] = now
+    return False
+
+
+def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
+    """Ф6: команда коррекции протокола от Ильи в DM.
+
+    Должна проверяться ПОСЛЕ `maybe_route_to_protocol_command` (Ф4 имеет
+    наивысший приоритет — это явная команда «протокол <series> <date>»).
+    Если parse OK — запускаем `apply_correction` (best-effort через
+    subprocess чтобы не блокировать listener'а; correction может занять
+    минуту-полторы при структурной правке).
+
+    Возвращает True если parse удался — caller выходит из process_message
+    без дальнейших попыток роутинга.
+    """
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+    try:
+        from notary.lib.correction_command import parse_correction_command  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("correction_command import failed: %s", e)
+        return False
+    parsed = parse_correction_command(text)
+    if parsed is None:
+        return False
+    series, date_str, instruction, kind = parsed.series, parsed.date, parsed.instruction, parsed.kind
+
+    if _correction_command_is_dupe(series, date_str, instruction):
+        send_message(
+            token, chat_id,
+            f"⏳ Уже выполняю коррекцию `{series} {date_str}` — жду.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    send_message(
+        token, chat_id,
+        f"✏️ Применяю коррекцию `{series}` `{date_str}` (kind={kind})…",
+        reply_to=msg.get("message_id"),
+    )
+
+    try:
+        from notary.lib.llm_postprocess import apply_correction  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.exception("apply_correction import failed: %s", e)
+        send_message(
+            token, chat_id,
+            f"❌ Не загрузил correction-модуль: {type(e).__name__}",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    try:
+        result = apply_correction(
+            series=series,
+            date=date_str,
+            instruction=instruction,
+            in_group=True,
+            meeting_sid=f"corr-{series}-{date_str}",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("apply_correction failed: %s", e)
+        send_message(
+            token, chat_id,
+            f"❌ Коррекция упала: {type(e).__name__}: {str(e)[:200]}",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+
+    if result.get("status") == "applied":
+        # У9 (цикл5/ход3): различаем «применил полностью» vs «применил на
+        # диске, в группу пушнуть не смог» — Илье важно понимать что произошло.
+        ig = result.get("in_group_action") or "none"
+        err = result.get("error")
+        version_name = Path(result.get('version_path') or '').name
+        if err:
+            send_message(
+                token, chat_id,
+                f"⚠️ Применил на диске (version={version_name}, kind={result.get('kind')}), "
+                f"в группу пушнуть не смог: {err}. Проверь права бота / переотправь вручную.",
+                reply_to=msg.get("message_id"),
+            )
+        elif ig in ("deleted-old+sent-new", "sent-new-with-warning"):
+            send_message(
+                token, chat_id,
+                f"✅ Применил полностью. kind={result.get('kind')} version={version_name} "
+                f"group={ig} summary_sent={result.get('summary_sent')}",
+                reply_to=msg.get("message_id"),
+            )
+        elif ig in ("none-no-binding", "none"):
+            send_message(
+                token, chat_id,
+                f"✅ Применил на диске (version={version_name}, kind={result.get('kind')}). "
+                f"В группу не пушил (group={ig}).",
+                reply_to=msg.get("message_id"),
+            )
+        else:
+            send_message(
+                token, chat_id,
+                f"✅ Применил. kind={result.get('kind')} version={version_name} group={ig}",
+                reply_to=msg.get("message_id"),
+            )
+    elif result.get("status") == "file-only":
+        send_message(
+            token, chat_id,
+            f"✅ Применил (file-only). version={Path(result.get('version_path') or '').name}",
+            reply_to=msg.get("message_id"),
+        )
+    else:
+        send_message(
+            token, chat_id,
+            f"❌ Коррекция не применена: {result.get('error') or 'unknown error'}",
+            reply_to=msg.get("message_id"),
+        )
+    return True
+
+
 def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
     """Если есть pending/timed_out clarify-state — передаёт msg в clarify_worker.
 
@@ -408,11 +570,10 @@ def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
 
 
 def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -> None:
-    """Inline-кнопка от Ф3 (clarify спикеров) или Ф5 (task_filter).
+    """Inline-кнопка от Ф3 (clarify спикеров), Ф5 (task_filter) или Ф6 (delivery).
 
-    Порядок: сначала task_clarify_worker (новый, Ф5), потом clarify_worker (Ф3).
-    Сами по себе callback'и идемпотентны — но Ф5-кнопка имеет жёсткий префикс
-    (`tf:`/`td:`), не пересекается с Ф3 (`cl:`).
+    Порядок: Ф6 delivery (`cd:`) → Ф5 task_clarify (`tf:`/`td:`) → Ф3 clarify (`cl:`).
+    Префиксы не пересекаются — порядок задаёт лишь чисто организационный.
     """
     # Sender check (chat_id для callback внутри сообщения).
     msg = cbq.get("message") or {}
@@ -425,6 +586,15 @@ def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -
     if pending_root is None:
         logger.warning("callback received but clarify lib unavailable")
         return
+
+    # Ф6 delivery (cd:)
+    try:
+        from notary.lib import delivery_worker  # noqa: PLC0415
+        handled = delivery_worker.process_callback(cbq, pending_root, token)
+        if handled:
+            return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("delivery_worker.process_callback failed: %s", e)
 
     # Ф5 task_clarify (task_filter/task_deadlines)
     try:
@@ -462,6 +632,14 @@ def sweep_clarify_timeouts() -> None:
             logger.info("task-clarify sweep: marked %d as timed_out", n2)
     except Exception as e:  # noqa: BLE001
         logger.exception("task_clarify sweep failed: %s", e)
+    # Ф6 delivery sweep — отдельный модуль, отдельные state-файлы (`-delivery.json`).
+    try:
+        from notary.lib import delivery_worker  # noqa: PLC0415
+        n3 = delivery_worker.sweep_timeouts(pending_root)
+        if n3:
+            logger.info("delivery sweep: marked %d as timed_out", n3)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("delivery sweep failed: %s", e)
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
@@ -476,6 +654,12 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # Защита от ложноположительных встроена в parse_protocol_command:
     # нужны и series, и дата, и глагол/слово-маркер, и пустой хвост.
     if maybe_route_to_protocol_command(token, cid, msg):
+        return
+
+    # Ф6 команды коррекции: «удали задачу N из …» / «поправь протокол …»/
+    # «<series> <date>: задачу X не было». ПОСЛЕ Ф4 — у parse_protocol_command
+    # тот же синтаксис «протокол <series> <date>», и у Ф4 приоритет.
+    if maybe_route_to_correction_command(token, cid, msg):
         return
 
     # Reply-привязка опциональна. Reply на сообщение бота:
@@ -498,6 +682,11 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
         if not orig_text.startswith(TRIGGER_PREFIX):
             return
     else:
+        # Ф6 delivery: текстовый ответ «chat_id / ссылка / личка / никуда».
+        # Имеет приоритет — формат уникальный (число / t.me/c-ссылка), не
+        # пересекается ни с Ф5 task-clarify («N=…» / «убрать N»), ни с Ф3.
+        if maybe_route_to_delivery_text(token, msg):
+            return
         # Ф5 task-clarify имеет приоритет: формат «N=...» / «убрать N» уникальные.
         if maybe_route_to_task_clarify_text(token, msg):
             return

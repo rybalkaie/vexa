@@ -1104,7 +1104,20 @@ def _format_protocol_user_prompt(
     meta_block.append(f"- participants: {participants_str}")
     meta_block.append(f"- transcript_filename: {transcript_filename}")
 
-    return "\n".join(meta_block) + "\n\nТранскрипт:\n\n" + transcript_md
+    # У4 (цикл5/ход3): correction_instruction (если есть) идёт ПЕРЕД
+    # транскриптом с явным префиксом приоритета — иначе Sonnet может
+    # проигнорировать правку, опираясь только на общие правила из system_prompt.
+    correction = meeting_meta.get("correction_instruction")
+    correction_block = ""
+    if isinstance(correction, str) and correction.strip():
+        correction_block = (
+            "\n\nКРИТИЧЕСКАЯ ИНСТРУКЦИЯ ОТ ПОЛЬЗОВАТЕЛЯ ДЛЯ ЭТОЙ КОРРЕКЦИИ "
+            "(приоритет выше общих правил методички):\n"
+            + correction.strip()
+            + "\nУчти её при формировании итогового протокола."
+        )
+
+    return "\n".join(meta_block) + correction_block + "\n\nТранскрипт:\n\n" + transcript_md
 
 
 def _is_protocol_generation_enabled() -> bool:
@@ -1821,33 +1834,20 @@ def _append_to_stakeholder_track(
     section_title: str,
     bullet_block: str,
 ) -> bool:
-    """Зовёт `stakeholder-track.sh append` для атомарной дописи в накопитель.
+    """Атомарная дописка в накопитель стейкхолдера (pure-Python).
 
-    Возвращает True на успех. False на сбой (rc != 0).
+    Ф6 закрыл архитектурный долг Ф5: вместо shell-обёртки
+    `~/.local/bin/stakeholder-track.sh` (живёт только на маке) используем
+    `lib.stakeholder_track.append_to_open_subsection` (`fcntl.flock` +
+    `tempfile + os.rename` + whitelist из реестра). Работает одинаково
+    на маке и на VPS.
+
+    Возвращает True на успех. False на сбой (whitelist / lock / write).
     """
-    import subprocess
-    script = os.path.expanduser("~/.local/bin/stakeholder-track.sh")
-    if not os.path.isfile(script):
-        logger.warning("[route_tasks] stakeholder-track.sh не найден: %s", script)
-        return False
-    try:
-        proc = subprocess.run(
-            [script, "append", str(file_path), section_title],
-            input=bullet_block,
-            text=True,
-            capture_output=True,
-            timeout=30,
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        logger.warning("[route_tasks] stakeholder-track.sh failed: %s", e)
-        return False
-    if proc.returncode != 0:
-        logger.warning(
-            "[route_tasks] stakeholder-track.sh rc=%d stderr=%s",
-            proc.returncode, proc.stderr.strip()[:200],
-        )
-        return False
-    return True
+    from . import stakeholder_track
+    return stakeholder_track.append_to_open_subsection(
+        file_path, section_title, bullet_block,
+    )
 
 
 def route_tasks(
@@ -2453,3 +2453,1103 @@ def parse_task_filter_answer(text: str, n_tasks: int) -> Optional[list[int]]:
         return None
     return indices
 
+
+# ===========================================================================
+# Ф6: доставка протокола в Telegram-группу + correction flow
+# ===========================================================================
+#
+# Поток финализации (после Ф5):
+#   1. `deliver_protocol(meta, text, *, meta_json_path)` — идемпотентная
+#      отправка: split по 4000 символов, send_message в группу, append
+#      `message_id` в `meta.delivered.message_ids` atomic.
+#   2. Если `telegram_chat_id` для series нет — `ask_delivery_destination`
+#      шлёт Илье вопрос «куда отправить?» через того же бота, state
+#      `<meeting_id>-delivery.json` в `_pending_clarification/`.
+#   3. После ответа Ильи (callback «Не отправлять» / «В личку» / chat_id /
+#      ссылка) — `delivery_worker.process_*` применяет: либо send в группу +
+#      сохранить привязку в watched.yaml, либо записать decision=skip/dm.
+#   4. Correction flow: команды в личке боту «удали задачу N из <series>
+#      <date>» / «поправь протокол <series> <date>: ...» парсит
+#      `correction_command.parse_correction_command`, исполнение — в
+#      `apply_correction` (этом модуле, ниже).
+#
+# Идемпотентность (УПУ1): `meta.delivered = {chat_id, message_ids[], at,
+# decision?, history?}`. Перед каждой отправкой — проверка совпадения; если
+# уже доставлено в нужный chat и количество частей совпадает — пропуск.
+# Любое изменение `meta.json` — atomic через `_atomic_write_text(json.dumps)`.
+
+# Модель для summary «было/стало» при коррекции — Haiku 4.5 (быстро, дёшево,
+# хватит на 5-10 строк сравнения).
+CORRECTION_SUMMARY_MODEL = "claude-haiku-4-5-20251001"
+
+# Telegram delete_message: 48ч от момента доставки. После — старое сообщение
+# не удалить, новая версия прилетит как продолжение + предупреждение.
+DELETE_MESSAGE_WINDOW_SEC = 48 * 3600
+
+# Префикс callback_data для «куда отправить» (chat-destination clarify).
+DELIVERY_CALLBACK_PREFIX = "cd:"
+
+# Лимит одной TG-части после split (с запасом до 4096 на маркер «(N/M) »).
+DELIVERY_MAX_LEN = 3500
+
+
+def _is_protocol_delivery_enabled() -> bool:
+    """Гейт `ENABLE_PROTOCOL_DELIVERY` (дефолт ON; `0/false/no` → OFF)."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_DELIVERY") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def _read_meta_json(meta_json_path: Path) -> Optional[dict]:
+    """Читает meta.json. None если файла нет / битый JSON."""
+    if not meta_json_path or not meta_json_path.is_file():
+        return None
+    try:
+        return json.loads(meta_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("[delivery] meta read failed %s: %s", meta_json_path, e)
+        return None
+
+
+def _update_meta_delivered(meta_json_path: Path, new_delivered: dict) -> bool:
+    """Atomic update поля `delivered` в meta.json (read-merge-write).
+
+    `new_delivered` ПОЛНОСТЬЮ заменяет поле `delivered` (caller сам merge'ит
+    history если нужно). Возвращает True на успех.
+
+    Н10 (цикл5/ход1): exclusive flock на `.{name}.lock`-файле в той же
+    директории — защита от race между delivery (finalize) и correction worker'ом
+    при перекрытии окон. Lock держится только на время read-merge-write.
+    """
+    if not meta_json_path:
+        logger.warning("[delivery] meta_json_path не задан — пропуск")
+        return False
+    meta_json_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = meta_json_path.parent / f".{meta_json_path.name}.lock"
+    fd: Optional[int] = None
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as e:
+            logger.warning("[delivery] flock failed %s: %s", lock_path, e)
+            return False
+        meta = _read_meta_json(meta_json_path)
+        if meta is None:
+            meta = {}
+        meta["delivered"] = new_delivered
+        try:
+            _atomic_write_text(meta_json_path, json.dumps(meta, ensure_ascii=False, indent=2))
+        except OSError as e:
+            logger.warning("[delivery] meta write failed %s: %s", meta_json_path, e)
+            return False
+        return True
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _load_watched_for_series(series: str, watched_path: Optional[Path] = None) -> Optional[int]:
+    """Возвращает `telegram_chat_id` для series из watched.yaml или None.
+
+    Импорт `cli.registry` ленивый (`venv-cli` имеет PyYAML, на VPS — тоже).
+    На сбое — None (caller спросит Илью).
+    """
+    try:
+        from notary.cli.registry import load_watched, get_telegram_chat_id_for_series
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[delivery] cli.registry import failed: %s", e)
+        return None
+    try:
+        watched = load_watched()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[delivery] load_watched failed: %s", e)
+        return None
+    cid = get_telegram_chat_id_for_series(series, watched)
+    if cid is None:
+        return None
+    return cid
+
+
+def _persist_telegram_chat_id(series: str, chat_id: int) -> bool:
+    """Atomic upsert `telegram_chat_id` для series в watched.yaml.
+
+    Возвращает True если хоть одна запись обновлена. False — иначе или на ошибку.
+
+    Н3 (цикл5/ход1): release_watched_lock гарантированно вызывается через
+    finally — раньше при ValueError из `set_telegram_chat_id_for_series`
+    lock висел на watched.yaml до stale-cleanup fs.
+    """
+    try:
+        from notary.cli.registry import (  # noqa: PLC0415
+            load_watched, save_watched, set_telegram_chat_id_for_series,
+            release_watched_lock,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[delivery] cli.registry import failed (persist): %s", e)
+        return False
+    try:
+        watched = load_watched(lock=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[delivery] load_watched lock failed: %s", e)
+        return False
+    saved = False
+    try:
+        try:
+            n = set_telegram_chat_id_for_series(series, chat_id, watched)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[delivery] set_telegram_chat_id_for_series failed: %s", e)
+            return False
+        if n == 0:
+            logger.warning("[delivery] series=%s нет в watched.yaml — привязку не сохранил", series)
+            return False
+        try:
+            save_watched(watched)
+            saved = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[delivery] save_watched failed: %s", e)
+            return False
+    finally:
+        # save_watched сам делает release_lock. Если до save_watched не дошли —
+        # выпускаем явно, иначе flock висит на process'е до его смерти.
+        if not saved:
+            try:
+                release_watched_lock()
+            except Exception:  # noqa: BLE001
+                pass
+    return True
+
+
+class DeliveryError(RuntimeError):
+    """Сбой при попытке доставки протокола в Telegram."""
+
+
+def deliver_protocol(
+    meeting_meta: dict,
+    protocol_text: str,
+    *,
+    meta_json_path: Optional[Path] = None,
+    target_chat_id: Optional[int] = None,
+    meeting_sid: Optional[str] = None,
+) -> dict:
+    """Идемпотентно доставляет протокол в Telegram-группу.
+
+    Параметры:
+      meeting_meta: dict с `series`, `date`, `sessionUid` (для лога).
+      protocol_text: содержимое `<date>-protokol.md`.
+      meta_json_path: путь к meta.json встречи — для записи `delivered`.
+        Если None — идемпотентность через диск не работает (рискованно,
+        caller должен сам гарантировать одинокий вызов).
+      target_chat_id: явно заданный chat_id (если None — берём из
+        watched.yaml по `meeting_meta.series`).
+      meeting_sid: для structured-лога.
+
+    Возвращает dict:
+      {status: "sent"|"skipped"|"asked"|"disabled"|"error",
+       chat_id: int|None,
+       message_ids: list[int],
+       parts_count: int,
+       error?: str}
+
+    Семантика статусов:
+      - "sent"      — отправили N частей, `delivered.message_ids` обновлён.
+      - "skipped"   — идемпотентный пропуск (уже доставлено в этот chat).
+      - "asked"     — `target_chat_id` неизвестен → отправили вопрос Илье,
+                      state в `_pending_clarification/<sid>-delivery.json`.
+      - "disabled"  — `ENABLE_PROTOCOL_DELIVERY=0`.
+      - "error"     — внутренняя ошибка (нет токена, send упал).
+    """
+    if not _is_protocol_delivery_enabled():
+        logger.info("[delivery] disabled by ENABLE_PROTOCOL_DELIVERY=0")
+        return {"status": "disabled", "chat_id": None, "message_ids": [], "parts_count": 0}
+
+    if not protocol_text or not protocol_text.strip():
+        return {
+            "status": "error",
+            "chat_id": None,
+            "message_ids": [],
+            "parts_count": 0,
+            "error": "empty protocol text",
+        }
+
+    series = meeting_meta.get("series") or ""
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+
+    # Шаг 1: chat_id из meta / watched.yaml.
+    chat_id = target_chat_id
+    if chat_id is None:
+        chat_id_from_meta = meeting_meta.get("telegram_chat_id")
+        if isinstance(chat_id_from_meta, int) and not isinstance(chat_id_from_meta, bool):
+            chat_id = chat_id_from_meta
+    if chat_id is None and series:
+        chat_id = _load_watched_for_series(series)
+
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    if not bot_token:
+        logger.warning("[delivery] meeting=%s TELEGRAM_NOTARIUS_BOT_TOKEN не задан", meeting_sid or "?")
+        return {
+            "status": "error",
+            "chat_id": chat_id,
+            "message_ids": [],
+            "parts_count": 0,
+            "error": "no bot token",
+        }
+
+    # Шаг 2: chat_id неизвестен → спрашиваем Илью.
+    if chat_id is None:
+        try:
+            ask_path = ask_delivery_destination(
+                meeting_id=meeting_sid or meeting_meta.get("sessionUid") or "unknown",
+                meeting_meta=meeting_meta,
+                bot_token=bot_token,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[delivery] ask_destination failed: %s", e)
+            ask_path = None
+        if ask_path is None:
+            return {
+                "status": "error",
+                "chat_id": None,
+                "message_ids": [],
+                "parts_count": 0,
+                "error": "no chat_id and clarify failed",
+            }
+        logger.info("[delivery] asked meeting=%s reason=no_binding", meeting_sid or "?")
+        return {
+            "status": "asked",
+            "chat_id": None,
+            "message_ids": [],
+            "parts_count": 0,
+        }
+
+    # Шаг 3: split на части — счётчик parts_count нужен для idempotency check.
+    chunks = telegram_api.split_long_message(protocol_text, max_len=DELIVERY_MAX_LEN)
+    expected_parts = len(chunks)
+
+    # Шаг 4: idempotency check.
+    meta = _read_meta_json(meta_json_path) if meta_json_path else None
+    if meta:
+        delivered = meta.get("delivered")
+        if isinstance(delivered, dict):
+            d_chat = delivered.get("chat_id")
+            d_msgs = delivered.get("message_ids") or []
+            d_decision = delivered.get("decision")
+            # Полный успех — count совпал.
+            if d_chat == chat_id and isinstance(d_msgs, list) and len(d_msgs) == expected_parts:
+                logger.info(
+                    "[delivery] idempotent skip meeting=%s chat_id=%s parts=%d",
+                    meeting_sid or "?", chat_id, expected_parts,
+                )
+                return {
+                    "status": "skipped",
+                    "chat_id": chat_id,
+                    "message_ids": list(d_msgs),
+                    "parts_count": expected_parts,
+                }
+            # Н1: partial-failure из прошлого прогона. Не перепосылаем уже
+            # отправленное (дубль в группе), а просим Илью разрулить.
+            if (
+                d_chat == chat_id
+                and d_decision == "partial-failure"
+                and isinstance(d_msgs, list)
+                and 0 < len(d_msgs) < expected_parts
+            ):
+                logger.warning(
+                    "[delivery] partial-failure detected meeting=%s sent=%d/%d — "
+                    "skip auto-retry to avoid duplicate parts. Manual recovery: "
+                    "clear meta.delivered or use correction command.",
+                    meeting_sid or "?", len(d_msgs), expected_parts,
+                )
+                return {
+                    "status": "skipped",
+                    "chat_id": chat_id,
+                    "message_ids": list(d_msgs),
+                    "parts_count": expected_parts,
+                    "error": "partial-failure-skip",
+                }
+
+    # Шаг 5: отправка.
+    started = time.monotonic()
+    sent_ids: list[int] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        try:
+            result = telegram_api.send_message(bot_token, chat_id, chunk)
+        except telegram_api.TelegramApiError as e:
+            logger.warning(
+                "[delivery] send failed meeting=%s part=%d/%d: %s",
+                meeting_sid or "?", idx, expected_parts, e,
+            )
+            # Уже отправленные сохраняем в delivered (частичная доставка).
+            if sent_ids and meta_json_path:
+                partial = {
+                    "chat_id": chat_id,
+                    "message_ids": sent_ids,
+                    "at": _now_iso(),
+                    "decision": "partial-failure",
+                }
+                _update_meta_delivered(meta_json_path, partial)
+            return {
+                "status": "error",
+                "chat_id": chat_id,
+                "message_ids": sent_ids,
+                "parts_count": expected_parts,
+                "error": str(e),
+            }
+        msg_id = int(result.get("message_id") or 0)
+        sent_ids.append(msg_id)
+        # Append после каждой успешной отправки — частичный delivered, чтобы
+        # после рестарта мы не отправили дубль для уже доставленной части.
+        if meta_json_path:
+            partial = {
+                "chat_id": chat_id,
+                "message_ids": sent_ids,
+                "at": _now_iso(),
+            }
+            _update_meta_delivered(meta_json_path, partial)
+
+    elapsed = time.monotonic() - started
+    at = _now_iso()
+    logger.info(
+        "[delivery] sent meeting=%s chat_id=%s parts=%d message_ids=%s elapsed=%.1fs at=%s",
+        meeting_sid or "?", chat_id, expected_parts, sent_ids, elapsed, at,
+    )
+    return {
+        "status": "sent",
+        "chat_id": chat_id,
+        "message_ids": sent_ids,
+        "parts_count": expected_parts,
+        "at": at,
+        "elapsed_s": round(elapsed, 1),
+    }
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----- Ф6: clarification «куда отправить» --------------------------------
+
+
+def ask_delivery_destination(
+    meeting_id: str,
+    meeting_meta: dict,
+    *,
+    bot_token: Optional[str] = None,
+) -> Optional[Path]:
+    """Шлёт Илье в личку вопрос «куда отправить протокол?» с inline keyboard.
+
+    State пишет в `_pending_clarification/<meeting_id>-delivery.json` —
+    listener позже подбирает callback (`cd:<short>:<action>`) или текст.
+
+    Возвращает Path сохранённого state-файла или None при ошибке.
+
+    Поддерживаемые ответы Ильи:
+      - callback «🚫 Никуда» → `decision=skip`.
+      - callback «💬 В личку» → отправить ему в DM, привязку НЕ сохранять.
+      - текст: число (chat_id) / `https://t.me/c/<id>/...` ссылка.
+    """
+    bot_token = (bot_token or os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    chat_id_raw = (
+        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
+    if not bot_token or not chat_id_raw:
+        logger.warning(
+            "[delivery] meeting=%s ask_destination skipped: no bot/chat env",
+            meeting_id,
+        )
+        return None
+    try:
+        dm_chat_id = int(chat_id_raw)
+    except ValueError:
+        logger.warning("[delivery] meeting=%s TELEGRAM_CHAT_ID не число", meeting_id)
+        return None
+
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+
+    text = (
+        f"📬 Куда отправить протокол «{series}» {date}?\n\n"
+        f"Ответь: chat_id (число), ссылкой на группу (https://t.me/c/.../) — "
+        f"привязка запомнится для будущих встреч этой series.\n\n"
+        f"Кнопки ниже — для one-off без привязки."
+    )
+    rows = [
+        [{"text": "💬 Отправить в личку", "callback_data": f"{DELIVERY_CALLBACK_PREFIX}{_short_id(meeting_id)}:dm"}],
+        [{"text": "🚫 Не отправлять", "callback_data": f"{DELIVERY_CALLBACK_PREFIX}{_short_id(meeting_id)}:skip"}],
+    ]
+    reply_markup = telegram_api.build_inline_keyboard(rows)
+
+    try:
+        result = telegram_api.send_message(bot_token, dm_chat_id, text, reply_markup=reply_markup)
+    except telegram_api.TelegramApiError as e:
+        logger.warning("[delivery] meeting=%s ask send failed: %s", meeting_id, e)
+        return None
+
+    try:
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+    except ValueError:
+        timeout_s = 420
+    sent_at = datetime.now(timezone.utc)
+    deadline = sent_at + timedelta(seconds=timeout_s)
+
+    state = {
+        "meeting_id": meeting_id,
+        "kind": "delivery",
+        "meta": {
+            "series": series,
+            "date": date,
+            "sessionUid": meeting_meta.get("sessionUid"),
+        },
+        "chat_id": dm_chat_id,
+        "message_id": int(result.get("message_id") or 0),
+        "sent_at": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "deadline_at": deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timeout_s": timeout_s,
+        "status": "pending",
+    }
+    pending_root = clarify_state.resolve_pending_dir()
+    pending_root.mkdir(parents=True, exist_ok=True)
+    target = pending_root / f"{_validate_meeting_id_for_task(meeting_id)}-delivery.json"
+    _atomic_write_text(target, json.dumps(state, ensure_ascii=False, indent=2))
+    logger.info("[delivery] asked meeting=%s state=%s", meeting_id, target.name)
+    return target
+
+
+# Регулярка для t.me ссылок на группу/канал. Распознаёт:
+#   https://t.me/c/<internal>/<msg>     — internal id (без -100 префикса)
+#   https://t.me/<username>/<msg>       — public username (chat_id неизвестен)
+#   tg://...                            — игнорируем (не поддерживаем)
+_TG_GROUP_LINK_RE = re.compile(
+    r"https?://t\.me/c/(\d+)(?:/\d+)?",
+    re.IGNORECASE,
+)
+
+
+def parse_chat_destination_answer(text: str) -> tuple[str, Optional[int]]:
+    """Парсер ответа Ильи на вопрос «куда отправить».
+
+    Возвращает `(kind, chat_id|None)`:
+      - ("chat", <int>)   — извлекли chat_id из числа или ссылки.
+      - ("skip", None)    — «никуда» / «не нужно» / «пропусти».
+      - ("dm", None)      — «личка» / «мне в личку».
+      - ("invalid", None) — не распознали (caller отвечает «не понял»).
+    """
+    if not text or not text.strip():
+        return ("invalid", None)
+    raw = text.strip()
+    low = raw.lower()
+
+    # «никуда» / «не отправлять».
+    if re.search(r"\b(никуда|не\s+отправляй|не\s+нужно|skip|пропусти)\b", low):
+        return ("skip", None)
+    # «в личку» / «мне» / «лично».
+    if re.search(r"\b(в\s+личку|лично|мне\s+в\s+личку|dm)\b", low):
+        return ("dm", None)
+
+    # Ссылка t.me/c/<id>/...: chat_id = -100 * <id> (см. документацию TG).
+    link_m = _TG_GROUP_LINK_RE.search(raw)
+    if link_m:
+        try:
+            internal = int(link_m.group(1))
+            return ("chat", -1000000000000 - internal)
+        except ValueError:
+            pass
+
+    # Просто число — chat_id (с минусом для группы).
+    num_m = re.search(r"-?\d+", raw)
+    if num_m:
+        try:
+            cid = int(num_m.group(0))
+            return ("chat", cid)
+        except ValueError:
+            pass
+    return ("invalid", None)
+
+
+def parse_delivery_callback_data(data: str, *, meeting_id: str) -> Optional[str]:
+    """Парсер callback_data вида `cd:<short_id>:<action>`.
+
+    Возвращает action ("dm" / "skip") если data — наш callback и meeting_id
+    совпал. None иначе.
+    """
+    if not isinstance(data, str) or not data.startswith(DELIVERY_CALLBACK_PREFIX):
+        return None
+    body = data[len(DELIVERY_CALLBACK_PREFIX):]
+    parts = body.split(":")
+    if len(parts) != 2:
+        return None
+    mid_short, action = parts
+    if mid_short != _short_id(meeting_id):
+        return None
+    if action not in ("dm", "skip"):
+        return None
+    return action
+
+
+# ===========================================================================
+# Ф6: correction flow — версия + diff-summary
+# ===========================================================================
+
+
+class CorrectionError(RuntimeError):
+    """Сбой при коррекции протокола (правка / запись версии / send)."""
+
+
+def _next_version_path(protocol_path: Path) -> Path:
+    """Вычисляет путь `_versions/<date>-protokol-vN.md` для следующей версии.
+
+    Папка `_versions/` создаётся в той же директории, что и протокол.
+    Имя протокола — `<date>-protokol.md` → версия `<date>-protokol-vN.md`.
+    N инкрементальный: max(существующих vN) + 1.
+    """
+    versions_dir = protocol_path.parent / "_versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    stem = protocol_path.stem  # "<date>-protokol"
+    pattern = re.compile(rf"^{re.escape(stem)}-v(\d+)\.md$")
+    max_n = 0
+    for f in versions_dir.glob(f"{stem}-v*.md"):
+        m = pattern.match(f.name)
+        if m:
+            try:
+                max_n = max(max_n, int(m.group(1)))
+            except ValueError:
+                continue
+    return versions_dir / f"{stem}-v{max_n + 1}.md"
+
+
+def _save_protocol_version(protocol_path: Path) -> Optional[Path]:
+    """Копирует текущий `<date>-protokol.md` в `_versions/<date>-protokol-vN.md`.
+
+    Возвращает путь сохранённой версии или None если файла-протокола нет.
+    """
+    if not protocol_path.is_file():
+        return None
+    try:
+        content = protocol_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[correction] read protocol failed %s: %s", protocol_path, e)
+        return None
+    version_path = _next_version_path(protocol_path)
+    try:
+        _atomic_write_text(version_path, content)
+    except OSError as e:
+        logger.warning("[correction] write version failed %s: %s", version_path, e)
+        return None
+    return version_path
+
+
+_TARGETED_REMOVE_RE = re.compile(
+    r"^удали(?:ть)?\s+задачу\s+(\d+)\s+из\b",
+    re.IGNORECASE,
+)
+_TARGETED_NEGATE_RE = re.compile(
+    r"задачу\s+(\d+)\s+не\s+было",
+    re.IGNORECASE,
+)
+
+
+def _classify_instruction(instruction: str) -> tuple[str, Optional[int]]:
+    """Классифицирует инструкцию: ("targeted_remove", N) / ("structural", None).
+
+    `targeted_remove` — точечный edit (удалить задачу N) без LLM.
+    `structural` — структурная правка → regenerate_protocol с prompt-инъекцией.
+    """
+    if not instruction:
+        return ("structural", None)
+    s = instruction.strip()
+    m = _TARGETED_REMOVE_RE.search(s)
+    if m:
+        try:
+            return ("targeted_remove", int(m.group(1)))
+        except ValueError:
+            pass
+    m = _TARGETED_NEGATE_RE.search(s)
+    if m:
+        try:
+            return ("targeted_remove", int(m.group(1)))
+        except ValueError:
+            pass
+    return ("structural", None)
+
+
+def _apply_targeted_remove(protocol_text: str, task_number: int) -> Optional[str]:
+    """Точечный edit: удалить N-ю задачу из секции `## Задачи` / `## 🟠 Задачи`.
+
+    Подсчёт задач — по строкам, начинающимся с `- ` после заголовка задач.
+    Возвращает новый текст или None если не нашли заголовок задач / N вне диапазона.
+    """
+    if task_number < 1:
+        return None
+    lines = protocol_text.split("\n")
+    # Ищем секцию задач. ОТДЕЛЬНОЕ слово «Задачи» в заголовке (опц. с эмодзи
+    # или другими non-letter символами вначале), НЕ часть композита «Решения
+    # и задачи». Допустимо: «## Задачи», «## 🟠 Задачи», «## 🟡 Задачи Ильи».
+    # У8 (цикл5/ход3): универсальный поиск через regex — срезаем `^##\s+` +
+    # любую последовательность non-letter (эмодзи, *, и т.п.) + опц. пробелы,
+    # затем сверяемся с «задачи»/«задача» как первым словом. Не зависит от
+    # конкретного списка эмодзи в методичке.
+    # НОВ2 (цикл5/ход4): дополнительно срезаем markdown bold-обёртку `**` —
+    # `## **Задачи**` или `## **🟠 Задачи**` поддерживаются.
+    _NON_LETTER_PREFIX = re.compile(r"^##\s+(?:[^\w\s]+\s*)*", re.UNICODE)
+    tasks_h_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if not line.startswith("## "):
+            continue
+        body = _NON_LETTER_PREFIX.sub("", line).rstrip("*").lstrip("*")
+        # Срезаем замыкающий `**` если он попал в конец первого слова.
+        first_word = body.strip().split()[:1]
+        if not first_word:
+            continue
+        word = first_word[0].lower().rstrip(":.*").lstrip("*")
+        if word in ("задачи", "задача"):
+            tasks_h_idx = i
+            break
+    if tasks_h_idx is None:
+        return None
+    # Дальше до следующей H2 — список задач (буллеты `- `).
+    next_h_idx = len(lines)
+    for j in range(tasks_h_idx + 1, len(lines)):
+        if lines[j].startswith("## "):
+            next_h_idx = j
+            break
+
+    # Соберём индексы строк-буллетов в этом окне.
+    bullet_indices: list[int] = []
+    for k in range(tasks_h_idx + 1, next_h_idx):
+        if re.match(r"^-\s+", lines[k]):
+            bullet_indices.append(k)
+    if task_number > len(bullet_indices):
+        return None
+    start = bullet_indices[task_number - 1]
+    # Конец задачи: до следующего буллета / heading / EOF.
+    end = next_h_idx
+    if task_number < len(bullet_indices):
+        end = bullet_indices[task_number]
+
+    # Срезаем хвостовые пустые строки (косметика).
+    rm_end = end
+    while rm_end > start + 1 and rm_end - 1 < len(lines) and lines[rm_end - 1].strip() == "":
+        rm_end -= 1
+    # И ведущую пустую строку перед start (если есть и предыдущая не пустая).
+    rm_start = start
+    if rm_start > 0 and lines[rm_start - 1].strip() == "":
+        # Не трогаем — обычно одна пустая между заголовком и буллетом.
+        pass
+
+    new_lines = lines[:rm_start] + lines[rm_end:]
+    return "\n".join(new_lines)
+
+
+CORRECTION_SUMMARY_PROMPT = """Ты помогаешь сформулировать короткое сравнение «было/стало» для пользователя после правки протокола встречи.
+
+На вход тебе дан unified-diff между старой и новой версией протокола. Сформулируй 5–10 строк русского текста в формате:
+
+🔄 Обновил протокол «<series>» <date>.
+
+**Было:** <одна-две фразы что было>
+**Стало:** <одна-две фразы что стало>
+
+Дополнительно (опционально, если уместно):
+- если удалили задачу — укажи кратко (одной строкой) какую;
+- если изменили формулировку — укажи в чём суть изменения;
+- если изменили решение — то же.
+
+Не дублируй протокол целиком. Не выдумывай ничего, чего нет в diff.
+
+Ответь только готовым русским текстом сообщения (без markdown-обёртки, без префиксов).
+"""
+
+
+def _compose_correction_summary(
+    old_text: str,
+    new_text: str,
+    meeting_meta: dict,
+    *,
+    meeting_sid: Optional[str] = None,
+    timeout: int = 60,
+) -> str:
+    """Сводное сообщение «было/стало» через Claude Haiku по diff'у.
+
+    На ошибке Haiku — fallback на короткое заводское сообщение «Обновил
+    протокол… см. выше». Без всплытия исключения.
+    """
+    import difflib
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or "—"
+    fallback = (
+        f"🔄 Обновил протокол «{series}» {date}. "
+        f"Старая версия выше — пользуйся новой."
+    )
+
+    if not old_text or not new_text:
+        return fallback
+
+    diff_lines = list(difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        fromfile="было",
+        tofile="стало",
+        lineterm="",
+        n=2,
+    ))
+    if not diff_lines:
+        return f"🔄 Обновил протокол «{series}» {date} (изменений по содержанию нет)."
+
+    # Урезаем diff если он гигантский (>200 строк).
+    if len(diff_lines) > 200:
+        diff_lines = diff_lines[:200] + ["... (diff обрезан)"]
+
+    user_prompt = (
+        f"Series: {series}\nDate: {date}\n\nDiff (unified):\n"
+        + "\n".join(diff_lines)
+    )
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=CORRECTION_SUMMARY_PROMPT,
+            timeout=timeout,
+            model=CORRECTION_SUMMARY_MODEL,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning("[correction] `claude` not in PATH — fallback summary")
+        return fallback
+    except ClaudeCliError as e:
+        logger.warning("[correction] summary CLI error meeting=%s: %s", meeting_sid or "?", e)
+        return fallback
+    text = (raw or "").strip()
+    if not text:
+        return fallback
+    return text
+
+
+def _resolve_protocol_paths(
+    series: str,
+    date: str,
+    *,
+    root: Optional[Path] = None,
+) -> tuple[Optional[Path], Optional[Path], Optional[Path]]:
+    """Резолвит (transcript_path, protocol_path, meta_json_path) для (series, date).
+
+    Поддерживает legacy `<root>/<series>-<date>/` и новую `<root>/<series>/`
+    структуры (как `meetings_listener.maybe_route_to_protocol_command`).
+
+    meta_json_path — `<dir>/meta.json` (если есть).
+    Возвращает (None, None, None) если папка не найдена.
+    """
+    root = root or Path(
+        os.path.expanduser(os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR") or "~/Projects/me/встречи")
+    )
+    if not root.is_dir():
+        return (None, None, None)
+    new_dir = root / series
+    legacy_dir = root / f"{series}-{date}"
+    target_dir: Optional[Path] = None
+    if (new_dir / f"{date}.md").is_file():
+        target_dir = new_dir
+    elif (legacy_dir / f"{date}.md").is_file():
+        target_dir = legacy_dir
+    else:
+        return (None, None, None)
+    transcript_path = target_dir / f"{date}.md"
+    protocol_path = target_dir / f"{date}-protokol.md"
+    meta_json_path = target_dir / "meta.json"
+    if not meta_json_path.is_file():
+        meta_json_path = None  # type: ignore[assignment]
+    return (transcript_path, protocol_path, meta_json_path)
+
+
+def apply_correction(
+    series: str,
+    date: str,
+    instruction: str,
+    *,
+    in_group: bool = True,
+    root: Optional[Path] = None,
+    meeting_sid: Optional[str] = None,
+) -> dict:
+    """Применяет коррекцию протокола: сохраняет версию + правит .md + (опц.)
+    отправляет в группу с summary «было/стало».
+
+    Параметры:
+      series, date: ключ к встрече.
+      instruction: команда Ильи целиком (например «удали задачу 1 из …»).
+      in_group: True — пересылка в группу (delete старого msg в окне 48ч);
+                False — file-only коррекция.
+      root: override `~/Projects/me/встречи/`.
+      meeting_sid: для лога.
+
+    Возвращает dict:
+      {status: "applied"|"file-only"|"error",
+       kind: "targeted_remove"|"structural"|"none",
+       version_path: str|None,
+       in_group_action: "deleted-old+sent-new"|"sent-new-with-warning"|"file-only"|"none"|"none-no-binding"|None,
+       summary_sent: bool,
+       error?: str}
+    """
+    transcript_path, protocol_path, meta_json_path = _resolve_protocol_paths(series, date, root=root)
+    if not protocol_path or not protocol_path.is_file():
+        return {
+            "status": "error",
+            "kind": "none",
+            "version_path": None,
+            "in_group_action": None,
+            "summary_sent": False,
+            "error": f"protocol not found for series={series} date={date}",
+        }
+
+    try:
+        old_text = protocol_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return {
+            "status": "error",
+            "kind": "none",
+            "version_path": None,
+            "in_group_action": None,
+            "summary_sent": False,
+            "error": f"read failed: {e}",
+        }
+
+    # 1. Сохраняем версию vN.
+    version_path = _save_protocol_version(protocol_path)
+
+    # 2. Классифицируем и применяем правку.
+    kind, target_n = _classify_instruction(instruction)
+    new_text: Optional[str] = None
+    if kind == "targeted_remove" and target_n:
+        new_text = _apply_targeted_remove(old_text, target_n)
+        if new_text is None:
+            logger.warning(
+                "[correction] meeting=%s targeted_remove(%d) не сработал — fallback structural",
+                meeting_sid or "?", target_n,
+            )
+            kind = "structural"
+
+    if kind == "structural":
+        # Структурная правка через regenerate_protocol с prompt-инъекцией.
+        if transcript_path and transcript_path.is_file():
+            try:
+                method_text = _load_method_text()
+            except RuntimeError as e:
+                return {
+                    "status": "error",
+                    "kind": "structural",
+                    "version_path": str(version_path) if version_path else None,
+                    "in_group_action": None,
+                    "summary_sent": False,
+                    "error": f"method load failed: {e}",
+                }
+            try:
+                transcript_md = transcript_path.read_text(encoding="utf-8")
+            except OSError as e:
+                return {
+                    "status": "error",
+                    "kind": "structural",
+                    "version_path": str(version_path) if version_path else None,
+                    "in_group_action": None,
+                    "summary_sent": False,
+                    "error": f"transcript read failed: {e}",
+                }
+            # У4 (цикл5/ход3): инструкция Ильи идёт в `meeting_meta` →
+            # user_prompt (через _format_protocol_user_prompt). Это даёт ей
+            # приоритет над общими правилами методички (которые Sonnet
+            # читает в system_prompt). Так Sonnet увидит «коррекция от
+            # пользователя» ПЕРЕД анализом transcript'а.
+            try:
+                meeting_meta_for_regen = {
+                    "series": series,
+                    "date": date,
+                    "transcript_filename": transcript_path.name,
+                    "correction_instruction": instruction.strip(),
+                }
+                new_text = generate_protocol(
+                    transcript_md,
+                    meeting_meta_for_regen,
+                    method_text=method_text,
+                    meeting_sid=meeting_sid,
+                )
+            except ProtocolGenerationError as e:
+                return {
+                    "status": "error",
+                    "kind": "structural",
+                    "version_path": str(version_path) if version_path else None,
+                    "in_group_action": None,
+                    "summary_sent": False,
+                    "error": f"regen failed: {e}",
+                }
+        else:
+            return {
+                "status": "error",
+                "kind": "structural",
+                "version_path": str(version_path) if version_path else None,
+                "in_group_action": None,
+                "summary_sent": False,
+                "error": "transcript missing — structural correction requires transcript",
+            }
+
+    if new_text is None or new_text.strip() == old_text.strip():
+        return {
+            "status": "error",
+            "kind": kind,
+            "version_path": str(version_path) if version_path else None,
+            "in_group_action": None,
+            "summary_sent": False,
+            "error": "no effective change",
+        }
+
+    # 3. Atomic write нового .md.
+    try:
+        _atomic_write_text(protocol_path, new_text)
+    except OSError as e:
+        return {
+            "status": "error",
+            "kind": kind,
+            "version_path": str(version_path) if version_path else None,
+            "in_group_action": None,
+            "summary_sent": False,
+            "error": f"write failed: {e}",
+        }
+    logger.info(
+        "[correction] applied meeting=%s kind=%s version=%s",
+        meeting_sid or "?", kind,
+        version_path.name if version_path else "?",
+    )
+
+    if not in_group:
+        return {
+            "status": "file-only",
+            "kind": kind,
+            "version_path": str(version_path) if version_path else None,
+            "in_group_action": "file-only",
+            "summary_sent": False,
+        }
+
+    # 4. In-group отправка. Берём delivered из meta.json.
+    delivered = None
+    if meta_json_path:
+        meta = _read_meta_json(meta_json_path)
+        if meta:
+            delivered = meta.get("delivered")
+    chat_id: Optional[int] = None
+    if isinstance(delivered, dict):
+        d_chat = delivered.get("chat_id")
+        if isinstance(d_chat, int):
+            chat_id = d_chat
+    if chat_id is None:
+        # Нет привязки → пытаемся взять из watched.yaml.
+        cid = _load_watched_for_series(series) if series else None
+        if cid:
+            chat_id = cid
+    if chat_id is None:
+        return {
+            "status": "applied",
+            "kind": kind,
+            "version_path": str(version_path) if version_path else None,
+            "in_group_action": "none-no-binding",
+            "summary_sent": False,
+        }
+
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    if not bot_token:
+        return {
+            "status": "applied",
+            "kind": kind,
+            "version_path": str(version_path) if version_path else None,
+            "in_group_action": "none",
+            "summary_sent": False,
+            "error": "no bot token",
+        }
+
+    # 4a. Окно 48ч? Если delivered.at + 48ч > now → можно удалить старое.
+    can_delete = False
+    if isinstance(delivered, dict):
+        at_iso = delivered.get("at")
+        if isinstance(at_iso, str):
+            try:
+                at_dt = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
+                if at_dt.tzinfo is None:
+                    at_dt = at_dt.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - at_dt).total_seconds()
+                can_delete = age < DELETE_MESSAGE_WINDOW_SEC
+            except ValueError:
+                pass
+
+    deleted_n = 0
+    if can_delete and isinstance(delivered, dict):
+        msgs = delivered.get("message_ids") or []
+        for msg_id in msgs:
+            try:
+                ok = telegram_api.delete_message(bot_token, chat_id, int(msg_id))
+                if ok:
+                    deleted_n += 1
+            except (TypeError, ValueError):
+                continue
+
+    # 4b. Отправка новой версии.
+    chunks = telegram_api.split_long_message(new_text, max_len=DELIVERY_MAX_LEN)
+    new_msg_ids: list[int] = []
+    for chunk in chunks:
+        try:
+            result = telegram_api.send_message(bot_token, chat_id, chunk)
+        except telegram_api.TelegramApiError as e:
+            return {
+                "status": "applied",
+                "kind": kind,
+                "version_path": str(version_path) if version_path else None,
+                "in_group_action": "sent-new-with-warning",
+                "summary_sent": False,
+                "error": f"send failed: {e}",
+            }
+        new_msg_ids.append(int(result.get("message_id") or 0))
+
+    # 4c. Сводка «было/стало» через Haiku.
+    summary_text = _compose_correction_summary(
+        old_text, new_text, {"series": series, "date": date}, meeting_sid=meeting_sid,
+    )
+    if not can_delete:
+        summary_text = (
+            "⚠️ Старая версия протокола выше осталась — Telegram запрещает "
+            "удалять сообщения старше 48 часов. Используйте обновлённый "
+            "протокол ниже.\n\n"
+        ) + summary_text
+    summary_sent = False
+    try:
+        telegram_api.send_message(bot_token, chat_id, summary_text)
+        summary_sent = True
+    except telegram_api.TelegramApiError as e:
+        logger.warning("[correction] summary send failed: %s", e)
+
+    # 4d. Обновляем meta.delivered → новые message_ids + history.
+    if meta_json_path:
+        history_entry = {
+            "at": _now_iso(),
+            "chat_id": chat_id,
+            "message_ids": list(delivered.get("message_ids") or []) if isinstance(delivered, dict) else [],
+            "reason": "correction",
+        }
+        prev_history = []
+        if isinstance(delivered, dict):
+            prev_history = list(delivered.get("history") or [])
+        new_delivered = {
+            "chat_id": chat_id,
+            "message_ids": new_msg_ids,
+            "at": _now_iso(),
+            "history": prev_history + [history_entry],
+        }
+        _update_meta_delivered(meta_json_path, new_delivered)
+
+    action = "deleted-old+sent-new" if can_delete and deleted_n else "sent-new-with-warning"
+    logger.info(
+        "[correction] in-group meeting=%s deleted_old=%d sent_new=%d summary_sent=%s",
+        meeting_sid or "?", deleted_n, len(new_msg_ids), summary_sent,
+    )
+    return {
+        "status": "applied",
+        "kind": kind,
+        "version_path": str(version_path) if version_path else None,
+        "in_group_action": action,
+        "summary_sent": summary_sent,
+    }

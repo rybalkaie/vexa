@@ -58,6 +58,7 @@ from lib.name_mapping import map_all, apply_mapping  # noqa: E402
 from lib.llm_postprocess import (  # noqa: E402
     ProtocolGenerationError,
     clarify_speakers_via_telegram,
+    deliver_protocol,
     extract_tasks,
     map_speaker_names,
     maybe_clarify_pending_deadlines,
@@ -719,6 +720,38 @@ def main() -> int:
     else:
         log.info("[extract_tasks] протокол не сгенерирован — пропуск задач")
 
+    # 4.0.3. Ф6: доставка протокола в Telegram-группу.
+    # Идемпотентность через `meta.delivered` в meta.json. Если привязки
+    # series→chat_id в watched.yaml нет — `deliver_protocol` сам спросит
+    # Илью через notarius-бота (state в `_pending_clarification/...delivery.json`),
+    # listener подберёт ответ. Best-effort: на сбой LLM/IO/Telegram —
+    # warning, finalize не валится; протокол на диске уже есть, можно
+    # переотправить вручную (через Ф6.x CLI или повторную финализацию).
+    delivery_result = {"status": "not-run"}
+    if protocol_path.is_file():
+        try:
+            protocol_text_for_delivery = protocol_path.read_text(encoding="utf-8")
+        except OSError as e:
+            log.warning("[delivery] protocol read failed: %s", e)
+            protocol_text_for_delivery = ""
+        if protocol_text_for_delivery.strip():
+            delivery_meta = dict(meta)
+            delivery_meta["date"] = date_part
+            delivery_meta["sessionUid"] = session_uid
+            # meta.json финализированной встречи — для idempotency. Лежит
+            # рядом с транскриптом (collector кладёт meta туда же).
+            meta_json_path = md_path.parent / "meta.json"
+            try:
+                delivery_result = deliver_protocol(
+                    meeting_meta=delivery_meta,
+                    protocol_text=protocol_text_for_delivery,
+                    meta_json_path=meta_json_path if meta_json_path.is_file() else None,
+                    meeting_sid=session_uid,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[delivery] failed (non-fatal): %s", e)
+                delivery_result = {"status": "error", "error": str(e)}
+
     # 4.1. Ф3 clarify-trigger: если есть unresolved cluster'ы (LLM сдался)
     # или low-confidence (LLM ответил, но неуверенно) — отправляем Илье
     # уведомление с inline keyboard и пишем `_pending_clarification/<sid>.json`.
@@ -810,6 +843,7 @@ def main() -> int:
         "unresolved_clusters": unresolved_after,
         "speaker_confidence": speaker_confidence,
         "tasks_extracted": tasks_extracted_meta,
+        "delivery": delivery_result,
     }
     if backend == "speechmatics":
         result_json.update({
