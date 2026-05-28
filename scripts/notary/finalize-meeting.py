@@ -55,7 +55,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
 from lib.name_mapping import map_all, apply_mapping  # noqa: E402
-from lib.llm_postprocess import map_speaker_names  # noqa: E402
+from lib.llm_postprocess import map_speaker_names, clarify_speakers_via_telegram  # noqa: E402
 from lib.render import render_protocol  # noqa: E402
 
 
@@ -583,6 +583,33 @@ def main() -> int:
         bundle.abort()
         raise
     log.info("Protocol written → %s", md_path)
+
+    # 4.1. Ф3 clarify-trigger: если есть unresolved cluster'ы (LLM сдался)
+    # или low-confidence (LLM ответил, но неуверенно) — отправляем Илье
+    # уведомление с inline keyboard и пишем `_pending_clarification/<sid>.json`.
+    # Поток НЕ блокируется: финализация уже записала транскрипт «как есть»
+    # (с «Спикер N» для unresolved). Worker подберёт ответ позже и
+    # переразметит файл атомарно. План — фаза 3 meeting-notary-llm.
+    # TODO Ф4: re-trigger generate_protocol после applied clarify-mapping.
+    try:
+        clarify_meta = dict(meta)
+        # передаём в clarify дату — она нужна для формирования сообщения и
+        # как часть state-файла для аудита.
+        clarify_meta["date"] = date_part
+        clarify_speakers_via_telegram(
+            meeting_id=session_uid,
+            turns=turns,
+            speaker_confidence=speaker_confidence,
+            cluster_to_name=cluster_to_name,
+            expected_participants=expected,
+            panel_participants=participants,
+            meta=clarify_meta,
+            transcript_path=md_path,
+        )
+    except Exception as e:
+        # Clarify — best-effort. Не валим финализацию из-за проблемы с Telegram.
+        log.warning("clarify_speakers_via_telegram failed (non-fatal): %s", e)
+
     if backend == "speechmatics":
         log.info("Transcripts archive → %s, %s", transcripts_json_path, transcripts_txt_path)
         # Append в bench-speechmatics-prod.log — Ф4 семидневный мониторинг.

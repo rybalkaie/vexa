@@ -139,6 +139,88 @@ sudo -u dev bash -c '
 **ADR (почему именно Speechmatics):**
 [`~/Projects/anzhee-dealer-360/decisions/2026-05-27-stt-speechmatics.md`](../../../../anzhee-dealer-360/decisions/2026-05-27-stt-speechmatics.md).
 
+## Ф3: Interactive clarification через Telegram
+
+Если LLM-маппинг (`map_speaker_names`) дал низкий confidence хотя бы по
+одному кластеру (порог — `CLARIFY_THRESHOLD`, дефолт `0.7`), или какой-то
+кластер вообще не разрешён — `finalize-meeting.py` дополнительно:
+1. Отправляет Илье в личку сообщение с цитатами реплик + inline keyboard
+   (кнопки с вариантами имён + «Другое (текстом)»).
+2. Атомарно пишет состояние в `_pending_clarification/<meeting_id>.json`.
+3. **НЕ блокирует** финализацию: транскрипт уже на диске с «Спикер N» по
+   unresolved cluster'ам.
+
+Отдельный worker (`tools/run_clarify_worker.py`) long-poll'ит ответы Ильи,
+парсит callback / текст, переразмечает транскрипт на диске **атомарно**.
+
+### Архитектурное замечание про Telegram-бот
+
+Worker использует **отдельный** Telegram-бот через `CLARIFY_BOT_TOKEN`,
+**НЕ** существующий `@Ilia_claude_1_bot`. Причина: claude-telegram daemon
+(`~/.claude/channels/telegram/` → плагин `claude-plugins-official/telegram`)
+монопольно владеет `getUpdates` для своего токена, а Telegram отдаёт
+updates только одному getUpdates-консюмеру одновременно. Плагин daemon'а
+молча проглатывает callback_query чужих паттернов (server.ts:731-737 —
+матчит только `^perm:`), поэтому переиспользовать его нельзя без правки
+upstream-кода плагина.
+
+Шаг владельца: создать **второго** бота через @BotFather, токен положить
+в `.env.notary` как `CLARIFY_BOT_TOKEN`, добавить бота в личку Ильи
+(или `/start` от Ильи). `TELEGRAM_CHAT_ID` остаётся прежним — это chat_id
+самого Ильи (число), куда шлются уточнения.
+
+### Запуск worker'а
+
+```bash
+# Ручной запуск (для теста):
+cd /srv/meeting-notary  # на VPS, или ~/Projects/meeting-notary на маке
+set -a; source .env.notary; set +a
+python3 vexa/scripts/notary/tools/run_clarify_worker.py
+```
+
+systemd unit (на VPS, путь `/etc/systemd/system/meeting-notary-clarify.service`):
+
+```ini
+[Unit]
+Description=meeting-notary clarify worker (long-poll Telegram callbacks)
+After=network-online.target
+
+[Service]
+Type=simple
+User=dev
+WorkingDirectory=/srv/meeting-notary
+EnvironmentFile=/srv/meeting-notary/.env.notary
+# Создаём pending-dir под dev'ом ДО запуска worker'а — иначе clarify падает
+# на silent OSError при первой записи state-файла (Ход 3 У4/У5/У8).
+ExecStartPre=/bin/mkdir -p /opt/meeting-notary/_pending_clarification
+ExecStart=/home/dev/meeting-notary/venv/bin/python /srv/meeting-notary/vexa/scripts/notary/tools/run_clarify_worker.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Установка:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now meeting-notary-clarify.service
+journalctl --user-unit meeting-notary-clarify -f   # либо без --user, см. куда положил unit
+```
+
+### Env-флаги Ф3
+
+| Env | Дефолт | Назначение |
+|-----|--------|------------|
+| `CLARIFY_BOT_TOKEN` | _нет_ | Токен ОТДЕЛЬНОГО бота (см. выше). Пусто → clarify не шлётся. |
+| `ENABLE_LLM_CLARIFY` | `1` | `0`/`false`/`no` отключает clarify целиком. |
+| `CLARIFY_THRESHOLD` | `0.7` | Порог confidence — ниже → cluster идёт на уточнение. |
+| `CLARIFY_TIMEOUT` | `420` | Секунд до `timed_out`. Поздний ответ только обновляет файл. |
+| `CLARIFY_LONG_POLL_TIMEOUT` | `25` | long-poll окно одного `getUpdates`. |
+| `TELEGRAM_CHAT_ID` | _нет_ | chat_id Ильи (число). Шлётся туда. |
+| `MEETING_NOTARY_PENDING_DIR` | авто | Где хранить state-файлы. |
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция
