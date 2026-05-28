@@ -553,6 +553,85 @@ python3 -m notary.lib.vstrechi_index
 - `--rollback` падает на конфликтах (свежий файл в src, mtime/checksum не сошлись) — список пропущенных в `migrate-rollback-conflicts-<ts>.json` рядом с манифестом. Ручной merge с backup-папкой `~/Projects/me/встречи.backup-<ts>` (полная копия снимается перед `--apply`).
 - Если совсем «всё сломалось» — `rm -rf ~/Projects/me/встречи && mv ~/Projects/me/встречи.backup-<ts> ~/Projects/me/встречи` (но потеряются изменения, сделанные после миграции).
 
+## Ф8 — Boevoy smoke + 7 дней наблюдения с порогами
+
+После Ф6 (доставка) и Ф7 (миграция) — финальный этап плана. Деплой
+готов, остаётся подтвердить регрессионную стабильность за 7 дней по
+**3 порогам** (РАЗМ3 плана): ≤1 misdelivery, ≤2 ложных задач, 0 потерь
+файлов.
+
+**Артефакты Ф8:**
+
+- [`tools/observe_thresholds.py`](tools/observe_thresholds.py) — собирает
+  метрики за окно (default 7 дней) из `journalctl -u meeting-notary-listener`
+  на VPS (или из файла `--log-file` для smoke). Парсит `[delivery] sent`,
+  `[delivery] idempotent skip`, `Protocol written →`, `[route_tasks]`,
+  `[correction] applied`. Считает 3 порога:
+  - **misdelivery** — две `[delivery] sent` для одного meeting_id с
+    разными chat_id (multiple-chat-ids) или одинаковым (duplicate-send).
+  - **ложных задач** — строки в `~/Projects/me/tasks.md` с пометкой
+    `протокол <series> <date>` в секциях «❌ Отменено» / «Удалено» /
+    зачёркнутые `~~..~~`. ~/Projects/me/ не git → эвристика по секциям.
+  - **потерь файлов** — `Protocol written → <path>` есть, файла на диске нет.
+  Вывод: markdown-таблица + JSON (`--format both`). Опционально дайджест
+  Илье в личку через `~/.local/bin/tg-send` (`--push-telegram`). Exit code
+  0 если все пороги выдержаны, 1 если хоть один превышен.
+
+- [`tools/set-telegram-chat-id.py`](tools/set-telegram-chat-id.py)
+  `<series> <chat_id> [--create-test-series]` — atomic-обёртка над
+  `cli.registry.set_telegram_chat_id_for_series` + `save_watched`.
+  `--create-test-series` создаёт manual-series для smoke (cron в субботу,
+  `enabled=false` — реальная финализация по расписанию не сработает).
+  Запуск на маке (правит локальный `watched.yaml`) или на VPS
+  (`--registry-dir /srv/meeting-notary/registry` либо env).
+
+- [`~/Projects/me/plans/observations/2026-05-28-meeting-notary-llm.md`](../../../../me/plans/observations/2026-05-28-meeting-notary-llm.md) —
+  файл наблюдения, шаблон. Заполняется по ходу 7 дней (раздел «Аномалии»)
+  и финально 2026-06-04 (раздел «Итог» по выводу `observe_thresholds.py`).
+
+- [`~/Projects/me/methods/kak-dobavit-bota-v-gruppu-vstrech.md`](../../../../me/methods/kak-dobavit-bota-v-gruppu-vstrech.md) —
+  manual checklist владельцу: создать группу → добавить
+  `@ilya_protocol_meeting_bot` админом → узнать chat_id из лога listener'а
+  → прописать через `set-telegram-chat-id.py`.
+
+**Boevoy smoke Ф6** (запускается владельцем при добавлении бота в
+тестовую группу):
+
+```bash
+# 1) Деплой Ф6+Ф7 на VPS (если ещё не).
+cd ~/Projects/meeting-notary && make deploy-notary
+
+# 2) Создать test-delivery-smoke series + привязка к группе.
+ssh meeting-notary '/srv/meeting-notary/venv-cli/bin/python \
+    /srv/meeting-notary/vexa/scripts/notary/tools/set-telegram-chat-id.py \
+    test-delivery-smoke <chat_id> --create-test-series'
+
+# 3) Synthetic finalize (создать meta.json + 2026-05-28.md как
+#    minimal-transcript) → прогон finalize-meeting.py.
+# 4) Повторный finalize — проверить idempotent skip.
+# 5) Correction smoke в DM: «удали задачу 1 из test-delivery-smoke 2026-05-28».
+```
+
+Подробная пошаговая инструкция — в handoff
+[`~/Projects/me/plans/reports/handoff-meeting-notary-llm-Ф8.md`](../../../../me/plans/reports/handoff-meeting-notary-llm-%D0%A48.md), раздел «Boevoy smoke».
+
+**После 7 дней наблюдения (2026-06-04):**
+
+```bash
+cd ~/Projects/meeting-notary/vexa/scripts/notary
+python3 tools/observe_thresholds.py --journal-host meeting-notary \
+    --days 7 --format both \
+    --out ~/Projects/me/plans/observations/2026-06-04-meeting-notary-llm-report.md
+```
+
+→ если exit 0 → план закрывается (заполнить «## Итог» в файле плана).
+→ если exit 1 → `/план-доработок-1` с отчётом как input.
+
+**ВАЖНО (нерекомендуется):** не оставлять `test-delivery-smoke` в
+`watched.yaml` после прогона smoke — это test-series, помеченная
+`enabled=false`, но мусор. Удалить запись вручную после ввода в эксплуатацию
+реальных групп.
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция
