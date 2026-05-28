@@ -33,6 +33,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -1491,11 +1493,45 @@ def extract_tasks(
             seen.add(n)
             merged.append(n)
 
+    # У6 (ход 3): даём Sonnet явный день недели + ISO дату следующей пятницы /
+    # понедельника. Sonnet 4.6 cutoff январь 2026 — он не должен «угадывать»
+    # день недели в 2026+ году. Без этой подсказки промт мог посчитать «к
+    # пятнице» относительно своей internal даты.
+    weekday_hint = ""
+    next_friday_iso = ""
+    next_monday_iso = ""
+    end_of_week_iso = ""
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        try:
+            base_dt = datetime.strptime(date, "%Y-%m-%d")
+            ru_weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+            wd = base_dt.weekday()
+            weekday_hint = f"\n- weekday: {ru_weekdays[wd]} (если в протоколе «к пятнице» / «к понедельнику» — считай от этого дня)"
+            # Пятница недели встречи (если суббота/воскресенье — пятница СЛЕДУЮЩЕЙ недели).
+            delta_friday = 4 - wd if wd <= 4 else (4 - wd) + 7
+            end_of_week_iso = (base_dt + timedelta(days=delta_friday)).strftime("%Y-%m-%d")
+            # Ближайший понедельник после встречи.
+            delta_monday = (0 - wd) % 7
+            if delta_monday == 0:
+                delta_monday = 7
+            next_monday_iso = (base_dt + timedelta(days=delta_monday)).strftime("%Y-%m-%d")
+            # Следующая пятница (если на встрече сказали «к пятнице» — обычно эта пятница).
+            next_friday_iso = end_of_week_iso
+        except ValueError:
+            pass
+    deadlines_hint = ""
+    if next_friday_iso:
+        deadlines_hint = (
+            f"\n- end_of_meeting_week: {end_of_week_iso} (пятница недели встречи)"
+            f"\n- next_monday: {next_monday_iso} (ближайший понедельник после встречи)"
+            f"\n- next_friday: {next_friday_iso} (пятница после встречи, если «к пятнице»)"
+        )
+
     user_prompt = (
         f"spheres: {spheres_str}\n\n"
         f"Метаданные встречи:\n"
         f"- series: {series}\n"
-        f"- date: {date}\n"
+        f"- date: {date}{weekday_hint}{deadlines_hint}\n"
         f"- duration: {duration_str}\n"
         f"- participants: {', '.join(merged) if merged else '—'}\n\n"
         f"Протокол:\n\n{protocol_md.strip()}"
@@ -1562,9 +1598,14 @@ def _owner_kind(owner: str, stakeholders: list[dict]) -> tuple[str, Optional[dic
         return ("other", None)
     raw = owner.strip()
     raw_low = raw.lower()
-    # Илья — точное / first-word совпадение.
+    # Илья — точное / first-word совпадение. Регистронезависимо для обеих
+    # сторон (Н8 ход 1: «РЫБАЛКА» в верхнем регистре не должен попадать в
+    # `other` и терять задачу Ильи).
+    raw_first_low = raw_low.split()[:1]
     for nm in ILYA_NAMES:
-        if raw_low == nm.lower() or raw.split()[:1] == nm.split()[:1]:
+        nm_low = nm.lower()
+        nm_first_low = nm_low.split()[:1]
+        if raw_low == nm_low or raw_first_low == nm_first_low:
             return ("ilia", None)
     if _SPEAKER_LABEL_RE.match(raw):
         return ("unknown_owner", None)
@@ -1643,10 +1684,12 @@ def _format_task_line(task: dict, *, created: str, series: str, date: str, marke
 
 
 def _task_already_exists(tasks_md_path: Path, owner_marker: str, text: str, series: str, date: str) -> bool:
-    """Грубая защита от дублей: ищем строку с похожим текстом + ссылкой на этот протокол.
+    """Дубль-чек: задача с тем же `text` + контекстом `протокол <series> <date>`
+    уже существует в tasks.md.
 
-    `owner_marker` — строка-маркер для unknown_owner (например `[?]`) или пусто для Ильи.
-    Сравниваем по первым 30 символам text + наличию `протокол <series> <date>`.
+    Сравнение — sha1[:12] от `(text.strip().lower() + "|" + ctx.lower())`. Менее
+    подвержено ложным совпадениям, чем сравнение по первым 30 символам (две
+    задачи могут иметь одинаковое начало, но разные хвосты — см. ход 1 Н3).
     """
     if not tasks_md_path.is_file():
         return False
@@ -1654,17 +1697,43 @@ def _task_already_exists(tasks_md_path: Path, owner_marker: str, text: str, seri
         raw = tasks_md_path.read_text(encoding="utf-8")
     except OSError:
         return False
-    needle_text = text[:30].lower()
-    needle_ctx = f"протокол {series} {date}".lower()
+    ctx = f"протокол {series} {date}".lower()
+
+    def _normalize(s: str) -> str:
+        """Свёрнутая нормализация для хэш-сравнения дублей (ход 4 НОВ2):
+        нижний регистр + сжатые подряд пробелы + trim. Защита от
+        двойных пробелов в формулировках LLM при двух прогонах."""
+        return re.sub(r"\s+", " ", s.strip().lower())
+
+    needle_hash = hashlib.sha1(
+        (_normalize(text) + "|" + ctx).encode("utf-8")
+    ).hexdigest()[:12]
+    # Идём по строкам, для каждой с маркером ctx — извлекаем text (между предпоследним
+    # `|` и последним), считаем хэш, сравниваем.
     for line in raw.splitlines():
         ln_low = line.lower()
-        if needle_text and needle_text in ln_low and needle_ctx in ln_low:
+        if ctx not in ln_low:
+            continue
+        # Формат строки: `- <created> | до <due> | с <start> | [сфера] | <text> | контекст: ...`
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 6:
+            continue
+        # `text` обычно в parts[-2] (последний — «контекст: …»). Подстраховка
+        # для случая, когда text сам содержит ` | `: берём предпоследний.
+        line_text = parts[-2]
+        line_text_clean = re.sub(r"^\[\?\]\s+\S+:\s+", "", line_text)  # снимаем «[?] Спикер N:» если есть
+        line_hash = hashlib.sha1(
+            (_normalize(line_text_clean) + "|" + ctx).encode("utf-8")
+        ).hexdigest()[:12]
+        if line_hash == needle_hash:
             return True
     return False
 
 
 def _append_to_tasks_md(tasks_md_path: Path, new_lines: list[str]) -> int:
-    """Дописывает строки в раздел `## 📥 Актуальные (живые задачи)` через atomic write.
+    """Дописывает строки в раздел `## 📥 Актуальные (живые задачи)` через atomic write
+    под `fcntl.flock` (РИСК5 в Тех-решениях плана: lock-конкуренция при параллельной
+    финализации двух встреч).
 
     Возвращает число записанных строк.
     Если файл не найден — возвращает 0 + warning.
@@ -1674,48 +1743,77 @@ def _append_to_tasks_md(tasks_md_path: Path, new_lines: list[str]) -> int:
         return 0
     if not new_lines:
         return 0
+
+    # Lock-файл рядом с tasks.md. flock(LOCK_EX) сериализует read-modify-write
+    # двух параллельных финализаций. Без него — lost-update (вторая запись
+    # затирает первую). Lock-файл может пережить процесс — это ок, fcntl
+    # снимает блокировку при close(), сам файл остаётся.
+    lock_path = tasks_md_path.with_suffix(tasks_md_path.suffix + ".lock")
     try:
-        raw = tasks_md_path.read_text(encoding="utf-8")
+        lock_fh = open(lock_path, "a")
     except OSError as e:
-        logger.warning("[route_tasks] tasks.md не читается: %s", e)
-        return 0
+        logger.warning("[route_tasks] lock-файл недоступен (%s): продолжаю без блокировки — РИСК lost-update", e)
+        lock_fh = None
+    locked = False
+    if lock_fh is not None:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except OSError as e:
+            logger.warning("[route_tasks] flock failed: %s — продолжаю без блокировки", e)
+    try:
+        try:
+            raw = tasks_md_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("[route_tasks] tasks.md не читается: %s", e)
+            return 0
 
-    lines = raw.split("\n")
-    # Ищем заголовок «## 📥 Актуальные (живые задачи)».
-    actual_idx = None
-    next_h2_idx = None
-    for i, line in enumerate(lines):
-        if line.startswith("## 📥 Актуальные"):
-            actual_idx = i
-            break
-    if actual_idx is None:
-        logger.warning("[route_tasks] раздел '## 📥 Актуальные' не найден в tasks.md")
-        return 0
-    for i in range(actual_idx + 1, len(lines)):
-        if lines[i].startswith("## "):
-            next_h2_idx = i
-            break
-    if next_h2_idx is None:
-        next_h2_idx = len(lines)
+        lines = raw.split("\n")
+        # Ищем заголовок «## 📥 Актуальные (живые задачи)».
+        actual_idx = None
+        next_h2_idx = None
+        for i, line in enumerate(lines):
+            if line.startswith("## 📥 Актуальные"):
+                actual_idx = i
+                break
+        if actual_idx is None:
+            logger.warning("[route_tasks] раздел '## 📥 Актуальные' не найден в tasks.md")
+            return 0
+        for i in range(actual_idx + 1, len(lines)):
+            if lines[i].startswith("## "):
+                next_h2_idx = i
+                break
+        if next_h2_idx is None:
+            next_h2_idx = len(lines)
 
-    # Точка вставки — в конец блока «📥 Актуальные», перед next_h2_idx,
-    # пропустив висячие пустые строки.
-    insert_at = next_h2_idx
-    while insert_at > actual_idx + 1 and lines[insert_at - 1].strip() == "":
-        insert_at -= 1
+        # Точка вставки — в конец блока «📥 Актуальные», перед next_h2_idx,
+        # пропустив висячие пустые строки.
+        insert_at = next_h2_idx
+        while insert_at > actual_idx + 1 and lines[insert_at - 1].strip() == "":
+            insert_at -= 1
 
-    inject: list[str] = []
-    # Гарантируем пустую строку отделения от предыдущего контента.
-    if insert_at > 0 and lines[insert_at - 1].strip() != "":
-        inject.append("")
-    inject.extend(new_lines)
+        inject: list[str] = []
+        # Гарантируем пустую строку отделения от предыдущего контента.
+        if insert_at > 0 and lines[insert_at - 1].strip() != "":
+            inject.append("")
+        inject.extend(new_lines)
 
-    new_lines_total = list(lines)
-    new_lines_total[insert_at:insert_at] = inject
-    new_text = "\n".join(new_lines_total)
+        new_lines_total = list(lines)
+        new_lines_total[insert_at:insert_at] = inject
+        new_text = "\n".join(new_lines_total)
 
-    _atomic_write_text(tasks_md_path, new_text)
-    return len(new_lines)
+        _atomic_write_text(tasks_md_path, new_text)
+        return len(new_lines)
+    finally:
+        if lock_fh is not None:
+            try:
+                if locked:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                try:
+                    lock_fh.close()
+                except OSError:
+                    pass
 
 
 def _append_to_stakeholder_track(
@@ -2037,8 +2135,14 @@ def maybe_clarify_pending_deadlines(
     meeting_id: str,
     ilia_tasks_no_deadline: list[dict],
     meeting_meta: dict,
+    *,
+    unknown_owner_count: int = 0,
 ) -> Optional[Path]:
     """Если есть задачи Ильи без срока — шлём Илье «какие даты ставим?».
+
+    `unknown_owner_count` (ход 3 У8): если >0 — в это же сообщение добавляем
+    блок «N задач с нераспознанным владельцем (`[?]` в tasks.md)». Так Илья
+    получает ОДНО сообщение вместо двух подряд (deadlines + unknown).
 
     State: `_pending_clarification/<meeting_id>-deadlines.json`. Listener
     обрабатывает callback с префиксом `td:` либо текстовый ответ.
@@ -2079,6 +2183,15 @@ def maybe_clarify_pending_deadlines(
         "Поддерживаю: ISO-даты, «сегодня/завтра», «на этой/следующей неделе», "
         "«к понедельнику/вторнику/...», «без срока»."
     )
+    # У8 (ход 3): прицепляем блок про [?]-задачи, чтобы не отправлять отдельное
+    # сообщение Илье — он и так на этом же UI отвечает по дедлайнам.
+    # НОВ4 (ход 4): clamp на отрицательные значения от потенциально кривого caller'а.
+    if isinstance(unknown_owner_count, int) and unknown_owner_count > 0:
+        lines.append("")
+        lines.append(
+            f"❓ Ещё {unknown_owner_count} задач(и) с нераспознанным владельцем "
+            f"(в tasks.md помечены `[?]`). Поправь руками когда увидишь."
+        )
     text = "\n".join(lines)
 
     try:

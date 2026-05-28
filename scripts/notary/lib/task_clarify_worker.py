@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -81,14 +82,24 @@ def _write_state(state: dict, pending_root: Path, *, file_suffix: str) -> None:
     llm_postprocess._atomic_write_text(target, json.dumps(state, ensure_ascii=False, indent=2))
 
 
+_RETENTION_DAYS = 7
+
+
 def sweep_timeouts(pending_root: Path) -> int:
-    """Помечает истекшие task_filter/task_deadlines как timed_out.
+    """Помечает истекшие task_filter/task_deadlines как timed_out + чистит
+    старые state'ы (>RETENTION_DAYS, ход 3 У9).
 
     Поведение по таймауту: «лучше шум, чем потеря» — для task_filter
     оставляем все задачи (filter в tasks.md уже произошёл); для
     task_deadlines дедлайны остаются `до —`.
+
+    Retention: state'ы со status ∈ {resolved, timed_out} старше N дней
+    удаляются — иначе папка растёт без ограничений (60+ за месяц на 10
+    встречах/неделю).
     """
     n = 0
+    now = time.time()
+    retention_seconds = _RETENTION_DAYS * 24 * 3600
     for kind, suffix in (
         ("task_filter", _TASKS_FILE_SUFFIX),
         ("task_deadlines", _DEADLINES_FILE_SUFFIX),
@@ -101,6 +112,29 @@ def sweep_timeouts(pending_root: Path) -> int:
                 logger.info("[task-clarify] timed_out meeting=%s kind=%s",
                             state["meeting_id"], kind)
                 n += 1
+        # Retention: удаляем resolved/timed_out старше RETENTION_DAYS
+        # по mtime файла.
+        if not pending_root.exists():
+            continue
+        for f in pending_root.glob(f"*{suffix}"):
+            if f.name.startswith("."):
+                continue
+            try:
+                age = now - f.stat().st_mtime
+            except OSError:
+                continue
+            if age < retention_seconds:
+                continue
+            try:
+                state = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (state or {}).get("status") in ("resolved", "timed_out"):
+                try:
+                    f.unlink()
+                    logger.info("[task-clarify] purged old state file=%s age=%.0fd", f.name, age / 86400)
+                except OSError:
+                    pass
     return n
 
 
@@ -322,29 +356,53 @@ def _apply_filter_resolution(
     date = (state.get("meta") or {}).get("date", "—")
     ctx_needle = f"протокол {series} {date}".lower()
 
+    # Под flock — те же гарантии, что у `_append_to_tasks_md` (ход 1 Н7).
+    lock_path = tasks_md_path.with_suffix(tasks_md_path.suffix + ".lock")
     try:
-        raw = tasks_md_path.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.warning("[task-clarify] read tasks.md failed: %s", e)
+        lock_fh = open(lock_path, "a")
+    except OSError:
+        lock_fh = None
+    locked = False
+    if lock_fh is not None:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except OSError:
+            pass
+    try:
+        try:
+            raw = tasks_md_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("[task-clarify] read tasks.md failed: %s", e)
+            _write_state(state, pending_root, file_suffix=_TASKS_FILE_SUFFIX)
+            return
+
+        lines = raw.split("\n")
+        removed = 0
+        for idx_1 in to_remove:
+            if idx_1 < 1 or idx_1 > n:
+                continue
+            text_needle = (tasks[idx_1 - 1].get("text") or "")[:30].lower()
+            for i, ln in enumerate(lines):
+                ln_low = ln.lower()
+                if text_needle and text_needle in ln_low and ctx_needle in ln_low:
+                    lines[i] = None  # type: ignore[assignment]
+                    removed += 1
+                    break
+
+        lines = [ln for ln in lines if ln is not None]
+        llm_postprocess._atomic_write_text(tasks_md_path, "\n".join(lines))
         _write_state(state, pending_root, file_suffix=_TASKS_FILE_SUFFIX)
-        return
-
-    lines = raw.split("\n")
-    removed = 0
-    for idx_1 in to_remove:
-        if idx_1 < 1 or idx_1 > n:
-            continue
-        text_needle = (tasks[idx_1 - 1].get("text") or "")[:30].lower()
-        for i, ln in enumerate(lines):
-            ln_low = ln.lower()
-            if text_needle and text_needle in ln_low and ctx_needle in ln_low:
-                lines[i] = None  # type: ignore[assignment]
-                removed += 1
-                break
-
-    lines = [ln for ln in lines if ln is not None]
-    llm_postprocess._atomic_write_text(tasks_md_path, "\n".join(lines))
-    _write_state(state, pending_root, file_suffix=_TASKS_FILE_SUFFIX)
+    finally:
+        if lock_fh is not None:
+            try:
+                if locked:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                try:
+                    lock_fh.close()
+                except OSError:
+                    pass
     logger.info(
         "[task-clarify] resolved meeting=%s type=task_filter removed=%d/%d",
         state["meeting_id"], removed, len(to_remove),

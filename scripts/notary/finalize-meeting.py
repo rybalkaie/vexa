@@ -693,21 +693,25 @@ def main() -> int:
                     log.warning("[route_tasks] failed (non-fatal): %s", e)
                     route_result = {}
 
-                # Clarification дедлайнов задач Ильи без срока.
+                # Clarification дедлайнов + блок [?] объединяем в ОДНО
+                # сообщение Илье (ход 3 У8: не спамим личку 3 сообщениями
+                # подряд по одной встрече). Если deadlines==0 и unknown>0 —
+                # отдельный notify; если оба 0 — ничего не шлём.
                 ilia_no_deadline = [
                     t for t in tasks
                     if (t.get("owner") or "").lower().startswith("илья")
                     and not t.get("deadline")
                 ]
+                unk = tasks_extracted_meta.get("unknown_owner", 0)
                 if ilia_no_deadline:
                     try:
-                        maybe_clarify_pending_deadlines(session_uid, ilia_no_deadline, task_meta)
+                        maybe_clarify_pending_deadlines(
+                            session_uid, ilia_no_deadline, task_meta,
+                            unknown_owner_count=unk,
+                        )
                     except Exception as e:  # noqa: BLE001
                         log.warning("[task-clarify] deadlines clarify failed (non-fatal): %s", e)
-
-                # Сводное уведомление по [?]-задачам.
-                unk = tasks_extracted_meta.get("unknown_owner", 0)
-                if unk > 0:
+                elif unk > 0:
                     try:
                         notify_unknown_owners(session_uid, unk, task_meta)
                     except Exception as e:  # noqa: BLE001
