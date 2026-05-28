@@ -1,31 +1,21 @@
 """Worker для приёма ответов на clarify-вопросы (Ф3 meeting-notary-llm).
 
-Архитектурное решение (см. handoff Ф3): **Path B** — отдельный процесс на
-**ОТДЕЛЬНОМ** Telegram-боте (`CLARIFY_BOT_TOKEN`), потому что daemon
-`@Ilia_claude_1_bot` монопольно владеет `getUpdates` для своего токена,
-а его плагин (`~/.claude/plugins/cache/.../telegram/0.0.6/server.ts`)
-молча проглатывает callback'и не из паттерна `^perm:` — расширить нельзя
-без правки upstream-плагина.
+Архитектурное решение (2026-05-28, fix-промт Ф3): clarify-обработчики
+встроены в уже работающий `meetings_listener.py` daemon, который 24/7
+long-poll'ит `TELEGRAM_NOTARIUS_BOT_TOKEN` (`@ilya_protocol_meeting_bot`).
+Telegram отдаёт getUpdates только одному потребителю на токен —
+поэтому отдельный процесс на том же боте запустить нельзя.
 
-Поэтому worker:
-  - Использует `CLARIFY_BOT_TOKEN` (другой бот, заведённый владельцем
-    специально для clarify), НЕ конфликтуя с claude-telegram daemon'ом.
-  - Если `CLARIFY_BOT_TOKEN` совпадает с `TELEGRAM_BOT_TOKEN` — рефьюзит старт
-    с явным сообщением «дай отдельный токен либо погаси daemon».
+Этот модуль теперь — **библиотека хендлеров**:
+  - `process_callback(callback_query, pending_root, token)` — обработка inline-кнопки;
+  - `process_text_message(msg, pending_root, token)` — обработка текстового ответа;
+  - `sweep_timeouts(pending_root)` — помечает просроченные state'ы как `timed_out`.
 
-Что делает worker (в бесконечном цикле):
-  - `getUpdates` long-poll (25 сек) с `allowed_updates=["callback_query","message"]`.
-  - Для каждого update проверяет `_pending_clarification/*.json` со статусом pending.
-  - На callback — парсит, применяет, помечает state.
-  - На текст — парсит (regex + LLM-fallback), применяет если пендинг ровно один.
-  - Параллельно: периодически идёт по pending state'ам, выставляет `timed_out`
-    для просроченных.
+Listener импортирует эти три функции и зовёт их в своём long-poll цикле.
 
-Запуск:
-  python3 vexa/scripts/notary/tools/run_clarify_worker.py
-
-  С systemd (Ф3 deliverable, см. README):
-  systemctl --user start meeting-notary-clarify.service
+Standalone-режим (`run_forever` / `main`) остался для **локального smoke на маке**
+или для случая когда захочется отдельного процесса/бота. В продакшене на VPS
+он НЕ используется.
 
 Дисциплина «Опасной тройки»:
   - Логируем metadata (meeting_id, cluster, имя), но НЕ тексты ответа.
@@ -78,31 +68,6 @@ def save_offset(pending_root: Path, offset: int) -> None:
         p.write_text(str(offset), encoding="utf-8")
     except OSError as e:
         logger.warning("[clarify-worker] offset save failed: %s", e)
-
-
-def _validate_token_separation(clarify_token: str) -> None:
-    """Защита от случая «один токен на daemon и worker» — getUpdates конкурируют."""
-    daemon_env = os.path.expanduser("~/.claude/channels/telegram/.env")
-    if not os.path.exists(daemon_env):
-        # На VPS daemon'а Ильи нет — не наша забота.
-        return
-    try:
-        with open(daemon_env, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    other = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if other and other == clarify_token:
-                        raise SystemExit(
-                            "CLARIFY_BOT_TOKEN совпадает с TELEGRAM_BOT_TOKEN из "
-                            "~/.claude/channels/telegram/.env — getUpdates у Telegram "
-                            "ОДИН на токен. Дай отдельного бота через @BotFather, либо "
-                            "погаси daemon `launchctl bootout gui/$(id -u) "
-                            "~/Library/LaunchAgents/com.ilarybalka.claude-telegram.plist`."
-                        )
-                    return
-    except OSError:
-        return
 
 
 # ----- Обработка одного pending state'а -------------------------------------
@@ -216,7 +181,11 @@ def _is_authorized_sender(from_user: dict, allowed_chat_id: Optional[int]) -> bo
 
 
 def _allowed_chat_id() -> Optional[int]:
-    raw = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    raw = (
+        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
     if not raw:
         return None
     try:
@@ -225,7 +194,7 @@ def _allowed_chat_id() -> Optional[int]:
         return None
 
 
-def _process_callback(
+def process_callback(
     callback_query: dict,
     pending_root: Path,
     bot_token: str,
@@ -321,7 +290,7 @@ def _process_callback(
         logger.debug("[clarify-worker] edit_message after callback failed: %s", e)
 
 
-def _process_text_message(
+def process_text_message(
     msg: dict,
     pending_root: Path,
     bot_token: str,
@@ -426,7 +395,7 @@ def _try_apply_text_to_state(
 
 # ----- Таймауты -------------------------------------------------------------
 
-def _sweep_timeouts(pending_root: Path) -> int:
+def sweep_timeouts(pending_root: Path) -> int:
     """Помечает просроченные pending'и как timed_out. Возвращает число изменений."""
     n = 0
     for state in clarify_state.list_pending(root=pending_root, status_filter=["pending"]):
@@ -451,11 +420,31 @@ def _handle_signal(_signum, _frame):
     logger.info("[clarify-worker] signal received, shutting down")
 
 
+def has_any_pending_clarify(pending_root: Optional[Path] = None) -> bool:
+    """True если есть хоть один state со статусом pending или timed_out.
+
+    Используется listener'ом чтобы решить: применить текстовое сообщение Ильи
+    как clarify-ответ (`process_text_message`) или передать в старый apply_reply
+    flow для блока 📅.
+    """
+    root = pending_root or clarify_state.resolve_pending_dir()
+    if not root.exists():
+        return False
+    for status in ("pending", "timed_out"):
+        if clarify_state.list_pending(root=root, status_filter=[status]):
+            return True
+    return False
+
+
 def run_forever(bot_token: str, *, long_poll_timeout: int = 25) -> None:
-    """Бесконечный long-poll цикл. Прерывается по SIGTERM/SIGINT."""
+    """Бесконечный long-poll цикл (standalone-mode для локального smoke).
+
+    В продакшене на VPS вместо этого вызываются `process_callback`,
+    `process_text_message`, `sweep_timeouts` из meetings_listener.py,
+    который владеет единственным getUpdates на токен.
+    """
     if not bot_token:
-        raise SystemExit("CLARIFY_BOT_TOKEN не задан — нечего слушать.")
-    _validate_token_separation(bot_token)
+        raise SystemExit("TELEGRAM_NOTARIUS_BOT_TOKEN не задан — нечего слушать.")
     pending_root = clarify_state.resolve_pending_dir()
     pending_root.mkdir(parents=True, exist_ok=True)
 
@@ -475,7 +464,7 @@ def run_forever(bot_token: str, *, long_poll_timeout: int = 25) -> None:
         # Сначала — sweep таймаутов (дешёво, файловые операции).
         now = time.monotonic()
         if now - last_sweep >= sweep_interval_s:
-            _sweep_timeouts(pending_root)
+            sweep_timeouts(pending_root)
             last_sweep = now
 
         # long-poll. Сам call длится до `long_poll_timeout` сек, не сжигает CPU.
@@ -496,9 +485,9 @@ def run_forever(bot_token: str, *, long_poll_timeout: int = 25) -> None:
                 update_id = int(upd.get("update_id") or 0)
                 offset = max(offset, update_id + 1)
                 if "callback_query" in upd:
-                    _process_callback(upd["callback_query"], pending_root, bot_token)
+                    process_callback(upd["callback_query"], pending_root, bot_token)
                 elif "message" in upd:
-                    _process_text_message(upd["message"], pending_root, bot_token)
+                    process_text_message(upd["message"], pending_root, bot_token)
             except Exception as e:
                 # Не валим воркера на одной ошибке — это сервис.
                 logger.exception("[clarify-worker] update %s processing failed: %s",
@@ -514,11 +503,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    token = (os.environ.get("CLARIFY_BOT_TOKEN") or "").strip()
+    token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
     if not token:
         sys.stderr.write(
-            "CLARIFY_BOT_TOKEN не задан. Создай отдельного Telegram-бота через "
-            "@BotFather и положи токен в .env.notary (см. README раздел Ф3).\n"
+            "TELEGRAM_NOTARIUS_BOT_TOKEN не задан. На VPS он уже есть в "
+            "/srv/meeting-notary/.env.notary; в проде слушает meetings_listener.\n"
+            "Standalone-mode (этот скрипт) — только для локального smoke на маке.\n"
         )
         return 2
     try:

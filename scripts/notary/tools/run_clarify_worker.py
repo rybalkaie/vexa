@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Entry-point для worker'а clarify-flow (Ф3 meeting-notary-llm).
 
-Запускается под systemd / launchd. Реальная логика — `lib.clarify_worker.main()`.
+**Standalone-режим только для локального smoke на маке.** В продакшене на VPS
+clarify-хендлеры встроены в `meetings_listener.py` (тот же бот, тот же
+getUpdates). Использует `TELEGRAM_NOTARIUS_BOT_TOKEN`.
+
+Реальная логика — `lib.clarify_worker.main()`.
 """
 
 from __future__ import annotations

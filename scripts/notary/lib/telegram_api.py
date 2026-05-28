@@ -1,4 +1,4 @@
-"""Прямой Telegram Bot API через httpx.
+"""Прямой Telegram Bot API через stdlib `urllib.request` (без зависимостей).
 
 Минимум, нужный Ф3 (clarify-flow) и Ф6 (доставка в группу + correction flow):
   - send_message(...) с поддержкой `reply_markup` (InlineKeyboardMarkup).
@@ -7,9 +7,10 @@
   - answer_callback_query(...) — снять «крутилку» у нажатой кнопки.
   - delete_message(...) — для correction flow Ф6 (в 48-часовом окне).
 
-Намеренно НЕ используем aiogram / python-telegram-bot — план зафиксировал
-«50–80 строк голого httpx без framework». Здесь sync httpx — long-poll worker'у
-сложности async не нужны, а вызовы из finalize-meeting.py — одиночные.
+Намеренно НЕ используем aiogram / python-telegram-bot / httpx — модуль должен
+импортироваться из `meetings_listener.py`, который крутится под `venv-cli`
+без heavy-зависимостей. Stdlib `urllib.request` — единственный надёжный путь
+без install-step на VPS.
 
 Дисциплина «Опасной тройки»:
   - Передаваемые тексты НЕ логируем (только len и `chat_id`).
@@ -18,7 +19,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import urllib.error
+import urllib.request
 from typing import Any, Optional
 
 
@@ -36,31 +40,36 @@ def _bot_url(token: str, method: str) -> str:
     return f"https://api.telegram.org/bot{token}/{method}"
 
 
-def _load_httpx():
-    """Ленивый импорт httpx — чтобы smoke парсеров проходил без сетевой обвязки.
-
-    Прод-окружение (VPS / мак с полным venv) всегда имеет httpx
-    (`requirements.txt` пиннует `httpx==0.28.1` для speechmatics_client.py).
-    """
-    import httpx  # noqa: PLC0415  ленивый импорт намеренно
-    return httpx
-
-
 def _post(token: str, method: str, payload: dict[str, Any], *, timeout: float = _API_TIMEOUT_SEC) -> dict:
     """POST + проверка `ok`. Возвращает `result`-секцию."""
-    httpx = _load_httpx()
     url = _bot_url(token, method)
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
     try:
-        resp = httpx.post(url, json=payload, timeout=timeout)
-    except httpx.HTTPError as e:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        # Telegram присылает JSON с описанием даже на 4xx.
+        try:
+            raw = e.read()
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise TelegramApiError(f"{method} HTTP {e.code}: {e.reason}") from e
+        desc = (data or {}).get("description", "")
+        raise TelegramApiError(f"{method} ok=false: HTTP={e.code} desc={desc!r}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise TelegramApiError(f"{method} network error: {type(e).__name__}: {e}") from e
     try:
-        data = resp.json()
-    except ValueError as e:
-        raise TelegramApiError(f"{method} returned non-JSON: HTTP {resp.status_code}") from e
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise TelegramApiError(f"{method} returned non-JSON: HTTP {status}") from e
     if not isinstance(data, dict) or not data.get("ok"):
         desc = (data or {}).get("description", "")
-        raise TelegramApiError(f"{method} ok=false: HTTP={resp.status_code} desc={desc!r}")
+        raise TelegramApiError(f"{method} ok=false: HTTP={status} desc={desc!r}")
     return data.get("result") or {}
 
 

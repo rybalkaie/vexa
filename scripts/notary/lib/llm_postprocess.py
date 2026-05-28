@@ -36,9 +36,16 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from .align import AlignedTurn
+# AlignedTurn используется только в сигнатурах типов finalize-path функций
+# (`map_speaker_names`, `clarify_speakers_via_telegram`, `_build_samples_for_cluster`).
+# Listener / clarify-worker зовут только parse_* / apply_* — поэтому `.align`
+# (тянет pyannote через `.diarize`) импортируем лениво, чтобы `venv-cli` без
+# pyannote/torch мог импортить этот модуль для парсинга callback_data.
+if TYPE_CHECKING:
+    from .align import AlignedTurn
+
 from .claude_cli import (
     ClaudeCliError,
     ClaudeCliNotInstalled,
@@ -295,6 +302,11 @@ _SAMPLES_PER_CLUSTER = 3
 
 # 4096 — лимит Telegram. С запасом на форматирование/HTML — режем ~3500.
 _TELEGRAM_MSG_MAX = 3500
+
+# Префикс clarify-сообщения — публичная константа.
+# meetings_listener.py использует её для роутинга Reply на clarify-сообщения
+# (отличая их от Reply на блок 📅, который идёт в apply_reply flow).
+CLARIFY_MSG_PREFIX = "\U0001F399"  # 🎙 STUDIO MICROPHONE
 
 
 # --- Парсеры ответа (callback + текст) ----------------------------------
@@ -677,7 +689,7 @@ def _build_clarify_message_text(
     n_clusters = len(unclear_clusters)
     suffix = "" if n_clusters == 1 else ("а" if 2 <= n_clusters <= 4 else "ов")
     lines: list[str] = [
-        f"🎙 Встреча «{series}» от {date_str}",
+        f"{CLARIFY_MSG_PREFIX} Встреча «{series}» от {date_str}",
         f"Нужны имена: {n_clusters} спикер{suffix}.",
         "",
     ]
@@ -759,7 +771,7 @@ def clarify_speakers_via_telegram(
          (cluster ∈ cluster_to_name, но confidence < CLARIFY_THRESHOLD).
       2. Если таких нет — return None, ничего не делает.
       3. Если ENABLE_LLM_CLARIFY=0 — return None (финализация идёт «как есть»).
-      4. Если нет CLARIFY_BOT_TOKEN / TELEGRAM_CHAT_ID — лог + None (не блокер).
+      4. Если нет TELEGRAM_NOTARIUS_BOT_TOKEN / TELEGRAM_CHAT_ID — лог + None (не блокер).
       5. Иначе: формирует сообщение, шлёт через Bot API, записывает
          `_pending_clarification/<meeting_id>.json` атомарно.
       6. НЕ блокирует поток — finalize-meeting.py продолжает с текущими именами
@@ -817,13 +829,19 @@ def clarify_speakers_via_telegram(
         )
         return None
 
-    # Бот + chat.
-    bot_token = (os.environ.get("CLARIFY_BOT_TOKEN") or "").strip()
-    chat_id_raw = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    # Бот + chat. Переиспользуем `@ilya_protocol_meeting_bot` —
+    # тот же токен, что у meetings_listener'а (он же шлёт вечерний блок 📅
+    # и принимает Reply на него; clarify-callback'и идут к нему же).
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    chat_id_raw = (
+        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
     if not bot_token or not chat_id_raw:
         logger.warning(
             "[clarify] meeting=%s low-conf clusters=%d, "
-            "но CLARIFY_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — пропуск",
+            "но TELEGRAM_NOTARIUS_BOT_TOKEN/TELEGRAM_(NOTARIUS_)CHAT_ID не заданы — пропуск",
             meeting_id, len(unclear),
         )
         return None

@@ -150,75 +150,57 @@ sudo -u dev bash -c '
 3. **НЕ блокирует** финализацию: транскрипт уже на диске с «Спикер N» по
    unresolved cluster'ам.
 
-Отдельный worker (`tools/run_clarify_worker.py`) long-poll'ит ответы Ильи,
-парсит callback / текст, переразмечает транскрипт на диске **атомарно**.
+Clarify-хендлеры (callback / текст / sweep таймаутов) встроены **в уже
+работающий** `meetings_listener.py` daemon, который 24/7 long-poll'ит
+`TELEGRAM_NOTARIUS_BOT_TOKEN` (`@ilya_protocol_meeting_bot`).
 
 ### Архитектурное замечание про Telegram-бот
 
-Worker использует **отдельный** Telegram-бот через `CLARIFY_BOT_TOKEN`,
-**НЕ** существующий `@Ilia_claude_1_bot`. Причина: claude-telegram daemon
-(`~/.claude/channels/telegram/` → плагин `claude-plugins-official/telegram`)
-монопольно владеет `getUpdates` для своего токена, а Telegram отдаёт
-updates только одному getUpdates-консюмеру одновременно. Плагин daemon'а
-молча проглатывает callback_query чужих паттернов (server.ts:731-737 —
-матчит только `^perm:`), поэтому переиспользовать его нельзя без правки
-upstream-кода плагина.
+Clarify + delivery (Ф6) + старый apply-reply на блок 📅 идут через **один**
+бот `@ilya_protocol_meeting_bot` (env `TELEGRAM_NOTARIUS_BOT_TOKEN`).
+Решение Ильи 2026-05-28: третий бот не плодим, переиспользуем существующий.
 
-Шаг владельца: создать **второго** бота через @BotFather, токен положить
-в `.env.notary` как `CLARIFY_BOT_TOKEN`, добавить бота в личку Ильи
-(или `/start` от Ильи). `TELEGRAM_CHAT_ID` остаётся прежним — это chat_id
-самого Ильи (число), куда шлются уточнения.
+Технически: Telegram отдаёт `getUpdates` только одному потребителю на токен.
+На VPS этого потребителя владеет уже работающий `meeting-notary-listener.service`
+(systemd, аптайм с 2026-05-27, обрабатывает Reply Ильи на вечерний блок 📅).
+Поэтому Ф3 не поднимает отдельный процесс — `lib/clarify_worker.py` стал
+библиотекой хендлеров (`process_callback`, `process_text_message`,
+`sweep_timeouts`), которые listener импортирует и вызывает в своём цикле.
 
-### Запуск worker'а
+`meetings_listener.py` теперь принимает оба типа апдейтов:
+- `callback_query` — всегда clarify (inline-кнопки от Ф3).
+- `message` с Reply на 📅 — старый apply-reply flow.
+- `message` без Reply — если есть pending clarify state, передаётся в clarify;
+  иначе — apply-reply (как было).
 
+Periodic sweep таймаутов — каждые 30 секунд в основном цикле listener'а.
+
+### Запуск (на VPS — уже запущен!)
+
+Listener:
 ```bash
-# Ручной запуск (для теста):
-cd /srv/meeting-notary  # на VPS, или ~/Projects/meeting-notary на маке
-set -a; source .env.notary; set +a
-python3 vexa/scripts/notary/tools/run_clarify_worker.py
+sudo systemctl status meeting-notary-listener.service
+# active (running) since 2026-05-27, ловит и apply_reply, и clarify.
+
+# После обновления кода — рестарт обязателен (Type=simple, новый код в памяти не подхватится):
+sudo systemctl restart meeting-notary-listener.service
+sudo journalctl -u meeting-notary-listener -f
 ```
 
-systemd unit (на VPS, путь `/etc/systemd/system/meeting-notary-clarify.service`):
-
-```ini
-[Unit]
-Description=meeting-notary clarify worker (long-poll Telegram callbacks)
-After=network-online.target
-
-[Service]
-Type=simple
-User=dev
-WorkingDirectory=/srv/meeting-notary
-EnvironmentFile=/srv/meeting-notary/.env.notary
-# Создаём pending-dir под dev'ом ДО запуска worker'а — иначе clarify падает
-# на silent OSError при первой записи state-файла (Ход 3 У4/У5/У8).
-ExecStartPre=/bin/mkdir -p /opt/meeting-notary/_pending_clarification
-ExecStart=/home/dev/meeting-notary/venv/bin/python /srv/meeting-notary/vexa/scripts/notary/tools/run_clarify_worker.py
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Установка:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now meeting-notary-clarify.service
-journalctl --user-unit meeting-notary-clarify -f   # либо без --user, см. куда положил unit
-```
+Standalone `tools/run_clarify_worker.py` остался **только для локального
+smoke на маке** (env `TELEGRAM_NOTARIUS_BOT_TOKEN`). В проде на VPS его
+запускать НЕ нужно — listener делает то же самое.
 
 ### Env-флаги Ф3
 
 | Env | Дефолт | Назначение |
 |-----|--------|------------|
-| `CLARIFY_BOT_TOKEN` | _нет_ | Токен ОТДЕЛЬНОГО бота (см. выше). Пусто → clarify не шлётся. |
+| `TELEGRAM_NOTARIUS_BOT_TOKEN` | _из .env.notary_ | Токен `@ilya_protocol_meeting_bot`, тот же что у listener'а. Без него clarify не шлётся. |
 | `ENABLE_LLM_CLARIFY` | `1` | `0`/`false`/`no` отключает clarify целиком. |
 | `CLARIFY_THRESHOLD` | `0.7` | Порог confidence — ниже → cluster идёт на уточнение. |
 | `CLARIFY_TIMEOUT` | `420` | Секунд до `timed_out`. Поздний ответ только обновляет файл. |
-| `CLARIFY_LONG_POLL_TIMEOUT` | `25` | long-poll окно одного `getUpdates`. |
-| `TELEGRAM_CHAT_ID` | _нет_ | chat_id Ильи (число). Шлётся туда. |
+| `CLARIFY_LONG_POLL_TIMEOUT` | `25` | long-poll окно (используется только в standalone-mode). |
+| `TELEGRAM_NOTARIUS_CHAT_ID` / `TELEGRAM_CHAT_ID` | _из .env.notary_ | chat_id Ильи (число). Один из двух обязателен. |
 | `MEETING_NOTARY_PENDING_DIR` | авто | Где хранить state-файлы. |
 
 ## Дисциплина «Опасной тройки» (Ф3)
