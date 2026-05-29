@@ -79,8 +79,25 @@ def case_sent_with_split(tmpdir: Path) -> bool:
     _sent.clear()
     meta_json = tmpdir / "meta_split.json"
     meta_json.write_text(json.dumps({}), encoding="utf-8")
-    # Создаём text >3500 чтобы триггернуть split.
-    proto = ("# Шапка\n\n" + ("текстик " * 80 + "\n---\n") * 8 + "x" * 4000)
+    # Ф1-доработки 29.05: split идёт `split_protocol_smart` на сформированном
+    # TG-тексте (max_len=4096). Сырой протокол со множеством секций — чтобы
+    # текст после `format_protocol_as_tg_text` гарантированно превысил лимит.
+    # Каждая секция = шапка + 30 длинных буллетов; 4 секции = ~6000+ символов.
+    sections = []
+    for i in range(1, 5):
+        bullets = "\n\n".join(
+            f"▪️ Длинный буллет №{j} в секции {i} с подробностями про разные аспекты "
+            f"и контекст обсуждения участников встречи."
+            for j in range(1, 31)
+        )
+        sections.append(f"## {i}) Тема номер {i}\n\n{bullets}\n")
+    proto = (
+        "#протоколвстречи 29.05.2026\n\n"
+        "**Встреча:** Тест разбиения на части.\n\n"
+        "**Длительность:** 30 мин\n\n"
+        "**Участники:** Илья Рыбалка\n\n"
+        "---\n\n" + "\n---\n\n".join(sections)
+    )
     result = L.deliver_protocol(
         meeting_meta={"series": "test-smoke", "date": "2026-05-28"},
         protocol_text=proto,
@@ -97,13 +114,25 @@ def case_sent_with_split(tmpdir: Path) -> bool:
     if len(_sent) != result.get("parts_count"):
         print(f"  [case sent] sent={len(_sent)} != parts={result.get('parts_count')}")
         return False
-    # Проверка: meta.delivered обновлён.
+    # Проверка: meta.delivered обновлён (Ф1-доработки 29.05 — теперь array,
+    # не object; ищем запись для нужного chat_id).
     data = json.loads(meta_json.read_text(encoding="utf-8"))
-    delivered = data.get("delivered") or {}
-    if delivered.get("chat_id") != -1001234567890:
-        print(f"  [case sent] meta.delivered.chat_id неверный: {delivered}")
+    raw_delivered = data.get("delivered")
+    if isinstance(raw_delivered, dict):
+        records = [raw_delivered]
+    elif isinstance(raw_delivered, list):
+        records = [r for r in raw_delivered if isinstance(r, dict)]
+    else:
+        records = []
+    matched = None
+    for rec in reversed(records):
+        if rec.get("chat_id") == -1001234567890:
+            matched = rec
+            break
+    if matched is None:
+        print(f"  [case sent] meta.delivered не содержит chat_id=-1001234567890: {records}")
         return False
-    if len(delivered.get("message_ids") or []) != result.get("parts_count"):
+    if len(matched.get("message_ids") or []) != result.get("parts_count"):
         print(f"  [case sent] message_ids count != parts")
         return False
     return True

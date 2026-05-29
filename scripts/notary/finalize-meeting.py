@@ -460,6 +460,34 @@ def main() -> int:
     session_uid = meta.get("sessionUid") or "unknown"
     wav_path = (meta.get("files") or {}).get("wav")
     if not wav_path or not os.path.exists(wav_path):
+        # Ф1-доработки (2026-05-29): если протокол УЖЕ доставлен (есть запись
+        # в meta.delivered), WAV был легитимно почищен collector'ом — это
+        # «nothing to do», не сбой. Возвращаем rc=10, collector интерпретирует
+        # его как «всё ок, не шлём alert».
+        delivered_raw = meta.get("delivered")
+        has_delivery = False
+        # Н8 хода 1: partial-failure НЕ считается успешной доставкой. Если
+        # WAV пропал и в meta только partial-failure записи — мы НЕ должны
+        # отдавать rc=10 «всё ок», иначе оставшиеся части протокола никогда
+        # не дойдут. Принимаем за успех только записи без decision или с
+        # decision != "partial-failure".
+        def _is_success_record(r):
+            return (
+                isinstance(r, dict)
+                and r.get("message_ids")
+                and r.get("decision") != "partial-failure"
+            )
+        if isinstance(delivered_raw, list):
+            has_delivery = any(_is_success_record(r) for r in delivered_raw)
+        elif isinstance(delivered_raw, dict):
+            has_delivery = _is_success_record(delivered_raw)
+        if has_delivery:
+            log.info(
+                "WAV отсутствует (meta.files.wav=%s) И meta.delivered непустой — "
+                "nothing to do, exit rc=10 (no alert)",
+                wav_path,
+            )
+            return 10
         log.error("WAV not found (meta.files.wav=%s)", wav_path)
         return 3
     participants = meta.get("participants") or []
@@ -814,16 +842,20 @@ def main() -> int:
         except Exception as e:
             log.warning("bench-prod log write failed: %s", e)
 
-    # 5. keep_audio.
+    # 5. WAV cleanup перенесён в collector (Ф1-доработки 2026-05-29).
+    # Раньше: finalize удалял WAV здесь, до подтверждения доставки в TG.
+    # Сейчас: WAV живёт до тех пор, пока collector не убедится, что
+    #   (а) `.md` лёг в MEETINGS_DIR; (б) TG-доставка прошла (`delivery.status
+    #       in {sent, skipped}` в stdout JSON).
+    # Это даёт возможность безболезненно перезапустить finalize при сбое
+    # доставки. См. _finalize_and_collect в collector.py.
     keep_audio_from_meta = bool(meta.get("keepAudio") or meta.get("keep_audio"))
-    if args.keep_audio or keep_audio_from_meta:
-        log.info("keep_audio=true — WAV сохраняется")
-    else:
-        try:
-            os.unlink(wav_path)
-            log.info("WAV удалён (default-удаление аудио после транскрипции)")
-        except Exception as e:
-            log.warning("Не удалось удалить WAV %s: %s", wav_path, e)
+    log.info(
+        "WAV cleanup decision deferred to collector (keep_audio_flag=%s, "
+        "delivery_status=%s)",
+        bool(args.keep_audio or keep_audio_from_meta),
+        delivery_result.get("status"),
+    )
 
     # 5.1. Если этот sid был в _failed/ — успешная финализация значит retry прошёл.
     sid_files = list(_failed_dir().glob(f"{session_uid}.*")) if _failed_dir().exists() else []

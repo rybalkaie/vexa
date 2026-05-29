@@ -59,6 +59,7 @@ from .claude_cli import (
     call_claude_print,
 )
 from . import clarify_state
+from . import protocol_to_tg
 from . import telegram_api
 
 
@@ -688,18 +689,26 @@ def _build_clarify_message_text(
     series: str,
     date_str: str,
     unclear_clusters: dict[str, dict],
+    *,
+    resolved_names: Optional[list[str]] = None,
 ) -> str:
     """Markdown-ish текст сообщения для Ильи. Telegram parse_mode НЕ используем,
     чтобы не залипнуть на эскейпинге символов в именах/репликах.
+
+    `resolved_names` — кто уже определён в этой встрече. Добавляется первой
+    строкой («уже определены: Илья, Михаил»), чтобы Илья видел контекст и
+    не путался при ответе про оставшиеся cluster'ы.
     """
     series = series or "—"
     n_clusters = len(unclear_clusters)
     suffix = "" if n_clusters == 1 else ("а" if 2 <= n_clusters <= 4 else "ов")
     lines: list[str] = [
         f"{CLARIFY_MSG_PREFIX} Встреча «{series}» от {date_str}",
-        f"Нужны имена: {n_clusters} спикер{suffix}.",
-        "",
     ]
+    if resolved_names:
+        lines.append("Уже определены: " + ", ".join(resolved_names) + ".")
+    lines.append(f"Нужны имена: {n_clusters} спикер{suffix}.")
+    lines.append("")
     for cluster_key, data in unclear_clusters.items():
         speaker_label = data.get("speaker_label_in_md", cluster_key)
         confidence = data.get("confidence")
@@ -810,29 +819,48 @@ def clarify_speakers_via_telegram(
         for idx, cluster_key in enumerate(clusters_in_md)
     }
 
+    # Ф1-доработки (бывшая Ф7 INBOX#7): гейт clarify по «есть имя».
+    # Раньше clarify шёл и на low-confidence (имя есть, но conf<threshold) —
+    # это давало false-positive clarify на встречах вроде 29.05, где все
+    # имена резолвлены, но LLM не дотянул до 0.7. Владелец принял: clarify
+    # шлём ТОЛЬКО на полностью unresolved cluster'ы (`name is None`).
+    # Low-conf клиента не дёргает; имя в `<date>.md` уже подставлено через
+    # `_apply_clarify_mapping_to_transcript` (см. план 28.05 Ф3) — для
+    # ситуации «решил оспорить low-conf» есть отдельный путь correction.
     unclear: dict[str, dict] = {}
+    resolved_names_ordered: list[str] = []
+    seen_resolved: set[str] = set()
     for cluster_key in clusters_in_md:
         name = cluster_to_name.get(cluster_key)
         if name is None:
-            # Полностью неразрешённый — точно нужен clarify.
             unclear[cluster_key] = {
                 "speaker_label_in_md": cluster_to_human_label[cluster_key],
                 "confidence": None,
             }
             continue
-        conf = speaker_confidence.get(cluster_key)
-        if conf is not None and conf < threshold:
-            # Имя есть, но LLM сам помечен «не уверен».
-            unclear[cluster_key] = {
-                "speaker_label_in_md": cluster_to_human_label[cluster_key],
-                "confidence": conf,
-                "current_guess": name,
-            }
+        # Имя есть — собираем в список «уже определены». low-conf явно
+        # игнорируем (см. комментарий выше). Порядок — как в clusters_in_md.
+        if name not in seen_resolved:
+            seen_resolved.add(name)
+            resolved_names_ordered.append(name)
+
+    # Логируем для аудита: что именно сэкономили low-conf-уведомлений.
+    suppressed_low_conf = 0
+    if threshold > 0:
+        for cluster_key, name in cluster_to_name.items():
+            if cluster_key not in clusters_in_md:
+                continue
+            if cluster_key in unclear:
+                continue
+            conf = speaker_confidence.get(cluster_key)
+            if conf is not None and conf < threshold:
+                suppressed_low_conf += 1
 
     if not unclear:
         logger.info(
-            "[clarify] meeting=%s nothing to clarify (threshold=%.2f)",
-            meeting_id, threshold,
+            "[clarify] meeting=%s nothing to clarify "
+            "(all resolved; suppressed_low_conf=%d, threshold=%.2f)",
+            meeting_id, suppressed_low_conf, threshold,
         )
         return None
 
@@ -879,7 +907,10 @@ def clarify_speakers_via_telegram(
     # Сообщение + клавиатура.
     series = meta.get("series") or ""
     date_str = (meta.get("date") or (meta.get("startTs") or "")[:10] or "—")
-    text = _build_clarify_message_text(series, date_str, unclear)
+    text = _build_clarify_message_text(
+        series, date_str, unclear,
+        resolved_names=resolved_names_ordered,
+    )
     cluster_keys_ordered = list(unclear.keys())
     reply_markup = _build_clarify_inline_keyboard(meeting_id, cluster_keys_ordered, unclear)
 
@@ -2510,11 +2541,53 @@ def _read_meta_json(meta_json_path: Path) -> Optional[dict]:
         return None
 
 
-def _update_meta_delivered(meta_json_path: Path, new_delivered: dict) -> bool:
+def _normalize_delivered(raw) -> list[dict]:
+    """Принимает значение `delivered` из meta.json в любом формате,
+    возвращает массив записей (новый формат Ф1).
+
+    Миграция (доработки 2026-05-29): старый формат — `{chat_id, message_ids, at, decision?}`
+    (object), новый — массив таких объектов. При чтении старого формата
+    оборачиваем в одноэлементный массив. Не-dict/не-list игнорируем (None).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        # Старый формат — один объект.
+        return [raw]
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _find_delivery_for_chat(records: list[dict], chat_id: int) -> Optional[dict]:
+    """Ищет последнюю запись доставки для конкретного chat_id."""
+    for rec in reversed(records):
+        if rec.get("chat_id") == chat_id:
+            return rec
+    return None
+
+
+def _update_meta_delivered(
+    meta_json_path: Path,
+    new_record: dict,
+    *,
+    replace_for_chat_id: bool = True,
+) -> bool:
     """Atomic update поля `delivered` в meta.json (read-merge-write).
 
-    `new_delivered` ПОЛНОСТЬЮ заменяет поле `delivered` (caller сам merge'ит
-    history если нужно). Возвращает True на успех.
+    Новый формат (Ф1, 2026-05-29): `delivered` — массив записей вида
+    `{chat_id, message_ids, at[, decision]}`. `new_record` добавляется в
+    конец массива; при `replace_for_chat_id=True` (дефолт) предыдущая
+    запись с тем же chat_id заменяется в-place (используется для частичного
+    delivered, когда чанки отправляются по одному и каждый раз обновляется
+    «прогресс» одной записи).
+
+    Caller'ы, которые хотят сохранить ВСЕ исторические записи (включая старые
+    в тот же chat_id), могут передать `replace_for_chat_id=False`.
+
+    Миграция (УПУ2 доработок 29.05): при чтении старого формата
+    `{chat_id, ...}` оборачиваем в одноэлементный массив через
+    `_normalize_delivered`.
 
     Н10 (цикл5/ход1): exclusive flock на `.{name}.lock`-файле в той же
     директории — защита от race между delivery (finalize) и correction worker'ом
@@ -2536,7 +2609,12 @@ def _update_meta_delivered(meta_json_path: Path, new_delivered: dict) -> bool:
         meta = _read_meta_json(meta_json_path)
         if meta is None:
             meta = {}
-        meta["delivered"] = new_delivered
+        existing = _normalize_delivered(meta.get("delivered"))
+        chat_id = new_record.get("chat_id")
+        if replace_for_chat_id and chat_id is not None:
+            existing = [r for r in existing if r.get("chat_id") != chat_id]
+        existing.append(new_record)
+        meta["delivered"] = existing
         try:
             _atomic_write_text(meta_json_path, json.dumps(meta, ensure_ascii=False, indent=2))
         except OSError as e:
@@ -2724,20 +2802,40 @@ def deliver_protocol(
             "parts_count": 0,
         }
 
-    # Шаг 3: split на части — счётчик parts_count нужен для idempotency check.
-    chunks = telegram_api.split_long_message(protocol_text, max_len=DELIVERY_MAX_LEN)
+    # Шаг 3: форматирование TG-текста + smart-split (Ф1 доработок, 2026-05-29).
+    # Раньше: raw markdown структурного протокола → split_long_message по 3500.
+    # Сейчас: structured `.md` парсится в TG-формат с эмодзи-заголовками
+    # (1️⃣2️⃣✅📌), маркером `•`, хэштегом `#протоколвстречи` на 2-й строке,
+    # участниками «Имя Фамилия» (через people.md) и реальной длительностью
+    # речи (если меta содержит recording.firstSpeechMs — после Ф3 плана).
+    # Split — `split_protocol_smart` по логическим границам секций; никогда
+    # не рвёт буллет/секцию посредине, для `📌 ЗАДАЧИ` доп. разрыв по именам.
+    tg_text = protocol_to_tg.format_protocol_as_tg_text(protocol_text, meeting_meta)
+    chunks = protocol_to_tg.split_protocol_smart(tg_text, max_len=protocol_to_tg.TG_MAX_LEN)
+    if not chunks:
+        return {
+            "status": "error",
+            "chat_id": chat_id,
+            "message_ids": [],
+            "parts_count": 0,
+            "error": "empty TG text after formatting",
+        }
     expected_parts = len(chunks)
 
-    # Шаг 4: idempotency check.
+    # Шаг 4: idempotency check по array-формату `meta.delivered`.
+    # Старый формат `{chat_id, ...}` нормализуется в `[{...}]` через
+    # `_normalize_delivered`. Проверяем доставку для нашего chat_id:
+    # совпало count чанков → skip; partial-failure → skip с warning.
+    # Доставки в другие chat_id не блокируют — позволяет смену
+    # `telegram_chat_id` в watched.yaml без дубля (РИСК5).
     meta = _read_meta_json(meta_json_path) if meta_json_path else None
     if meta:
-        delivered = meta.get("delivered")
-        if isinstance(delivered, dict):
-            d_chat = delivered.get("chat_id")
-            d_msgs = delivered.get("message_ids") or []
-            d_decision = delivered.get("decision")
-            # Полный успех — count совпал.
-            if d_chat == chat_id and isinstance(d_msgs, list) and len(d_msgs) == expected_parts:
+        records = _normalize_delivered(meta.get("delivered"))
+        rec = _find_delivery_for_chat(records, chat_id)
+        if rec is not None:
+            d_msgs = rec.get("message_ids") or []
+            d_decision = rec.get("decision")
+            if isinstance(d_msgs, list) and len(d_msgs) == expected_parts and d_decision != "partial-failure":
                 logger.info(
                     "[delivery] idempotent skip meeting=%s chat_id=%s parts=%d",
                     meeting_sid or "?", chat_id, expected_parts,
@@ -2748,29 +2846,30 @@ def deliver_protocol(
                     "message_ids": list(d_msgs),
                     "parts_count": expected_parts,
                 }
-            # Н1: partial-failure из прошлого прогона. Не перепосылаем уже
-            # отправленное (дубль в группе), а просим Илью разрулить.
-            if (
-                d_chat == chat_id
-                and d_decision == "partial-failure"
-                and isinstance(d_msgs, list)
-                and 0 < len(d_msgs) < expected_parts
-            ):
+            if d_decision == "partial-failure" and isinstance(d_msgs, list) and 0 < len(d_msgs) < expected_parts:
                 logger.warning(
                     "[delivery] partial-failure detected meeting=%s sent=%d/%d — "
                     "skip auto-retry to avoid duplicate parts. Manual recovery: "
                     "clear meta.delivered or use correction command.",
                     meeting_sid or "?", len(d_msgs), expected_parts,
                 )
+                # Н5 хода 1: возвращаем status="partial-skipped", НЕ "skipped" —
+                # collector использует это для решения по cleanup WAV. Чистый
+                # "skipped" означает «idempotent OK» → WAV удаляется. А
+                # partial-skipped НЕ должен триггерить cleanup, иначе теряем
+                # шанс на дозалив оставшихся частей после ручного recovery.
                 return {
-                    "status": "skipped",
+                    "status": "partial-skipped",
                     "chat_id": chat_id,
                     "message_ids": list(d_msgs),
                     "parts_count": expected_parts,
                     "error": "partial-failure-skip",
                 }
 
-    # Шаг 5: отправка.
+    # Шаг 5: отправка. Запись `meta.delivered` идёт ПОСЛЕ каждого успешного
+    # send'а (частичный прогресс), replace-for-chat-id=True — обновляет
+    # существующую запись для этого chat_id (не плодит лог из частичных
+    # доставок одной встречи).
     started = time.monotonic()
     sent_ids: list[int] = []
     for idx, chunk in enumerate(chunks, start=1):
@@ -2781,7 +2880,6 @@ def deliver_protocol(
                 "[delivery] send failed meeting=%s part=%d/%d: %s",
                 meeting_sid or "?", idx, expected_parts, e,
             )
-            # Уже отправленные сохраняем в delivered (частичная доставка).
             if sent_ids and meta_json_path:
                 partial = {
                     "chat_id": chat_id,
@@ -2799,8 +2897,6 @@ def deliver_protocol(
             }
         msg_id = int(result.get("message_id") or 0)
         sent_ids.append(msg_id)
-        # Append после каждой успешной отправки — частичный delivered, чтобы
-        # после рестарта мы не отправили дубль для уже доставленной части.
         if meta_json_path:
             partial = {
                 "chat_id": chat_id,
