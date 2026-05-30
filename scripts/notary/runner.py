@@ -27,6 +27,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,7 @@ from notary.lib.state import (  # noqa: E402
 )
 
 LOG_DIR = Path(os.path.expanduser(
-    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+    os.environ.get("MEETING_NOTARY_LOG_DIR") or "~/Library/Logs/meeting-notary"
 ))
 LOG_FILE = LOG_DIR / "runner.log"
 RUNS_DIR = LOG_DIR / "runs"  # per-meeting stdout/stderr
@@ -60,7 +61,15 @@ BOT_IMAGE = "vexa-bot:notarius-telemost"
 DOCKER_NETWORK = "vexa_vexa"
 TRANSCRIPTS_VOLUME = "/home/dev/meeting-notary/_tmp/transcripts:/transcripts"
 TRANSCRIPTION_URL = "http://172.17.0.1:8083/v1/audio/transcriptions"
+# Ф3 (2026-05-29): live-whisper draft. Дефолт "0" — выключен (на CPU-VPS тонет,
+# финальный протокол собирается из WAV через Speechmatics). Читается из
+# EnvironmentFile=/srv/meeting-notary/.env.notary (см. systemd-юнит runner'а) и
+# пробрасывается боту через -e ниже. =1 включить только при наличии GPU.
+ENABLE_LIVE_DRAFT = os.environ.get("ENABLE_LIVE_DRAFT", "0")
+REDIS_URL = os.environ.get("MEETING_NOTARY_REDIS_URL") or "redis://vexa-redis-1:6379"
 TELEGRAM_BOT_TOKEN_FILE = "/home/dev/meeting-notary/vexa/.env.notary"
+
+LOCAL_DOCKER = os.environ.get("MEETING_NOTARY_LOCAL_DOCKER") == "1"
 
 START_WINDOW_MIN = 5  # min до начала; runner запускает если 0 ≤ delta ≤ 5
 STARTED_GRACE_MIN = 1  # запускаем и если start_at уже наступил, но не более 1 мин назад
@@ -180,17 +189,80 @@ def _candidates(queue: list[dict[str, Any]], now: datetime) -> list[dict[str, An
 
 
 def _is_vexa_running() -> bool:
-    """Проверить через ssh, есть ли активный контейнер с vexa-bot:notarius-telemost."""
-    cmd = ["ssh", SSH_HOST, "docker ps --filter ancestor=" + shlex.quote(BOT_IMAGE) + " --format '{{.ID}}'"]
+    """Проверить, есть ли активный контейнер с vexa-bot:notarius-telemost.
+
+    На маке — через ssh meeting-notary; на VPS (MEETING_NOTARY_LOCAL_DOCKER=1) —
+    напрямую через docker ps без префикса ssh.
+    """
+    if LOCAL_DOCKER:
+        cmd = ["docker", "ps", "--filter", f"ancestor={BOT_IMAGE}", "--format", "{{.ID}}"]
+    else:
+        cmd = ["ssh", SSH_HOST, "docker ps --filter ancestor=" + shlex.quote(BOT_IMAGE) + " --format '{{.ID}}'"]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
-        logger.warning("docker ps на VPS — timeout (считаем что бот не запущен)")
+        logger.warning("docker ps — timeout (считаем что бот не запущен)")
         return False
     if out.returncode != 0:
-        logger.warning("docker ps на VPS rc=%d stderr=%s — считаем что не запущен", out.returncode, out.stderr.strip()[:200])
+        logger.warning("docker ps rc=%d stderr=%s — считаем что не запущен", out.returncode, out.stderr.strip()[:200])
         return False
     return bool(out.stdout.strip())
+
+
+def _verify_container_alive(name: str, log_file: Path, series: str, start_at: str) -> None:
+    """Через 3с после `docker run -d` проверить что контейнер не Exited.
+
+    docker run -d возвращает rc=0 сразу как контейнер создан — ZodError / image-bug
+    может убить процесс через 200мс, rc остаётся 0 на стороне runner. Этот hook
+    ловит ранние exit'ы и пушит алерт + docker logs в run-лог для debug.
+    Лучше дать ложноположительный алерт, чем молча пропустить мёртвого бота.
+    """
+    time.sleep(3)
+    if LOCAL_DOCKER:
+        inspect_cmd = ["docker", "inspect", name, "--format",
+                       "{{.State.Status}}|{{.State.ExitCode}}"]
+    else:
+        inspect_cmd = ["ssh", SSH_HOST,
+                       "docker inspect " + shlex.quote(name) +
+                       " --format '{{.State.Status}}|{{.State.ExitCode}}'"]
+    try:
+        proc = subprocess.run(inspect_cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        logger.warning("docker inspect %s — timeout, считаем что жив", name)
+        return
+    if proc.returncode != 0:
+        logger.warning("docker inspect %s rc=%d, не могу проверить состояние", name, proc.returncode)
+        return
+    status, _, exit_code = (proc.stdout.strip().partition("|"))
+    # exited — упал; created/restarting через 3с = stuck на bootstrap (image pull,
+    # network init, OCI runtime delay). exit_code=137 (SIGKILL) — внешний docker stop
+    # (например ручной smoke), не наш баг — молча игнор.
+    if status not in {"exited", "created", "restarting"}:
+        return
+    if status == "exited" and exit_code == "137":
+        logger.info("Container %s остановлен внешне (SIGKILL exit_code=137) — не алертим", name)
+        return
+    # Контейнер уже Exited / stuck — снимаем логи и алертим
+    logs_cmd = (["docker", "logs", "--tail", "40", name] if LOCAL_DOCKER
+                else ["ssh", SSH_HOST, "docker logs --tail 40 " + shlex.quote(name)])
+    try:
+        logs_proc = subprocess.run(logs_cmd, capture_output=True, text=True, timeout=15)
+        try:
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(f"\n# --- docker inspect: status={status} exit_code={exit_code} ---\n")
+                f.write(f"# --- docker logs --tail 40 {name} ---\n")
+                f.write(logs_proc.stdout or "")
+                f.write(logs_proc.stderr or "")
+        except OSError:
+            pass
+    except subprocess.TimeoutExpired:
+        logger.warning("docker logs %s — timeout", name)
+    push(
+        f"Бот «{series}» (start {start_at}) не живёт через 3с после старта "
+        f"(status={status} exit_code={exit_code}). Лог: {log_file.name}",
+        dedupe=False,
+    )
+    logger.error("Container %s не запустился штатно (status=%s exit_code=%s)", name, status, exit_code)
 
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -207,16 +279,27 @@ def _launch_bot(item: dict[str, Any], now: datetime) -> bool:
     Возвращает True если ssh+docker run отработали успешно (rc=0).
     """
     url = item["url"]
-    series = item.get("series") or item["meeting_id"]
+    # str(): series в норме slug-строка из watched.yaml, но fallback на
+    # item["meeting_id"] теоретически может быть числом. Нормализуем в источнике,
+    # чтобы строкой ушло ВЕЗДЕ: в bot_config["series"] → meta.series у бота, в
+    # docker label, в путь папки серии. Иначе meta.series (JSON-число) и label
+    # (всегда строка) разъехались бы по типу и матч «бот в звонке» в collector'е
+    # (isinstance str) тихо не сработал бы (Н1 цикла Ф4).
+    series = str(item.get("series") or item["meeting_id"])
     start_at = item["start_at"]
     session_uid = _safe_session_uid(item["meeting_id"], start_at)
 
-    # Создаём целевую папку серии на маке (долг Ф4).
-    series_dir = Path(os.path.expanduser(f"~/Projects/me/встречи/{series}"))
-    try:
-        series_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        logger.warning("Не смог создать папку серии %s: %s", series_dir, e)
+    # Создаём целевую папку серии. На маке — мак-путь, на VPS (LOCAL_DOCKER=1)
+    # папка не нужна: collector кладёт .md в /srv/meeting-notary/protocols/<series>,
+    # а на мак притаскивает mirror через rsync.
+    if not LOCAL_DOCKER:
+        series_dir = Path(os.path.expanduser(f"~/Projects/me/встречи/{series}"))
+        try:
+            series_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("Не смог создать папку серии %s: %s", series_dir, e)
+    else:
+        series_dir = Path("/srv/meeting-notary/protocols") / series
 
     bot_config = {
         "platform": "yandex_telemost",
@@ -225,55 +308,109 @@ def _launch_bot(item: dict[str, Any], now: datetime) -> bool:
         "sessionUid": session_uid,
         "language": "ru",
         "task": "transcribe",
+        # Обязательные поля для vexa-bot Zod-схемы (build 2026-05-26+):
+        # redisUrl — Zod-required; meeting_id — docker.js делает required-check после Zod.
+        "redisUrl": REDIS_URL,
+        "meeting_id": int(now.timestamp()),
+        # series + expectedParticipants — для маппинга имён в финализаторе.
+        # camelCase ключи в bot_config, чтобы vexa-bot (TS) читал из BotConfig без конверсии.
+        "series": series,
+        "expectedParticipants": item.get("expected_participants") or [],
     }
 
-    docker_inner = (
-        f"docker run --rm -d "
-        f"--name vexa-notarius-{shlex.quote(session_uid)} "
-        f"--network {shlex.quote(DOCKER_NETWORK)} "
-        f"-v {shlex.quote(TRANSCRIPTS_VOLUME)} "
-        f"-e BOT_CONFIG={shlex.quote(json.dumps(bot_config, ensure_ascii=False))} "
-        f"-e TRANSCRIPTION_SERVICE_URL={shlex.quote(TRANSCRIPTION_URL)} "
-        f"{shlex.quote(BOT_IMAGE)}"
-    )
+    # Ф4 (2026-05-29): docker label'ы для матчинга «бот ещё в звонке» в collector'е.
+    # Раньше collector строил имя контейнера из имени meta-файла
+    # (`vexa-notarius-<date>-tm-<ms>`) и сравнивал с реальным
+    # `vexa-notarius-auto-<meeting_id>-<start>` — никогда не совпадало (баг 4Г),
+    # гейт был мёртв. Теперь collector резолвит контейнер по label
+    # `meeting-notary.series` (надёжный общий ключ meta↔контейнер: sessionUid в meta
+    # = `tm-<ms>` от бота, а session_uid контейнера = `auto-...` от runner — не
+    # связаны; series runner кладёт и в BOT_CONFIG→meta, и сюда в label).
+    # session_uid дублируем в label для дебага. Namespace `meeting-notary.*`.
+    # series уже нормализован к str выше (Н1 цикла Ф4) → meta.series и label
+    # одного типа, матч в collector'е надёжен.
+    labels = {
+        "meeting-notary.role": "notarius",
+        "meeting-notary.series": series,
+        "meeting-notary.sessionUid": session_uid,
+    }
+
+    if LOCAL_DOCKER:
+        label_args: list[str] = []
+        for k, v in labels.items():
+            label_args += ["--label", f"{k}={v}"]
+        docker_cmd = [
+            "docker", "run", "-d",
+            "--name", f"vexa-notarius-{session_uid}",
+            "--network", DOCKER_NETWORK,
+            "-v", TRANSCRIPTS_VOLUME,
+            *label_args,
+            "-e", f"BOT_CONFIG={json.dumps(bot_config, ensure_ascii=False)}",
+            "-e", f"TRANSCRIPTION_SERVICE_URL={TRANSCRIPTION_URL}",
+            "-e", f"ENABLE_LIVE_DRAFT={ENABLE_LIVE_DRAFT}",
+            BOT_IMAGE,
+        ]
+    else:
+        label_flags = " ".join(
+            f"--label {shlex.quote(f'{k}={v}')}" for k, v in labels.items()
+        )
+        docker_inner = (
+            f"docker run -d "
+            f"--name vexa-notarius-{shlex.quote(session_uid)} "
+            f"--network {shlex.quote(DOCKER_NETWORK)} "
+            f"-v {shlex.quote(TRANSCRIPTS_VOLUME)} "
+            f"{label_flags} "
+            f"-e BOT_CONFIG={shlex.quote(json.dumps(bot_config, ensure_ascii=False))} "
+            f"-e TRANSCRIPTION_SERVICE_URL={shlex.quote(TRANSCRIPTION_URL)} "
+            f"-e ENABLE_LIVE_DRAFT={shlex.quote(ENABLE_LIVE_DRAFT)} "
+            f"{shlex.quote(BOT_IMAGE)}"
+        )
+        docker_cmd = ["ssh", SSH_HOST, docker_inner]
 
     log_file = RUNS_DIR / f"{now.strftime('%Y%m%dT%H%M%SZ')}-{item['meeting_id']}.log"
+    mode_hint = "local docker" if LOCAL_DOCKER else "ssh docker run"
     logger.info(
-        "Запуск: meeting=%s event_id=%s start=%s url=%s session=%s log=%s",
-        item["meeting_id"], item["event_id"], start_at, url, session_uid, log_file,
+        "Запуск (%s): meeting=%s event_id=%s start=%s url=%s session=%s log=%s",
+        mode_hint, item["meeting_id"], item["event_id"], start_at, url, session_uid, log_file,
     )
     try:
         with log_file.open("w", encoding="utf-8") as f:
             f.write(f"# Запуск бота {now.isoformat()}\n")
+            f.write(f"# mode={mode_hint}\n")
             f.write(f"# meeting_id={item['meeting_id']}\n")
             f.write(f"# event_id={item['event_id']}\n")
             f.write(f"# start_at={start_at}\n")
             f.write(f"# url={url}\n")
             f.write(f"# session_uid={session_uid}\n")
             f.write(f"# series_dir={series_dir}\n")
-            f.write("# --- ssh stdout/stderr ниже ---\n\n")
+            f.write(f"# --- {mode_hint} stdout/stderr ниже ---\n\n")
             f.flush()
             proc = subprocess.run(
-                ["ssh", SSH_HOST, docker_inner],
+                docker_cmd,
                 stdout=f, stderr=subprocess.STDOUT, timeout=60,
             )
         if proc.returncode != 0:
             push(
                 f"Не смог запустить бот «{series}» (start {start_at}): "
-                f"ssh rc={proc.returncode}. Лог: {log_file.name}",
+                f"{mode_hint} rc={proc.returncode}. Лог: {log_file.name}",
                 dedupe=False,
             )
-            logger.error("ssh docker run rc=%d, см. %s", proc.returncode, log_file)
+            logger.error("%s rc=%d, см. %s", mode_hint, proc.returncode, log_file)
             return False
-        logger.info("ssh docker run OK")
+        logger.info("%s OK", mode_hint)
+        # docker run -d возвращает rc=0 как только контейнер создан, НЕ когда он жив.
+        # Через 3с проверяем State.Status — если уже Exited, бот упал на bootstrap
+        # (ZodError, image-not-found, network-init) и tg-send алертит с docker logs.
+        # На маке (SSH-режим) тоже работает — `ssh meeting-notary docker inspect ...`.
+        _verify_container_alive(f"vexa-notarius-{session_uid}", log_file, series, start_at)
         return True
     except subprocess.TimeoutExpired:
         push(
             f"Не смог запустить бот «{series}» (start {start_at}): "
-            f"ssh timeout 60s. Проверь связь с VPS.",
+            f"{mode_hint} timeout 60s.",
             dedupe=False,
         )
-        logger.error("ssh timeout для %s", item["meeting_id"])
+        logger.error("%s timeout для %s", mode_hint, item["meeting_id"])
         return False
     except Exception as e:  # noqa: BLE001
         push(

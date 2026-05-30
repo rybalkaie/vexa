@@ -30,7 +30,22 @@ import * as path from "path";
 
 const LOG_PREFIX = "[adapter-telemost]";
 const TRANSCRIPT_DIR = process.env.TELEMOST_TRANSCRIPT_DIR || "/transcripts";
-const SILENCE_END_AFTER_MS = 60_000;
+// Ф5 (2026-05-29): chunk-декаплинг записи и присутствия в звонке (Вариант Б
+// владельца). Вместо единого silence-таймаута выхода — две границы тишины:
+//   • CHUNK_SILENCE_PAUSE_MS — тишина дольше этого ПРИОСТАНАВЛИВАЕТ запись:
+//     закрываем текущий chunk_N.wav, но бот ОСТАЁТСЯ в звонке. Новая речь
+//     открывает chunk_(N+1).wav. Режет хвосты тишины в WAV и (с Ф5.3 multi-chunk
+//     finalize) позволяет финализировать части по ходу встречи.
+//   • OUT_OF_CALL_SILENCE_MS — суммарная тишина дольше этого = бот выходит из
+//     звонка целиком (как раньше делал единый silence_20min).
+// Семантика выхода из паузы: пауза наступает на CHUNK_SILENCE_PAUSE_MS (5 мин)
+// тишины; из паузы бот выходит, когда суммарная тишина достигает
+// OUT_OF_CALL_SILENCE_MS (20 мин) — т.е. ещё 15 мин после закрытия chunk'а.
+// Раньше (до Ф5) был единый SILENCE_END_AFTER_MS = 20 мин (а ещё раньше 60s —
+// убивало бота на тихих минутах, см. sales-quality 2026-05-27). Пороги
+// зафиксированы владельцем 2026-05-29.
+const CHUNK_SILENCE_PAUSE_MS = 5 * 60_000; // 5 мин — приостановка записи (chunk close)
+const OUT_OF_CALL_SILENCE_MS = 20 * 60_000; // 20 мин — выход из звонка
 const URL_CHECK_INTERVAL_MS = 3_000;
 const SAMPLE_RATE = 16000;
 
@@ -57,8 +72,11 @@ function transcriptTxtPath(sessionUid: string): string {
   return path.join(TRANSCRIPT_DIR, `${dateStamp()}-${sessionUid}.txt`);
 }
 
-function transcriptWavPath(sessionUid: string): string {
-  return path.join(TRANSCRIPT_DIR, `${dateStamp()}-${sessionUid}.wav`);
+// Ф5: путь к WAV отдельного chunk'а. `stamp` фиксируется один раз на встречу
+// (иначе chunk'и встречи через полночь получат разные date-префиксы и
+// финализатор не сгруппирует их). idx — 1-based.
+function chunkWavPath(stamp: string, sessionUid: string, idx: number): string {
+  return path.join(TRANSCRIPT_DIR, `${stamp}-${sessionUid}.chunk${idx}.wav`);
 }
 
 function metaJsonPath(sessionUid: string): string {
@@ -310,15 +328,33 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
   };
 }
 
+// Ф5: запись об одном chunk'е (фрагменте записи между паузами тишины).
+// Все *Ms — UNIX epoch ms (Date.now()), та же конвенция, что задал Ф3.
+// startTs/endTs — ISO-строки (согласованы с meta.startTs/endTs). Длительность
+// речи chunk'а = lastSpeechMs - firstSpeechMs; compute_duration_label (Ф1)
+// суммирует это по всем chunks[].
+type ChunkRecord = {
+  idx: number;
+  wav: string;
+  startTs: string;
+  firstSpeechMs: number | null;
+  lastSpeechMs: number | null;
+  endTs: string | null;
+  samples: number;
+  durationS: number;
+};
+
 export async function startYandexTelemostRecording(page: Page, botConfig: BotConfig): Promise<void> {
   const sessionUid = botConfig.connectionId || `tm-${Date.now()}`;
   ensureTranscriptDir();
 
-  const wavPath = transcriptWavPath(sessionUid);
+  // Ф5: date-префикс фиксируется ОДИН раз на встречу (см. chunkWavPath) —
+  // иначе chunk'и встречи через полночь разъедутся по префиксам.
+  const stamp = dateStamp();
   const txtPath = transcriptTxtPath(sessionUid);
   const metaPath = metaJsonPath(sessionUid);
 
-  logStep("recording_start", { session: sessionUid, txt: txtPath, wav: wavPath, meta: metaPath });
+  logStep("recording_start", { session: sessionUid, txt: txtPath, meta: metaPath, stamp });
 
   const explicitUrl = botConfig.transcriptionServiceUrl || process.env.TRANSCRIPTION_SERVICE_URL;
   const transcriptionUrl = explicitUrl || "http://172.17.0.1:8083/v1/audio/transcriptions";
@@ -329,23 +365,182 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const language = botConfig.language || "ru";
   const botName = botConfig.botName || "Бот";
 
-  // Full WAV writer — пишем все сэмплы непрерывным потоком.
-  const wavWriter = new WavStreamWriter(wavPath, SAMPLE_RATE);
-  wavWriter.open();
-  logStep("wav_writer_opened", { path: wavPath });
+  // Ф3 (2026-05-29): live-whisper draft по умолчанию ОТКЛЮЧЁН.
+  // На CPU-VPS он тонет (transcribeChain копит сотни 3s-чанков, каждый — POST в
+  // faster-whisper-medium на CPU), заваливает логи строками "whisper failed" и
+  // грузит transcription-service, при этом для финального протокола бесполезен —
+  // протокол собирается из полного WAV через Speechmatics (см. finalize-meeting.py).
+  // Код live-draft НЕ удалён — оставлен на случай GPU-сценария в будущем.
+  // ENABLE_LIVE_DRAFT=1 — включить (только если есть GPU); дефолт "0" — выключить.
+  const liveDraftEnabled = (process.env.ENABLE_LIVE_DRAFT || "0") === "1";
+  logStep("live_draft_flag", { enabled: liveDraftEnabled });
+
+  // Ф5 (2026-05-29): SHA коммита vexa/, из которого СОБРАН образ бота.
+  // Прокидывается build-time через --build-arg GIT_SHA (см. Dockerfile +
+  // Makefile build-bot). Пишется в meta.recording.startedFromCommit — будущий
+  // рассинхрон git↔образ виден сразу из meta (инцидент 29.05: образ silence_20min
+  // vs HEAD silence_60s — был незаметен, ловился только сравнением вручную).
+  // Если build-arg не передан / "unknown" — поле null, не падаем.
+  const rawCommit = process.env.NOTARY_BOT_GIT_SHA;
+  const startedFromCommit = rawCommit && rawCommit !== "unknown" ? rawCommit : null;
+  logStep("bot_image_commit", { startedFromCommit });
 
   // Participants polling — параллельно встрече.
   const participantsPoll = startParticipantsPolling(page, botName);
 
   // Метрики конца встречи.
-  // ВАЖНО: silence-таймер стартует только ПОСЛЕ того как мы услышали первый
-  // не-тихий чанк. До этого считается «стартовое ожидание» с лимитом
-  // noOneJoinedTimeout — это не «встреча идёт в тишине», а «встреча ещё не
-  // началась» (план Ф2: «Встреча идёт» = был хотя бы 1 не-тихий аудио-кадр).
+  // ВАЖНО: silence/pause-таймеры стартуют только ПОСЛЕ первого не-тихого чанка.
+  // До этого работает «стартовое ожидание» с лимитом noOneJoinedTimeout — это
+  // не «встреча идёт в тишине», а «встреча ещё не началась». Стартовая «фора до
+  // первой речи» (meetingStarted) Ф5 НЕ затронута.
   let meetingStarted = false;
   let lastNonSilenceTs = Date.now();
   const startTs = Date.now();
   const noOneJoinedTimeoutMs = botConfig.automaticLeave?.noOneJoinedTimeout ?? 300_000;
+  let endReason = "unknown";
+
+  // Ф5: состояния chunk-декаплинга.
+  //   recording_active        — пишем сэмплы в текущий chunk_N.wav.
+  //   recording_paused_in_call — тишина > CHUNK_SILENCE_PAUSE_MS, writer закрыт,
+  //                              бот ОСТАЁТСЯ в звонке, ждём новой речи (resume)
+  //                              или суммарной тишины > OUT_OF_CALL_SILENCE_MS (выход).
+  // Конвенция *Ms — UNIX epoch ms (Date.now()), та же, что в Ф3 (см. ChunkRecord).
+  type RecState = "recording_active" | "recording_paused_in_call";
+  let recState: RecState = "recording_active";
+  const chunks: ChunkRecord[] = [];
+  let currentChunk: ChunkRecord | null = null;
+  let currentWriter: WavStreamWriter | null = null;
+
+  // Собрать meta-объект из текущего состояния chunks[].
+  const buildMeta = () => {
+    const endTs = Date.now();
+    // Топ-уровневые агрегаты для Ф1 fallback (НЕС1): первый/последний chunk С РЕЧЬЮ
+    // (а не буквально chunks[0]/chunks[-1] — chunk без речи дал бы null и сломал
+    // single-chunk fallback). В нормальном прогоне это и есть first/last chunk.
+    const withSpeech = chunks.filter((c) => c.firstSpeechMs != null && c.lastSpeechMs != null);
+    const topFirst = withSpeech.length ? withSpeech[0].firstSpeechMs : null;
+    const topLast = withSpeech.length ? withSpeech[withSpeech.length - 1].lastSpeechMs : null;
+    const primaryWav = chunks.length ? chunks[0].wav : null;
+    const totalSamples = chunks.reduce((a, c) => a + c.samples, 0);
+    const totalDurationS = chunks.reduce((a, c) => a + c.durationS, 0);
+    return {
+      sessionUid,
+      botName,
+      meetingUrl: botConfig.meetingUrl || null,
+      nativeMeetingId: (botConfig as any).nativeMeetingId || null,
+      series: (botConfig as any).series || null,
+      expectedParticipants: (botConfig as any).expectedParticipants || [],
+      language,
+      startTs: new Date(startTs).toISOString(),
+      endTs: new Date(endTs).toISOString(),
+      durationS: Math.round((endTs - startTs) / 1000),
+      audioDurationS: Math.round(totalDurationS),
+      audioSamples: totalSamples,
+      sampleRate: SAMPLE_RATE,
+      endReason,
+      participants: participantsPoll.getNames(),
+      // ВАЖНО (конфиденциальность Ф3 «опасной тройки»): НЕ кладём содержимое
+      // транскрипта — только структуру/таймстемпы. Имена участников — да.
+      recording: {
+        // Ф5: SHA сборки образа — детект рассинхрона git↔образ из meta.
+        startedFromCommit,
+        // Ф3-конвенция (UNIX epoch ms). Топ-уровень = агрегат по chunks для Ф1
+        // single-chunk fallback; основной источник длительности — chunks[].
+        firstSpeechMs: topFirst,
+        lastSpeechMs: topLast,
+        chunks: chunks.map((c) => ({
+          idx: c.idx,
+          wav: c.wav,
+          startTs: c.startTs,
+          firstSpeechMs: c.firstSpeechMs,
+          lastSpeechMs: c.lastSpeechMs,
+          endTs: c.endTs,
+          durationS: Math.round(c.durationS),
+        })),
+      },
+      files: {
+        // Backward-compat: до Ф5.3 (multi-chunk finalize) финализатор читает
+        // files.wav — указываем на первый chunk. Для классического прогона без
+        // пауз chunk_1 = весь WAV встречи. Multi-chunk → meta.recording.chunks[].
+        wav: primaryWav,
+        draftTxt: txtPath,
+        meta: metaPath,
+      },
+    };
+  };
+
+  const writeMeta = (reason: string) => {
+    try {
+      const meta = buildMeta();
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
+      // 0666 чтобы dev мог удалить/перезаписать с хоста (см. WavStreamWriter.open).
+      try { fs.chmodSync(metaPath, 0o666); } catch {}
+      logStep("meta_written", { path: metaPath, reason, chunks: chunks.length, participants_count: meta.participants.length });
+    } catch (err: any) {
+      log(`${LOG_PREFIX} meta write failed: ${err.message}`);
+    }
+  };
+
+  // Открыть новый chunk_(N+1).wav и сделать его текущим (recording_active).
+  // Возвращает созданную запись (TS не отслеживает мутацию currentChunk через
+  // замыкание — вызывающий использует возврат, а не суженный до null currentChunk).
+  const openChunk = (nowMs: number): ChunkRecord => {
+    const idx = chunks.length + 1;
+    const wav = chunkWavPath(stamp, sessionUid, idx);
+    const writer = new WavStreamWriter(wav, SAMPLE_RATE);
+    writer.open();
+    const rec: ChunkRecord = {
+      idx,
+      wav,
+      startTs: new Date(nowMs).toISOString(),
+      firstSpeechMs: null,
+      lastSpeechMs: null,
+      endTs: null,
+      samples: 0,
+      durationS: 0,
+    };
+    chunks.push(rec);
+    currentChunk = rec;
+    currentWriter = writer;
+    recState = "recording_active";
+    logStep("chunk_opened", { idx, wav });
+    return rec;
+  };
+
+  // Закрыть текущий chunk: дописать длины WAV, зафиксировать endTs/samples,
+  // эмитить «событие» chunk_closed (инкрементальная meta — внешний poll/Ф5.3
+  // увидит закрытый chunk при живом боте; collector гейтит finalize по
+  // live-контейнеру (Ф4), так что преждевременной финализации не будет).
+  const closeChunk = (nowMs: number, reason: string) => {
+    if (currentWriter && currentWriter.isOpen()) {
+      let stats = { samples: 0, durationS: 0 };
+      try {
+        stats = currentWriter.close();
+      } catch (err: any) {
+        log(`${LOG_PREFIX} chunk close failed: ${err.message}`);
+      }
+      if (currentChunk) {
+        currentChunk.endTs = new Date(nowMs).toISOString();
+        currentChunk.samples = stats.samples;
+        currentChunk.durationS = stats.durationS;
+      }
+      logStep("chunk_closed", {
+        idx: currentChunk?.idx,
+        reason,
+        samples: stats.samples,
+        duration_s: stats.durationS,
+        firstSpeechMs: currentChunk?.firstSpeechMs,
+        lastSpeechMs: currentChunk?.lastSpeechMs,
+      });
+    }
+    currentWriter = null;
+    writeMeta(`chunk_closed:${reason}`);
+  };
+
+  // Открываем chunk_1 сразу — ловим «фору до первой речи» (silence/pause-таймеры
+  // стартуют только после meetingStarted, см. checkLoop).
+  const firstChunk = openChunk(startTs);
+  logStep("wav_writer_opened", { path: firstChunk.wav });
 
   // FIFO promise-chain для draft-транскрипции (порядок строк в .txt).
   let transcribeChain: Promise<void> = Promise.resolve();
@@ -362,24 +557,42 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       const bin = Buffer.from(b64, "base64");
       const samples = new Float32Array(bin.buffer, bin.byteOffset, bin.byteLength / 4);
 
-      // 2) Пишем в полный WAV ВСЕ сэмплы — и тихие, и шумные. Без этого
-      //    pyannote-диарезация смотрит обрезанное аудио и таймкоды поедут.
-      try {
-        wavWriter.writeSamples(samples);
-      } catch (err: any) {
-        log(`${LOG_PREFIX} wav write failed: ${err.message}`);
-      }
-
-      // 3) Метрики «встреча идёт».
+      // 2) Речь + границы + resume из паузы. ВАЖНО: resume-транзишн ДО writeSamples,
+      //    чтобы первый не-тихий кадр после паузы попал уже в новый chunk_(N+1).
       if (!isSilent) {
         lastNonSilenceTs = nowMs;
+        if (recState === "recording_paused_in_call") {
+          // Возобновление записи новым chunk'ом.
+          openChunk(nowMs);
+          logStep("recording_resumed", { idx: currentChunk?.idx });
+        }
+        if (currentChunk) {
+          if (currentChunk.firstSpeechMs == null) currentChunk.firstSpeechMs = nowMs;
+          currentChunk.lastSpeechMs = nowMs;
+        }
         if (!meetingStarted) {
           meetingStarted = true;
           logStep("meeting_started_first_audio");
         }
       }
 
+      // 3) Пишем сэмплы только когда активны (в паузе writer закрыт). Пишем И
+      //    тихие, и шумные кадры — без этого pyannote-диарезация смотрит
+      //    обрезанное аудио и таймкоды поедут.
+      if (recState === "recording_active" && currentWriter && currentWriter.isOpen()) {
+        try {
+          currentWriter.writeSamples(samples);
+        } catch (err: any) {
+          log(`${LOG_PREFIX} wav write failed: ${err.message}`);
+        }
+      }
+
       // 4) Стримовая транскрипция (draft) — только не-тихие чанки.
+      // Ф3: при ENABLE_LIVE_DRAFT=0 (дефолт) live-whisper не зовётся вообще —
+      // transcribeChunk не вызывается, сетевые запросы к TRANSCRIPTION_SERVICE_URL
+      // не идут, transcribeChain не растёт. WAV (шаг 3) и метрики (шаг 2) при
+      // этом пишутся как обычно — полный WAV для Speechmatics не страдает.
+      if (!liveDraftEnabled) return;
       if (isSilent) return;
 
       transcribeChain = transcribeChain.then(async () => {
@@ -406,15 +619,13 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const stopCapture = await setupBrowserCapture(page);
   logStep("browser_capture_initialized");
 
-  let endReason = "unknown";
-
   // Все cleanup'ы в finally — иначе при исключении в main Promise
   // (например, в setInterval/setupBrowserCapture) WAV-fd останется
   // открытым в долгоживущем runner-процессе Ф5+ (в Ф3 docker run --rm
   // умирает и kernel закрывает fd — не утечка, но в Ф5 будет).
   try {
   // Метрики и завершение работы — Promise, который resolve'ится при окончании встречи.
-  await new Promise<void>(async (resolve, reject) => {
+  await new Promise<void>(async (resolve) => {
     const checkLoop = async () => {
       try {
         const now = Date.now();
@@ -439,12 +650,23 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           return;
         }
 
-        // Silence check (только после meetingStarted)
-        if (now - lastNonSilenceTs >= SILENCE_END_AFTER_MS) {
-          endReason = "silence_60s";
-          logStep("end_silence_60s", { silent_for_ms: now - lastNonSilenceTs });
-          clearInterval(timer);
-          return resolve();
+        // Ф5 chunk-декаплинг: две границы тишины.
+        const silentForMs = now - lastNonSilenceTs;
+        if (recState === "recording_active") {
+          // Тишина > порога приостановки → закрыть chunk, остаться в звонке.
+          if (silentForMs >= CHUNK_SILENCE_PAUSE_MS) {
+            closeChunk(now, "silence_pause");
+            recState = "recording_paused_in_call";
+            logStep("recording_paused", { silent_for_ms: silentForMs, chunks: chunks.length });
+          }
+        } else {
+          // recording_paused_in_call: суммарная тишина > выходного порога → выход.
+          if (silentForMs >= OUT_OF_CALL_SILENCE_MS) {
+            endReason = "silence_out_of_call";
+            logStep("end_silence_out_of_call", { silent_for_ms: silentForMs });
+            clearInterval(timer);
+            return resolve();
+          }
         }
       } catch {
         // page может закрыться — не fatal
@@ -464,7 +686,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   } finally {
     // ВАЖНО: cleanup в finally — даже если main Promise бросил.
     // Порядок: сначала остановить polling (он мог быть в середине открытия панели),
-    // потом stopCapture, потом close WAV.
+    // потом stopCapture, потом close текущего chunk'а + final_exit meta.
     try {
       participantsPoll.stop();
     } catch (err: any) {
@@ -476,53 +698,17 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       log(`${LOG_PREFIX} stop capture failed: ${err.message}`);
     }
 
-    // Закрываем WAV — обновляются длины в заголовке.
-    let wavStats = { samples: 0, durationS: 0 };
-    try {
-      wavStats = wavWriter.close();
-      logStep("wav_writer_closed", { samples: wavStats.samples, duration_s: wavStats.durationS });
-    } catch (err: any) {
-      log(`${LOG_PREFIX} wav close failed: ${err.message}`);
-    }
-
-    // Пишем meta.json. ВАЖНО: НЕ кладём в meta содержимое транскрипта — только пути.
-    // Это правило конфиденциальности Ф3 «опасной тройки»: транскрипт = личные данные,
-    // metadata = структура. Имена участников — да, они оправдают существование маппинга.
-    const endTs = Date.now();
-    const meta = {
-      sessionUid,
-      botName,
-      meetingUrl: botConfig.meetingUrl || null,
-      nativeMeetingId: (botConfig as any).nativeMeetingId || null,
-      language,
-      startTs: new Date(startTs).toISOString(),
-      endTs: new Date(endTs).toISOString(),
-      durationS: Math.round((endTs - startTs) / 1000),
-      audioDurationS: Math.round(wavStats.durationS),
-      audioSamples: wavStats.samples,
-      sampleRate: SAMPLE_RATE,
-      endReason,
-      participants: participantsPoll.getNames(),
-      files: {
-        wav: wavPath,
-        draftTxt: txtPath,
-        meta: metaPath,
-      },
-    };
-    try {
-      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
-      // 0666 чтобы dev мог удалить/перезаписать с хоста (см. WavStreamWriter.open).
-      try { fs.chmodSync(metaPath, 0o666); } catch {}
-      logStep("meta_written", { path: metaPath, participants_count: meta.participants.length });
-    } catch (err: any) {
-      log(`${LOG_PREFIX} meta write failed: ${err.message}`);
-    }
+    // final_exit «событие». closeChunk само-защищён (закрывает writer только
+    // если он открыт) и ВСЕГДА пишет финальную meta с полным chunks[]. Если вышли
+    // из паузы (writer уже закрыт) — chunk не трогается, пишется только meta.
+    const closeTs = Date.now();
+    closeChunk(closeTs, "final_exit");
 
     logStep("recording_done", {
-      wav: wavPath,
-      duration_s: wavStats.durationS,
+      chunks: chunks.length,
       end_reason: endReason,
-      participants_count: meta.participants.length,
+      participants_count: participantsPoll.getNames().length,
+      startedFromCommit,
     });
   }
 }

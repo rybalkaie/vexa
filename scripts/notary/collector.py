@@ -55,6 +55,11 @@ VPS_VENV = "~/meeting-notary/venv"  # venv с pyannote/torch/whisper (созда
 
 LOCAL_FINALIZE = os.environ.get("MEETING_NOTARY_LOCAL_FINALIZE") == "1"
 
+# Ф4: матчинг «бот ещё в звонке». Контейнеры нотариуса именуются
+# `vexa-notarius-*`; runner ставит на них label `meeting-notary.series=<series>`.
+NOTARIUS_NAME_PREFIX = "vexa-notarius-"
+SERIES_LABEL = "meeting-notary.series"
+
 
 def _target_md_for_session(series: str, date_str: str, session_uid: str) -> Path:
     """Единая точка вычисления пути к .md (Ф7 синхронизация на _target_path).
@@ -168,22 +173,25 @@ def main() -> int:
     logger.info("Candidate sessions (%d): %s", len(pending), pending)
 
     # 2. Для каждого — проверить, что бот завершился (контейнер ушёл).
-    try:
-        ps_proc = ssh_capture(
-            f"docker ps --format '{{{{.Names}}}}' --filter 'name=vexa-notarius-'",
-            timeout=20,
-        )
-        active = set(s.strip() for s in (ps_proc.stdout or "").splitlines() if s.strip())
-    except subprocess.TimeoutExpired:
-        logger.warning("docker ps timeout — считаем что нет активных")
-        active = set()
+    # ИСТОРИЯ БАГА 4Г (Ф4-доработки 29.05): раньше тут строилось
+    # `cont_name = vexa-notarius-{sid}`, где `sid` — имя meta-файла на диске
+    # (`<date>-tm-<ms>`, см. recording.ts:318 `tm-${Date.now()}`). Реальное имя
+    # контейнера — `vexa-notarius-auto-<meeting_id>-<start>` (runner._safe_session_uid).
+    # Они НИКОГДА не совпадали → гейт «бот ещё в звонке» был мёртв, и при живом
+    # боте collector мог запустить finalize на ещё дописываемом WAV (катастрофа
+    # для Ф5 chunk-декаплинга, где meta может появиться при активной записи).
+    # Сейчас резолвим контейнер по docker label `meeting-notary.series`, который
+    # runner ставит при старте (sessionUid в meta `tm-...` ≠ session_uid
+    # контейнера `auto-...` — не связаны; series — единственный надёжный общий
+    # ключ, runner пишет его и в BOT_CONFIG→meta, и в label). См. handoff Ф4.
+    running_index = _running_notarius_index()
 
     for sid in pending:
-        cont_name = f"vexa-notarius-{sid}"
-        if cont_name in active:
-            logger.info("Скип %s — контейнер ещё активен", sid)
-            continue
         meta = _read_meta_obj(sid)
+        running = _find_running_container_for(meta, running_index)
+        if running:
+            logger.info("Скип %s — бот ещё в звонке (контейнер %s)", sid, running)
+            continue
         # Idempotency-guard (Ф1-доработки 29.05): если meta.delivered непустой,
         # протокол уже доставлен — finalize запускать НЕ нужно. Также
         # пробуем убрать WAV, если он ещё на диске (cleanup отложенный из
@@ -306,6 +314,73 @@ def _delivery_done(meta: dict) -> bool:
         if msgs and decision != "partial-failure":
             return True
     return False
+
+
+def _running_notarius_index() -> dict[str, Any]:
+    """Снимок живых контейнеров нотариуса за один `docker ps`.
+
+    Возвращает {"by_series": {series: [names]}, "unlabeled": [names]}.
+
+    Фильтруем по ИМЕНИ (`vexa-notarius-*`), а не по label — чтобы поймать и
+    legacy-контейнеры без наших Ф4-label'ов (запущенные до деплоя Ф4). У каждого
+    тащим label `meeting-notary.series` (пусто = legacy/без проводки). При
+    timeout / ошибке docker считаем, что активных нет (как и старая логика).
+    """
+    fmt = '{{.Names}}\t{{.Label "' + SERIES_LABEL + '"}}'
+    by_series: dict[str, list[str]] = {}
+    unlabeled: list[str] = []
+    result = {"by_series": by_series, "unlabeled": unlabeled}
+    cmd = f"docker ps --filter name={NOTARIUS_NAME_PREFIX} --format {shlex.quote(fmt)}"
+    try:
+        ps_proc = ssh_capture(cmd, timeout=20)
+    except subprocess.TimeoutExpired:
+        logger.warning("docker ps timeout — считаем что нет активных ботов")
+        return result
+    if ps_proc.returncode != 0:
+        logger.warning(
+            "docker ps rc=%d stderr=%s — считаем что нет активных",
+            ps_proc.returncode, (ps_proc.stderr or "").strip()[:200],
+        )
+        return result
+    for line in (ps_proc.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        name, _, series = line.partition("\t")
+        name = name.strip()
+        series = series.strip()
+        if not name:
+            continue
+        if series:
+            by_series.setdefault(series, []).append(name)
+        else:
+            unlabeled.append(name)
+    return result
+
+
+def _find_running_container_for(meta: dict | None, running_index: dict[str, Any]) -> str | None:
+    """Имя живого контейнера-бота для этой встречи, либо None (Ф4, баг 4Г).
+
+    Резолв через docker label `meeting-notary.series` (ставит runner), а НЕ через
+    имя meta-файла. Ключ сопоставления — `series`: meta.sessionUid (`tm-<ms>`,
+    генерит бот recording.ts:318) и session_uid контейнера (`auto-<id>-<start>`,
+    runner) не связаны; единственный надёжный общий ключ — series (runner пишет
+    его и в BOT_CONFIG→meta, и в label). Обоснование выбора series вместо
+    sessionUid — handoff Ф4.
+
+    Консервативная страховка: если жив legacy-контейнер без наших label'ов
+    (transition-окно до деплоя Ф4) и точечного совпадения по series нет — вернём
+    его имя. Инвариант runner: параллельных Vexa-сессий нет (`_is_vexa_running`),
+    значит любой живой бот = идёт запись → лучше отложить finalize на тик, чем
+    запустить его на пишущемся WAV.
+    """
+    by_series = running_index.get("by_series") or {}
+    unlabeled = running_index.get("unlabeled") or []
+    series = meta.get("series") if isinstance(meta, dict) else None
+    if isinstance(series, str) and series and by_series.get(series):
+        return by_series[series][0]
+    if unlabeled:
+        return unlabeled[0]
+    return None
 
 
 def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:

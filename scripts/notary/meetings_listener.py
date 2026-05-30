@@ -605,6 +605,15 @@ def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -
     except Exception as e:  # noqa: BLE001
         logger.exception("task_clarify_worker.process_callback failed: %s", e)
 
+    # Ф8 vocab (vocab:approve_all/reject_all) — авто-словарь
+    try:
+        from notary.lib import vocab_worker  # noqa: PLC0415
+        handled = vocab_worker.process_callback(cbq, pending_root, token)
+        if handled:
+            return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("vocab_worker.process_callback failed: %s", e)
+
     # Ф3 clarify спикеров
     try:
         from notary.lib import clarify_worker  # noqa: PLC0415
@@ -640,6 +649,14 @@ def sweep_clarify_timeouts() -> None:
             logger.info("delivery sweep: marked %d as timed_out", n3)
     except Exception as e:  # noqa: BLE001
         logger.exception("delivery sweep failed: %s", e)
+    # Ф8 vocab sweep — запросы старше 48ч авто-отклоняются (свои state в vocab/).
+    try:
+        from notary.lib import vocab_worker  # noqa: PLC0415
+        n4 = vocab_worker.sweep_timeouts(pending_root)
+        if n4:
+            logger.info("vocab sweep: %d просроченных авто-отклонено", n4)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("vocab sweep failed: %s", e)
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:

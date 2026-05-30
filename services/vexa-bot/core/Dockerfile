@@ -91,5 +91,14 @@ RUN chmod +x /app/entrypoint.sh
 # Expose DISPLAY port for headful browser operations (adjust as needed)
 ENV DISPLAY=:99
 
+# meeting-notary Ф5 (2026-05-29): SHA коммита vexa/, из которого собран образ.
+# Прокидывается build-time: docker build --build-arg GIT_SHA=<short-sha[-dirty]> ...
+# (см. Makefile цель build-bot). recording.ts читает NOTARY_BOT_GIT_SHA и пишет в
+# meta.recording.startedFromCommit → рассинхрон git↔образ виден прямо из meta.json.
+# Дефолт "unknown" (если build-arg не передан — recording.ts трактует как null,
+# не падает). Инцидент 29.05: образ silence_20min vs HEAD silence_60s был незаметен.
+ARG GIT_SHA=unknown
+ENV NOTARY_BOT_GIT_SHA=$GIT_SHA
+
 # Set the command to run our entrypoint script
 CMD ["/app/entrypoint.sh"]

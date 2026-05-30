@@ -780,6 +780,38 @@ def main() -> int:
                 log.warning("[delivery] failed (non-fatal): %s", e)
                 delivery_result = {"status": "error", "error": str(e)}
 
+    # 4.0.3b. Ф8 LLM-proposer: кандидаты в Speechmatics vocab по стенограмме.
+    # Зовём ТОЛЬКО после успешной TG-доставки протокола (status in {sent,
+    # skipped}) — иначе нет смысла тратить вызов Claude. Best-effort (РИСК4):
+    # любой сбой proposer'а внутри конвертируется в статус, не бросает; здесь
+    # дополнительный try на случай ImportError пакета. НЕ блокирует pipeline.
+    # Гейт DISABLE_AUTO_VOCAB обрабатывается внутри propose(). До готовности
+    # applier'а (Шаг 8.3) кандидаты только логируются и складываются в stash —
+    # держи DISABLE_AUTO_VOCAB=1 в проде, пока applier не задеплоен.
+    if delivery_result.get("status") in {"sent", "skipped"} and md_path.is_file():
+        try:
+            from notary.auto_vocab import llm_proposer  # noqa: PLC0415
+            proposer_meta = dict(meta)
+            proposer_meta["date"] = date_part
+            pr = llm_proposer.propose_from_meta(
+                proposer_meta, md_path, session_uid=session_uid
+            )
+            log.info(
+                "[auto-vocab] proposer: status=%s candidates=%d cost=$%.4f",
+                pr.get("status"), len(pr.get("candidates", [])), pr.get("cost_usd", 0.0),
+            )
+            # Шаг 8.3: применить кандидатов — high→авто-словарь+silent TG,
+            # low→TG-запрос с кнопками. Best-effort, не блокирует.
+            if pr.get("status") == "ok" and pr.get("candidates"):
+                from notary.auto_vocab import applier  # noqa: PLC0415
+                ar = applier.apply_proposal(session_uid, proposer_meta)
+                log.info(
+                    "[auto-vocab] applier: status=%s high+%d low→TG %d",
+                    ar.get("status"), len(ar.get("high_added", [])), ar.get("low_sent", 0),
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("[auto-vocab] proposer/applier failed (non-fatal): %s", e)
+
     # 4.0.4. Ф7: обновление INDEX.md в корне ~/Projects/me/встречи/.
     # Без LLM, простой os.walk. Best-effort: не валим финализацию из-за индекса.
     # Гейт ENABLE_VSTRECHI_INDEX (дефолт ON).

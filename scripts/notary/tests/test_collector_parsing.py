@@ -147,5 +147,58 @@ class TestDeliveryDone(unittest.TestCase):
         }))
 
 
+class TestFindRunningContainerFor(unittest.TestCase):
+    """Ф4 (баг 4Г): матчинг «бот ещё в звонке» по label `meeting-notary.series`.
+
+    Чистая логика над снимком `_running_notarius_index` — без вызова docker.
+    """
+
+    def test_match_by_series(self):
+        idx = {"by_series": {"weekly-sales": ["vexa-notarius-auto-1-x"]}, "unlabeled": []}
+        self.assertEqual(
+            collector._find_running_container_for({"series": "weekly-sales"}, idx),
+            "vexa-notarius-auto-1-x",
+        )
+
+    def test_no_match_other_series_finalizes(self):
+        """Жив бот другой серии → для этой meta finalize НЕ блокируется."""
+        idx = {"by_series": {"weekly-sales": ["vexa-notarius-auto-1-x"]}, "unlabeled": []}
+        self.assertIsNone(
+            collector._find_running_container_for({"series": "oneoff-foo"}, idx),
+        )
+
+    def test_no_running_containers(self):
+        idx = {"by_series": {}, "unlabeled": []}
+        self.assertIsNone(
+            collector._find_running_container_for({"series": "any"}, idx),
+        )
+
+    def test_unlabeled_legacy_is_conservative(self):
+        """Legacy-контейнер без наших label'ов (transition) → перестраховка."""
+        idx = {"by_series": {}, "unlabeled": ["vexa-notarius-legacy"]}
+        self.assertEqual(
+            collector._find_running_container_for({"series": "any"}, idx),
+            "vexa-notarius-legacy",
+        )
+
+    def test_meta_without_series_falls_back_to_unlabeled(self):
+        idx = {"by_series": {"s": ["c1"]}, "unlabeled": ["vexa-notarius-legacy"]}
+        # meta без series: точечно сопоставить нельзя; если есть unlabeled — скип.
+        self.assertEqual(
+            collector._find_running_container_for({}, idx),
+            "vexa-notarius-legacy",
+        )
+
+    def test_meta_without_series_but_only_labeled_running_finalizes(self):
+        """meta без series + живы только label'нутые боты других серий → finalize OK
+        (их WAV закрыт, meta существует; live-бот — другая сессия)."""
+        idx = {"by_series": {"s": ["c1"]}, "unlabeled": []}
+        self.assertIsNone(collector._find_running_container_for({}, idx))
+
+    def test_meta_none(self):
+        idx = {"by_series": {}, "unlabeled": []}
+        self.assertIsNone(collector._find_running_container_for(None, idx))
+
+
 if __name__ == "__main__":
     unittest.main()
