@@ -651,7 +651,7 @@ def sweep_clarify_timeouts() -> None:
         from notary.lib import clarify_worker  # noqa: PLC0415
         n = clarify_worker.sweep_timeouts(pending_root)
         if n:
-            logger.info("clarify sweep: marked %d as timed_out", n)
+            logger.info("clarify sweep: %d изменений (pending→timed_out и timed_out→archived)", n)
     except Exception as e:  # noqa: BLE001
         logger.exception("clarify sweep failed: %s", e)
     # Ф5 task_clarify sweep — отдельный модуль, отдельные state-файлы.

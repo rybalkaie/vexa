@@ -134,6 +134,57 @@ class TestReplyMatching(unittest.TestCase):
         self.assertIn("открытых уточнений", self.fake_tg.sent[-1][1])
 
 
+# ───────── Anti-misattribution (ход1 цикла5): reply на ЗАКРЫТЫЙ вопрос ─────────
+
+class TestReplyToClosedQuestion(unittest.TestCase):
+    """Reply на уже закрытый (resolved/archived) вопрос НЕ применяется по count
+    к другой открытой встрече — иначе ответ про встречу A попал бы во встречу B."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.captured: list[tuple] = []
+
+        def _capture(text, state, bot_token, reply_chat_id, pending_root, *, is_late):
+            self.captured.append((state["meeting_id"], is_late))
+
+        self.apply_patch = mock.patch.object(clarify_worker, "_try_apply_text_to_state", _capture)
+        self.fake_tg = _FakeTelegram()
+        self.tg_patch = mock.patch.object(clarify_worker, "telegram_api", self.fake_tg)
+        self.apply_patch.start()
+        self.tg_patch.start()
+
+    def tearDown(self):
+        self.apply_patch.stop()
+        self.tg_patch.stop()
+        self.tmp.cleanup()
+
+    def _msg(self, reply_mid):
+        return {
+            "text": "Спикер 3 = Дарья",
+            "from": {"id": 42},
+            "chat": {"id": 42},
+            "reply_to_message": {"message_id": reply_mid},
+        }
+
+    def test_reply_to_resolved_not_applied_to_single_other_pending(self):
+        """A=resolved (msg 100), B=единственный pending (msg 200). Reply на 100
+        НЕ должен примениться к B; бот сообщает, что вопрос закрыт."""
+        clarify_state.write_state(_state("auto-tm-A", status="resolved", message_id=100), root=self.root)
+        clarify_state.write_state(_state("auto-tm-B", status="pending", message_id=200), root=self.root)
+        clarify_worker.process_text_message(self._msg(100), self.root, "tok")
+        self.assertEqual(self.captured, [], "ответ на закрытый A не должен примениться к B")
+        self.assertTrue(self.fake_tg.sent, "бот должен сообщить, что вопрос закрыт")
+
+    def test_reply_to_archived_not_applied_to_single_other_pending(self):
+        """archived (msg 100) + единственный pending (msg 200). Reply на 100 → не угадываем."""
+        clarify_state.write_state(_state("auto-tm-arch", status="archived", message_id=100), root=self.root)
+        clarify_state.write_state(_state("auto-tm-live", status="pending", message_id=200), root=self.root)
+        clarify_worker.process_text_message(self._msg(100), self.root, "tok")
+        self.assertEqual(self.captured, [])
+        self.assertTrue(self.fake_tg.sent)
+
+
 # ─────────────────────── REQ 4.4 — переходный фолбэк (УПУ3) ───────────────────────
 
 class TestTransitionalFallback(unittest.TestCase):

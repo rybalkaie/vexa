@@ -357,14 +357,18 @@ def process_callback(
         logger.debug("[clarify-worker] edit_message after callback failed: %s", e)
 
 
-def _find_state_by_message_id(message_id, pending_root: Path) -> Optional[dict]:
-    """Ф4 (REQ 4.2): находит открытый clarify-state, чей сохранённый `message_id`
+def _find_state_by_message_id(
+    message_id, pending_root: Path,
+    *, statuses: tuple[str, ...] = ("pending", "timed_out"),
+) -> Optional[dict]:
+    """Ф4 (REQ 4.2): находит clarify-state, чей сохранённый `message_id`
     совпадает с message_id отвеченного (reply) сообщения бота.
 
-    Смотрим только pending/timed_out (archived/resolved исключены — поздний ответ
-    на архивный/уже-закрытый вопрос не применяем). `message_id == 0` в state = «не
-    сохранён» (старый код / send без ответа Telegram) → не матчим (УПУ3-фолбэк
-    подхватит по количеству).
+    По умолчанию смотрим только ОТКРЫТЫЕ pending/timed_out (поздний ответ на них
+    ещё применяем). `statuses` можно переопределить на ЗАКРЫТЫЕ
+    (resolved/archived) — чтобы отличить «reply на уже закрытый вопрос» от УПУ3
+    (старый state без сохранённого id). `message_id == 0` в state = «не сохранён»
+    (старый код / send без ответа Telegram) → не матчим (count-фолбэк подхватит).
     """
     try:
         target = int(message_id)
@@ -373,7 +377,7 @@ def _find_state_by_message_id(message_id, pending_root: Path) -> Optional[dict]:
     if target <= 0:
         return None
     for state in clarify_state.list_pending(
-        root=pending_root, status_filter=["pending", "timed_out"]
+        root=pending_root, status_filter=list(statuses)
     ):
         try:
             if int(state.get("message_id") or 0) == target:
@@ -419,9 +423,29 @@ def process_text_message(
                 text, matched, bot_token, chat_id, pending_root, is_late=is_late
             )
             return
-        # message_id не совпал (старый clarify без сохранённого message_id —
-        # УПУ3, либо reply на не-clarify сообщение) → падаем в count-фолбэк
-        # ниже, поздний ответ не теряется.
+        # Среди ОТКРЫТЫХ совпадения нет. Если этот message_id принадлежит уже
+        # ЗАКРЫТОМУ вопросу (resolved/archived) — Илья реплайнул на закрытый
+        # вопрос. НЕ угадываем по count (иначе применим ответ к ЧУЖОЙ открытой
+        # встрече — misattribution). Старый clarify без сохранённого id (УПУ3)
+        # сюда не попадёт: у него message_id=0 → не найдётся ни среди открытых,
+        # ни среди закрытых → корректно падает в count-фолбэк ниже.
+        closed = _find_state_by_message_id(
+            reply_to_mid, pending_root, statuses=("resolved", "archived")
+        )
+        if closed is not None:
+            why = "уже отвечен" if closed.get("status") == "resolved" else "слишком старый (архивирован)"
+            try:
+                telegram_api.send_message(
+                    bot_token, chat_id,
+                    f"↩️ Этот вопрос {why}. Чтобы поправить — ответь Reply'ем на "
+                    "активный вопрос или нажми кнопку под ним.",
+                )
+            except telegram_api.TelegramApiError as e:
+                logger.warning("[clarify-worker] reply-to-closed notice failed: %s", e)
+            return
+        # message_id не совпал ни с одним известным state (старый clarify без
+        # сохранённого message_id — УПУ3, либо reply на не-clarify сообщение) →
+        # падаем в count-фолбэк ниже, поздний ответ не теряется.
 
     pendings = clarify_state.list_pending(root=pending_root, status_filter=["pending"])
     # Поздний ответ через текст? — допустимо: смотрим timed_out тоже, если
