@@ -535,7 +535,10 @@ def _finalize_and_collect(session_uid: str) -> None:
         # vexa-notarius-* (контейнер ещё Up или Exited <STARTED_GRACE_MIN).
         proc = ssh_capture(f"bash -lc {shlex.quote(finalize_cmd)}", timeout=10800)
     except subprocess.TimeoutExpired:
-        push(f"Финализация «{session_uid}» — timeout 3ч на VPS. Проверь ssh meeting-notary docker ps + логи.")
+        push(
+            f"Финализация «{session_uid}» — timeout 3ч на VPS. Проверь ssh meeting-notary docker ps + логи.",
+            dedupe_key=f"finalize-timeout:{session_uid}",
+        )
         logger.error("finalize timeout: %s", session_uid)
         return
     # rc=10 «nothing to do» (Ф1-доработки 29.05): WAV почищен, но
@@ -549,7 +552,14 @@ def _finalize_and_collect(session_uid: str) -> None:
         return
     if proc.returncode != 0:
         logger.error("finalize rc=%d stderr=%s", proc.returncode, proc.stderr.strip()[:400])
-        push(f"Финализация «{session_uid}» упала: rc={proc.returncode}. Лог: ~/Library/Logs/meeting-notary/collector.log")
+        # REQ 1.5: per-meeting ключ дедупа. Потеря WAV (rc=3) и прочие сбои
+        # finalize по ОДНОЙ встрече глушатся 6ч-дедупом, но НОВАЯ потеря по
+        # другой встрече (другой session_uid) всегда доходит до владельца —
+        # P0-алерт не проглатывается из-за совпадения текста сообщения.
+        push(
+            f"Финализация «{session_uid}» упала: rc={proc.returncode}. Лог: ~/Library/Logs/meeting-notary/collector.log",
+            dedupe_key=f"finalize-fail:{session_uid}",
+        )
         return
 
     # 2. Парсим результат finalize'а (один блок JSON с series + delivery + paths).

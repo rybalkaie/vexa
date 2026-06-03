@@ -198,7 +198,7 @@ smoke на маке** (env `TELEGRAM_NOTARIUS_BOT_TOKEN`). В проде на VP
 | `TELEGRAM_NOTARIUS_BOT_TOKEN` | _из .env.notary_ | Токен `@ilya_protocol_meeting_bot`, тот же что у listener'а. Без него clarify не шлётся. |
 | `ENABLE_LLM_CLARIFY` | `1` | `0`/`false`/`no` отключает clarify целиком. |
 | `CLARIFY_THRESHOLD` | `0.7` | Порог confidence — ниже → cluster идёт на уточнение. |
-| `CLARIFY_TIMEOUT` | `420` | Секунд до `timed_out`. Поздний ответ только обновляет файл. |
+| `CLARIFY_TIMEOUT` | `86400` | Секунд до `timed_out` (24 ч). Поздний ответ только обновляет файл. |
 | `CLARIFY_LONG_POLL_TIMEOUT` | `25` | long-poll окно (используется только в standalone-mode). |
 | `TELEGRAM_NOTARIUS_CHAT_ID` / `TELEGRAM_CHAT_ID` | _из .env.notary_ | chat_id Ильи (число). Один из двух обязателен. |
 | `MEETING_NOTARY_PENDING_DIR` | авто | Где хранить state-файлы. |
@@ -334,7 +334,7 @@ cd ~/Projects/meeting-notary && .venv-cli/bin/python vexa/scripts/notary/tools/r
 | > 120 мин | > 20 |
 
 При превышении бот через `@ilya_protocol_meeting_bot` шлёт Илье список и
-ждёт `CLARIFY_TIMEOUT=420 сек` (7 минут). Ответы: «оставить все» / «убрать 3,5,7».
+ждёт `CLARIFY_TIMEOUT=86400 сек` (24 часа). Ответы: «оставить все» / «убрать 3,5,7».
 Без ответа — оставляем все (поведение «лучше шум, чем потеря»).
 
 ### Clarification дедлайнов
@@ -364,7 +364,7 @@ launchd-агент, что и методички (`meeting-notary-methods-push.s
 | `ENABLE_TASK_ROUTING` | `1` | Выключить = задачи извлекаются, но не пишутся (дебаг промта). |
 | `MEETING_NOTARY_TASKS_MD` | `~/Projects/me/tasks.md` | Целевой файл записи задач Ильи. |
 | `MEETING_NOTARY_STAKEHOLDERS_JSON` | — | Явный путь к JSON-реестру. |
-| `CLARIFY_TIMEOUT` | `420` (общий с Ф3) | Таймаут ответа на clarification по задачам. |
+| `CLARIFY_TIMEOUT` | `86400` (общий с Ф3) | Таймаут ответа на clarification по задачам (24 ч). |
 
 ### Structured-лог Ф5
 
@@ -410,7 +410,7 @@ state `_pending_clarification/<meeting_id>-delivery.json`. Listener
 - **t.me/c/-ссылка** → парсер вычисляет `chat_id = -1000000000000 - <internal>`.
 - **«в личку»** → отправка Илье в DM, привязка НЕ сохраняется.
 - **«никуда»** → `delivered.decision="skip"`, ничего не шлём.
-- **Таймаут** (`CLARIFY_TIMEOUT=420s`, общий с Ф3/Ф5) → `decision="skip-timeout"`.
+- **Таймаут** (`CLARIFY_TIMEOUT=86400s` = 24 ч, общий с Ф3/Ф5) → `decision="skip-timeout"`.
 
 **Correction flow** (команды в личке боту):
 

@@ -17,15 +17,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-TG_SEND_BIN = Path(os.path.expanduser("~/.local/bin/tg-send"))
+TG_SEND_BIN = Path(os.path.expanduser(
+    os.environ.get("TG_SEND_BIN") or "~/.local/bin/tg-send"
+))
 DEDUP_DIR = Path(os.path.expanduser(
-    os.environ.get("MEETING_NOTARY_LOG_DIR", "~/Library/Logs/meeting-notary")
+    os.environ.get("MEETING_NOTARY_LOG_DIR") or "~/Library/Logs/meeting-notary"
 ))
 DEDUP_WINDOW_SEC = 6 * 3600
 
 
-def _dedupe_key(message: str) -> Path:
-    h = hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
+def _dedupe_key(identity: str) -> Path:
+    h = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return DEDUP_DIR / f".tg-dedupe-{h}"
 
 
@@ -47,10 +49,23 @@ def _gc_old_markers(now: float) -> None:
         pass
 
 
-def push(message: str, *, dedupe: bool = True, silent: bool = False) -> bool:
+def push(
+    message: str,
+    *,
+    dedupe: bool = True,
+    silent: bool = False,
+    dedupe_key: str | None = None,
+) -> bool:
     """Отправить push в Telegram через tg-send. Возвращает True если отправили.
 
     dedupe=True — не повторять то же сообщение в течение DEDUP_WINDOW_SEC.
+
+    dedupe_key — явный ключ дедупликации вместо текста сообщения. Нужен для
+    P0-алертов (потеря WAV): ключ вида f"finalize-fail:{session_uid}" даёт
+    дедуп ПО ВСТРЕЧЕ — шумный повтор по одной встрече глушится на 6 ч, но
+    НОВАЯ потеря WAV по ДРУГОЙ встрече (другой session_uid → другой ключ)
+    всегда доходит до владельца, даже если текст сообщения совпал. Без
+    dedupe_key поведение прежнее (дедуп по тексту).
     """
     if not TG_SEND_BIN.exists():
         logger.warning("tg-send не найден по пути %s — push пропущен", TG_SEND_BIN)
@@ -60,7 +75,7 @@ def push(message: str, *, dedupe: bool = True, silent: bool = False) -> bool:
         DEDUP_DIR.mkdir(parents=True, exist_ok=True)
         now = time.time()
         _gc_old_markers(now)
-        marker = _dedupe_key(message)
+        marker = _dedupe_key(dedupe_key if dedupe_key is not None else message)
         if marker.exists():
             age = now - marker.stat().st_mtime
             if age < DEDUP_WINDOW_SEC:

@@ -926,9 +926,9 @@ def clarify_speakers_via_telegram(
 
     # Сохранение state.
     try:
-        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "86400"))
     except ValueError:
-        timeout_s = 420
+        timeout_s = 86400
     sent_at = datetime.now(timezone.utc)
     deadline = sent_at + timedelta(seconds=timeout_s)
 
@@ -2120,9 +2120,9 @@ def maybe_clarify_task_count(
         return None
 
     try:
-        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "86400"))
     except ValueError:
-        timeout_s = 420
+        timeout_s = 86400
     sent_at = datetime.now(timezone.utc)
     deadline = sent_at + timedelta(seconds=timeout_s)
     state = {
@@ -2232,9 +2232,9 @@ def maybe_clarify_pending_deadlines(
         return None
 
     try:
-        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "86400"))
     except ValueError:
-        timeout_s = 420
+        timeout_s = 86400
     sent_at = datetime.now(timezone.utc)
     deadline = sent_at + timedelta(seconds=timeout_s)
     state = {
@@ -2986,9 +2986,9 @@ def ask_delivery_destination(
         return None
 
     try:
-        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "420"))
+        timeout_s = int(os.environ.get("CLARIFY_TIMEOUT", "86400"))
     except ValueError:
-        timeout_s = 420
+        timeout_s = 86400
     sent_at = datetime.now(timezone.utc)
     deadline = sent_at + timedelta(seconds=timeout_s)
 
