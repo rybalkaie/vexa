@@ -114,9 +114,21 @@ def _protocol_paths(meta: dict, sid: str, flat: Path, archive: Path) -> list[Pat
     return cands
 
 
-def _wav_present(meta: dict) -> bool:
+def _wav_present(meta: dict, tdir: Path, sid: str) -> bool:
+    """WAV физически на диске ХОСТА?
+
+    ВАЖНО: `meta.files.wav` — путь ВНУТРИ docker-контейнера (`/transcripts/<sid>.wav`),
+    на хосте его НЕТ (bind-mount монтирует контейнерный /transcripts в host tdir).
+    Поэтому `os.path.exists(meta.files.wav)` на хосте всегда False — нельзя по нему
+    судить о наличии WAV. Проверяем хостовый путь `<tdir>/<sid>.wav` напрямую.
+    """
+    host_wav = tdir / f"{sid}.wav"
+    if host_wav.exists():
+        return True
+    # Подстраховка: если meta.files.wav вдруг АБСОЛЮТНЫЙ хостовый путь (не контейнерный
+    # /transcripts/...), уважаем и его.
     wav = (meta.get("files") or {}).get("wav")
-    return bool(wav) and os.path.exists(wav)
+    return bool(wav) and not str(wav).startswith("/transcripts/") and os.path.exists(wav)
 
 
 def _atomic_write(path: Path, meta: dict) -> None:
@@ -170,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         if _delivery_done(meta):
             n_skip_done += 1
             continue  # уже помечен
-        if _wav_present(meta):
+        if _wav_present(meta, tdir, sid):
             n_skip_wav += 1
             print(f"  ⏭  {sid}: WAV на диске — finalize отработает штатно, НЕ трогаем")
             continue
