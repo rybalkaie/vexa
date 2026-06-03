@@ -61,6 +61,30 @@ NOTARIUS_NAME_PREFIX = "vexa-notarius-"
 SERIES_LABEL = "meeting-notary.series"
 
 
+def _env_float(name: str, default: float) -> float:
+    """Положительный float из env, иначе default (терпим мусор/пусто)."""
+    try:
+        v = float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+# Ф3 (2026-06-03): watchdog зависшего bot-контейнера. Зависшим считаем контейнер,
+# который (а) живёт дольше любой реальной встречи — наблюдаемый максимум ~122 мин
+# (Татьяна); бот сам уходит после 20 мин тишины (`endReason=silence_20min`),
+# поэтому > 2ч живёт только при зависшем авто-выходе → дефолт-порог 4ч с запасом;
+# ЛИБО (б) его запись (WAV/chunk) не растёт дольше STALL-порога. Порог STALL
+# заведомо > 20 мин (окно авто-выхода бота по тишине), иначе убьём бота,
+# легитимно досиживающего паузу → дефолт 30 мин. `docker kill` БЕЗОПАСЕН для WAV:
+# Ф2 пишет валидную шапку на диск каждые ~3с — на диске лежит готовый WAV до
+# любого kill. Пороги настраиваемы через env; watchdog можно выключить
+# MEETING_NOTARY_WATCHDOG=0.
+WATCHDOG_ENABLED = os.environ.get("MEETING_NOTARY_WATCHDOG", "1") != "0"
+WATCHDOG_MAX_HOURS = _env_float("MEETING_NOTARY_WATCHDOG_MAX_HOURS", 4.0)
+WATCHDOG_STALL_MIN = _env_float("MEETING_NOTARY_WATCHDOG_STALL_MIN", 30.0)
+
+
 def _target_md_for_session(series: str, date_str: str, session_uid: str) -> Path:
     """Единая точка вычисления пути к .md (Ф7 синхронизация на _target_path).
 
@@ -139,6 +163,13 @@ def ssh_capture(cmd: str, *, timeout: int = 60) -> subprocess.CompletedProcess[s
 def main() -> int:
     setup_logging()
     logger.info("=== collector run ===")
+
+    # Ф3 (REQ 3.2): watchdog зависших bot-контейнеров — ДО finalize-петли, чтобы
+    # убитый контейнер освободил серию уже в этом тике. Не должен ронять collector.
+    try:
+        _run_watchdog()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("watchdog упал (не фатально для collector): %s", e)
 
     # 1. Все *.meta.json — потенциальные кандидаты. Ранее `list_cmd` отсеивал
     # уже-финализированные через `[[ -f $VPS_PROTOCOLS/<sid>.md ]]`. Это
@@ -369,9 +400,11 @@ def _find_running_container_for(meta: dict | None, running_index: dict[str, Any]
 
     Консервативная страховка: если жив legacy-контейнер без наших label'ов
     (transition-окно до деплоя Ф4) и точечного совпадения по series нет — вернём
-    его имя. Инвариант runner: параллельных Vexa-сессий нет (`_is_vexa_running`),
-    значит любой живой бот = идёт запись → лучше отложить finalize на тик, чем
-    запустить его на пишущемся WAV.
+    его имя. С Ф3 (2026-06-03) разные серии пишутся параллельно, поэтому
+    блокировать finalize нужно ТОЛЬКО для своей серии (точное совпадение по
+    label) — finalize встречи серии X не должен ждать живого бота серии Y. Но
+    unlabeled legacy-бот (серию не знаем) по-прежнему трактуем перестраховочно:
+    лучше отложить finalize на тик, чем запустить его на возможно пишущемся WAV.
     """
     by_series = running_index.get("by_series") or {}
     unlabeled = running_index.get("unlabeled") or []
@@ -381,6 +414,181 @@ def _find_running_container_for(meta: dict | None, running_index: dict[str, Any]
     if unlabeled:
         return unlabeled[0]
     return None
+
+
+# ─── Ф3 (2026-06-03): watchdog зависшего bot-контейнера (REQ 3.2) ───
+
+_DOCKER_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?")
+
+
+def _parse_docker_time(s: str) -> datetime | None:
+    """RFC3339 `State.StartedAt` от docker → aware datetime UTC, либо None.
+
+    docker отдаёт наносекунды (`...:54.243456789Z`), а `datetime.fromisoformat`
+    ест максимум микросекунды (6 знаков) → обрезаем дробную часть до 6. Пояс
+    docker всегда UTC (`Z`). `0001-01-01...` = sentinel «контейнер не стартовал».
+    """
+    if not s or s.strip().startswith("0001-01-01"):
+        return None
+    m = _DOCKER_TS_RE.match(s.strip())
+    if not m:
+        return None
+    frac = (m.group(2) or "")[:7]  # ".123456"
+    try:
+        dt = datetime.fromisoformat(m.group(1) + frac)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _docker_started_at(name: str) -> datetime | None:
+    """`docker inspect State.StartedAt` контейнера → datetime UTC, либо None."""
+    cmd = ("docker inspect --format " + shlex.quote("{{.State.StartedAt}}") +
+           " " + shlex.quote(name))
+    try:
+        proc = ssh_capture(cmd, timeout=15)
+    except subprocess.TimeoutExpired:
+        logger.warning("watchdog: docker inspect %s — timeout", name)
+        return None
+    if proc.returncode != 0:
+        logger.warning("watchdog: docker inspect %s rc=%d", name, proc.returncode)
+        return None
+    return _parse_docker_time(proc.stdout or "")
+
+
+def _newest_recording_activity_sec(now: datetime, started_at: datetime | None) -> float | None:
+    """Секунд с последнего роста записи (WAV/chunk) контейнера, либо None.
+
+    Активность = mtime самого свежего `*.wav` в каталоге транскриптов,
+    появившегося в окне жизни контейнера (mtime ≥ StartedAt − запас). `*.wav`
+    покрывает и одиночный WAV, и `*.chunkN.wav` (Ф5). Исключаем
+    `*.finalize-concat.wav` (артефакт finalize, не запись); `.recover-bak`/`.pcm`
+    не оканчиваются на `.wav` → и так мимо. Старые WAV прошлых встреч отсекает
+    фильтр по mtime. None — подходящих файлов нет (запись ещё не появилась / уже
+    почищена) → вызывающий пропустит STALL-триггер (остаётся age-триггер).
+
+    При нескольких параллельных записях окна жизни пересекаются: контейнер видит
+    «самый свежий WAV в своём окне», возможно чужой → STALL сработает, лишь когда
+    стихли ВСЕ записи. Это осознанно консервативно: НИКОГДА не убить здоровую
+    встречу; зависшую при этом добьёт age-триггер.
+    """
+    if not LOCAL_FINALIZE:
+        return None
+    base = Path(VPS_TRANSCRIPTS)
+    if not base.is_dir():
+        return None
+    floor = (started_at.timestamp() - 120) if started_at else None
+    newest: float | None = None
+    try:
+        for p in base.glob("*.wav"):
+            if p.name.endswith(".finalize-concat.wav"):
+                continue
+            try:
+                mt = p.stat().st_mtime
+            except OSError:
+                continue
+            if floor is not None and mt < floor:
+                continue
+            if newest is None or mt > newest:
+                newest = mt
+    except OSError:
+        return None
+    if newest is None:
+        return None
+    return max(0.0, now.timestamp() - newest)
+
+
+def _watchdog_verdicts(
+    containers: list[dict[str, Any]], *, max_age_sec: float, stall_sec: float,
+) -> list[tuple[str, str | None, str]]:
+    """Чистое решение, какие контейнеры зависли (тестируемо без docker/диска).
+
+    containers: list[{"name", "series", "age_sec": float|None, "stale_sec": float|None}]
+      age_sec   — сколько живёт контейнер (now − StartedAt);
+      stale_sec — сколько НЕ растёт запись (now − newest mtime), None = не оценить.
+    Возвращает [(name, series, reason)] для зависших. Консервативно: если оба
+    показателя None — НЕ трогаем (на неопределённости не убиваем). age приоритетнее
+    stall (жёсткий потолок длительности).
+    """
+    out: list[tuple[str, str | None, str]] = []
+    for c in containers:
+        name = c.get("name")
+        if not name:
+            continue
+        age = c.get("age_sec")
+        stale = c.get("stale_sec")
+        if age is not None and age > max_age_sec:
+            out.append((name, c.get("series"),
+                        f"живёт {age / 3600:.1f}ч > порога {max_age_sec / 3600:.1f}ч "
+                        f"(встреча не идёт так долго — авто-выход бота, видимо, завис)"))
+            continue
+        if stale is not None and stale > stall_sec:
+            out.append((name, c.get("series"),
+                        f"запись не растёт {stale / 60:.0f} мин > порога {stall_sec / 60:.0f} мин "
+                        f"(бот не ушёл после тишины — запись мертва)"))
+            continue
+    return out
+
+
+def _kill_container(name: str) -> bool:
+    """`docker kill <name>`. True при rc=0. Безопасно для WAV (Ф2 periodic flush)."""
+    cmd = "docker kill " + shlex.quote(name)
+    try:
+        proc = ssh_capture(cmd, timeout=20)
+    except subprocess.TimeoutExpired:
+        logger.error("watchdog: docker kill %s — timeout", name)
+        return False
+    if proc.returncode != 0:
+        logger.error("watchdog: docker kill %s rc=%d stderr=%s", name,
+                     proc.returncode, (proc.stderr or "").strip()[:200])
+        return False
+    return True
+
+
+def _run_watchdog(now: datetime | None = None) -> None:
+    """Найти и убить зависшие bot-контейнеры (REQ 3.2). Только на VPS.
+
+    Гоняется в начале тика collector'а ДО finalize-петли: убитый контейнер
+    освобождает серию уже в этом тике (finalize гейтится по живому контейнеру),
+    и встреча дособерётся, как только meta на диске. Не должен ронять collector —
+    вызывается под try/except в main().
+    """
+    if not (WATCHDOG_ENABLED and LOCAL_FINALIZE):
+        return
+    if now is None:
+        now = datetime.now(timezone.utc)
+    index = _running_notarius_index()
+    series_of: dict[str, str | None] = {}
+    for s, names in (index.get("by_series") or {}).items():
+        for nm in names:
+            series_of[nm] = s
+    for nm in (index.get("unlabeled") or []):
+        series_of.setdefault(nm, None)
+    if not series_of:
+        return
+    containers: list[dict[str, Any]] = []
+    for nm in series_of:
+        started = _docker_started_at(nm)
+        age = (now - started).total_seconds() if started else None
+        stale = _newest_recording_activity_sec(now, started)
+        containers.append({"name": nm, "series": series_of.get(nm),
+                           "age_sec": age, "stale_sec": stale})
+    verdicts = _watchdog_verdicts(
+        containers,
+        max_age_sec=WATCHDOG_MAX_HOURS * 3600.0,
+        stall_sec=WATCHDOG_STALL_MIN * 60.0,
+    )
+    for name, series, reason in verdicts:
+        killed = _kill_container(name)
+        label = series or name
+        push(
+            f"⚠️ Watchdog убил зависший бот-контейнер «{label}»: {reason}. "
+            f"{'docker kill OK' if killed else 'docker kill НЕ удался — проверь руками'}. "
+            f"Запись (если была) сохранена на диске (Ф2), финализация — на следующем тике.",
+            dedupe_key=f"watchdog-kill:{name}",
+        )
+        logger.warning("watchdog: контейнер %s (series=%s) — %s; kill=%s",
+                       name, series, reason, killed)
 
 
 def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:

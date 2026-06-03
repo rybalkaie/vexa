@@ -74,6 +74,32 @@ LOCAL_DOCKER = os.environ.get("MEETING_NOTARY_LOCAL_DOCKER") == "1"
 START_WINDOW_MIN = 5  # min до начала; runner запускает если 0 ≤ delta ≤ 5
 STARTED_GRACE_MIN = 1  # запускаем и если start_at уже наступил, но не более 1 мин назад
 
+# Ф3 (2026-06-03): concurrency. Матчинг живых ботов — по ИМЕНИ-префиксу (как в
+# collector), series тащим из label `meeting-notary.series` (его ставит runner
+# при старте — см. _launch_bot). Имя-префикс ловит и legacy-контейнеры без
+# label'ов (запущенные до Ф4). Эти константы держим в синхроне с одноимёнными
+# в collector.py.
+NOTARIUS_NAME_PREFIX = "vexa-notarius-"
+SERIES_LABEL = "meeting-notary.series"
+
+
+def _env_int(name: str, default: int) -> int:
+    """Положительный int из env, иначе default (терпим мусор/пусто)."""
+    try:
+        v = int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+# Ф3 (2026-06-03): потолок одновременных записей. Раньше любой живой
+# bot-контейнер блокировал старт 2-й встречи (`_is_vexa_running` по
+# `ancestor=образ`) — из-за этого 03.06 пропустился директорат, пока шла встреча
+# Татьяны (122 мин). Теперь разные серии пишутся параллельно, но в пределах
+# лимита: CCX13 = 2 vCPU + headless-Chrome у каждого бота тяжёл → дефолт 2.
+# Тонкая настройка через env (на случай разовой тройной накладки встреч).
+MAX_CONCURRENT_BOTS = _env_int("MEETING_NOTARY_MAX_CONCURRENT_BOTS", 2)
+
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,52 +136,63 @@ def main() -> int:
         return 0
     logger.info("Кандидатов на старт: %d", len(candidates))
 
-    # Конфликт: если в окне старта оказалось несколько встреч — берём первую.
-    primary = candidates[0]
-    others = candidates[1:]
-    for o in others:
-        push(
-            f"Не записал «{o.get('series')}» (start {o.get('start_at')}): "
-            f"конфликт с «{primary.get('series')}». "
-            f"Параллельные сессии Vexa пока не поддерживаем.",
-            dedupe=True,
-        )
-        logger.warning(
-            "Конфликт: %s пропущен из-за %s",
-            o.get("meeting_id"),
-            primary.get("meeting_id"),
-        )
+    # Ф3 (2026-06-03): concurrency. Один снимок живых ботов на тик; решаем по
+    # КАЖДОМУ кандидату отдельно (раньше — жёсткое «primary + others-в-отказ» +
+    # глобальный гейт `_is_vexa_running` «любой контейнер образа = занято», что и
+    # блокировало 2-ю встречу 03.06). Теперь:
+    #   • разные серии пишутся ПАРАЛЛЕЛЬНО, в пределах MAX_CONCURRENT_BOTS;
+    #   • вторая запись ТОЙ ЖЕ серии и переполнение лимита → пропуск С
+    #     УВЕДОМЛЕНИЕМ владельца с причиной (REQ 3.3 — не молчаливый пропуск).
+    # Финализацию 2-й встречи в очередь ставить тут не нужно: collector
+    # (Type=oneshot, OnUnitActiveSec=300s) не перекрывает свои тики, а finalize
+    # внутри тика идёт последовательным for-циклом — два Speechmatics-finalize
+    # разом на 2 vCPU не запустятся by design.
+    snapshot = _running_bots_snapshot()
+    running_count = int(snapshot.get("total") or 0)
+    launched_series: set[str] = set()
 
-    # State-файл идемпотентности: атомарный acquire.
-    if not state_acquire(primary["event_id"], now=now):
-        logger.info(
-            "event_id=%s уже стартовал недавно — пропуск (повторный launchd-тик или ручной run)",
-            primary["event_id"],
+    for cand in candidates:
+        series = str(cand.get("series") or cand["meeting_id"])
+        start_at = cand.get("start_at")
+        action, reason = _concurrency_decision(
+            series, snapshot, launched_series, running_count, MAX_CONCURRENT_BOTS,
         )
-        return 0
+        if action != "launch":
+            # REQ 3.3 — пропуск старта с ПРИЧИНОЙ. dedupe_key по событию (а не по
+            # тексту): повтор того же пропуска в окне старта (runner раз в минуту)
+            # глушится на 6ч, но пропуск ДРУГОЙ встречи всегда доходит. State НЕ
+            # занимаем — если лимит освободится в окне старта, следующий тик
+            # попробует снова.
+            push(
+                f"Не записал «{series}» (start {start_at}): {reason}.",
+                dedupe_key=f"start-skip:{action}:{cand.get('event_id')}",
+            )
+            logger.warning("Старт %s пропущен (%s): %s", cand.get("meeting_id"), action, reason)
+            continue
 
-    # Проверим, что на VPS не запущен уже бот.
-    if _is_vexa_running():
-        push(
-            f"Не записал «{primary.get('series')}» (start {primary.get('start_at')}): "
-            f"на VPS уже идёт активная Vexa-сессия. Проверь docker ps.",
-            dedupe=True,
-        )
-        logger.warning("Vexa уже запущена — primary пропущен")
-        return 0
+        # State-файл идемпотентности: атомарный acquire ТОЛЬКО перед реальным
+        # запуском (пропуски по занятости/лимиту state не занимают).
+        if not state_acquire(cand["event_id"], now=now):
+            logger.info(
+                "event_id=%s уже стартовал недавно — пропуск (повторный тик или ручной run)",
+                cand["event_id"],
+            )
+            continue
 
-    launched_ok = _launch_bot(primary, now)
-
-    if launched_ok and primary.get("type") == "one-off":
-        _auto_disable_one_off(primary["meeting_id"])
-    elif not launched_ok and primary.get("type") == "one-off":
-        logger.info(
-            "auto-disable пропущен: one-off %s не стартовал успешно (rc!=0) — "
-            "запись остаётся enabled. ПРЕДУПРЕЖДЕНИЕ: state-файл уже занял "
-            "event_id на 12ч TTL — повторный запуск ЭТОГО event_id блокируется. "
-            "Чтобы попробовать снова в окне старта: почисти `.state.json` руками.",
-            primary["meeting_id"],
-        )
+        launched_ok = _launch_bot(cand, now)
+        if launched_ok:
+            launched_series.add(series)
+            running_count += 1  # учитываем в лимите для следующих кандидатов тика
+            if cand.get("type") == "one-off":
+                _auto_disable_one_off(cand["meeting_id"])
+        elif cand.get("type") == "one-off":
+            logger.info(
+                "auto-disable пропущен: one-off %s не стартовал успешно (rc!=0) — "
+                "запись остаётся enabled. ПРЕДУПРЕЖДЕНИЕ: state-файл уже занял "
+                "event_id на 12ч TTL — повторный запуск ЭТОГО event_id блокируется. "
+                "Чтобы попробовать снова в окне старта: почисти `.state.json` руками.",
+                cand["meeting_id"],
+            )
     return 0
 
 
@@ -188,25 +225,87 @@ def _candidates(queue: list[dict[str, Any]], now: datetime) -> list[dict[str, An
     return out
 
 
-def _is_vexa_running() -> bool:
-    """Проверить, есть ли активный контейнер с vexa-bot:notarius-telemost.
+def _running_bots_snapshot() -> dict[str, Any]:
+    """Снимок живых bot-контейнеров нотариуса за один `docker ps` (Ф3).
 
-    На маке — через ssh meeting-notary; на VPS (MEETING_NOTARY_LOCAL_DOCKER=1) —
-    напрямую через docker ps без префикса ssh.
+    Возвращает {"by_series": {series: [names]}, "unlabeled": [names], "total": int}.
+    series — из label `meeting-notary.series` (ставит runner); имя-префикс
+    `vexa-notarius-*` ловит и legacy-контейнеры без label'ов (до Ф4) — они
+    попадают в `unlabeled` и считаются в `total` (занимают лимит), но точечно
+    по серии не дедупятся. На маке — через ssh; на VPS (LOCAL_DOCKER=1) —
+    локально. При timeout/ошибке docker — пустой снимок (как старая
+    `_is_vexa_running`: «считаем, что не запущен»): лучше дать старт, чем
+    заблокировать запись из-за слепого docker.
+
+    Сменил прежний фильтр `ancestor=<образ>` на `name=vexa-notarius-` (как в
+    collector): ancestor ловил и ручные/dev-боты того же образа, а главное —
+    был БУЛЕВЫМ глобальным гейтом без разбивки по сериям (корень бага 03.06).
     """
+    fmt = '{{.Names}}\t{{.Label "' + SERIES_LABEL + '"}}'
+    by_series: dict[str, list[str]] = {}
+    unlabeled: list[str] = []
+    snap: dict[str, Any] = {"by_series": by_series, "unlabeled": unlabeled, "total": 0}
     if LOCAL_DOCKER:
-        cmd = ["docker", "ps", "--filter", f"ancestor={BOT_IMAGE}", "--format", "{{.ID}}"]
+        cmd = ["docker", "ps", "--filter", f"name={NOTARIUS_NAME_PREFIX}", "--format", fmt]
     else:
-        cmd = ["ssh", SSH_HOST, "docker ps --filter ancestor=" + shlex.quote(BOT_IMAGE) + " --format '{{.ID}}'"]
+        cmd = ["ssh", SSH_HOST,
+               "docker ps --filter name=" + shlex.quote(NOTARIUS_NAME_PREFIX) +
+               " --format " + shlex.quote(fmt)]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
-        logger.warning("docker ps — timeout (считаем что бот не запущен)")
-        return False
+        logger.warning("docker ps — timeout (считаем, что активных ботов нет)")
+        return snap
     if out.returncode != 0:
-        logger.warning("docker ps rc=%d stderr=%s — считаем что не запущен", out.returncode, out.stderr.strip()[:200])
-        return False
-    return bool(out.stdout.strip())
+        logger.warning("docker ps rc=%d stderr=%s — считаем, что активных нет",
+                       out.returncode, (out.stderr or "").strip()[:200])
+        return snap
+    total = 0
+    for line in (out.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        name, _, series = line.partition("\t")
+        name = name.strip()
+        series = series.strip()
+        if not name:
+            continue
+        total += 1
+        if series:
+            by_series.setdefault(series, []).append(name)
+        else:
+            unlabeled.append(name)
+    snap["total"] = total
+    return snap
+
+
+def _concurrency_decision(
+    series: str,
+    snapshot: dict[str, Any],
+    launched_series: set[str],
+    running_count: int,
+    max_bots: int,
+) -> tuple[str, str | None]:
+    """Чистое решение по одному кандидату (тестируемо без docker).
+
+    Возвращает (action, reason):
+      • ("launch", None)        — можно стартовать;
+      • ("skip_series", text)   — бот этой серии уже пишет (живой контейнер) ИЛИ
+                                  стартовал в этом же тике → не дублируем серию;
+      • ("skip_capacity", text) — достигнут лимит одновременных записей.
+
+    Re-entrancy именно ПО СЕРИИ (а не «любой бот = занято») — две РАЗНЫЕ серии
+    пишутся параллельно (REQ 3.1). Лимит — потолок ресурсов (CCX13 2 vCPU).
+    """
+    by_series = snapshot.get("by_series") or {}
+    if series in launched_series or by_series.get(series):
+        return ("skip_series",
+                f"уже идёт активная запись серии «{series}» — "
+                f"вторую запись той же серии не запускаю (проверь docker ps)")
+    if running_count >= max_bots:
+        return ("skip_capacity",
+                f"достигнут лимит одновременных записей ({running_count}/{max_bots}) — "
+                f"освободится по завершении активных встреч")
+    return ("launch", None)
 
 
 def _verify_container_alive(name: str, log_file: Path, series: str, start_at: str) -> None:
