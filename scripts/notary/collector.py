@@ -433,9 +433,14 @@ def _parse_docker_time(s: str) -> datetime | None:
     m = _DOCKER_TS_RE.match(s.strip())
     if not m:
         return None
-    frac = (m.group(2) or "")[:7]  # ".123456"
+    # Go RFC3339Nano срезает хвостовые нули → дробь может быть 1–9 знаков
+    # (`.5`, `.243456789`). `datetime.fromisoformat` на Python <3.11 принимает
+    # дробь ТОЛЬКО из 3 или 6 знаков → нормализуем к ровно 6 (паддинг справа
+    # нулями + обрезка) для версионной независимости.
+    digits = (m.group(2) or "").lstrip(".")
+    micro = f".{digits[:6]:0<6}" if digits else ""  # fill '0', left-align, ширина 6
     try:
-        dt = datetime.fromisoformat(m.group(1) + frac)
+        dt = datetime.fromisoformat(m.group(1) + micro)
     except ValueError:
         return None
     return dt.replace(tzinfo=timezone.utc)
@@ -474,10 +479,16 @@ def _newest_recording_activity_sec(now: datetime, started_at: datetime | None) -
     """
     if not LOCAL_FINALIZE:
         return None
+    # Без StartedAt окно жизни контейнера неизвестно → НЕ оцениваем активность
+    # (иначе взяли бы новейший из ВСЕХ *.wav, включая древние с прошлых встреч →
+    # ложный STALL → false-kill живого/неизвестного контейнера, Н2 цикла Ф3).
+    # Возврат None = STALL-триггер пропущен, остаётся только age-триггер.
+    if started_at is None:
+        return None
     base = Path(VPS_TRANSCRIPTS)
     if not base.is_dir():
         return None
-    floor = (started_at.timestamp() - 120) if started_at else None
+    floor = started_at.timestamp() - 120
     newest: float | None = None
     try:
         for p in base.glob("*.wav"):
@@ -487,7 +498,7 @@ def _newest_recording_activity_sec(now: datetime, started_at: datetime | None) -
                 mt = p.stat().st_mtime
             except OSError:
                 continue
-            if floor is not None and mt < floor:
+            if mt < floor:
                 continue
             if newest is None or mt > newest:
                 newest = mt
@@ -584,7 +595,10 @@ def _run_watchdog(now: datetime | None = None) -> None:
         push(
             f"⚠️ Watchdog убил зависший бот-контейнер «{label}»: {reason}. "
             f"{'docker kill OK' if killed else 'docker kill НЕ удался — проверь руками'}. "
-            f"Запись (если была) сохранена на диске (Ф2), финализация — на следующем тике.",
+            f"WAV на диске валиден (Ф2). Если встреча успела закрыть chunk (была пауза) — "
+            f"meta.json есть, финализация подберёт на следующем тике. Если шла без пауз — "
+            f"meta.json мог не записаться (SIGKILL минует final_exit): проверь "
+            f"~/meeting-notary/_tmp/transcripts/ на WAV без .meta.json и восстанови вручную.",
             dedupe_key=f"watchdog-kill:{name}",
         )
         logger.warning("watchdog: контейнер %s (series=%s) — %s; kill=%s",

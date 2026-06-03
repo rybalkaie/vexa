@@ -179,7 +179,9 @@ def main() -> int:
             )
             continue
 
-        launched_ok = _launch_bot(cand, now)
+        # seq = сколько уже запустили В ЭТОМ ТИКЕ → уникальный meeting_id на бота
+        # (общий now не даёт коллизии redis-канала команд, У2 цикла Ф3).
+        launched_ok = _launch_bot(cand, now, seq=len(launched_series))
         if launched_ok:
             launched_series.add(series)
             running_count += 1  # учитываем в лимите для следующих кандидатов тика
@@ -372,8 +374,16 @@ def _safe_session_uid(meeting_id: str, start_at: str) -> str:
     return f"auto-{meeting_id}-{_SAFE_ID_RE.sub('_', raw_start)}"
 
 
-def _launch_bot(item: dict[str, Any], now: datetime) -> bool:
+def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
     """Дёрнуть docker run на VPS. Не блокируется — запускаем в фоне.
+
+    `seq` — порядковый номер запуска В ЭТОМ ТИКЕ (0-based). Нужен для
+    уникальности `bot_config["meeting_id"]`: бот подписывается на redis-канал
+    `bot_commands:meeting:<meeting_id>` (vexa-bot index.ts), а `now` у всех
+    запусков одного тика общий → без `seq` два ПАРАЛЛЕЛЬНЫХ бота получили бы
+    один meeting_id и один канал команд → stop/reconfigure одной встречи рвал бы
+    запись другой (У2 цикла Ф3). seq ≤ MAX_CONCURRENT_BOTS ≪ 60с между тиками →
+    коллизий между тиками нет.
 
     Возвращает True если ssh+docker run отработали успешно (rc=0).
     """
@@ -409,8 +419,10 @@ def _launch_bot(item: dict[str, Any], now: datetime) -> bool:
         "task": "transcribe",
         # Обязательные поля для vexa-bot Zod-схемы (build 2026-05-26+):
         # redisUrl — Zod-required; meeting_id — docker.js делает required-check после Zod.
+        # meeting_id = unix-сек + seq: уникален среди ПАРАЛЛЕЛЬНЫХ ботов одного
+        # тика (общий now), чтобы redis-канал команд не пересекался (У2 Ф3).
         "redisUrl": REDIS_URL,
-        "meeting_id": int(now.timestamp()),
+        "meeting_id": int(now.timestamp()) + seq,
         # series + expectedParticipants — для маппинга имён в финализаторе.
         # camelCase ключи в bot_config, чтобы vexa-bot (TS) читал из BotConfig без конверсии.
         "series": series,

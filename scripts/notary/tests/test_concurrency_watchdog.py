@@ -226,6 +226,14 @@ class TestParseDockerTime(unittest.TestCase):
         dt = collector._parse_docker_time("2026-06-03T11:14:54.243456Z")
         self.assertEqual(dt.microsecond, 243456)
 
+    def test_short_fraction_zero_padded(self):
+        """Go RFC3339Nano срезает хвостовые нули → дробь 1–2 знака. Должна
+        нормализоваться паддингом нулей справа (Н1 цикла Ф3), а не падать на
+        Python 3.10 (там fromisoformat принимает только 3/6 знаков)."""
+        self.assertEqual(collector._parse_docker_time("2026-06-03T11:14:54.5Z").microsecond, 500000)
+        self.assertEqual(collector._parse_docker_time("2026-06-03T11:14:54.24Z").microsecond, 240000)
+        self.assertEqual(collector._parse_docker_time("2026-06-03T11:14:54.2434Z").microsecond, 243400)
+
     def test_no_fraction(self):
         dt = collector._parse_docker_time("2026-06-03T11:14:54Z")
         self.assertIsNotNone(dt)
