@@ -65,8 +65,10 @@ from lib.llm_postprocess import (  # noqa: E402
     maybe_clarify_task_count,
     notify_unknown_owners,
     regenerate_protocol_for_meeting,
+    review_and_flag_protocol_file,
     route_tasks,
 )
+from lib.delivery_grace import wait_for_clarify_grace  # noqa: E402
 from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
 
@@ -768,6 +770,58 @@ def main() -> int:
     else:
         log.info("[extract_tasks] протокол не сгенерирован — пропуск задач")
 
+    # 4.0.2b. Ф5 (5.4 + 5.3): clarify спикеров ДО доставки + grace-окно.
+    # Порядок изменён в Ф5: раньше clarify шёл ПОСЛЕ доставки (протокол уходил
+    # со «Спикер N», поздний ответ только правил файл). Теперь:
+    #   5.4 — clarify_speakers_via_telegram сначала пытается АВТО-подставить
+    #         известного участника (people.md / expected) при строгом 1:1 и
+    #         перегенерировать протокол; вопрос уходит только про неопознанных.
+    #   5.3 — если вопрос ушёл, ждём ~5 мин (PROTOCOL_DELIVERY_GRACE_SEC) шанса,
+    #         что Илья ответит и имя попадёт уже в ПЕРВУЮ доставку. Доставка НЕ
+    #         блокируется навсегда: по таймауту шлём как есть; поздний ответ
+    #         (в окне суток) дошлёт обновлённую версию (5.5/5.6 в clarify_worker).
+    # Best-effort: сбой clarify/grace не валит finalize.
+    clarify_state_path = None
+    try:
+        clarify_meta = dict(meta)
+        clarify_meta["date"] = date_part
+        clarify_state_path = clarify_speakers_via_telegram(
+            meeting_id=session_uid,
+            turns=turns,
+            speaker_confidence=speaker_confidence,
+            cluster_to_name=cluster_to_name,
+            expected_participants=expected,
+            panel_participants=participants,
+            meta=clarify_meta,
+            transcript_path=md_path,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("clarify_speakers_via_telegram failed (non-fatal): %s", e)
+    if clarify_state_path is not None:
+        try:
+            wait_for_clarify_grace(session_uid, log)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[delivery] grace-wait failed (non-fatal): %s", e)
+
+    # 4.0.2c. Ф5 (5.2): LLM-постпроход «подозрительные числа / инверсии».
+    # Прогоняем на ФИНАЛЬНОЙ (после авто/grace-доразметки) версии протокола,
+    # ДО доставки. ВОПР1 вариант А: НЕ авто-правим, только помечаем ⚠️ «проверь».
+    # Best-effort: нет claude в PATH / сбой → 0 пометок, файл не трогаем.
+    # ЗАМЕТКА: этот claude-проход спроектирован под объединение с 6.2/7.3 в
+    # ОДИН вызов (review_protocol(checks=...)) — см. llm_postprocess.review_protocol.
+    if _is_protocol_enabled() and protocol_path.is_file():
+        try:
+            n_flags = review_and_flag_protocol_file(
+                protocol_path=protocol_path,
+                transcript_path=md_path,
+                checks=("values",),
+                meeting_sid=session_uid,
+            )
+            if n_flags:
+                log.info("[review] meeting=%s flagged %d suspicious item(s) ⚠️", session_uid, n_flags)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[review] failed (non-fatal): %s", e)
+
     # 4.0.3. Ф6: доставка протокола в Telegram-группу.
     # Идемпотентность через `meta.delivered` в meta.json. Если привязки
     # series→chat_id в watched.yaml нет — `deliver_protocol` сам спросит
@@ -851,31 +905,10 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         log.warning("[vstrechi-index] update failed (non-fatal): %s", e)
 
-    # 4.1. Ф3 clarify-trigger: если есть unresolved cluster'ы (LLM сдался)
-    # или low-confidence (LLM ответил, но неуверенно) — отправляем Илье
-    # уведомление с inline keyboard и пишем `_pending_clarification/<sid>.json`.
-    # Поток НЕ блокируется: финализация уже записала транскрипт «как есть»
-    # (с «Спикер N» для unresolved). Worker подберёт ответ позже,
-    # переразметит файл атомарно И перегенерирует протокол (Ф4 hook в
-    # clarify_worker._apply_resolution).
-    try:
-        clarify_meta = dict(meta)
-        # передаём в clarify дату — она нужна для формирования сообщения и
-        # как часть state-файла для аудита.
-        clarify_meta["date"] = date_part
-        clarify_speakers_via_telegram(
-            meeting_id=session_uid,
-            turns=turns,
-            speaker_confidence=speaker_confidence,
-            cluster_to_name=cluster_to_name,
-            expected_participants=expected,
-            panel_participants=participants,
-            meta=clarify_meta,
-            transcript_path=md_path,
-        )
-    except Exception as e:
-        # Clarify — best-effort. Не валим финализацию из-за проблемы с Telegram.
-        log.warning("clarify_speakers_via_telegram failed (non-fatal): %s", e)
+    # 4.1. Ф5: clarify спикеров теперь идёт ДО доставки (блок 4.0.2b выше) —
+    # с авто-подстановкой известных (5.4) и grace-окном (5.3). Здесь раньше был
+    # повторный trigger ПОСЛЕ доставки (дизайн Ф3/Ф4); в Ф5 он перенесён вверх,
+    # чтобы имя попадало в первую доставку, а не только в поздний до-сыл.
 
     if backend == "speechmatics":
         log.info("Transcripts archive → %s, %s", transcripts_json_path, transcripts_txt_path)

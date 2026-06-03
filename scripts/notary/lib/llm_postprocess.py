@@ -899,6 +899,63 @@ def clarify_speakers_via_telegram(
         logger.warning("[clarify] meeting=%s name_pool пустой — Илье не из чего выбирать", meeting_id)
         return None
 
+    # 5.4: сверка с people.md / expected_participants ПЕРЕД вопросом.
+    # Если кластер однозначно ложится на известного участника (строгий 1:1) —
+    # подставляем авто, не дёргаем Илью. 2+ совпадения = не угадываем (ask).
+    try:
+        people_md = protocol_to_tg._read_people_md()
+        people_names = protocol_to_tg._extract_names_from_people(people_md) if people_md else []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[clarify] meeting=%s people.md read failed (5.4): %s", meeting_id, e)
+        people_names = []
+    auto_map = auto_resolve_known_speakers(
+        unclear, resolved_names_ordered, name_pool,
+        people_names=people_names, expected_participants=list(expected_participants),
+    )
+    if auto_map:
+        label_to_name: dict[str, str] = {}
+        for cluster_key, name in auto_map.items():
+            label = unclear.get(cluster_key, {}).get("speaker_label_in_md")
+            if label:
+                label_to_name[label] = name
+            unclear.pop(cluster_key, None)
+            if name not in seen_resolved:
+                seen_resolved.add(name)
+                resolved_names_ordered.append(name)
+        if label_to_name:
+            try:
+                file_updated = apply_clarify_mapping_to_transcript(transcript_path, label_to_name)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[clarify] meeting=%s auto-apply failed (5.4): %s", meeting_id, e)
+                file_updated = False
+            if file_updated:
+                # Перегенерируем протокол, чтобы первичная доставка ушла уже
+                # с подставленным именем (а не «Спикер N»).
+                try:
+                    proto_path = transcript_path.parent / f"{transcript_path.stem}-protokol.md"
+                    regenerate_protocol_for_meeting(
+                        transcript_path=transcript_path,
+                        protocol_path=proto_path,
+                        meeting_meta={
+                            "series": meta.get("series") or "",
+                            "date": meta.get("date") or (meta.get("startTs") or "")[:10] or "",
+                            "sessionUid": meta.get("sessionUid"),
+                            "expectedParticipants": list(expected_participants),
+                            "participants": list(panel_participants),
+                            "transcript_filename": transcript_path.name,
+                        },
+                        meeting_sid=meeting_id,
+                    )
+                except ProtocolGenerationError as e:
+                    logger.warning("[clarify] meeting=%s auto-resolve regen failed (5.4): %s", meeting_id, e)
+            logger.info(
+                "[clarify] meeting=%s auto-resolved %d known speaker(s): %s",
+                meeting_id, len(label_to_name), label_to_name,
+            )
+    if not unclear:
+        logger.info("[clarify] meeting=%s all clusters auto-resolved (5.4) — no clarify", meeting_id)
+        return None
+
     # Samples — реплики из turns для каждого unclear cluster'а.
     for cluster_key, data in unclear.items():
         data["samples"] = _build_samples_for_cluster(turns, cluster_key)
@@ -1031,6 +1088,8 @@ GENERATE_PROTOCOL_BASE_PROMPT = """Ты редактор протокола вс
 - Задачи (блок «Задачи») извлекай ТОЛЬКО те, что явно прозвучали как договорённости («сделаю X», «пришлю Y», «договорились что Z к пятнице»). Не додумывай задачи из общего смысла.
 - Имена в задачах и решениях бери ровно как они в транскрипте. Если в транскрипте «Спикер 3» — оставь «Спикер 3» (не выдумывай имя).
 - Темы (## 1) ... ## 2) ...) группируй по СМЫСЛУ, а не по хронологии транскрипта.
+- Сохраняй СУБСТАНТИВНЫЙ контекст пункта — то конкретное, что человек явно дал: основание/причину («потому что …»), канал/источник («лиды из РСЯ», «через кабинет YME»), состояние/способ («распределяем вручную», «склад занят»), объект («палетное хранение»). Не сворачивай это до пустого «обсудили вопрос лидов» — теряется суть, ради которой пункт и попал в протокол.
+- Но это НЕ отмена сжатия: режь воду, повторы, болтовню, формулируй ёмко. Цель — «коротко, но с сохранением смысла», а не «длинно». Объём протокола должен оставаться компактным (см. длину ниже); добавляется не объём, а точность пункта.
 - Длина: компактнее транскрипта в 5–10 раз.
 - Каждый буллет тематического блока — на отдельной строке с ПУСТОЙ строкой между буллетами (иначе они склеятся в один параграф).
 - Эмодзи-маркеры — только функциональные из стандарта (▪️ ▫️ 🔸 🟠). Никаких декоративных.
@@ -3648,4 +3707,555 @@ def apply_correction(
         "version_path": str(version_path) if version_path else None,
         "in_group_action": action,
         "summary_sent": summary_sent,
+    }
+
+
+# ===========================================================================
+# Ф5 (5.2): LLM-постпроход «подозрительные числа / инверсии» → ⚠️ «проверь»
+# ===========================================================================
+#
+# ВОПР1 → вариант А: НЕ авто-правим (финансы — цена ошибки авто-правки выше,
+# чем пропущенная пометка). Только помечаем ⚠️ в протоколе и оставляем
+# решение Илье.
+#
+# === ПРОЕКТНАЯ ЗАМЕТКА ДЛЯ Ф6/Ф7 (объединение в ОДИН claude-вызов) =========
+# `review_protocol()` спроектирован как ЕДИНЫЙ ревью-проход, расширяемый по
+# секциям (`checks`):
+#   - "values"  (Ф5, ЗДЕСЬ)  — подозрительные числа / отрицания / антонимы.
+#   - "roles"   (Ф6 6.2)     — у одного спикера смешаны разные роли/темы.
+#   - "memory"  (Ф7 7.3)     — сверка с выжимками прошлых встреч серии.
+# Чтобы НЕ плодить три отдельных claude-вызова на одну встречу, Ф6 и Ф7
+# добавляют свою секцию в `_build_review_system_prompt(checks)` и свой
+# разбор в `_parse_review_response()` + обработчик в `apply_review_flags()`.
+# Тогда finalize зовёт review_protocol(checks=("values","roles","memory"))
+# ОДИН раз, а не три. Контракт ответа — JSON с ключами по именам секций.
+# ===========================================================================
+
+# Модель ревью-прохода. Sonnet 4.6 — нужна аккуратность в сверке чисел и
+# смысла «свободно↔занято»; Haiku на это слишком слаб (даёт false-positive).
+PROTOCOL_REVIEW_MODEL = "claude-sonnet-4-6"
+
+# Маркер, который вставляется в строку протокола. Якорим по нему идемпотентность
+# (повторный проход не плодит дубли ⚠️).
+REVIEW_FLAG_MARKER = "⚠️"
+
+
+class ProtocolReviewError(RuntimeError):
+    """Сбой ревью-прохода (CLI/claude/parse)."""
+
+
+def _is_protocol_review_enabled() -> bool:
+    """Kill-switch ревью-прохода 5.2: `ENABLE_PROTOCOL_REVIEW` (дефолт ON;
+    `0/false/no` → OFF). Нужен, чтобы при сбое в проде отключить лишний
+    claude-вызов в hot-path без передеплоя кода."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_REVIEW") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+_REVIEW_VALUES_SECTION = """### Секция "values" — подозрительные числа и инверсии смысла
+
+Сверь КАЖДОЕ число и КАЖДОЕ утверждение в протоколе с транскриптом. Помечай ТОЛЬКО реально подозрительное:
+- число в протоколе не сходится с транскриптом (например «28 млн» в протоколе, а в речи «2,8 миллиона» — порядок/запятая) или внутренне противоречиво;
+- отрицание/утверждение перевёрнуто («хватает» ↔ «не хватает», «успеваем» ↔ «не успеваем»);
+- антонимная пара перепутана («свободно» ↔ «занято», «вырос» ↔ «упал», «дороже» ↔ «дешевле»).
+
+НЕ помечай: стилистику, формулировки, орфографию, округления, которые явно следуют из речи. Лучше пропустить сомнительное, чем зашуметь — порог высокий. Если не уверен, что это ошибка, — НЕ помечай."""
+
+
+def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
+    """Собирает system-prompt ревью-прохода из включённых секций.
+
+    Ф6/Ф7 добавят сюда свои секции (см. проектную заметку выше).
+    """
+    sections: list[str] = []
+    if "values" in checks:
+        sections.append(_REVIEW_VALUES_SECTION)
+    # Ф6: if "roles" in checks: sections.append(_REVIEW_ROLES_SECTION)
+    # Ф7: if "memory" in checks: sections.append(_REVIEW_MEMORY_SECTION)
+    sections_text = "\n\n".join(sections)
+    return (
+        "Ты — придирчивый проверяющий протокола встречи. Тебе дан готовый "
+        "протокол и исходный транскрипт. Твоя задача — НАЙТИ подозрительные "
+        "места и вернуть их списком. Ты НИЧЕГО не правишь сам.\n\n"
+        + sections_text
+        + "\n\nОтвет — СТРОГО JSON-объект без markdown-обёртки:\n"
+        '{"findings": [{"section": "values", "quote": "<точная подстрока из '
+        'протокола — буллет/фраза, где проблема>", "note": "<коротко (3-7 слов) '
+        'что проверить>"}]}\n'
+        "Если подозрительного нет — верни {\"findings\": []}. "
+        "`quote` должен быть ДОСЛОВНОЙ подстрокой протокола (можно неполная "
+        "строка, но без перефраза) — по ней пометка встанет на нужное место."
+    )
+
+
+def _parse_review_response(raw: str) -> list[dict]:
+    """Парсит JSON-ответ ревью-прохода в список findings. Терпим к обёртке.
+
+    Возвращает список dict'ов `{section, quote, note}`. На мусор — [].
+    """
+    if not raw or not raw.strip():
+        return []
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    # Вырезаем первый JSON-объект, если модель добавила прозу вокруг.
+    if not text.lstrip().startswith("{"):
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if m:
+            text = m.group(0)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("[review] не распарсил JSON ответа (len=%d)", len(raw))
+        return []
+    findings = data.get("findings") if isinstance(data, dict) else None
+    if not isinstance(findings, list):
+        return []
+    out: list[dict] = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        quote = (f.get("quote") or "").strip()
+        note = (f.get("note") or "").strip()
+        if not quote or not note:
+            continue
+        out.append({
+            "section": (f.get("section") or "values").strip() or "values",
+            "quote": quote,
+            "note": note,
+        })
+    return out
+
+
+def _normalize_for_match(s: str) -> str:
+    """Нормализует строку для нечёткого поиска quote в протоколе.
+
+    Схлопывает пробелы, нижний регистр И срезает markdown-эмфазу (`*`, `_`,
+    backtick) — claude нередко цитирует текст без bold-обёртки, а в протоколе
+    он жирный (`**свободен**`). Только для матча; в вывод пишем исходную строку.
+    """
+    out = re.sub(r"[*_`]+", "", (s or ""))
+    return re.sub(r"\s+", " ", out).strip().lower()
+
+
+def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
+    """Вставляет ⚠️-пометки в протокол по findings (ВОПР1 → НЕ авто-правит).
+
+    Для каждого finding ищет строку протокола, содержащую `quote` (нечётко,
+    по схлопнутым пробелам/регистру). Нашёл → дописывает в конец строки
+    ` ⚠️ проверь: <note>`. Не нашёл — складывает в хвостовой блок
+    «## ⚠️ Проверить» (чтобы пометка не потерялась, REQ 5.2).
+
+    Идемпотентно: если в строке уже есть ⚠️ с этим note — не дублирует.
+    Чистая функция (без IO/claude) — основной объект unit-тестов 5.2.
+    """
+    if not findings:
+        return protocol_text
+    lines = protocol_text.split("\n")
+    norm_lines = [_normalize_for_match(ln) for ln in lines]
+    unmatched: list[dict] = []
+    for f in findings:
+        quote_norm = _normalize_for_match(f["quote"])
+        note = f["note"]
+        if not quote_norm:
+            continue
+        # Ищем самую короткую подходящую строку (точнее попадание).
+        best_idx = -1
+        for i, nl in enumerate(norm_lines):
+            if not nl or not lines[i].strip():
+                continue
+            if quote_norm in nl:
+                if best_idx == -1 or len(nl) < len(norm_lines[best_idx]):
+                    best_idx = i
+        if best_idx == -1:
+            unmatched.append(f)
+            continue
+        flag = f"{REVIEW_FLAG_MARKER} проверь: {note}"
+        # Идемпотентность: этот note уже стоит на строке?
+        if flag in lines[best_idx]:
+            continue
+        lines[best_idx] = lines[best_idx].rstrip() + f"  {flag}"
+        norm_lines[best_idx] = _normalize_for_match(lines[best_idx])
+    out = "\n".join(lines)
+    if unmatched:
+        block = [f"\n## {REVIEW_FLAG_MARKER} Проверить", ""]
+        for f in unmatched:
+            block.append(f"{REVIEW_FLAG_MARKER} {f['note']} — «{f['quote']}»")
+            block.append("")
+        # Не дублируем блок при повторном проходе.
+        if f"## {REVIEW_FLAG_MARKER} Проверить" not in out:
+            out = out.rstrip() + "\n" + "\n".join(block).rstrip() + "\n"
+    return out
+
+
+def review_protocol(
+    protocol_text: str,
+    transcript_md: str,
+    *,
+    checks: tuple[str, ...] = ("values",),
+    meeting_sid: Optional[str] = None,
+    timeout: int = 120,
+) -> list[dict]:
+    """Ревью-проход (5.2): возвращает список findings (НЕ правит протокол).
+
+    Единый расширяемый проход — см. ПРОЕКТНУЮ ЗАМЕТКУ выше (Ф6/Ф7 добавляют
+    секции в `checks`, чтобы переиспользовать ЭТОТ claude-вызов). Best-effort:
+    нет claude в PATH / сбой / пустой ответ → [] (finalize не валится).
+    """
+    if not _is_protocol_review_enabled():
+        logger.info("[review] disabled by ENABLE_PROTOCOL_REVIEW=0")
+        return []
+    if not protocol_text or not protocol_text.strip():
+        return []
+    if not transcript_md or not transcript_md.strip():
+        return []
+    system_prompt = _build_review_system_prompt(checks)
+    user_prompt = (
+        "Протокол (проверяемый):\n\n" + protocol_text
+        + "\n\n---\n\nТранскрипт (источник истины):\n\n" + transcript_md
+    )
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=system_prompt,
+            timeout=timeout,
+            model=PROTOCOL_REVIEW_MODEL,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning("[review] `claude` не в PATH — пропуск ревью-прохода")
+        return []
+    except ClaudeCliError as e:
+        logger.warning("[review] meeting=%s claude error: %s", meeting_sid or "?", str(e)[:200])
+        return []
+    findings = _parse_review_response(raw)
+    logger.info(
+        "[review] meeting=%s checks=%s findings=%d",
+        meeting_sid or "?", ",".join(checks), len(findings),
+    )
+    return findings
+
+
+def review_and_flag_protocol_file(
+    protocol_path: Path,
+    transcript_path: Path,
+    *,
+    checks: tuple[str, ...] = ("values",),
+    meeting_sid: Optional[str] = None,
+) -> int:
+    """Высокоуровневая обёртка 5.2: читает протокол+транскрипт, прогоняет
+    `review_protocol`, вписывает ⚠️ через `apply_review_flags`, atomic-write.
+
+    Возвращает число вставленных пометок (0 — нечего/сбой). Best-effort:
+    любой сбой → 0, файл не трогаем.
+    """
+    if not protocol_path.is_file() or not transcript_path.is_file():
+        return 0
+    try:
+        protocol_text = protocol_path.read_text(encoding="utf-8")
+        transcript_md = transcript_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[review] read failed: %s", e)
+        return 0
+    findings = review_protocol(
+        protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
+    )
+    if not findings:
+        return 0
+    new_text = apply_review_flags(protocol_text, findings)
+    if new_text == protocol_text:
+        return 0
+    try:
+        _atomic_write_text(protocol_path, new_text)
+    except OSError as e:
+        logger.warning("[review] write failed %s: %s", protocol_path, e)
+        return 0
+    return len(findings)
+
+
+# ===========================================================================
+# Ф5 (5.4): авто-подстановка известных спикеров перед clarify
+# ===========================================================================
+
+
+def _is_known_person(
+    name: str,
+    people_names: list[str],
+    expected_set: set[str],
+) -> bool:
+    """«Известный» = есть в expected_participants серии ИЛИ в people.md.
+
+    people.md-членство: точное полное имя ЛИБО однозначный резолв
+    короткого имени (через protocol_to_tg._resolve_full_name — там же
+    защита от коллизий «2 Михаила» → не резолвится).
+    """
+    n = (name or "").strip()
+    if not n:
+        return False
+    if n in expected_set:
+        return True
+    if people_names:
+        if n in people_names:
+            return True
+        resolved = protocol_to_tg._resolve_full_name(n, people_names)
+        if resolved != n and " " in resolved:
+            return True
+    return False
+
+
+def auto_resolve_known_speakers(
+    unclear_clusters: dict[str, dict],
+    resolved_names: list[str],
+    name_pool: list[str],
+    *,
+    people_names: Optional[list[str]] = None,
+    expected_participants: Optional[list[str]] = None,
+) -> dict[str, str]:
+    """5.4: до clarify пытается ОДНОЗНАЧНО подставить известного участника.
+
+    Подставляем ТОЛЬКО когда остаётся РОВНО один неразмеченный кластер И
+    ровно один не-занятый известный кандидат (строгий 1:1). Любая
+    неоднозначность (2+ кластера ИЛИ 2+ кандидата, в т.ч. «2 Михаила») →
+    {} → отдаём Илье на clarify (защита от коллизий, ВОПР по 5.4).
+
+    «Известный» = `expected_participants` серии ∪ people.md (см.
+    `_is_known_person`). Память серии (Ф7) добавит свои имена в `name_pool` /
+    `expected_participants` — хук без изменения этой функции.
+
+    Args:
+      unclear_clusters: {cluster_key: {...}} — неразмеченные кластеры.
+      resolved_names: имена, уже привязанные к другим кластерам (заняты).
+      name_pool: кандидаты (expected + участники панели).
+      people_names: имена из people.md (см. protocol_to_tg._extract_names_from_people).
+      expected_participants: ожидаемый состав серии.
+
+    Returns:
+      {cluster_key: name} для авто-подстановки (пусто, если неоднозначно).
+    """
+    if len(unclear_clusters) != 1:
+        return {}
+    expected_set = {
+        (e or "").strip() for e in (expected_participants or []) if (e or "").strip()
+    }
+    occupied = {(r or "").strip() for r in (resolved_names or []) if (r or "").strip()}
+    people_names = people_names or []
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for n in name_pool or []:
+        nn = (n or "").strip()
+        if not nn or nn in seen or nn in occupied:
+            continue
+        seen.add(nn)
+        if _is_known_person(nn, people_names, expected_set):
+            candidates.append(nn)
+    if len(candidates) != 1:
+        return {}
+    (cluster_key,) = tuple(unclear_clusters.keys())
+    return {cluster_key: candidates[0]}
+
+
+# ===========================================================================
+# Ф5 (5.5 + 5.6): до-сыл ИСПРАВЛЕННОЙ версии протокола (revision-маркер)
+# ===========================================================================
+#
+# Контекст (digest Ф4→Ф5): поздний clarify-ответ уже перегенерирует
+# `<date>-protokol.md` на диске (clarify_worker._apply_resolution), но в группу
+# повторно НЕ дослыается (дизайн Ф3). 5.6 связывает «поздний clarify изменил
+# протокол» → «дослать обновлённую версию в чат», ОБХОДЯ идемпотентность
+# meta.delivered. 6ч-дедуп (notify.py) здесь не при чём — до-сыл идёт прямым
+# telegram_api.send_message, а не через notify(). 5.5 — блок «🔁 Что
+# изменилось» в досланной версии.
+#
+# РИСК (из промта): не сломать идемпотентность Ф1. Обычный повтор finalize
+# по-прежнему даёт skip/rc=10 (deliver_protocol не трогаем). Обходит дедуп
+# ТОЛЬКО этот путь — и ТОЛЬКО когда контент протокола реально изменился
+# (content-hash), т.е. legitimate до-сыл, а не любой повторный вызов.
+
+REVISION_SUMMARY_PROMPT = """Ты помогаешь сформулировать короткий блок «что изменилось» для пользователя после доразметки протокола встречи (поздно уточнили, кто говорил, и т.п.).
+
+На вход — unified-diff между прошлой и новой версией протокола. Сформулируй 3–8 строк русского текста в формате:
+
+🔁 Что изменилось в протоколе «<series>» <date>:
+
+- <одно изменение одной строкой>
+- <ещё одно, если есть>
+
+Чаще всего меняется имя спикера (был «Спикер N» → стало имя) — так и пиши. Не дублируй протокол целиком, не выдумывай ничего сверх diff. Только готовый русский текст без markdown-обёртки и без префиксов."""
+
+
+def _protocol_content_hash(text: str) -> str:
+    """Стабильный хеш содержимого протокола (для revision-идемпотентности).
+
+    Нормализуем хвостовые пробелы строк, чтобы косметика не считалась
+    изменением. ⚠️-пометки 5.2 в хеш ВХОДЯТ (это смысловое изменение).
+    """
+    norm = "\n".join(ln.rstrip() for ln in (text or "").split("\n")).strip()
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _compose_revision_summary(
+    old_text: str,
+    new_text: str,
+    meeting_meta: dict,
+    *,
+    meeting_sid: Optional[str] = None,
+    timeout: int = 60,
+) -> str:
+    """Блок «🔁 Что изменилось» через Haiku по diff'у. Fallback — заводская строка."""
+    import difflib
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or "—"
+    fallback = f"🔁 Обновил протокол «{series}» {date} — уточнил детали, новая версия ниже."
+    if not old_text or not new_text:
+        return fallback
+    diff_lines = list(difflib.unified_diff(
+        old_text.splitlines(), new_text.splitlines(),
+        fromfile="было", tofile="стало", lineterm="", n=2,
+    ))
+    if not diff_lines:
+        return fallback
+    if len(diff_lines) > 200:
+        diff_lines = diff_lines[:200] + ["... (diff обрезан)"]
+    user_prompt = f"Series: {series}\nDate: {date}\n\nDiff (unified):\n" + "\n".join(diff_lines)
+    try:
+        raw = call_claude_print(
+            user_prompt, system=REVISION_SUMMARY_PROMPT,
+            timeout=timeout, model=CORRECTION_SUMMARY_MODEL,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning("[revision] `claude` не в PATH — fallback summary")
+        return fallback
+    except ClaudeCliError as e:
+        logger.warning("[revision] summary CLI error meeting=%s: %s", meeting_sid or "?", e)
+        return fallback
+    text = (raw or "").strip()
+    return text or fallback
+
+
+def redeliver_revised_protocol(
+    meeting_meta: dict,
+    old_protocol_text: str,
+    new_protocol_text: str,
+    *,
+    meta_json_path: Optional[Path],
+    meeting_sid: Optional[str] = None,
+) -> dict:
+    """До-сыл ИСПРАВЛЕННОЙ версии в ту же группу (5.5 + 5.6).
+
+    Вызывается из clarify_worker._apply_resolution ПОСЛЕ перегенерации
+    протокола. ОБХОДИТ идемпотентность meta.delivered (это легитимный до-сыл),
+    шлёт блок «🔁 Что изменилось» + новую версию, помечает meta.delivered
+    ревизией (revision++, content_hash) — чтобы повтор не задвоил.
+
+    Гейты безопасности (РИСК 5.6 «не сломать Ф1»):
+      - только если протокол УЖЕ был доставлен (delivered с message_ids) —
+        иначе первичная доставка ещё впереди (grace окно) → not-delivered-yet;
+      - только если контент реально изменился (content_hash) — иначе no-change;
+      - то же содержимое, что уже помечено как revision-доставленное → skip.
+
+    Возвращает {status: sent|not-delivered-yet|no-change|skipped|disabled|error, ...}.
+    """
+    if not _is_protocol_delivery_enabled():
+        return {"status": "disabled"}
+    if not new_protocol_text or not new_protocol_text.strip():
+        return {"status": "error", "error": "empty new protocol"}
+
+    new_hash = _protocol_content_hash(new_protocol_text)
+    if old_protocol_text and _protocol_content_hash(old_protocol_text) == new_hash:
+        return {"status": "no-change"}
+
+    meta = _read_meta_json(meta_json_path) if meta_json_path else None
+    records = _normalize_delivered(meta.get("delivered")) if meta else []
+    # Берём последнюю запись с реально отправленными message_ids.
+    last = None
+    for rec in reversed(records):
+        if rec.get("message_ids"):
+            last = rec
+            break
+    if last is None:
+        # Ещё не доставляли (или delivered=skip/backfill) — первичная доставка
+        # сама подхватит новую версию. До-сыл не нужен.
+        return {"status": "not-delivered-yet"}
+    if last.get("content_hash") == new_hash:
+        # Эту версию уже дослали ревизией — идемпотентно молчим.
+        return {"status": "skipped", "reason": "already-revised"}
+
+    chat_id = last.get("chat_id")
+    if not isinstance(chat_id, int):
+        return {"status": "error", "error": "no chat_id in delivered record"}
+
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    if not bot_token:
+        return {"status": "error", "error": "no bot token"}
+
+    # Текущий номер ревизии.
+    prev_rev = 0
+    for rec in records:
+        try:
+            prev_rev = max(prev_rev, int(rec.get("revision") or 0))
+        except (TypeError, ValueError):
+            continue
+    revision = prev_rev + 1
+
+    # 1) Блок «🔁 Что изменилось» — отдельным сообщением ПЕРВЫМ.
+    summary = _compose_revision_summary(
+        old_protocol_text, new_protocol_text,
+        {"series": meeting_meta.get("series"), "date": meeting_meta.get("date")},
+        meeting_sid=meeting_sid,
+    )
+    try:
+        telegram_api.send_message(bot_token, chat_id, summary)
+    except telegram_api.TelegramApiError as e:
+        logger.warning("[revision] summary send failed meeting=%s: %s", meeting_sid or "?", e)
+
+    # 2) Новая версия протокола (тот же формат/сплит, что первичная доставка).
+    tg_text = protocol_to_tg.format_protocol_as_tg_text(new_protocol_text, meeting_meta)
+    chunks = protocol_to_tg.split_protocol_smart(tg_text, max_len=protocol_to_tg.TG_MAX_LEN)
+    if not chunks:
+        return {"status": "error", "error": "empty TG text after formatting"}
+    sent_ids: list[int] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        try:
+            result = telegram_api.send_message(bot_token, chat_id, chunk)
+        except telegram_api.TelegramApiError as e:
+            logger.warning(
+                "[revision] send failed meeting=%s part=%d/%d: %s",
+                meeting_sid or "?", idx, len(chunks), e,
+            )
+            return {
+                "status": "error", "chat_id": chat_id,
+                "message_ids": sent_ids, "error": str(e),
+            }
+        sent_ids.append(int(result.get("message_id") or 0))
+
+    # 3) meta.delivered ← новая запись с revision-маркером и content_hash.
+    #    replace_for_chat_id=True: следующий тик collector'а увидит свежие
+    #    message_ids → deliver_protocol даст idempotent skip (Ф1 цела).
+    at = _now_iso()
+    if meta_json_path:
+        prev_history = list(last.get("history") or [])
+        prev_history.append({
+            "at": at, "chat_id": chat_id,
+            "message_ids": list(last.get("message_ids") or []),
+            "reason": "revision", "revision": revision,
+        })
+        _update_meta_delivered(meta_json_path, {
+            "chat_id": chat_id,
+            "message_ids": sent_ids,
+            "at": at,
+            "decision": "revision",
+            "revision": revision,
+            "content_hash": new_hash,
+            "history": prev_history,
+        })
+    logger.info(
+        "[revision] sent meeting=%s chat_id=%s rev=%d parts=%d",
+        meeting_sid or "?", chat_id, revision, len(sent_ids),
+    )
+    return {
+        "status": "sent",
+        "chat_id": chat_id,
+        "message_ids": sent_ids,
+        "revision": revision,
+        "content_hash": new_hash,
     }

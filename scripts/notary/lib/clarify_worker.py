@@ -111,6 +111,15 @@ def _find_pending_state_by_callback(
     return None
 
 
+def _ack_suffix(is_late: bool, redelivery_status: Optional[str]) -> str:
+    """Текст подтверждения Илье с учётом до-сыла обновлённой версии (5.5/5.6)."""
+    if redelivery_status == "sent":
+        return "✅ Применил — обновлённую версию дослал в группу"
+    if not is_late:
+        return "✅ Применил"
+    return "⏰ Поздно (после таймаута) — обновил файл"
+
+
 def _apply_resolution(
     state: dict,
     mapping: dict[str, str],
@@ -118,15 +127,20 @@ def _apply_resolution(
     via: str,
     pending_root: Path,
     is_late: bool = False,
-) -> None:
-    """Применяет mapping к транскрипту на диске, помечает state."""
+) -> Optional[str]:
+    """Применяет mapping к транскрипту на диске, помечает state.
+
+    Возвращает статус до-сыла обновлённой версии в группу (5.5/5.6):
+    "sent" / "not-delivered-yet" / "no-change" / "skipped" / None (не пытались).
+    Нужен вызывающему для текста ack'а Илье.
+    """
     if not mapping:
         logger.info(
             "[clarify] %s meeting=%s via=%s nothing-to-apply",
             "late_answer" if is_late else "resolved",
             state.get("meeting_id"), via,
         )
-        return
+        return None
 
     transcript_path = Path(state.get("transcript_path", ""))
     label_to_name: dict[str, str] = {}
@@ -158,16 +172,31 @@ def _apply_resolution(
     # `<date>-protokol.md` рядом с ним. Делаем и для resolved (Илья нажал
     # кнопку в окне таймаута), и для late_answer (нажал после таймаута) —
     # план фиксирует, что поздний ответ обновляет файл на диске.
-    # В Telegram-группу повторно не шлём (этим займётся / откажется Ф6).
+    # Ф5 (5.5/5.6): если протокол УЖЕ был доставлен — дослыаем обновлённую
+    # версию в группу с блоком «🔁 Что изменилось» (revision-маркер).
     protocol_regenerated = False
+    redelivery_status: Optional[str] = None
     if file_updated and transcript_path.exists():
         # Имя протокола живёт рядом: `<date>-protokol.md` (тот же паттерн,
         # что в finalize-meeting.py). transcript_path.stem = `<date>`
         # (например `2026-05-27`); если в имени окажется не дата —
         # generate_protocol всё равно возьмёт дату из meta.
+        protocol_path = transcript_path.parent / f"{transcript_path.stem}-protokol.md"
+        meta_block = state.get("meta") or {}
+        # Снимок старой версии ДО перегенерации — для diff «🔁 что изменилось»
+        # и для content-hash идемпотентности до-сыла (5.6).
+        old_protocol_text = ""
+        if protocol_path.is_file():
+            try:
+                old_protocol_text = protocol_path.read_text(encoding="utf-8")
+            except OSError:
+                old_protocol_text = ""
+            # Сохраняем версию vN в _versions/ для аудита (как correction flow).
+            try:
+                llm_postprocess._save_protocol_version(protocol_path)
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            protocol_path = transcript_path.parent / f"{transcript_path.stem}-protokol.md"
-            meta_block = state.get("meta") or {}
             regen_meta = {
                 "series": meta_block.get("series") or "",
                 "date": meta_block.get("date") or "",
@@ -204,6 +233,43 @@ def _apply_resolution(
                 state.get("meeting_id"), e,
             )
 
+        # Ф5 (5.5/5.6): до-сыл обновлённой версии. meta.json лежит рядом с
+        # транскриптом. redeliver сам решает: если ещё не доставляли →
+        # not-delivered-yet (первичная доставка подхватит); если контент не
+        # менялся → no-change; иначе шлёт ревизию, ОБХОДЯ идемпотентность.
+        if protocol_regenerated:
+            try:
+                new_protocol_text = protocol_path.read_text(encoding="utf-8")
+            except OSError:
+                new_protocol_text = ""
+            if new_protocol_text.strip():
+                meta_json_path = transcript_path.parent / "meta.json"
+                try:
+                    redeliver_meta = {
+                        "series": meta_block.get("series") or "",
+                        "date": meta_block.get("date") or "",
+                        "sessionUid": meta_block.get("sessionUid"),
+                        "expectedParticipants": state.get("name_pool", []),
+                        "participants": [],
+                    }
+                    res = llm_postprocess.redeliver_revised_protocol(
+                        redeliver_meta,
+                        old_protocol_text,
+                        new_protocol_text,
+                        meta_json_path=meta_json_path if meta_json_path.is_file() else None,
+                        meeting_sid=state.get("meeting_id"),
+                    )
+                    redelivery_status = res.get("status")
+                    logger.info(
+                        "[revision] meeting=%s redelivery=%s",
+                        state.get("meeting_id"), redelivery_status,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[revision] redeliver failed (non-fatal) meeting=%s: %s",
+                        state.get("meeting_id"), e,
+                    )
+
     new_status = state.get("status")
     extra = {
         "resolved_via": via,
@@ -223,12 +289,11 @@ def _apply_resolution(
     )
     label = "late_answer" if is_late else "resolved"
     logger.info(
-        "[clarify] %s meeting=%s via=%s applied=%d file_updated=%s protocol_regen=%s delivered_unchanged=%s",
+        "[clarify] %s meeting=%s via=%s applied=%d file_updated=%s protocol_regen=%s redelivery=%s",
         label, state["meeting_id"], via, len(mapping), file_updated,
-        protocol_regenerated,
-        # late_answer не отправляет в группу повторно (см. план «Поздний ответ»).
-        "true" if is_late else "n/a",
+        protocol_regenerated, redelivery_status or "n/a",
     )
+    return redelivery_status
 
 
 def _is_authorized_sender(from_user: dict, allowed_chat_id: Optional[int]) -> bool:
@@ -328,7 +393,9 @@ def process_callback(
 
     mapping = {cluster_key: name_or_none}
     is_late = state.get("status") == "timed_out"
-    _apply_resolution(state, mapping, via="callback", pending_root=pending_root, is_late=is_late)
+    redelivery_status = _apply_resolution(
+        state, mapping, via="callback", pending_root=pending_root, is_late=is_late
+    )
 
     # Снимаем «крутилку» + подменяем текст сообщения, чтобы кнопки исчезли.
     try:
@@ -340,10 +407,7 @@ def process_callback(
             state.get("unclear_clusters", {}).get(cluster_key, {}).get("speaker_label_in_md")
             or cluster_key
         )
-        ack_suffix = (
-            "✅ Применил" if not is_late
-            else "⏰ Поздно (после таймаута) — обновил файл, в группу повторно не шлю"
-        )
+        ack_suffix = _ack_suffix(is_late, redelivery_status)
         telegram_api.edit_message_text(
             bot_token,
             chat_id=int(state["chat_id"]),
@@ -520,9 +584,11 @@ def _try_apply_text_to_state(
             pass
         return
 
-    _apply_resolution(state, mapping, via="text", pending_root=pending_root, is_late=is_late)
+    redelivery_status = _apply_resolution(
+        state, mapping, via="text", pending_root=pending_root, is_late=is_late
+    )
     try:
-        ack = "✅ Применил" if not is_late else "⏰ Поздно — обновил файл, в группу не шлю"
+        ack = _ack_suffix(is_late, redelivery_status)
         names = ", ".join(mapping.values())
         telegram_api.send_message(bot_token, reply_chat_id, f"{ack}: {names}")
     except telegram_api.TelegramApiError:
