@@ -186,6 +186,40 @@ def get_updates(
     return []
 
 
+def get_file_path(token: str, file_id: str, *, timeout: float = _API_TIMEOUT_SEC) -> Optional[str]:
+    """`getFile` → относительный `file_path` на серверах Telegram (или None).
+
+    Ф4: нужно чтобы скачать голосовое `.oga` (`download_file`). Логируем только
+    file_id-маркер, не сам путь.
+    """
+    if not file_id:
+        return None
+    result = _post(token, "getFile", {"file_id": file_id}, timeout=timeout)
+    fp = result.get("file_path")
+    logger.info("[tg-api] getFile ok has_path=%s", bool(fp))
+    return fp
+
+
+def download_file(token: str, file_path: str, dest_path: str, *, timeout: float = 120.0) -> None:
+    """Скачивает файл бота в `dest_path`.
+
+    URL: `https://api.telegram.org/file/bot<token>/<file_path>`. Токен в URL —
+    НЕ логируем. Голосовые короткие, читаем целиком в память (≤ единиц МБ).
+    """
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        raise TelegramApiError(f"download_file HTTP {e.code}: {e.reason}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise TelegramApiError(f"download_file network error: {type(e).__name__}: {e}") from e
+    with open(dest_path, "wb") as fh:
+        fh.write(data)
+    logger.info("[tg-api] download_file ok bytes=%d", len(data))
+
+
 def split_long_message(text: str, max_len: int = 3500) -> list[str]:
     """Делит длинное сообщение на части ≤ `max_len` символов (Telegram лимит 4096).
 

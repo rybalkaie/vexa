@@ -46,6 +46,22 @@ logger = logging.getLogger(__name__)
 # Постоянство offset'а для getUpdates (чтобы рестарт не повторял старые updates).
 OFFSET_FILE_NAME = ".clarify_offset"
 
+# Ф4 (REQ 4.3): timed_out, провисевший дольше этого порога, sweep архивирует.
+# Дефолт 7 дней — разумно для ночи, обратимо (статус, не удаление файла).
+# Переопределяется env `MEETING_NOTARY_CLARIFY_ARCHIVE_DAYS`.
+DEFAULT_CLARIFY_ARCHIVE_DAYS = 7
+
+
+def _archive_days() -> int:
+    raw = (os.environ.get("MEETING_NOTARY_CLARIFY_ARCHIVE_DAYS") or "").strip()
+    if not raw:
+        return DEFAULT_CLARIFY_ARCHIVE_DAYS
+    try:
+        v = int(raw)
+    except ValueError:
+        return DEFAULT_CLARIFY_ARCHIVE_DAYS
+    return v if v > 0 else DEFAULT_CLARIFY_ARCHIVE_DAYS
+
 
 def _offset_path(pending_root: Path) -> Path:
     return pending_root / OFFSET_FILE_NAME
@@ -341,13 +357,41 @@ def process_callback(
         logger.debug("[clarify-worker] edit_message after callback failed: %s", e)
 
 
+def _find_state_by_message_id(message_id, pending_root: Path) -> Optional[dict]:
+    """Ф4 (REQ 4.2): находит открытый clarify-state, чей сохранённый `message_id`
+    совпадает с message_id отвеченного (reply) сообщения бота.
+
+    Смотрим только pending/timed_out (archived/resolved исключены — поздний ответ
+    на архивный/уже-закрытый вопрос не применяем). `message_id == 0` в state = «не
+    сохранён» (старый код / send без ответа Telegram) → не матчим (УПУ3-фолбэк
+    подхватит по количеству).
+    """
+    try:
+        target = int(message_id)
+    except (TypeError, ValueError):
+        return None
+    if target <= 0:
+        return None
+    for state in clarify_state.list_pending(
+        root=pending_root, status_filter=["pending", "timed_out"]
+    ):
+        try:
+            if int(state.get("message_id") or 0) == target:
+                return state
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def process_text_message(
     msg: dict,
     pending_root: Path,
     bot_token: str,
 ) -> None:
-    """Текстовое сообщение Ильи. Race protection: применяем только если
-    ровно один pending state. Если 2+ — отвечаем «уточни meeting_id»."""
+    """Текстовое сообщение Ильи. Приоритет — reply-матчинг по `message_id`
+    (REQ 4.2): Reply на конкретный вопрос применяется даже при нескольких
+    открытых/истёкших clarify. Если reply нет (или message_id не сохранён —
+    УПУ3) — фолбэк «ровно один pending/timed_out», иначе просим кнопку."""
     text = msg.get("text") or ""
     if not text.strip():
         return
@@ -361,6 +405,23 @@ def process_text_message(
         return
     chat = msg.get("chat") or {}
     chat_id = int(chat.get("id") or 0)
+
+    # REQ 4.2 — reply-матчинг по message_id. Срабатывает раньше count-based
+    # логики: Илья ответил Reply'ем именно на этот вопрос → точная привязка
+    # к meeting'у, сколько бы открытых/истёкших clarify ни было.
+    reply_src = msg.get("reply_to_message") or {}
+    reply_to_mid = reply_src.get("message_id")
+    if reply_to_mid is not None:
+        matched = _find_state_by_message_id(reply_to_mid, pending_root)
+        if matched is not None:
+            is_late = matched.get("status") == "timed_out"
+            _try_apply_text_to_state(
+                text, matched, bot_token, chat_id, pending_root, is_late=is_late
+            )
+            return
+        # message_id не совпал (старый clarify без сохранённого message_id —
+        # УПУ3, либо reply на не-clarify сообщение) → падаем в count-фолбэк
+        # ниже, поздний ответ не теряется.
 
     pendings = clarify_state.list_pending(root=pending_root, status_filter=["pending"])
     # Поздний ответ через текст? — допустимо: смотрим timed_out тоже, если
@@ -447,7 +508,14 @@ def _try_apply_text_to_state(
 # ----- Таймауты -------------------------------------------------------------
 
 def sweep_timeouts(pending_root: Path) -> int:
-    """Помечает просроченные pending'и как timed_out. Возвращает число изменений."""
+    """Sweep таймаутов. Возвращает число изменённых state'ов.
+
+    Два шага:
+      1) pending → timed_out по дедлайну;
+      2) timed_out → archived (REQ 4.3) если провисел дольше N дней
+         (`MEETING_NOTARY_CLARIFY_ARCHIVE_DAYS`, дефолт 7) — чтобы stale не
+         копились и `has_any_pending_clarify` их не считал активными.
+    """
     n = 0
     for state in clarify_state.list_pending(root=pending_root, status_filter=["pending"]):
         if clarify_state.is_past_deadline(state):
@@ -456,6 +524,20 @@ def sweep_timeouts(pending_root: Path) -> int:
                 extra={"resolved_at": clarify_state.now_iso()},
             )
             logger.info("[clarify] timed_out meeting=%s", state["meeting_id"])
+            n += 1
+
+    archive_days = _archive_days()
+    for state in clarify_state.list_pending(root=pending_root, status_filter=["timed_out"]):
+        age = clarify_state.timed_out_age_days(state)
+        if age is not None and age >= archive_days:
+            clarify_state.mark_status(
+                state["meeting_id"], "archived", root=pending_root,
+                extra={"archived_at": clarify_state.now_iso()},
+            )
+            logger.info(
+                "[clarify] archived stale timed_out meeting=%s age=%.1fd threshold=%dd",
+                state["meeting_id"], age, archive_days,
+            )
             n += 1
     return n
 
@@ -476,7 +558,8 @@ def has_any_pending_clarify(pending_root: Optional[Path] = None) -> bool:
 
     Используется listener'ом чтобы решить: применить текстовое сообщение Ильи
     как clarify-ответ (`process_text_message`) или передать в старый apply_reply
-    flow для блока 📅.
+    flow для блока 📅. `archived` (REQ 4.3) НЕ считается активным — sweep
+    архивирует stale, и они перестают перехватывать текстовые ответы Ильи.
     """
     root = pending_root or clarify_state.resolve_pending_dir()
     if not root.exists():

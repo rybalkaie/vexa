@@ -37,6 +37,10 @@
   resolved    — Илья уже ответил, повторные callback'и игнорируем.
   timed_out   — таймаут прошёл; поздний ответ всё ещё применяет mapping
                 и переписывает транскрипт на диске, **в группу повторно не шлёт**.
+  archived    — Ф4: timed_out провисел > N дней без ответа; sweep его архивирует,
+                чтобы stale не копились. `has_any_pending_clarify` его НЕ считает
+                активным, reply-матчинг по нему не срабатывает. Файл оставляем для
+                аудита (статус обратим), физическую чистку отдаём cleanup.service.
 """
 
 from __future__ import annotations
@@ -174,7 +178,7 @@ def mark_status(
     extra: Optional[dict[str, Any]] = None,
 ) -> Optional[dict]:
     """Обновляет статус (атомарно). Возвращает новый state или None если файла нет."""
-    if new_status not in ("pending", "resolved", "timed_out"):
+    if new_status not in ("pending", "resolved", "timed_out", "archived"):
         raise ValueError(f"unknown status: {new_status!r}")
     state = read_state(meeting_id, root=root)
     if state is None:
@@ -186,17 +190,41 @@ def mark_status(
     return state
 
 
-def is_past_deadline(state: dict) -> bool:
-    """Проверка таймаута для воркер'а. Сравнение по UTC."""
-    deadline = state.get("deadline_at")
-    if not deadline:
-        return False
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    """Парсит ISO-метку (в т.ч. '...Z'); None если пусто/битое. tz-aware (UTC)."""
+    if not ts or not isinstance(ts, str):
+        return None
     try:
-        # Поддерживаем '...Z' формат.
-        ts = deadline.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
-        return False
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) >= dt
+    return dt
+
+
+def is_past_deadline(state: dict) -> bool:
+    """Проверка таймаута для воркер'а. Сравнение по UTC."""
+    deadline = _parse_iso(state.get("deadline_at"))
+    if deadline is None:
+        return False
+    return datetime.now(timezone.utc) >= deadline
+
+
+def timed_out_age_days(state: dict, *, now: Optional[datetime] = None) -> Optional[float]:
+    """Сколько суток прошло с момента, как state ушёл в timed_out.
+
+    Опорная метка: `resolved_at` (его ставит sweep при переходе в timed_out) →
+    fallback `deadline_at` → `sent_at`. None если ни одной валидной метки нет —
+    тогда sweep НЕ архивирует (лучше оставить state, чем потерять поздний ответ).
+    `now` инъектируется в тестах.
+    """
+    ref: Optional[datetime] = None
+    for field in ("resolved_at", "deadline_at", "sent_at"):
+        ref = _parse_iso(state.get(field))
+        if ref is not None:
+            break
+    if ref is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return (now - ref).total_seconds() / 86400.0

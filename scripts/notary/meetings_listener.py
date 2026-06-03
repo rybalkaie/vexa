@@ -549,6 +549,27 @@ def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, A
     return True
 
 
+# Ф4 (REQ 4.1): фолбэк, когда голос распознать не удалось (транскрибация
+# недоступна / упала). Не молчим — явно говорим, что понимаем текст/кнопки.
+VOICE_FALLBACK_MSG = (
+    "🎙 Голос пока не расшифровал (транскрибация недоступна). "
+    "Ответь, пожалуйста, текстом — например «Спикер 3 = Дарья» — или нажми "
+    "кнопку под вопросом."
+)
+
+
+def transcribe_voice_or_none(token: str, msg: dict[str, Any]) -> str | None:
+    """Ф4: голосовое `.oga` → текст через `voice_input` (daemon-стек). None при
+    любой неудаче (нет модуля / не скачалось / не расшифровалось) — caller
+    отправит `VOICE_FALLBACK_MSG`. Текст транскрипта не логируем."""
+    try:
+        from notary.lib import voice_input  # noqa: PLC0415
+        return voice_input.voice_to_text(token, msg)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("voice transcription crashed: %s", e)
+        return None
+
+
 def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
     """Если есть pending/timed_out clarify-state — передаёт msg в clarify_worker.
 
@@ -665,6 +686,21 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     if cid != allowed_chat:
         logger.info("skip: chat_id=%s ≠ allowed=%s", cid, allowed_chat)
         return
+
+    # Ф4 (REQ 4.1): голосовой ответ. Скачиваем `.oga`, транскрибируем и
+    # подставляем как `text` — дальше идёт обычный dispatch (reply-матчинг по
+    # message_id для clarify тоже работает, т.к. `reply_to_message` сохраняется).
+    # Транскрибация недоступна → отвечаем (не молчим) и выходим.
+    if msg.get("voice"):
+        voice_text = transcribe_voice_or_none(token, msg)
+        if not voice_text or not voice_text.strip():
+            send_message(token, cid, VOICE_FALLBACK_MSG, reply_to=msg.get("message_id"))
+            logger.info("voice: транскрибация недоступна → отправлен фолбэк")
+            return
+        msg = dict(msg)
+        msg["text"] = voice_text
+        msg.pop("voice", None)
+        logger.info("voice → text: chars=%d", len(voice_text))
 
     # Сначала — Ф4 команда «протокол <series> <date>». Это явная команда
     # с фиксированным синтаксисом, проверяется до clarify/apply_reply.
