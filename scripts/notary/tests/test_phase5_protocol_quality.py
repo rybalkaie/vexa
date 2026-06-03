@@ -560,5 +560,69 @@ class TestDeliveryGrace(unittest.TestCase):
             self.assertEqual(dg.wait_for_clarify_grace("meeting-x"), "gone")
 
 
+# --------------------------------------------------------------------------
+# 5.2 — review_and_flag_protocol_file: файловая обёртка, которую зовёт finalize
+# (цикл5 ход3: закрытие пробела покрытия У5 — этот путь finalize дёргает напрямую)
+# --------------------------------------------------------------------------
+class TestReviewAndFlagFile(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="test-reviewfile-")
+        self.proto = Path(self.tmpdir) / "2026-06-02-protokol.md"
+        self.transcript = Path(self.tmpdir) / "2026-06-02.md"
+        self.proto.write_text(PROTOCOL_FOR_FLAGS, encoding="utf-8")
+        self.transcript.write_text("в речи 2,8 млн; склад занят", encoding="utf-8")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_flags_written_to_file(self):
+        findings = [{"section": "values", "quote": "28 млн", "note": "в речи 2,8 млн"}]
+        with mock.patch.object(lp, "review_protocol", return_value=findings):
+            n = lp.review_and_flag_protocol_file(self.proto, self.transcript, meeting_sid="sid")
+        self.assertEqual(n, 1)
+        self.assertIn("⚠️ проверь: в речи 2,8 млн", self.proto.read_text(encoding="utf-8"))
+
+    def test_no_findings_no_write(self):
+        before = self.proto.read_text(encoding="utf-8")
+        with mock.patch.object(lp, "review_protocol", return_value=[]):
+            n = lp.review_and_flag_protocol_file(self.proto, self.transcript, meeting_sid="sid")
+        self.assertEqual(n, 0)
+        self.assertEqual(self.proto.read_text(encoding="utf-8"), before)
+
+    def test_missing_protocol_returns_zero(self):
+        n = lp.review_and_flag_protocol_file(
+            Path(self.tmpdir) / "nope.md", self.transcript, meeting_sid="sid",
+        )
+        self.assertEqual(n, 0)
+
+
+# --------------------------------------------------------------------------
+# 5.3 — grace-петля: timeout и ранний выход по timed_out (не покрыто было)
+# --------------------------------------------------------------------------
+class TestDeliveryGraceLoop(unittest.TestCase):
+
+    def setUp(self):
+        self._old = os.environ.get("PROTOCOL_DELIVERY_GRACE_SEC")
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("PROTOCOL_DELIVERY_GRACE_SEC", None)
+        else:
+            os.environ["PROTOCOL_DELIVERY_GRACE_SEC"] = self._old
+
+    def test_wait_returns_timeout_when_stays_pending(self):
+        os.environ["PROTOCOL_DELIVERY_GRACE_SEC"] = "30"
+        with mock.patch.object(dg.clarify_state, "read_state", return_value={"status": "pending"}), \
+                mock.patch.object(dg.time, "sleep", return_value=None):
+            self.assertEqual(dg.wait_for_clarify_grace("m", poll_sec=10), "timeout")
+
+    def test_wait_returns_status_when_timed_out(self):
+        os.environ["PROTOCOL_DELIVERY_GRACE_SEC"] = "300"
+        with mock.patch.object(dg.clarify_state, "read_state", return_value={"status": "timed_out"}):
+            self.assertEqual(dg.wait_for_clarify_grace("m"), "timed_out")
+
+
 if __name__ == "__main__":
     unittest.main()
