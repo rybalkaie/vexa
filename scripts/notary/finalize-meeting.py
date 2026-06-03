@@ -68,6 +68,7 @@ from lib.llm_postprocess import (  # noqa: E402
     route_tasks,
 )
 from lib.render import render_protocol  # noqa: E402
+from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
 
 
 def setup_logging(verbose: bool) -> None:
@@ -459,7 +460,12 @@ def main() -> int:
 
     session_uid = meta.get("sessionUid") or "unknown"
     wav_path = (meta.get("files") or {}).get("wav")
-    if not wav_path or not os.path.exists(wav_path):
+    # Ф2: реальное аудио для STT. Склеивает все meta.recording.chunks[] (Ф5
+    # multichunk) в один WAV и чинит placeholder-шапку (data_size=0 у WAV, на
+    # котором бот умер до close() — корень P0). None → пригодного PCM нет ни в
+    # chunks[], ни в files.wav (тогда ниже отрабатывает rc=10/rc=3, как раньше).
+    audio_path, audio_is_temp = resolve_wav_for_stt(meta, log=log)
+    if audio_path is None:
         # Ф1-доработки (2026-05-29): если протокол УЖЕ доставлен (есть запись
         # в meta.delivered), WAV был легитимно почищен collector'ом — это
         # «nothing to do», не сбой. Возвращаем rc=10, collector интерпретирует
@@ -504,16 +510,19 @@ def main() -> int:
     participants_union: list[str] = list(dict.fromkeys(participants + expanded_expected))
     language = meta.get("language") or "ru"
 
-    log.info("Session %s — wav=%s, %d participants (panel) + %d expected → %d union, lang=%s",
-             session_uid, wav_path, len(participants), len(expected), len(participants_union), language)
+    log.info("Session %s — files.wav=%s → stt-audio=%s (temp=%s), "
+             "%d participants (panel) + %d expected → %d union, lang=%s",
+             session_uid, wav_path, audio_path, audio_is_temp,
+             len(participants), len(expected), len(participants_union), language)
 
-    # 2. STT + диаризация (зависит от backend).
+    # 2. STT + диаризация (зависит от backend). audio_path может быть временным
+    # сконкатенированным/починенным WAV — чистим его в finally после STT.
     sm_result = None  # заполняется только в speechmatics-ветке
     try:
         if backend == "speechmatics":
-            turns, extra, sm_result = _run_speechmatics(wav_path, log)
+            turns, extra, sm_result = _run_speechmatics(audio_path, log)
         else:
-            turns, extra = _run_whisper_pyannote(args, meta, wav_path, language, log)
+            turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)
     except Exception as e:
         # Импорт здесь, чтобы whisper_pyannote-ветка не тянула httpx-исключения.
         if backend == "speechmatics":
@@ -521,8 +530,10 @@ def main() -> int:
             if isinstance(e, (SpeechmaticsError, SpeechmaticsRejectedError)):
                 rejected = isinstance(e, SpeechmaticsRejectedError)
                 log.error("Speechmatics %s: %s", "rejected" if rejected else "failed", e)
+                # Стэшим именно audio_path (склеенный/починенный) — на retry он же
+                # станет files.wav, а исходные chunk-файлы могут быть уже почищены.
                 _stash_into_failed(
-                    session_uid, wav_path, args.meta_json,
+                    session_uid, audio_path, args.meta_json,
                     rejected=rejected, err_repr=f"{type(e).__name__}: {e}",
                 )
                 series_label = meta.get("series") or session_uid
@@ -542,6 +553,15 @@ def main() -> int:
                 return 4
         log.exception("STT/диаризация упала: %s", e)
         return 4
+    finally:
+        # Временный concat/repair WAV больше не нужен (на failure _stash_into_failed
+        # уже скопировал его в _failed/ ДО этого finally). Исходные chunk-WAV не
+        # трогаем — их чистит collector после доставки / cleanup.service по TTL.
+        if audio_is_temp and audio_path and os.path.exists(audio_path):
+            try:
+                os.unlink(audio_path)
+            except OSError as _e:
+                log.warning("Не смог удалить временный WAV %s: %s", audio_path, _e)
 
     # 2.1. Smoke-точка отказа для теста атомарности: симулируем сбой ПОСЛЕ STT.
     if getattr(args, "_test_fail_after_stt", False):

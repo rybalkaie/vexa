@@ -151,6 +151,21 @@ class WavStreamWriter {
     fs.writeSync(this.fd, header, 0, 44);
   }
 
+  // Обновить RIFF size (offset 4) и data size (offset 40) по текущему
+  // samplesWritten. position-аргумент у writeSync → pwrite(2): append-курсор
+  // НЕ сдвигается (Node/Linux), поэтому безопасно звать и по ходу записи, и при
+  // close(). На этом и держался корректный заголовок при штатном close().
+  private writeHeaderSizes(): void {
+    if (this.fd === null) return;
+    const dataLength = this.samplesWritten * 2;
+    const riffSizeBuf = Buffer.alloc(4);
+    riffSizeBuf.writeUInt32LE(36 + dataLength, 0);
+    fs.writeSync(this.fd, riffSizeBuf, 0, 4, 4);
+    const dataSizeBuf = Buffer.alloc(4);
+    dataSizeBuf.writeUInt32LE(dataLength, 0);
+    fs.writeSync(this.fd, dataSizeBuf, 0, 4, 40);
+  }
+
   writeSamples(samples: Float32Array): void {
     if (this.fd === null) return;
     const bytesPerSample = 2;
@@ -163,19 +178,27 @@ class WavStreamWriter {
     }
     fs.writeSync(this.fd, buf, 0, buf.length);
     this.samplesWritten += samples.length;
+    // P0-фикс (Ф2, 2026-06-03): держим WAV-заголовок актуальным на диске ПОСЛЕ
+    // каждого ~3с-чанка. Корень потери WAV 29.05–03.06: PCM стримился на диск
+    // (bind-mount), но data_size в шапке финализировался ТОЛЬКО в close() из
+    // finally-teardown'а. node бежит ребёнком bash (PID 1, см. entrypoint.sh),
+    // поэтому docker stop / рестарт / OOM убивают его SIGKILL'ом → finally не
+    // отрабатывает → шапка остаётся placeholder'ом data_size=0, и ридер видит
+    // «0 байт аудио» при десятках МБ реального PCM (06-01 .recover-bak: 86 МБ,
+    // data_size=0). Теперь на диске ВСЕГДА валидный WAV со всей речью минус
+    // последний <3с-кадр. Цена — 2 pwrite по 4 байта на чанк (мизер).
+    this.writeHeaderSizes();
   }
 
   close(): { samples: number; durationS: number } {
     if (this.fd === null) return { samples: 0, durationS: 0 };
-    const dataLength = this.samplesWritten * 2;
-    const riffSize = 36 + dataLength;
-    // Обновляем RIFF size (offset 4) и data size (offset 40).
-    const riffSizeBuf = Buffer.alloc(4);
-    riffSizeBuf.writeUInt32LE(riffSize, 0);
-    fs.writeSync(this.fd, riffSizeBuf, 0, 4, 4);
-    const dataSizeBuf = Buffer.alloc(4);
-    dataSizeBuf.writeUInt32LE(dataLength, 0);
-    fs.writeSync(this.fd, dataSizeBuf, 0, 4, 40);
+    this.writeHeaderSizes();
+    // fsync перед close: вытолкнуть данные+заголовок из page cache на диск
+    // (durability на случай reboot/краша/OOM хоста). Для видимости host'у через
+    // bind-mount fsync не нужен — но защищает от потери при жёстком сбое.
+    try { fs.fsyncSync(this.fd); } catch (err: any) {
+      log(`${LOG_PREFIX} wav fsync failed (non-fatal): ${err?.message}`);
+    }
     fs.closeSync(this.fd);
     this.fd = null;
     return { samples: this.samplesWritten, durationS: this.samplesWritten / this.sampleRate };
@@ -420,7 +443,15 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     const withSpeech = chunks.filter((c) => c.firstSpeechMs != null && c.lastSpeechMs != null);
     const topFirst = withSpeech.length ? withSpeech[0].firstSpeechMs : null;
     const topLast = withSpeech.length ? withSpeech[withSpeech.length - 1].lastSpeechMs : null;
-    const primaryWav = chunks.length ? chunks[0].wav : null;
+    // Страховка Ф2: files.wav → первый chunk С РЕЧЬЮ (withSpeech[0]), не
+    // буквально chunks[0]. Кейс «открыли chunk_1 на форе до первой речи, тишина,
+    // речь пошла только в chunk_2»: chunks[0] был бы пустым → single-chunk
+    // финализатор (legacy) взял бы тишину → «WAV not found»/пустой протокол.
+    // (Multichunk-финализатор Ф2 и так читает ВСЕ chunks[], но files.wav —
+    // backward-compat fallback, и его надо целить в кусок с реальной речью.)
+    const primaryWav = withSpeech.length
+      ? withSpeech[0].wav
+      : (chunks.length ? chunks[0].wav : null);
     const totalSamples = chunks.reduce((a, c) => a + c.samples, 0);
     const totalDurationS = chunks.reduce((a, c) => a + c.durationS, 0);
     return {
