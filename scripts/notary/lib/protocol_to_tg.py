@@ -45,6 +45,7 @@ Telegram сам подсветит хэштег и ничего не слома�
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -280,16 +281,109 @@ def _resolve_participants(meta: dict) -> list[str]:
 # --- Длительность речи (правка #5 владельца + НЕС1 приоритет источников) -
 
 
-def compute_duration_label(meta: dict) -> str:
+def speech_bounds_ms_from_raw_json(raw_json) -> Optional[tuple[int, int]]:
+    """Границы реальной речи по сырому ответу Speechmatics (json-v2).
+
+    Возвращает `(firstSpeechMs, lastSpeechMs)` — min(start_time) и max(end_time)
+    по элементам `results` с `type == "word"` (пунктуацию игнорируем), в
+    миллисекундах. `None` — если `raw_json` битый/пустой или нет ни одного слова.
+
+    Защита (РАЗМ1, риск «firstSpeechMs из results»): пропускаем нечисловые
+    тайминги; `end_time < start_time` нормализуем к `start_time` (не доверяем
+    отрицательной длительности слова).
+    """
+    if not isinstance(raw_json, dict):
+        return None
+    results = raw_json.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+
+    first_s: Optional[float] = None
+    last_s: Optional[float] = None
+    for r in results:
+        if not isinstance(r, dict) or r.get("type") != "word":
+            continue
+        try:
+            st = float(r.get("start_time"))
+            en = float(r.get("end_time"))
+        except (TypeError, ValueError):
+            continue
+        if en < st:
+            en = st
+        if first_s is None or st < first_s:
+            first_s = st
+        if last_s is None or en > last_s:
+            last_s = en
+
+    if first_s is None or last_s is None:
+        return None
+    return (int(round(first_s * 1000)), int(round(last_s * 1000)))
+
+
+def clean_speech_ms_from_raw_json(raw_json) -> Optional[int]:
+    """Чистое время речи (мс) = `lastSpeechMs - firstSpeechMs` по `raw_json`.
+
+    `None` — если границы не вычислились (битый/пустой `results`, нет слов) или
+    интервал не положительный. Никогда не бросает — защита от мусорного STT.
+    """
+    bounds = speech_bounds_ms_from_raw_json(raw_json)
+    if bounds is None:
+        return None
+    first_ms, last_ms = bounds
+    if last_ms <= first_ms:
+        return None
+    return last_ms - first_ms
+
+
+def _clean_speech_ms_from_transcript_json(path) -> Optional[int]:
+    """Читает архив `_transcripts/<date>.json` и считает чистое время речи (мс).
+
+    Архив (см. finalize-meeting.py): `{..., "raw_json": {"results": [...]}}`.
+    Допускаем и «голый» `raw_json` (с `results` на верхнем уровне) — на случай
+    если кто-то передаст путь к самому ответу Speechmatics.
+
+    Любая ошибка (нет файла, битый json, нет слов) → `None`, без исключения.
+    Сам warning о fallback логирует вызывающий `compute_duration_label`.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    rj = data.get("raw_json")
+    if not isinstance(rj, dict):
+        # Возможно, передали сам raw_json (results на верхнем уровне).
+        rj = data if isinstance(data.get("results"), list) else None
+    if rj is None:
+        return None
+    return clean_speech_ms_from_raw_json(rj)
+
+
+def compute_duration_label(meta: dict, transcript_json_path=None) -> str:
     """Возвращает «X ч Y мин» / «Y мин» / «<1 мин».
 
-    Приоритет источников (НЕС1):
+    Приоритет источников (НЕС1 + Ф1-доработки 2026-06-04):
       1. `meta.recording.chunks[]` (после Ф5) — sum (lastSpeechMs - firstSpeechMs).
-      2. `meta.recording.firstSpeechMs/lastSpeechMs` (после Ф3) — single-chunk.
-      3. Fallback (Ф1) — `endTs - startTs` (текущая логика).
+      2. `meta.recording.firstSpeechMs/lastSpeechMs` — single-chunk. Эти поля
+         пишет finalize-meeting.py по словам транскрипта (REQ 2.2) — для новых
+         встреч это основной путь «чистого времени».
+      3. **Транскрипт-json** (REQ 2.3) — если `transcript_json_path` передан явно
+         (путь к `_transcripts/<date>.json`), считаем чистое время прямо по
+         словам. Нужен для СТАРЫХ встреч без `recording.*` в meta.
+      4. Fallback — `endTs - startTs` (присутствие бота, «грязное» время).
 
-    TODO(Ф3): после прихода `firstSpeechMs`/`lastSpeechMs` в meta — это станет
-    основным путём. TODO(Ф5): chunks[] — суммарная речь, не время в звонке.
+    РАЗМ1: путь к транскрипту передаётся ЯВНЫМ аргументом, не угадывается с
+    диска (функция остаётся чистой относительно meta). `audio_duration_s` из
+    архива как длительность встречи НЕ используется (это длина аудио, не речь).
+
+    Если источники 1–2 пусты И `transcript_json_path` передан, но файла нет /
+    он битый / нет слов — логируем `warning` и только потом падаем на (4):
+    «грязное» время не должно проходить незаметно (критерий Ф1).
     """
     rec = meta.get("recording") or {}
 
@@ -317,7 +411,20 @@ def compute_duration_label(meta: dict) -> str:
     if isinstance(fs, (int, float)) and isinstance(ls, (int, float)) and ls > fs:
         return _format_ms(int(ls) - int(fs))
 
-    # (3) fallback endTs - startTs
+    # (3) транскрипт-json (между single-chunk и присутствием) — REQ 2.3.
+    if transcript_json_path is not None:
+        clean_ms = _clean_speech_ms_from_transcript_json(transcript_json_path)
+        if clean_ms is not None and clean_ms > 0:
+            return _format_ms(clean_ms)
+        # Путь передан, но непригоден — НЕ молчим, иначе «грязное» присутствие
+        # уедет в подпись незаметно (критерий Ф1).
+        logger.warning(
+            "[protocol_to_tg] clean-time: transcript json missing, "
+            "fallback to presence (path=%s)",
+            transcript_json_path,
+        )
+
+    # (4) fallback endTs - startTs
     start_ts = meta.get("startTs")
     end_ts = meta.get("endTs")
     start_dt = _parse_iso_or_none(start_ts)
@@ -833,3 +940,294 @@ def split_protocol_smart(text: str, max_len: int = TG_MAX_LEN) -> list[str]:
         chunks.append(cur)
 
     return chunks
+
+
+# --- PDF caption (Ф2 доработок protocol-pdf-telegram) --------------------
+#
+# Протокол уходит в Telegram PDF-вложением (`protocol_to_pdf` + sendDocument);
+# к нему — короткая подпись из 4 строк (REQ 3.1, эталон владельца 2026-06-04):
+#
+#     📋 #протоколвстречи
+#     <Серия> — DD.MM.YYYY
+#     Участники: <имена>
+#     Чистое время обсуждения: ~<Xч YYмин>
+#
+# Тело протокола в чат текстом НЕ дублируется (REQ 3.2) — только PDF + caption.
+
+
+# Человекочитаемые имена серий для шапки caption (РАЗМ2).
+#
+# Проверено на реальных встречах 2026-06-04: `meta.series` — это SLUG папки
+# серии (`marketplaces-tatiana`, `anzhee-direktorat`, `oneoff-…-e57601`), он же
+# ключ привязки chat_id в watched.yaml. Человекочитаемого поля в watched.yaml
+# НЕТ. Поэтому slug → отображаемое имя резолвим маппингом. Дефолты ниже —
+# эталон владельца; расширяется без правки кода через `_config/series-display.json`.
+_SERIES_DISPLAY_OVERRIDES = {
+    "marketplaces-tatiana": "Маркетплейсы (Татьяна)",
+    "anzhee-direktorat": "Директорат Anzhee",
+}
+
+# Разделитель «короткое имя — расшифровка» в теме протокола (em/en-dash/дефис
+# с пробелами). Для tier-3 резолва имени серии из `**Встреча:**`.
+_THEME_SEP_RE = re.compile(r"\s+[—–-]\s+")
+
+# Хвост-суффикс slug'а: `-<hex≥4>` (как `-e57601`/`-8399ea`) или `-YYYY-MM-DD`.
+_SLUG_HASH_SUFFIX_RE = re.compile(r"-(?:[0-9a-f]{4,}|\d{4}-\d{2}-\d{2})$")
+
+
+def _series_display_config_paths() -> list[str]:
+    """Пути к опциональному JSON-конфигу `slug → display`.
+
+    Env `MEETING_NOTARY_SERIES_DISPLAY_PATH` → `<registry>/_config/...` →
+    дефолт в `~/Projects/me/встречи/_config/...`. Файла обычно нет — это ок
+    (вернётся пустой маппинг, работают хардкод-дефолты).
+    """
+    paths: list[str] = []
+    env = os.environ.get("MEETING_NOTARY_SERIES_DISPLAY_PATH")
+    if env:
+        paths.append(env)
+    reg = os.environ.get("MEETING_NOTARY_REGISTRY_DIR")
+    if reg:
+        paths.append(os.path.join(reg, "_config", "series-display.json"))
+    paths.append(os.path.expanduser("~/Projects/me/встречи/_config/series-display.json"))
+    return paths
+
+
+def _load_series_display_config() -> dict:
+    """Best-effort загрузка JSON-маппинга `slug → имя`. Stdlib `json`, без yaml.
+
+    Нет файла → `{}` (тихо, это норма). Битый JSON / не-dict → `{}` + warning
+    (чтобы повреждённый конфиг не глушился незаметно).
+    """
+    for p in _series_display_config_paths():
+        if not p:
+            continue
+        try:
+            raw = Path(p).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("[protocol_to_tg] series-display config битый JSON: %s", p)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("[protocol_to_tg] series-display config не объект: %s", p)
+            return {}
+        # Только строковые пары slug→имя.
+        return {k: v for k, v in data.items()
+                if isinstance(k, str) and isinstance(v, str) and v.strip()}
+    return {}
+
+
+def _short_from_theme(theme: str) -> Optional[str]:
+    """Короткое имя серии из темы `**Встреча:** Имя — расшифровка` (до « — »).
+
+    Возвращает None, если темы нет или «голова» подозрительно длинная (это уже
+    не имя серии, а целое предложение — лучше fallback на slug)."""
+    theme = (theme or "").strip()
+    if not theme:
+        return None
+    head = _THEME_SEP_RE.split(theme, maxsplit=1)[0].strip()
+    if head and len(head) <= 48:
+        return head
+    return None
+
+
+def _humanize_slug(series: str) -> str:
+    """Последний резерв: `marketplaces-tatiana` → «Marketplaces tatiana».
+
+    Срезает хвост-хэш/дату, меняет `-`/`_` на пробел, капитализирует первую
+    букву. Качество для транслит-slug'ов слабое — поэтому caller логирует
+    warning, чтобы владелец добавил запись в маппинг."""
+    s = _SLUG_HASH_SUFFIX_RE.sub("", (series or "").strip())
+    s = re.sub(r"[-_]+", " ", s).strip()
+    if not s:
+        s = (series or "").strip()
+    return (s[:1].upper() + s[1:]) if s else (series or "—")
+
+
+def resolve_series_display_name(
+    meeting_meta: dict,
+    *,
+    protocol_text: Optional[str] = None,
+    parsed_header: Optional[dict] = None,
+) -> str:
+    """Человекочитаемое имя серии для 1-й части caption (РАЗМ2).
+
+    Приоритет:
+      1. Явное поле meta (`seriesTitle`/`series_display`) — future-proof.
+      2. Маппинг slug → имя: `_config/series-display.json` перебивает
+         хардкод-дефолты `_SERIES_DISPLAY_OVERRIDES`.
+      3. Тема `**Встреча:** Имя — …` из шапки протокола (до « — »).
+      4. Гуманизированный slug + warning (видно в логе → владелец добавит маппинг).
+    """
+    meta = meeting_meta or {}
+    for key in ("seriesTitle", "series_display", "seriesDisplayName"):
+        v = meta.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    series = (meta.get("series") or "").strip()
+    if series:
+        overrides = dict(_SERIES_DISPLAY_OVERRIDES)
+        overrides.update(_load_series_display_config())
+        if series in overrides:
+            return overrides[series]
+
+    if parsed_header is None and protocol_text is not None:
+        parsed_header = _parse_protocol_md(protocol_text).get("header") or {}
+    theme = (parsed_header or {}).get("theme") or ""
+    short = _short_from_theme(theme)
+    if short:
+        return short
+
+    if series:
+        human = _humanize_slug(series)
+        logger.warning(
+            "[protocol_to_tg] series %r нет в display-маппинге — caption берёт %r "
+            "(добавь в _config/series-display.json или _SERIES_DISPLAY_OVERRIDES)",
+            series, human,
+        )
+        return human
+    return "—"
+
+
+def _caption_date_from_parsed(meta: dict, parsed_header: dict) -> str:
+    """DD.MM.YYYY: из шапки протокола, иначе из `meta.date`/`startTs`."""
+    d = (parsed_header or {}).get("date") or ""
+    if d:
+        return d
+    ds = (meta or {}).get("date") or ((meta or {}).get("startTs") or "")[:10]
+    if ds and re.match(r"^\d{4}-\d{2}-\d{2}$", ds):
+        yyyy, mm, dd = ds.split("-")
+        return f"{dd}.{mm}.{yyyy}"
+    return ds or "—"
+
+
+def _clean_time_caption_line(meta: dict, transcript_json_path) -> str:
+    """Строка «Чистое время обсуждения: ~…» (Ф1 источник чистого времени).
+
+    Если время неизвестно (`—`) — без тильды, чтобы не было «~—»."""
+    duration = compute_duration_label(meta, transcript_json_path=transcript_json_path)
+    if duration and duration != "—":
+        return f"Чистое время обсуждения: ~{duration}"
+    return "Чистое время обсуждения: —"
+
+
+def _caption_participants(meta: dict) -> list[str]:
+    """Участники для caption/шапки PDF — эталон владельца «Илья Рыбалка, Татьяна».
+
+    Отличие от `_resolve_participants` (заголовок TG-текста): имена из
+    `expectedParticipants` (курируются в watched.yaml) берём КАК ЕСТЬ и НЕ
+    обогащаем через people.md. Причина: people.md-обогащение по первому имени
+    подставляет не того человека — marketplaces «Татьяна» ≠ «Татьяна Филиппова»
+    (управляющая МПервого, единственная «Татьяна» в people.md). Курируемый
+    список — источник истины.
+
+    Имена из `participants` (Telemost UI, часто «голое» имя) обогащаем через
+    people.md, как раньше — это исходное назначение правки #4 (bare «Михаил»
+    → «Михаил Еремеев»). first-name, уже занятый курируемым именем, UI не
+    перетирает (страховка от того же ложного обогащения).
+    """
+    raw_expected = [n.strip() for n in (meta.get("expectedParticipants") or [])
+                    if isinstance(n, str) and n.strip()]
+    raw_ui = [n.strip() for n in (meta.get("participants") or [])
+              if isinstance(n, str) and n.strip()]
+    people_md = _read_people_md()
+    people_names = _extract_names_from_people(people_md) if people_md else []
+
+    best_by_first: dict[str, str] = {}
+    locked: set = set()
+    order: list[str] = []
+
+    def _first(name: str) -> str:
+        parts = name.split()
+        return parts[0] if parts else name
+
+    # Курируемые expected — как есть, и блокируем их first-name от перезаписи.
+    for name in raw_expected:
+        f = _first(name)
+        if f not in best_by_first:
+            best_by_first[f] = name
+            order.append(f)
+        locked.add(f)
+
+    # Telemost UI — обогащаем; курируемые first-name не трогаем.
+    for raw in raw_ui:
+        full = _resolve_full_name(raw, people_names)
+        if not full or not full.strip():
+            continue
+        full = full.strip()
+        f = _first(full)
+        if f in locked:
+            continue
+        if f not in best_by_first:
+            best_by_first[f] = full
+            order.append(f)
+        elif len(full.split()) > len(best_by_first[f].split()):
+            best_by_first[f] = full
+
+    result: list[str] = []
+    seen_full: set = set()
+    for f in order:
+        full = best_by_first[f]
+        if full in seen_full:
+            continue
+        seen_full.add(full)
+        result.append(full)
+    return result
+
+
+def build_pdf_caption(
+    protocol_text: str,
+    meeting_meta: dict,
+    *,
+    transcript_json_path=None,
+) -> str:
+    """4-строчная подпись под PDF-вложение протокола (REQ 3.1).
+
+    `transcript_json_path` (для СТАРЫХ встреч без `recording.*`) передаётся
+    дальше в `compute_duration_label` (FORWARD-зависимость Ф1 / FU-2): путь к
+    `series_dir/_transcripts/<date>.json`, иначе подпись тихо уедет на присутствие.
+    Передавать только когда архив реально есть.
+    """
+    meta = meeting_meta or {}
+    parsed_header = _parse_protocol_md(protocol_text or "").get("header") or {}
+    date_str = _caption_date_from_parsed(meta, parsed_header)
+    series_name = resolve_series_display_name(meta, parsed_header=parsed_header)
+    resolved = _caption_participants(meta)
+    participants_str = ", ".join(resolved) if resolved else "—"
+    lines = [
+        f"📋 {HASHTAG}",
+        f"{series_name} — {date_str}",
+        f"Участники: {participants_str}",
+        _clean_time_caption_line(meta, transcript_json_path),
+    ]
+    return "\n".join(lines)
+
+
+def build_pdf_title_subtitle(
+    protocol_text: str,
+    meeting_meta: dict,
+    *,
+    transcript_json_path=None,
+) -> tuple[str, str]:
+    """(title, subtitle) для шапки самого PDF (рисует `protocol_to_pdf`).
+
+    title    = «<Серия> — DD.MM.YYYY»
+    subtitle = «Участники: … · Чистое время обсуждения: ~…»
+    """
+    meta = meeting_meta or {}
+    parsed_header = _parse_protocol_md(protocol_text or "").get("header") or {}
+    date_str = _caption_date_from_parsed(meta, parsed_header)
+    series_name = resolve_series_display_name(meta, parsed_header=parsed_header)
+    resolved = _caption_participants(meta)
+    participants_str = ", ".join(resolved) if resolved else "—"
+    duration = compute_duration_label(meta, transcript_json_path=transcript_json_path)
+    title = f"{series_name} — {date_str}"
+    if duration and duration != "—":
+        subtitle = f"Участники: {participants_str}  ·  Чистое время обсуждения: ~{duration}"
+    else:
+        subtitle = f"Участники: {participants_str}"
+    return title, subtitle

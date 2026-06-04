@@ -67,6 +67,7 @@ from lib.llm_postprocess import (  # noqa: E402
     regenerate_protocol_for_meeting,
     review_and_flag_protocol_file,
     route_tasks,
+    sync_stakeholder_track,
 )
 from lib.delivery_grace import wait_for_clarify_grace  # noqa: E402
 from lib.render import render_protocol  # noqa: E402
@@ -698,6 +699,53 @@ def main() -> int:
         raise
     log.info("Protocol written → %s", md_path)
 
+    # 4a-bis. Ф1-доработки (2026-06-04): «чистое время обсуждения» (REQ 2.1/2.2).
+    # По словам транскрипта (type=word) считаем firstSpeechMs=min(start_time),
+    # lastSpeechMs=max(end_time) и кладём в meta.recording. Это превращает
+    # «время в звонке» (endTs-startTs = присутствие бота) в реальное время речи
+    # от первой до последней реплики. Пишем И в in-memory meta (caption-путь Ф2
+    # читает через source 2 compute_duration_label), И обратно в meta.json
+    # (REQ 2.2: после finalize meta.json содержит recording.firstSpeechMs/Last).
+    if backend == "speechmatics" and sm_result is not None:
+        bounds = None
+        try:
+            from lib.protocol_to_tg import speech_bounds_ms_from_raw_json
+            bounds = speech_bounds_ms_from_raw_json(sm_result.raw_json)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[clean-time] speech-bounds compute failed (non-fatal): %s", e)
+        if bounds is not None:
+            first_ms, last_ms = bounds
+            rec = meta.get("recording")
+            if not isinstance(rec, dict):
+                rec = {}
+                meta["recording"] = rec
+            rec["firstSpeechMs"] = first_ms
+            rec["lastSpeechMs"] = last_ms
+            log.info(
+                "[clean-time] recording.firstSpeechMs=%d lastSpeechMs=%d (clean=%d ms)",
+                first_ms, last_ms, last_ms - first_ms,
+            )
+            # Персист обратно в meta.json (REQ 2.2). Атомарно — тем же
+            # механизмом, что и артефакты протокола. Best-effort: на сбой
+            # записи финализацию не валим (in-memory meta уже обогащён —
+            # caption этой доставки всё равно получит чистое время). abort()
+            # на сбое чистит висячий `.part` (как протокол-bundle выше).
+            meta_bundle = _AtomicBundle()
+            try:
+                meta_bundle.add(
+                    Path(args.meta_json),
+                    json.dumps(meta, ensure_ascii=False, indent=2),
+                )
+                meta_bundle.commit()
+            except Exception as e:  # noqa: BLE001
+                meta_bundle.abort()
+                log.warning("[clean-time] meta.json write-back failed (non-fatal): %s", e)
+        else:
+            log.warning(
+                "[clean-time] no word-level results in transcript — "
+                "recording.firstSpeechMs/lastSpeechMs not written"
+            )
+
     # 4.0.1. Ф4: LLM-генерация протокола Sonnet 4.6 по методичке.
     # Порядок: протокол ДО clarify. Если clarify сработает — hook в
     # clarify_worker._apply_resolution перегенерирует протокол на обновлённом
@@ -815,6 +863,20 @@ def main() -> int:
                         notify_unknown_owners(session_uid, unk, task_meta)
                     except Exception as e:  # noqa: BLE001
                         log.warning("[task-clarify] unknown-notify failed (non-fatal): %s", e)
+
+            # Ф3: автосвязка протокол → трек стейкхолдера (закрытие обсуждённых
+            # открытых вопросов + добавление новых). За флагом
+            # ENABLE_STAKEHOLDER_TRACK_CLOSE (дефолт ON); только 1:1 со
+            # стейкхолдером из реестра — гейт внутри. Не зависит от наличия
+            # задач (закрытие вопросов идёт по протоколу). Best-effort.
+            try:
+                sync_stakeholder_track(
+                    protocol_md_text,
+                    task_meta,
+                    meeting_sid=session_uid,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("[track-sync] failed (non-fatal): %s", e)
     else:
         log.info("[extract_tasks] протокол не сгенерирован — пропуск задач")
 

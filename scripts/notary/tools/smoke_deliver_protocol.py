@@ -25,10 +25,12 @@ from notary.lib import llm_postprocess as L  # noqa: E402
 from notary.lib import telegram_api  # noqa: E402
 
 
-# ----- mock send/delete -----
+# ----- mock send/delete/document/render -----
 
 _sent: list[tuple[int, str]] = []
 _deleted: list[tuple[int, int]] = []
+_sent_docs: list[tuple] = []          # (chat_id, file_path, caption)
+_render_calls: list[tuple] = []       # (title, subtitle)
 
 
 def _fake_send_message(token, chat_id, text, **kwargs):
@@ -41,27 +43,37 @@ def _fake_delete_message(token, chat_id, message_id):
     return True
 
 
+def _fake_send_document(token, chat_id, file_path, *, caption=None, filename=None, **kwargs):
+    _sent_docs.append((chat_id, file_path, caption))
+    return {"message_id": 2000 + len(_sent_docs), "chat": {"id": chat_id}}
+
+
+def _fake_render(md_text, out_pdf, *, title, subtitle, **kwargs):
+    """Mock PDF-рендера: валидная заглушка `%PDF`, без chrome/markdown."""
+    p = Path(out_pdf)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"%PDF-1.4\n" + b"x" * 64)
+    _render_calls.append((title, subtitle))
+    return p
+
+
 def case_idempotent_skip(tmpdir: Path) -> bool:
-    _sent.clear()
+    """RISK3: legacy-текстовая запись (N message_ids) → skip, PDF-дубль НЕ шлём."""
+    _sent_docs.clear()
+    _render_calls.clear()
     meta_json = tmpdir / "meta.json"
     meta_json.write_text(json.dumps({
         "sessionUid": "smoke-1",
-        "delivered": {
+        "delivered": {  # legacy object-формат, 2 текстовых чанка до деплоя
             "chat_id": -1001234567890,
             "message_ids": [100, 101],
             "at": "2026-05-28T20:00:00Z",
         },
     }), encoding="utf-8")
 
-    proto = "## Протокол\n\nдлинный текст " * 10  # < лимита → одна часть
-    # Заметим: ожидаем 1 часть → меняем delivered.message_ids на [100] до вызова.
-    data = json.loads(meta_json.read_text(encoding="utf-8"))
-    data["delivered"]["message_ids"] = [100]
-    meta_json.write_text(json.dumps(data), encoding="utf-8")
-
     result = L.deliver_protocol(
         meeting_meta={"series": "test-smoke", "date": "2026-05-28"},
-        protocol_text=proto,
+        protocol_text="## Протокол\n\nтекст\n",
         meta_json_path=meta_json,
         target_chat_id=-1001234567890,
         meeting_sid="smoke-1",
@@ -69,71 +81,114 @@ def case_idempotent_skip(tmpdir: Path) -> bool:
     if result.get("status") != "skipped":
         print(f"  [case idempotent] got status={result.get('status')}, expected skipped")
         return False
-    if _sent:
-        print("  [case idempotent] был вызов send_message — баг идемпотентности")
+    if _sent_docs:
+        print("  [case idempotent] был send_document — RISK3 нарушен (PDF-дубль)")
+        return False
+    if _render_calls:
+        print("  [case idempotent] PDF собирался зря при skip")
         return False
     return True
 
 
-def case_sent_with_split(tmpdir: Path) -> bool:
-    _sent.clear()
-    meta_json = tmpdir / "meta_split.json"
+def case_sent_pdf(tmpdir: Path) -> bool:
+    """REQ 1.1/3.1/3.2: один PDF + caption; meta.delivered помечен document:true."""
+    _sent_docs.clear()
+    _render_calls.clear()
+    meta_json = tmpdir / "meta_pdf.json"
     meta_json.write_text(json.dumps({}), encoding="utf-8")
-    # Ф1-доработки 29.05: split идёт `split_protocol_smart` на сформированном
-    # TG-тексте (max_len=4096). Сырой протокол со множеством секций — чтобы
-    # текст после `format_protocol_as_tg_text` гарантированно превысил лимит.
-    # Каждая секция = шапка + 30 длинных буллетов; 4 секции = ~6000+ символов.
-    sections = []
-    for i in range(1, 5):
-        bullets = "\n\n".join(
-            f"▪️ Длинный буллет №{j} в секции {i} с подробностями про разные аспекты "
-            f"и контекст обсуждения участников встречи."
-            for j in range(1, 31)
-        )
-        sections.append(f"## {i}) Тема номер {i}\n\n{bullets}\n")
     proto = (
-        "#протоколвстречи 29.05.2026\n\n"
-        "**Встреча:** Тест разбиения на части.\n\n"
-        "**Длительность:** 30 мин\n\n"
-        "**Участники:** Илья Рыбалка\n\n"
-        "---\n\n" + "\n---\n\n".join(sections)
+        "#протоколвстречи 03.06.2026\n\n"
+        "**Встреча:** Маркетплейсы — статус.\n\n"
+        "---\n\n"
+        "## 1) Раздел\n\n"
+        "▪️ Буллет один.\n\n▪️ Буллет два.\n"
     )
     result = L.deliver_protocol(
-        meeting_meta={"series": "test-smoke", "date": "2026-05-28"},
+        meeting_meta={
+            "series": "marketplaces-tatiana", "date": "2026-06-03",
+            "expectedParticipants": ["Илья Рыбалка", "Татьяна"], "participants": [],
+            "recording": {"firstSpeechMs": 0, "lastSpeechMs": 97 * 60 * 1000},
+        },
         protocol_text=proto,
         meta_json_path=meta_json,
         target_chat_id=-1001234567890,
-        meeting_sid="smoke-split",
+        meeting_sid="smoke-pdf",
     )
     if result.get("status") != "sent":
-        print(f"  [case sent] status={result.get('status')}")
+        print(f"  [case sent-pdf] status={result.get('status')}")
         return False
-    if result.get("parts_count") < 2:
-        print(f"  [case sent] split не сработал, parts={result.get('parts_count')}")
+    if result.get("parts_count") != 1 or not result.get("document"):
+        print(f"  [case sent-pdf] ожидали parts_count=1 + document=true, got {result}")
         return False
-    if len(_sent) != result.get("parts_count"):
-        print(f"  [case sent] sent={len(_sent)} != parts={result.get('parts_count')}")
+    if len(_sent_docs) != 1:
+        print(f"  [case sent-pdf] документов отправлено: {len(_sent_docs)} (ожидали 1)")
         return False
-    # Проверка: meta.delivered обновлён (Ф1-доработки 29.05 — теперь array,
-    # не object; ищем запись для нужного chat_id).
+    if len(_sent) != 0:
+        print("  [case sent-pdf] был send_message — тело текстом дублируется (REQ 3.2)")
+        return False
+    # Caption: 4 строки, слитный хэштег, человекочитаемая серия (REQ 3.1).
+    _, _, caption = _sent_docs[0]
+    if caption is None or caption.splitlines()[0] != "📋 #протоколвстречи":
+        print(f"  [case sent-pdf] caption 1-я строка неверна: {caption!r}")
+        return False
+    if "Маркетплейсы (Татьяна) — 03.06.2026" not in caption:
+        print(f"  [case sent-pdf] нет человекочитаемой серии в caption: {caption!r}")
+        return False
+    # meta.delivered: array + document:true (RISK1).
     data = json.loads(meta_json.read_text(encoding="utf-8"))
-    raw_delivered = data.get("delivered")
-    if isinstance(raw_delivered, dict):
-        records = [raw_delivered]
-    elif isinstance(raw_delivered, list):
-        records = [r for r in raw_delivered if isinstance(r, dict)]
-    else:
-        records = []
-    matched = None
-    for rec in reversed(records):
-        if rec.get("chat_id") == -1001234567890:
-            matched = rec
-            break
-    if matched is None:
-        print(f"  [case sent] meta.delivered не содержит chat_id=-1001234567890: {records}")
+    records = data.get("delivered")
+    records = records if isinstance(records, list) else [records]
+    matched = next((r for r in reversed(records)
+                    if isinstance(r, dict) and r.get("chat_id") == -1001234567890), None)
+    if matched is None or matched.get("message_ids") != [2001] or not matched.get("document"):
+        print(f"  [case sent-pdf] meta.delivered неверен: {records}")
         return False
-    if len(matched.get("message_ids") or []) != result.get("parts_count"):
-        print(f"  [case sent] message_ids count != parts")
+    return True
+
+
+def case_pdf_failure_alert(tmpdir: Path) -> bool:
+    """REQ 1.4: сбой сборки PDF → status error + алерт Илье; текстом НЕ слать."""
+    _sent_docs.clear()
+    _sent.clear()
+    alerts: list = []
+    meta_json = tmpdir / "meta_fail.json"
+    meta_json.write_text(json.dumps({}), encoding="utf-8")
+
+    orig_render = L.protocol_to_pdf.render_pdf_from_markdown
+    orig_alert = L._alert_owner_pdf_failure
+
+    def _boom(*a, **k):
+        raise L.protocol_to_pdf.PdfRenderError("smoke: chromium boom")
+
+    def _capture_alert(meta, chat_id, sid, err):
+        alerts.append((chat_id, type(err).__name__))
+
+    L.protocol_to_pdf.render_pdf_from_markdown = _boom
+    L._alert_owner_pdf_failure = _capture_alert
+    try:
+        result = L.deliver_protocol(
+            meeting_meta={"series": "test-smoke", "date": "2026-06-03"},
+            protocol_text="#протоколвстречи 03.06.2026\n\n## 1) Раздел\n\n▪️ x\n",
+            meta_json_path=meta_json,
+            target_chat_id=-1001234567890,
+            meeting_sid="smoke-fail",
+        )
+    finally:
+        L.protocol_to_pdf.render_pdf_from_markdown = orig_render
+        L._alert_owner_pdf_failure = orig_alert
+
+    if result.get("status") != "error":
+        print(f"  [case fail-alert] status={result.get('status')}, expected error")
+        return False
+    if len(alerts) != 1:
+        print(f"  [case fail-alert] алерт Илье не отправлен: {alerts}")
+        return False
+    if _sent_docs or _sent:
+        print("  [case fail-alert] что-то отправлено при сбое — текстом слать НЕЛЬЗЯ")
+        return False
+    data = json.loads(meta_json.read_text(encoding="utf-8"))
+    if data.get("delivered"):
+        print("  [case fail-alert] meta.delivered записан при сбое — блокирует ретрай")
         return False
     return True
 
@@ -227,9 +282,11 @@ def case_save_version(tmpdir: Path) -> bool:
 
 
 def main() -> int:
-    # Monkey-patch.
+    # Monkey-patch: сеть и chrome не дёргаем (PDF-путь Ф2).
     telegram_api.send_message = _fake_send_message
     telegram_api.delete_message = _fake_delete_message
+    telegram_api.send_document = _fake_send_document
+    L.protocol_to_pdf.render_pdf_from_markdown = _fake_render
     # Bot-token: пустой в smoke-окружении, делаем фикстуру чтобы deliver_protocol
     # не early-return'нул на check'е токена. Реальный bot API мокаем выше.
     os.environ.setdefault("TELEGRAM_NOTARIUS_BOT_TOKEN", "FAKE-SMOKE-TOKEN")
@@ -239,8 +296,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="smoke-deliver-") as td_str:
         td = Path(td_str)
         cases = [
-            ("idempotent skip", lambda: case_idempotent_skip(td)),
-            ("sent with split", lambda: case_sent_with_split(td)),
+            ("idempotent skip (RISK3 legacy→skip)", lambda: case_idempotent_skip(td)),
+            ("sent pdf + caption", lambda: case_sent_pdf(td)),
+            ("pdf failure → alert, no text", lambda: case_pdf_failure_alert(td)),
             ("disabled gate", lambda: case_disabled_gate(td)),
             ("targeted_remove", case_targeted_remove),
             ("classify_instruction", case_classify_instruction),
@@ -259,10 +317,11 @@ def main() -> int:
             else:
                 print(f"  ❌ {name}")
                 failed += 1
+    total = 7
     if failed:
-        print(f"\nРЕЗУЛЬТАТ: FAIL ({failed} fail)")
+        print(f"\nРЕЗУЛЬТАТ: FAIL ({failed}/{total} fail)")
         return 1
-    print("\nРЕЗУЛЬТАТ: PASS (6/6)")
+    print(f"\nРЕЗУЛЬТАТ: PASS ({total}/{total})")
     return 0
 
 

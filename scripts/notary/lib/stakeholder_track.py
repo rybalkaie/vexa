@@ -34,7 +34,28 @@ logger = logging.getLogger(__name__)
 
 
 _STK_OPEN_RE = re.compile(r"^##\s+🟢\s+Открыто\b")
+_STK_CLOSED_RE = re.compile(r"^##\s+✅\s+Закрыт")  # «## ✅ Закрытые»
 _STK_H3_RE = re.compile(r"^###\s+(.+)$")
+
+# Префикс буллета: `- [ ] ` / `- [x] ` (чекбокс) или просто `- `.
+_CHECKBOX_PREFIX_RE = re.compile(r"^-\s+\[[ xX]\]\s+")
+_PLAIN_BULLET_PREFIX_RE = re.compile(r"^-\s+")
+
+
+def _strip_bullet_prefix(text: str) -> str:
+    """Снимает `- [ ] ` / `- [x] ` / `- ` префикс буллета → контент пункта.
+
+    Используется и для сравнения (exact-match при закрытии), и для извлечения
+    «тела» пункта при переносе в «Закрытые». Если строка не буллет — возвращаем
+    как есть (после strip)."""
+    s = text.strip()
+    m = _CHECKBOX_PREFIX_RE.match(s)
+    if m:
+        return s[m.end():].strip()
+    m = _PLAIN_BULLET_PREFIX_RE.match(s)
+    if m:
+        return s[m.end():].strip()
+    return s
 
 
 def _load_whitelist(*, me_dir: Optional[str] = None) -> set[Path]:
@@ -157,6 +178,24 @@ def _find_subsection(
     return (sub_idx, sub_end)
 
 
+def _find_closed_block(lines: list[str]) -> tuple[Optional[int], Optional[int]]:
+    """Возвращает (closed_h2_idx, next_h2_idx) для блока «## ✅ Закрытые».
+    next_h2_idx может быть len(lines). (None, None) если секции нет."""
+    closed_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if line.startswith("## ") and _STK_CLOSED_RE.match(line):
+            closed_idx = i
+            break
+    if closed_idx is None:
+        return (None, None)
+    next_idx = len(lines)
+    for j in range(closed_idx + 1, len(lines)):
+        if lines[j].startswith("## "):
+            next_idx = j
+            break
+    return (closed_idx, next_idx)
+
+
 def append_to_open_subsection(
     file_path: Path,
     section_title: str,
@@ -267,6 +306,155 @@ def append_to_open_subsection(
         except OSError as e:
             logger.warning("[track] write failed %s: %s", file_path, e)
             return False
+        return True
+    finally:
+        _release_lock(fd)
+
+
+def close_open_item(
+    file_path: Path,
+    item_match: str,
+    *,
+    closed_date: str,
+    note: Optional[str] = None,
+    me_dir: Optional[str] = None,
+    skip_whitelist: bool = False,
+) -> bool:
+    """Переносит пункт из «## 🟢 Открыто» в «## ✅ Закрытые» (close/move, Ф3).
+
+    Обратимость (REQ 4.5): пункт НЕ удаляется, а ПЕРЕМЕЩАЕТСЯ с пометкой и
+    датой — Илья может вернуть руками.
+
+    `item_match` — дословный текст открытого пункта (с `- [ ]`/`- [x]`/`- `
+    префиксом или без — чекбокс снимаем при сравнении). Перенос ТОЛЬКО при
+    EXACT-match (РАЗМ3): не нашли точного совпадения в «Открыто» → no-op +
+    `warning` (не закрываем «похожий» — страховка от ложного закрытия).
+
+    `closed_date` — дата встречи (`YYYY-MM-DD`). `note` — пометка в скобках;
+    дефолт «закрыто ботом по встрече <closed_date>». Итоговая строка:
+    `- ✅ Закрыто <date> (<note>): <тело пункта>` (как в существующих треках).
+
+    Идемпотентность: если тело пункта уже присутствует в «✅ Закрытые» —
+    no-op (не дублируем). Если секции «✅ Закрытые» нет — создаём в конце файла.
+
+    Защиты те же, что у `append_to_open_subsection`: whitelist из реестра
+    стейкхолдеров, `fcntl.flock` (exclusive), atomic write
+    (`tempfile + fsync + os.rename`).
+
+    Возвращает True если пункт перенесён; False на no-op (пустой ввод /
+    не найден / уже закрыт / путь вне whitelist / lock|write fail).
+    Логирует причину.
+
+    `skip_whitelist=True` — только для тестов и smoke (пишем в /tmp-копию).
+    """
+    if not item_match or not item_match.strip():
+        logger.warning("[track] close: пустой item_match — skip")
+        return False
+    if not closed_date or not str(closed_date).strip():
+        logger.warning("[track] close: пустой closed_date — skip")
+        return False
+    if not file_path.is_file():
+        logger.warning("[track] close: target file missing: %s", file_path)
+        return False
+    if not skip_whitelist:
+        whitelist = _load_whitelist(me_dir=me_dir)
+        if not whitelist:
+            logger.warning("[track] close: whitelist пустой — реестр стейкхолдеров не загружен")
+            return False
+        if not _is_in_whitelist(file_path, whitelist):
+            logger.warning(
+                "[track] close: %s не в whitelist (size=%d) — отказ",
+                file_path, len(whitelist),
+            )
+            return False
+
+    closed_date = str(closed_date).strip()
+    note_txt = (note or f"закрыто ботом по встрече {closed_date}").strip()
+    needle_full = item_match.strip()
+    needle_content = _strip_bullet_prefix(item_match)
+
+    fd = _acquire_lock(file_path)
+    try:
+        try:
+            raw = file_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("[track] close: read failed %s: %s", file_path, e)
+            return False
+        trailing_nl = raw.endswith("\n")
+        lines = raw.split("\n")
+        if trailing_nl and lines and lines[-1] == "":
+            lines = lines[:-1]
+
+        open_idx, next_idx = _find_open_block(lines)
+
+        # 1. Точное совпадение открытого пункта (по полной строке ИЛИ по телу
+        #    без чекбокса). Первое совпадение выигрывает.
+        match_idx: Optional[int] = None
+        body: Optional[str] = None
+        if open_idx is not None:
+            for i in range(open_idx + 1, next_idx):
+                ln = lines[i]
+                if not ln.lstrip().startswith("-"):
+                    continue
+                content = _strip_bullet_prefix(ln)
+                if needle_full == ln.strip() or needle_content == content:
+                    match_idx = i
+                    body = content
+                    break
+
+        # 2. Идемпотентность: тело уже в «✅ Закрытые»? → no-op (не дублируем).
+        check_body = body if body is not None else needle_content
+        closed_idx, closed_next = _find_closed_block(lines)
+        if closed_idx is not None and check_body:
+            for j in range(closed_idx + 1, closed_next):
+                if check_body in lines[j]:
+                    logger.info(
+                        "[track] close: пункт уже в «Закрытые» — no-op: %r",
+                        check_body[:60],
+                    )
+                    return False
+
+        # 3. Точного совпадения в «Открыто» нет → НЕ закрываем похожий (РАЗМ3).
+        if match_idx is None:
+            logger.warning(
+                "[track] close: точный пункт не найден в «🟢 Открыто» — no-op (РАЗМ3): %r",
+                needle_full[:80],
+            )
+            return False
+
+        # 4. Перенос: удаляем строку из «Открыто», добавляем в «Закрытые».
+        closed_line = f"- ✅ Закрыто {closed_date} ({note_txt}): {body}"
+        new_lines = list(lines)
+        del new_lines[match_idx]
+
+        c_idx, _c_next = _find_closed_block(new_lines)
+        if c_idx is None:
+            # Секции «Закрытые» нет — создаём в конце файла.
+            if new_lines and new_lines[-1].strip() != "":
+                new_lines.append("")
+            new_lines.append("## ✅ Закрытые")
+            new_lines.append("")
+            new_lines.append(closed_line)
+        else:
+            # Вставляем первым (newest-first, как в существующих треках):
+            # сразу после заголовка, пропустив одну пустую строку-разделитель.
+            insert_at = c_idx + 1
+            if insert_at < len(new_lines) and new_lines[insert_at].strip() == "":
+                insert_at += 1
+            new_lines[insert_at:insert_at] = [closed_line]
+
+        out = "\n".join(new_lines)
+        if trailing_nl:
+            out += "\n"
+        try:
+            _atomic_write(file_path, out)
+        except OSError as e:
+            logger.warning("[track] close: write failed %s: %s", file_path, e)
+            return False
+        logger.info(
+            "[track] close: пункт перенесён в «Закрытые» (%s): %r",
+            closed_date, (body or "")[:60],
+        )
         return True
     finally:
         _release_lock(fd)

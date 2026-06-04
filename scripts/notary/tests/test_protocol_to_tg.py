@@ -19,6 +19,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # tests/ → notary/ — импортируем `lib.protocol_to_tg` как из finalize-meeting.py.
 _HERE = Path(__file__).resolve().parent
@@ -326,6 +327,270 @@ class TestResolveFullName(unittest.TestCase):
             ptg._resolve_full_name("Илья", []),
             "Илья Рыбалка",
         )
+
+
+class TestCleanSpeechFromRawJson(unittest.TestCase):
+    """Хелперы чистого времени по сырому Speechmatics-ответу (Ф1-доработки)."""
+
+    def test_bounds_and_clean_basic(self):
+        raw = {"results": [
+            {"type": "word", "start_time": 5.0, "end_time": 5.4,
+             "alternatives": [{"content": "a"}]},
+            {"type": "punctuation", "start_time": 5.4, "end_time": 5.4,
+             "alternatives": [{"content": "."}]},
+            {"type": "word", "start_time": 60.0, "end_time": 61.0,
+             "alternatives": [{"content": "b"}]},
+        ]}
+        self.assertEqual(ptg.speech_bounds_ms_from_raw_json(raw), (5000, 61000))
+        self.assertEqual(ptg.clean_speech_ms_from_raw_json(raw), 56000)
+
+    def test_punctuation_does_not_extend_bounds(self):
+        """Пунктуация позже последнего слова НЕ растягивает lastSpeechMs."""
+        raw = {"results": [
+            {"type": "word", "start_time": 1.0, "end_time": 2.0,
+             "alternatives": [{"content": "x"}]},
+            {"type": "punctuation", "start_time": 9.0, "end_time": 9.0,
+             "alternatives": [{"content": "?"}]},
+        ]}
+        self.assertEqual(ptg.speech_bounds_ms_from_raw_json(raw), (1000, 2000))
+
+    def test_empty_results_returns_none(self):
+        self.assertIsNone(ptg.clean_speech_ms_from_raw_json({"results": []}))
+        self.assertIsNone(ptg.speech_bounds_ms_from_raw_json({"results": []}))
+
+    def test_no_words_returns_none(self):
+        raw = {"results": [
+            {"type": "punctuation", "start_time": 1.0, "end_time": 1.0,
+             "alternatives": [{"content": "."}]},
+        ]}
+        self.assertIsNone(ptg.clean_speech_ms_from_raw_json(raw))
+
+    def test_broken_input_returns_none(self):
+        for bad in (None, [], "x", {}, {"results": "nope"}, 42):
+            self.assertIsNone(ptg.clean_speech_ms_from_raw_json(bad))
+            self.assertIsNone(ptg.speech_bounds_ms_from_raw_json(bad))
+
+    def test_garbage_timings_skipped(self):
+        """Нечисловые тайминги пропускаются, функция не падает."""
+        raw = {"results": [
+            {"type": "word", "start_time": "oops", "end_time": 5.0,
+             "alternatives": [{"content": "a"}]},
+            {"type": "word", "start_time": 10.0, "end_time": 12.0,
+             "alternatives": [{"content": "b"}]},
+        ]}
+        self.assertEqual(ptg.speech_bounds_ms_from_raw_json(raw), (10000, 12000))
+
+    def test_negative_word_duration_normalized(self):
+        """end_time < start_time → end нормализуется к start (нет отриц. речи)."""
+        raw = {"results": [
+            {"type": "word", "start_time": 10.0, "end_time": 9.0,
+             "alternatives": [{"content": "a"}]},
+        ]}
+        self.assertEqual(ptg.speech_bounds_ms_from_raw_json(raw), (10000, 10000))
+        # Один word, end==start → интервал 0 → None.
+        self.assertIsNone(ptg.clean_speech_ms_from_raw_json(raw))
+
+
+_FIXTURE_CLEAN = _HERE / "fixtures" / "transcript_clean_time_sample.json"
+
+
+class TestDurationLabelTranscriptJson(unittest.TestCase):
+    """Источник «транскрипт-json» в compute_duration_label (REQ 2.1/2.3)."""
+
+    def test_tatyana_case_clean_below_presence(self):
+        """REQ 2.1: присутствие 1ч42, первая реплика 5:00 → подпись 1ч37."""
+        meta = {
+            # Присутствие бота = endTs - startTs = 1 ч 42 мин («грязное» время).
+            "startTs": "2026-06-03T10:00:00Z",
+            "endTs": "2026-06-03T11:42:00Z",
+            # recording.* НЕТ — старая встреча, чистое время берётся из json.
+        }
+        label = ptg.compute_duration_label(
+            meta, transcript_json_path=str(_FIXTURE_CLEAN)
+        )
+        self.assertEqual(label, "1 ч 37 мин")
+        # Чистое время строго меньше присутствия, и это НЕ присутствие.
+        self.assertEqual(ptg.compute_duration_label(meta), "1 ч 42 мин")
+        self.assertNotEqual(label, ptg.compute_duration_label(meta))
+
+    def test_recording_fields_win_over_transcript_json(self):
+        """REQ 2.3: транскрипт-json ПОСЛЕ recording.firstSpeechMs, но ПЕРЕД endTs-startTs."""
+        meta_with_rec = {
+            "recording": {"firstSpeechMs": 0, "lastSpeechMs": 30 * 60 * 1000},  # 30 мин
+            "startTs": "2026-06-03T10:00:00Z",
+            "endTs": "2026-06-03T11:42:00Z",
+        }
+        self.assertEqual(
+            ptg.compute_duration_label(
+                meta_with_rec, transcript_json_path=str(_FIXTURE_CLEAN)
+            ),
+            "30 мин",
+        )
+
+    def test_missing_json_warns_and_falls_back_to_presence(self):
+        """Битый/отсутствующий json → warning + fallback на присутствие (не молча)."""
+        meta = {
+            "startTs": "2026-06-03T10:00:00Z",
+            "endTs": "2026-06-03T11:05:00Z",  # 1 ч 05 мин
+        }
+        bad_path = str(_HERE / "fixtures" / "does-not-exist.json")
+        with self.assertLogs("lib.protocol_to_tg", level="WARNING") as cm:
+            label = ptg.compute_duration_label(meta, transcript_json_path=bad_path)
+        self.assertEqual(label, "1 ч 05 мин")
+        self.assertTrue(
+            any("transcript json missing" in m for m in cm.output),
+            f"ожидали warning про missing transcript json, получили: {cm.output}",
+        )
+
+    def test_no_path_uses_presence_without_warning(self):
+        """Без пути — поведение как раньше (присутствие), без лишнего warning."""
+        meta = {
+            "startTs": "2026-06-03T10:00:00Z",
+            "endTs": "2026-06-03T11:05:00Z",
+        }
+        self.assertEqual(ptg.compute_duration_label(meta), "1 ч 05 мин")
+
+
+class TestResolveSeriesDisplayName(unittest.TestCase):
+    """РАЗМ2: slug серии → человекочитаемое имя для caption."""
+
+    def test_override_marketplaces(self):
+        self.assertEqual(
+            ptg.resolve_series_display_name({"series": "marketplaces-tatiana"}),
+            "Маркетплейсы (Татьяна)",
+        )
+
+    def test_override_anzhee(self):
+        self.assertEqual(
+            ptg.resolve_series_display_name({"series": "anzhee-direktorat"}),
+            "Директорат Anzhee",
+        )
+
+    def test_explicit_meta_field_wins(self):
+        self.assertEqual(
+            ptg.resolve_series_display_name(
+                {"series": "anzhee-direktorat", "seriesTitle": "Кастомное имя"}
+            ),
+            "Кастомное имя",
+        )
+
+    def test_theme_derived_for_unmapped(self):
+        """Неизвестная серия с темой `Имя — расшифровка` → имя до « — »."""
+        header = {"theme": "Синхронизация по вайб-кодингу — текущие проекты"}
+        self.assertEqual(
+            ptg.resolve_series_display_name(
+                {"series": "oneoff-vaibkoding-e57601"}, parsed_header=header
+            ),
+            "Синхронизация по вайб-кодингу",
+        )
+
+    def test_humanize_slug_fallback_warns(self):
+        """Нет маппинга и нет темы → гуманизированный slug + warning."""
+        with self.assertLogs("lib.protocol_to_tg", level="WARNING") as cm:
+            name = ptg.resolve_series_display_name({"series": "weekly-sync-abcd12"})
+        self.assertEqual(name, "Weekly sync")  # хвост-хэш отрезан, дефисы→пробел
+        self.assertTrue(any("display-маппинг" in m for m in cm.output))
+
+    def test_config_overrides_defaults(self, ):
+        """`_config/series-display.json` перебивает хардкод-дефолты."""
+        with mock.patch.object(
+            ptg, "_load_series_display_config",
+            return_value={"anzhee-direktorat": "Совет директоров"},
+        ):
+            self.assertEqual(
+                ptg.resolve_series_display_name({"series": "anzhee-direktorat"}),
+                "Совет директоров",
+            )
+
+
+class TestCaptionParticipants(unittest.TestCase):
+    """Участники caption: expected — как есть, UI — обогащаем (РАЗМ2/эталон)."""
+
+    def test_expected_names_not_enriched(self):
+        """«Татьяна» из watched.yaml НЕ обогащается до «Татьяна Филиппова»."""
+        out = ptg._caption_participants({
+            "expectedParticipants": ["Илья Рыбалка", "Татьяна"],
+            "participants": [],
+        })
+        self.assertEqual(out, ["Илья Рыбалка", "Татьяна"])
+
+    def test_ui_bare_name_enriched(self):
+        """Голое имя из Telemost UI обогащается через people.md (single match)."""
+        with mock.patch.object(
+            ptg, "_read_people_md", return_value="- **Ольга Новикова** — роль"
+        ):
+            out = ptg._caption_participants({
+                "expectedParticipants": ["Илья Рыбалка"],
+                "participants": ["Ольга"],
+            })
+        self.assertEqual(out, ["Илья Рыбалка", "Ольга Новикова"])
+
+    def test_locked_first_name_not_overridden_by_ui(self):
+        """Курируемое имя не перетирается одноимённым UI-именем."""
+        with mock.patch.object(
+            ptg, "_read_people_md", return_value="- **Татьяна Филиппова** — роль"
+        ):
+            out = ptg._caption_participants({
+                "expectedParticipants": ["Татьяна"],
+                "participants": ["Татьяна"],
+            })
+        self.assertEqual(out, ["Татьяна"])
+
+
+CAPTION_PROTO = (
+    "#протоколвстречи 03.06.2026\n\n"
+    "**Встреча:** Маркетплейсы — статус кабинетов.\n\n"
+    "---\n\n"
+    "## 1) Раздел\n\n"
+    "▪️ Буллет.\n"
+)
+
+
+class TestBuildPdfCaption(unittest.TestCase):
+    """REQ 3.1: 4-строчная подпись под PDF, совпадает с эталоном владельца."""
+
+    META = {
+        "series": "marketplaces-tatiana",
+        "date": "2026-06-03",
+        "expectedParticipants": ["Илья Рыбалка", "Татьяна"],
+        "participants": [],
+        # чистое время 1ч37 — single-chunk recording (Ф1 источник 2).
+        "recording": {"firstSpeechMs": 0, "lastSpeechMs": 97 * 60 * 1000},
+    }
+
+    def test_caption_matches_owner_etalon(self):
+        cap = ptg.build_pdf_caption(CAPTION_PROTO, self.META)
+        etalon = (
+            "📋 #протоколвстречи\n"
+            "Маркетплейсы (Татьяна) — 03.06.2026\n"
+            "Участники: Илья Рыбалка, Татьяна\n"
+            "Чистое время обсуждения: ~1 ч 37 мин"
+        )
+        self.assertEqual(cap, etalon)
+
+    def test_caption_is_exactly_four_lines(self):
+        cap = ptg.build_pdf_caption(CAPTION_PROTO, self.META)
+        self.assertEqual(len(cap.splitlines()), 4)
+
+    def test_hashtag_merged_on_first_line(self):
+        cap = ptg.build_pdf_caption(CAPTION_PROTO, self.META)
+        self.assertEqual(cap.splitlines()[0], "📋 #протоколвстречи")
+        self.assertNotIn("#протокол_встречи", cap)  # слитно, не с подчёркиванием
+
+    def test_unknown_duration_no_tilde(self):
+        """Без источника времени — «: —» без «~—»."""
+        cap = ptg.build_pdf_caption(CAPTION_PROTO, {
+            "series": "marketplaces-tatiana", "date": "2026-06-03",
+            "expectedParticipants": ["Илья Рыбалка"], "participants": [],
+        })
+        self.assertIn("Чистое время обсуждения: —", cap)
+        self.assertNotIn("~—", cap)
+
+    def test_title_subtitle(self):
+        title, subtitle = ptg.build_pdf_title_subtitle(CAPTION_PROTO, self.META)
+        self.assertEqual(title, "Маркетплейсы (Татьяна) — 03.06.2026")
+        self.assertIn("Участники: Илья Рыбалка, Татьяна", subtitle)
+        self.assertIn("Чистое время обсуждения: ~1 ч 37 мин", subtitle)
 
 
 if __name__ == "__main__":

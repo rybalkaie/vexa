@@ -167,8 +167,16 @@ class TestUpdateMetaDelivered(unittest.TestCase):
         self.assertEqual(len(meta["delivered"]), 2)
 
 
+def _fake_render(md_text, out_pdf, *, title, subtitle, **kwargs):
+    """Mock PDF-рендера: пишет валидную заглушку (>10 байт `%PDF`), без chrome."""
+    p = Path(out_pdf)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"%PDF-1.4\n" + b"x" * 64)
+    return p
+
+
 class TestDeliverProtocolIdempotency(unittest.TestCase):
-    """Smoke `deliver_protocol` end-to-end с mock-Telegram API."""
+    """Smoke `deliver_protocol` end-to-end по PDF-пути (mock render + sendDocument)."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="test-deliver-")
@@ -191,9 +199,11 @@ class TestDeliverProtocolIdempotency(unittest.TestCase):
         if self._old_enable is not None:
             os.environ["ENABLE_PROTOCOL_DELIVERY"] = self._old_enable
 
-    @mock.patch.object(lp.telegram_api, "send_message")
-    def test_first_call_sends_and_records(self, mock_send):
-        mock_send.return_value = {"message_id": 42}
+    @mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render)
+    @mock.patch.object(lp.telegram_api, "send_document")
+    def test_first_call_sends_pdf_and_records(self, mock_send_doc, mock_render):
+        """REQ 1.1: один PDF + caption; `delivered` помечен document:true (RISK1)."""
+        mock_send_doc.return_value = {"message_id": 42}
         result = lp.deliver_protocol(
             META, SAMPLE_PROTOCOL,
             meta_json_path=self.meta_path,
@@ -202,95 +212,118 @@ class TestDeliverProtocolIdempotency(unittest.TestCase):
         )
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["chat_id"], 999)
-        self.assertTrue(result["message_ids"])
-        # meta.delivered записан в новом формате.
+        self.assertEqual(result["message_ids"], [42])
+        self.assertEqual(result["parts_count"], 1)
+        self.assertTrue(result.get("document"))
+        # Ровно один документ; caption передан в send_document (REQ 3.1/3.2).
+        self.assertEqual(mock_send_doc.call_count, 1)
+        _, kwargs = mock_send_doc.call_args
+        self.assertIn("caption", kwargs)
+        self.assertIn("#протоколвстречи", kwargs["caption"])
+        # meta.delivered: новый array-формат + флаг document (RISK1).
         meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
         self.assertIsInstance(meta["delivered"], list)
         self.assertEqual(meta["delivered"][0]["chat_id"], 999)
+        self.assertEqual(meta["delivered"][0]["message_ids"], [42])
+        self.assertTrue(meta["delivered"][0]["document"])
 
-    @mock.patch.object(lp.telegram_api, "send_message")
-    def test_second_call_idempotent_skip(self, mock_send):
-        """Повторная доставка в тот же chat_id → skip без send."""
-        mock_send.return_value = {"message_id": 42}
-        # Первая.
+    @mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render)
+    @mock.patch.object(lp.telegram_api, "send_document")
+    def test_second_call_idempotent_skip(self, mock_send_doc, mock_render):
+        """REQ 1.5: повторная доставка в тот же chat_id → skip без send."""
+        mock_send_doc.return_value = {"message_id": 42}
         lp.deliver_protocol(
-            META, SAMPLE_PROTOCOL,
-            meta_json_path=self.meta_path,
-            target_chat_id=999,
-            meeting_sid="test-sid",
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=999, meeting_sid="test-sid",
         )
-        sends_after_first = mock_send.call_count
-        # Вторая.
+        sends_after_first = mock_send_doc.call_count
         result = lp.deliver_protocol(
-            META, SAMPLE_PROTOCOL,
-            meta_json_path=self.meta_path,
-            target_chat_id=999,
-            meeting_sid="test-sid",
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=999, meeting_sid="test-sid",
         )
         self.assertEqual(result["status"], "skipped")
-        # Не было новых отправок.
-        self.assertEqual(mock_send.call_count, sends_after_first)
+        self.assertEqual(mock_send_doc.call_count, sends_after_first)  # без нового send
 
-    @mock.patch.object(lp.telegram_api, "send_message")
-    def test_change_chat_id_sends_to_new_chat(self, mock_send):
-        """При смене target_chat_id → отправка в новый chat (РИСК5).
-
-        Покрывает кейс: админ сменил `telegram_chat_id` в watched.yaml после
-        первой доставки. Idempotency-guard для нового chat_id срабатывает
-        как «нет записи» → шлём.
-        """
-        mock_send.return_value = {"message_id": 42}
+    @mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render)
+    @mock.patch.object(lp.telegram_api, "send_document")
+    def test_change_chat_id_sends_to_new_chat(self, mock_send_doc, mock_render):
+        """РИСК5: смена target_chat_id → доставка в новый chat без дубля в старый."""
+        mock_send_doc.return_value = {"message_id": 42}
         lp.deliver_protocol(
-            META, SAMPLE_PROTOCOL,
-            meta_json_path=self.meta_path,
-            target_chat_id=999,
-            meeting_sid="test-sid",
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=999, meeting_sid="test-sid",
         )
-        first_send_count = mock_send.call_count
-        # Меняем chat_id.
+        first = mock_send_doc.call_count
         result = lp.deliver_protocol(
-            META, SAMPLE_PROTOCOL,
-            meta_json_path=self.meta_path,
-            target_chat_id=888,
-            meeting_sid="test-sid",
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=888, meeting_sid="test-sid",
         )
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["chat_id"], 888)
-        self.assertGreater(mock_send.call_count, first_send_count)
-        # Обе записи в meta.delivered.
+        self.assertGreater(mock_send_doc.call_count, first)
         meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
         chat_ids = sorted(r["chat_id"] for r in meta["delivered"])
         self.assertEqual(chat_ids, [888, 999])
 
-    @mock.patch.object(lp.telegram_api, "send_message")
-    def test_legacy_meta_delivered_migrated_on_idempotency_check(self, mock_send):
-        """Старый формат `delivered = {chat_id, ...}` корректно мигрирует
-        при idempotency-check: если chat_id совпадает И parts_count совпал,
-        шлём skip; иначе шлём.
-        """
-        # Симулируем legacy meta: один объект, не массив.
-        # Для idempotency parts_count должен совпасть; так как первая
-        # доставка ещё не делалась, рассчитаем parts через формат+split.
-        from lib import protocol_to_tg as ptg
-        tg_text = ptg.format_protocol_as_tg_text(SAMPLE_PROTOCOL, META)
-        parts = len(ptg.split_protocol_smart(tg_text, max_len=ptg.TG_MAX_LEN))
+    @mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render)
+    @mock.patch.object(lp.telegram_api, "send_document")
+    def test_legacy_text_delivery_skips_no_pdf_dup(self, mock_send_doc, mock_render):
+        """RISK3: встреча, доставленная ТЕКСТОМ до деплоя (message_ids=N чанков,
+        без document-флага), при повторном finalize НЕ должна уйти PDF-дублем —
+        существующая запись для chat_id трактуется как «уже доставлено» (skip),
+        число частей НЕ сверяется."""
         legacy = {
-            "delivered": {
+            "delivered": [{
                 "chat_id": 999,
-                "message_ids": list(range(1, parts + 1)),
-                "at": "old",
-            },
+                "message_ids": [101, 102, 103],  # 3 текстовых чанка (legacy)
+                "at": "2026-06-01T10:00:00Z",
+            }],
         }
         self.meta_path.write_text(json.dumps(legacy), encoding="utf-8")
-        mock_send.return_value = {"message_id": 42}
         result = lp.deliver_protocol(
-            META, SAMPLE_PROTOCOL,
-            meta_json_path=self.meta_path,
-            target_chat_id=999,
-            meeting_sid="test-sid",
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=999, meeting_sid="test-sid",
         )
         self.assertEqual(result["status"], "skipped")
-        mock_send.assert_not_called()
+        self.assertEqual(result["message_ids"], [101, 102, 103])
+        mock_send_doc.assert_not_called()  # PDF-дубль НЕ отправлен
+        mock_render.assert_not_called()    # и PDF даже не собирался
+
+    @mock.patch.object(lp, "_alert_owner_pdf_failure")
+    @mock.patch.object(lp.telegram_api, "send_document")
+    @mock.patch.object(
+        lp.protocol_to_pdf, "render_pdf_from_markdown",
+        side_effect=lp.protocol_to_pdf.PdfRenderError("chromium boom"),
+    )
+    def test_pdf_build_failure_alerts_no_text(self, mock_render, mock_send_doc, mock_alert):
+        """REQ 1.4: сбой СБОРКИ PDF → status error + алерт Илье; текстом НЕ слать."""
+        result = lp.deliver_protocol(
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=999, meeting_sid="test-sid",
+        )
+        self.assertEqual(result["status"], "error")
+        mock_alert.assert_called_once()
+        mock_send_doc.assert_not_called()  # текстом/документом ничего не ушло
+        # meta.delivered НЕ записан (доставки не было) → не блокирует ретрай.
+        meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(meta.get("delivered", []), [])
+
+    @mock.patch.object(lp, "_alert_owner_pdf_failure")
+    @mock.patch.object(
+        lp.telegram_api, "send_document",
+        side_effect=lp.telegram_api.TelegramApiError("sendDocument ok=false"),
+    )
+    @mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render)
+    def test_pdf_send_failure_alerts_no_text(self, mock_render, mock_send_doc, mock_alert):
+        """REQ 1.4: сбой ОТПРАВКИ (send_document) → status error + алерт; не дублим."""
+        result = lp.deliver_protocol(
+            META, SAMPLE_PROTOCOL, meta_json_path=self.meta_path,
+            target_chat_id=999, meeting_sid="test-sid",
+        )
+        self.assertEqual(result["status"], "error")
+        mock_alert.assert_called_once()
+        meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(meta.get("delivered", []), [])
 
 
 if __name__ == "__main__":

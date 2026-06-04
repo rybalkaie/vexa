@@ -362,9 +362,34 @@ launchd-агент, что и методички (`meeting-notary-methods-push.s
 |-----|--------|------------|
 | `ENABLE_TASK_EXTRACTION` | `1` | Выключить = `extract_tasks` всегда `[]`. |
 | `ENABLE_TASK_ROUTING` | `1` | Выключить = задачи извлекаются, но не пишутся (дебаг промта). |
+| `ENABLE_STAKEHOLDER_TRACK_CLOSE` | `1` (ON) | Автосвязка протокол → трек стейкхолдера (закрытие + добавление, см. ниже). Выключить = `0`/`false`/`no`. |
 | `MEETING_NOTARY_TASKS_MD` | `~/Projects/me/tasks.md` | Целевой файл записи задач Ильи. |
 | `MEETING_NOTARY_STAKEHOLDERS_JSON` | — | Явный путь к JSON-реестру. |
 | `CLARIFY_TIMEOUT` | `86400` (общий с Ф3) | Таймаут ответа на clarification по задачам (24 ч). |
+
+### Автосвязка протокол → трек стейкхолдера (закрытие + добавление)
+
+По итогам **1:1 встречи** со стейкхолдером из реестра `finalize-meeting`
+дополнительно синхронизирует его трек открытых вопросов
+(`lib.llm_postprocess.sync_stakeholder_track`):
+
+- LLM по протоколу + текущему списку «🟢 Открыто» решает, **что закрыть**
+  (обсуждённые/решённые вопросы) и **что добавить** (новые долги на контроль).
+- Закрытие — **обратимое**: пункт ПЕРЕНОСится из «## 🟢 Открыто» в
+  «## ✅ Закрытые» с датой и пометкой «закрыто ботом по встрече <date>», НЕ
+  удаляется (Илья может вернуть руками). Перенос — exact-match по дословному
+  тексту открытого пункта (страховка от ложного закрытия); не нашли точного
+  совпадения → no-op + `warning`.
+- Новые вопросы дописываются в «🟢 Открыто» через существующую
+  `append_to_open_subsection` (подсекция `### 📋 Из встречи <date>`).
+- Перенос/дописка — под тем же `fcntl.flock` + atomic write, что и Ф5-append
+  (`lib.stakeholder_track.close_open_item` / `append_to_open_subsection`).
+
+**Гейт `ENABLE_STAKEHOLDER_TRACK_CLOSE`** (env, **дефолт ON** — решение
+владельца 04.06: авто-закрытие сразу в проде, обратимость гарантируется
+переносом-не-удалением). При `0`/`false`/`no` — новый путь не выполняется,
+поведение как раньше (трек только пополняется задачами в Ф5, ничего не
+закрывается). Лог: `[track-sync] meeting=<sid> stakeholder=<slug> closed=N new=M errors=E`.
 
 ### Structured-лог Ф5
 
@@ -382,9 +407,16 @@ launchd-агент, что и методички (`meeting-notary-methods-push.s
 
 После генерации протокола (Ф4) и извлечения задач (Ф5) `finalize-meeting.py`
 вызывает `deliver_protocol(...)` из `lib/llm_postprocess.py` — идемпотентная
-отправка `.md` в Telegram-группу через `@ilya_protocol_meeting_bot`.
+отправка протокола в Telegram-группу через `@ilya_protocol_meeting_bot`.
 
-**Поток доставки:**
+> **⚠️ Ф2 доработок `protocol-pdf-telegram` (2026-06-04): доставка переведена с
+> текстовой простыни на PDF-вложение.** Протокол уходит ОДНИМ PDF + 4-строчная
+> подпись (caption); тело текстом НЕ дублируется. Описание «split по 3500 /
+> send_message по частям» ниже — legacy-контекст; актуальный путь — подраздел
+> **«PDF протоколов»** в конце Ф6. Идемпотентность теперь по наличию записи для
+> chat_id (не по числу частей — миграция текст→PDF, RISK3).
+
+**Поток доставки (legacy-текст; PDF см. подраздел «PDF протоколов»):**
 
 1. **chat_id** берётся из (а) явного `target_chat_id` параметра, (б)
    `meta.telegram_chat_id` если есть, (в) `watched.yaml` по
@@ -492,6 +524,81 @@ p.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
 #    Telegram-команда «протокол <series> <date>» в Ф4 — она перегенерирует
 #    .md и потом следующий finalize пушнёт).
 ```
+
+### PDF протоколов (Ф2 доработок `protocol-pdf-telegram`)
+
+С 2026-06-04 `deliver_protocol` шлёт протокол **PDF-вложением** (`telegram_api.
+send_document`, multipart на stdlib) с короткой подписью из 4 строк, а не
+текстовыми чанками. Генератор — `lib/protocol_to_pdf.py` (порт мак-генератора
+`~/.local/bin/protocol-to-pdf` на Linux: тот же CSS/HTML через headless-Chromium).
+
+**Подпись (caption) — 4 строки (REQ 3.1, эталон владельца):**
+
+```
+📋 #протоколвстречи
+<Серия> — DD.MM.YYYY
+Участники: <имена>
+Чистое время обсуждения: ~<Xч YYмин>
+```
+
+Имя серии — человекочитаемое (`marketplaces-tatiana` → «Маркетплейсы (Татьяна)»,
+`anzhee-direktorat` → «Директорат Anzhee»): маппинг `_SERIES_DISPLAY_OVERRIDES` в
+`lib/protocol_to_tg.py` + опциональный `_config/series-display.json` (slug→имя,
+перебивает дефолты; путь — env `MEETING_NOTARY_SERIES_DISPLAY_PATH` или
+`<registry>/_config/series-display.json`). Чистое время — из Ф1
+(`compute_duration_label`; для старых встреч читается `_transcripts/<date>.json`).
+Участники: `expectedParticipants` (watched.yaml) берутся как есть, имена из
+Telemost UI обогащаются через people.md.
+
+**Сбой сборки/отправки PDF (REQ 1.4):** короткий алерт Илье в личку через
+`lib.notify.push` (`~/.local/bin/tg-send`), `status="error"`, лог `[delivery] PDF
+доставка упала ... — алерт Илье, текстом НЕ шлём`. Текстового fallback НЕТ
+(решение владельца 04.06).
+
+**`meta.delivered` для PDF (RISK1 — формат НЕ ломаем):** `{chat_id, message_ids:
+[<id документа>], at, decision:"pdf", document:true}`. Три потребителя
+(идемпотентность, `_is_success_record`/rc=10, cleanup WAV) работают без правок.
+
+#### Системные зависимости на VPS — поставить ОДИН раз (НЕ выполнено этим планом)
+
+> ⚠️ Деплой-шаг владельца. Команды ниже — выполнить на VPS вручную при выкатке
+> батча. План `protocol-pdf-telegram` их НЕ выполнял (режим «код без деплоя»).
+
+```bash
+# chromium-headless + цветные эмодзи + кириллические шрифты:
+sudo apt-get update
+sudo apt-get install -y chromium fonts-noto-color-emoji fonts-noto-core
+#   (Debian: пакет «chromium»; Ubuntu: «chromium-browser» — тогда задать
+#    PROTOCOL_PDF_CHROME_BIN=chromium-browser)
+
+# python-пакет markdown в ТОТ venv, под которым крутится finalize/listener:
+/srv/meeting-notary/venv/bin/pip install markdown
+# (на маке для тестов: ~/Projects/meeting-notary/.venv-cli/bin/pip install markdown — уже сделано)
+```
+
+**Env (опционально):**
+
+- `PROTOCOL_PDF_CHROME_BIN` — путь/имя бинаря браузера (иначе автодетект:
+  `chromium` → `chromium-browser` → `google-chrome` → `google-chrome-stable`).
+- `PROTOCOL_PDF_NO_USER_DATA_DIR=1` — не использовать изолированный
+  `--user-data-dir` (на macOS-деве с запущенным GUI Chrome — отключается авто по
+  `sys.platform`; на Linux/VPS профиль нужен для параллельных finalize).
+
+#### Smoke-рендер ПЕРЕД переключением боевой доставки (RISK4)
+
+После установки chromium прогнать деплой-смоук (ловит деградацию шрифтов после
+`apt upgrade` — без `fonts-noto-color-emoji` цветные эмодзи станут ч/б):
+
+```bash
+PROTOCOL_PDF_CHROME_BIN=chromium /srv/meeting-notary/venv/bin/python \
+  vexa/scripts/notary/tools/smoke_render_pdf.py
+# Ждём «✅ PASS»: PDF >10 КБ, начинается с %PDF, есть image-XObject (= цветные
+# эмодзи срендерились). Иначе НЕ переключать боевую доставку.
+```
+
+Затем — ручная сверка первого боевого PDF на VPS с эталоном владельца
+(«Директорат Anzhee — 03.06.2026»: синяя шапка, цветные эмодзи, таблицы) до
+переключения боевой доставки.
 
 ## Ф7 — Миграция файловой структуры + INDEX.md (мак)
 

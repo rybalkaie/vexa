@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -218,6 +220,130 @@ def download_file(token: str, file_path: str, dest_path: str, *, timeout: float 
     with open(dest_path, "wb") as fh:
         fh.write(data)
     logger.info("[tg-api] download_file ok bytes=%d", len(data))
+
+
+# Лимит Telegram на caption у `sendDocument` — 1024 символа (на момент 2026-06).
+DOCUMENT_CAPTION_MAX = 1024
+
+
+def _encode_multipart(
+    boundary: str,
+    text_fields: dict[str, str],
+    *,
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    file_content_type: str,
+) -> bytes:
+    """Собирает тело `multipart/form-data` (stdlib, без зависимостей).
+
+    Текстовые поля — UTF-8. Файл — как есть (bytes). Каждая граница
+    префиксится `--`, финальная — `--<boundary>--`. RFC 7578.
+    """
+    crlf = b"\r\n"
+    bnd = boundary.encode("ascii")
+    parts: list[bytes] = []
+    for name, value in text_fields.items():
+        parts.append(b"--" + bnd)
+        parts.append(
+            ('Content-Disposition: form-data; name="%s"' % name).encode("utf-8")
+        )
+        parts.append(b"")
+        parts.append(value.encode("utf-8"))
+    parts.append(b"--" + bnd)
+    parts.append(
+        ('Content-Disposition: form-data; name="%s"; filename="%s"'
+         % (file_field, filename)).encode("utf-8")
+    )
+    parts.append(("Content-Type: %s" % file_content_type).encode("ascii"))
+    parts.append(b"")
+    parts.append(file_bytes)
+    parts.append(b"--" + bnd + b"--")
+    parts.append(b"")
+    return crlf.join(parts)
+
+
+def send_document(
+    token: str,
+    chat_id: int,
+    file_path: str,
+    *,
+    caption: Optional[str] = None,
+    filename: Optional[str] = None,
+    timeout: float = 120.0,
+) -> dict:
+    """Загружает файл в чат документом (`sendDocument`, multipart/form-data).
+
+    Реализация на stdlib `urllib` — без новых зависимостей (как остальной
+    модуль). Возвращает `result` (включая `message_id`).
+
+    Дисциплина «Опасной тройки» (REQ 1.3): логируем ТОЛЬКО `chat_id` и размер
+    файла. Путь к файлу, имя файла, caption и токен — НЕ логируем.
+
+    Параметры:
+      file_path — путь к файлу на диске (для нас — собранный PDF).
+      caption — подпись (≤ 1024 симв.; длиннее — обрезаем, чтобы не словить
+        ok=false на боевой доставке протокола).
+      filename — имя файла для Telegram (по умолчанию — basename пути).
+    """
+    path = Path(file_path)
+    try:
+        file_bytes = path.read_bytes()
+    except OSError as e:
+        raise TelegramApiError(
+            f"sendDocument read failed: {type(e).__name__}: {e}"
+        ) from e
+    if not file_bytes:
+        raise TelegramApiError("sendDocument: пустой файл")
+
+    text_fields: dict[str, str] = {"chat_id": str(chat_id)}
+    if caption is not None and caption != "":
+        text_fields["caption"] = caption[:DOCUMENT_CAPTION_MAX]
+
+    boundary = "----meeting-notary-" + uuid.uuid4().hex
+    body = _encode_multipart(
+        boundary,
+        text_fields,
+        file_field="document",
+        filename=(filename or path.name),
+        file_bytes=file_bytes,
+        file_content_type="application/pdf",
+    )
+
+    url = _bot_url(token, "sendDocument")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read()
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise TelegramApiError(f"sendDocument HTTP {e.code}: {e.reason}") from e
+        desc = (data or {}).get("description", "")
+        raise TelegramApiError(f"sendDocument ok=false: HTTP={e.code} desc={desc!r}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise TelegramApiError(
+            f"sendDocument network error: {type(e).__name__}: {e}"
+        ) from e
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise TelegramApiError(f"sendDocument returned non-JSON: HTTP {status}") from e
+    if not isinstance(data, dict) or not data.get("ok"):
+        desc = (data or {}).get("description", "")
+        raise TelegramApiError(f"sendDocument ok=false: HTTP={status} desc={desc!r}")
+    result = data.get("result") or {}
+    logger.info(
+        "[tg-api] sendDocument ok chat=%s msg_id=%s bytes=%d",
+        chat_id, result.get("message_id"), len(file_bytes),
+    )
+    return result
 
 
 def split_long_message(text: str, max_len: int = 3500) -> list[str]:

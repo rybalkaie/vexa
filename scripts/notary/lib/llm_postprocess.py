@@ -60,6 +60,7 @@ from .claude_cli import (
 )
 from . import clarify_state
 from . import protocol_to_tg
+from . import protocol_to_pdf
 from . import telegram_api
 
 
@@ -2126,6 +2127,317 @@ def _build_stakeholder_bullet_block(tasks: list[dict], meeting_meta: dict) -> li
     return lines
 
 
+# --- Ф3: автосвязка протокол → трек стейкхолдера (закрытие + добавление) ---
+
+STAKEHOLDER_TRACK_SYNC_MODEL = "claude-sonnet-4-6"
+
+_STK_SYNC_OPEN_H2_RE = re.compile(r"^##\s+🟢\s+Открыто\b")
+# Подсекция «🟢 Открыто», помеченная «… не закрывать …» (боевой паттерн:
+# «### Хвосты — не закрывать молча»). Её пункты НЕ предлагаем LLM на
+# авто-закрытие (Ф3, цикл5/У1): это явная пометка владельца «нужно ручное
+# внимание». Сужает только closed-кандидатов — безопасная сторона.
+_STK_SYNC_NO_AUTOCLOSE_RE = re.compile(r"^###\s+.*не\s+закрыва", re.IGNORECASE)
+
+
+class StakeholderTrackSyncError(RuntimeError):
+    """Сбой парсинга ответа LLM на шаге «что закрыть / что добавить»."""
+
+
+STAKEHOLDER_TRACK_SYNC_SYSTEM_PROMPT = """Ты ведёшь накопитель открытых вопросов/долгов по стейкхолдеру (1:1 встречи с Ильёй).
+
+На вход:
+1. Текущий список ОТКРЫТЫХ вопросов/долгов стейкхолдера (дословные формулировки, нумерованы).
+2. Протокол прошедшей 1:1 встречи.
+
+Реши две вещи:
+- closed: какие из текущих ОТКРЫТЫХ пунктов были РЕАЛЬНО обсуждены и закрыты/решены на этой встрече. Каждый элемент closed — ДОСЛОВНЫЙ текст пункта из списка открытых (копируй точно, без номера, без правок). НЕ закрывай пункт, если он лишь вскользь упомянут или не решён по сути. Сомневаешься — НЕ закрывай (лучше оставить открытым: закрытие потом стоит дороже, чем лишний открытый пункт).
+- new: какие НОВЫЕ вопросы / долги / договорённости на контроль возникли на встрече и которых ещё НЕТ в списке открытых. Короткая формулировка одной строкой (без markdown, без «- [ ]», без номера). Не дублируй то, что уже открыто.
+
+Правила:
+- НЕ выдумывай. closed — только дословно из переданного списка открытых; new — только то, что реально прозвучало в протоколе.
+- Если закрывать нечего — closed: []. Если новых нет — new: [].
+
+Формат ответа — СТРОГО валидный JSON-объект (без markdown-обёртки, без пояснений, без префиксов):
+{"closed": ["<дословный открытый пункт>", ...], "new": ["<новый вопрос одной строкой>", ...]}
+"""
+
+
+def _is_stakeholder_track_close_enabled() -> bool:
+    """Гейт Ф3 `ENABLE_STAKEHOLDER_TRACK_CLOSE`.
+
+    Дефолт ON (решение владельца 04.06: авто-закрытие сразу в проде, обратимо —
+    перенос с пометкой, не удаление). Выключить = `0`/`false`/`no` (тот же
+    контракт, что у `ENABLE_TASK_ROUTING`/`ENABLE_TASK_EXTRACTION`). Флаг
+    оставлен, чтобы можно было быстро выключить новый путь без отката кода."""
+    raw = (os.environ.get("ENABLE_STAKEHOLDER_TRACK_CLOSE") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def _norm_track_item(s: str) -> str:
+    """Нормализация для сравнения пунктов: lower + сжатые пробелы + trim."""
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _extract_open_track_items(track_text: str) -> list[str]:
+    """Дословные тела открытых пунктов (без `- [ ]` префикса) из блока
+    «## 🟢 Открыто». Заголовки подсекций (`### ...`) и пустые строки — мимо.
+
+    Пункты подсекций «… не закрывать …» (напр. «### Хвосты — не закрывать
+    молча») ИСКЛЮЧАЮТСЯ из кандидатов: это явная пометка владельца «ручное
+    внимание», бот их не авто-закрывает (цикл5/У1).
+
+    Логика снятия префикса — общая со `stakeholder_track._strip_bullet_prefix`,
+    чтобы то, что мы кладём LLM на вход, точно совпало с тем, что `close_open_item`
+    потом матчит exact-match'ем."""
+    from . import stakeholder_track  # lazy: одна копия логики снятия префикса
+    lines = track_text.split("\n")
+    open_idx: Optional[int] = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("## ") and _STK_SYNC_OPEN_H2_RE.match(ln):
+            open_idx = i
+            break
+    if open_idx is None:
+        return []
+    next_idx = len(lines)
+    for j in range(open_idx + 1, len(lines)):
+        if lines[j].startswith("## "):
+            next_idx = j
+            break
+    items: list[str] = []
+    protected = False  # внутри подсекции «… не закрывать …» — пункты пропускаем
+    for k in range(open_idx + 1, next_idx):
+        ln = lines[k]
+        if ln.startswith("### "):
+            protected = bool(_STK_SYNC_NO_AUTOCLOSE_RE.match(ln))
+            continue
+        if protected:
+            continue
+        if not ln.lstrip().startswith("- "):
+            continue
+        content = stakeholder_track._strip_bullet_prefix(ln)
+        if content:
+            items.append(content)
+    return items
+
+
+def _build_track_sync_prompt(open_items: list[str], protocol_md: str, meeting_meta: dict) -> str:
+    """User-промт: открытые пункты + протокол. Дисциплина «Опасной тройки» —
+    кладём только открытые пункты и протокол, ничего лишнего."""
+    series = meeting_meta.get("series") or "—"
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+    if open_items:
+        open_block = "\n".join(f"{i + 1}. {it}" for i, it in enumerate(open_items))
+    else:
+        open_block = "(открытых пунктов нет)"
+    return (
+        f"Встреча: {series} — {date}\n\n"
+        f"Текущие ОТКРЫТЫЕ вопросы/долги (для closed возвращай ДОСЛОВНО текст без номера):\n"
+        f"{open_block}\n\n"
+        f"Протокол встречи:\n\n{protocol_md.strip()}"
+    )
+
+
+def _parse_track_sync_response(raw: str, open_items: list[str]) -> dict:
+    """Парсит `{closed:[...], new:[...]}` из ответа LLM.
+
+    - closed: оставляем ТОЛЬКО дословные совпадения с `open_items` (РАЗМ3 —
+      exact-match защита от ложного закрытия). Возвращаем канонический текст
+      пункта из файла (чтобы `close_open_item` гарантированно нашёл его).
+      Не совпавшие — отбрасываем + лог.
+    - new: непустые строки, тримминг, дедуп против `open_items` (не добавляем
+      то, что уже открыто) и между собой.
+    """
+    raw = _strip_markdown_fence(raw)
+    start = raw.find("{")
+    if start < 0:
+        raise StakeholderTrackSyncError("ответ LLM не содержит JSON-объект")
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(raw[start:])
+    except json.JSONDecodeError as e:
+        raise StakeholderTrackSyncError(f"невалидный JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise StakeholderTrackSyncError(
+            f"ожидался объект, получили {type(parsed).__name__}"
+        )
+
+    open_norm = {_norm_track_item(s): s for s in open_items}
+
+    closed: list[str] = []
+    seen_c: set[str] = set()
+    closed_raw = parsed.get("closed")
+    if isinstance(closed_raw, list):
+        for it in closed_raw:
+            if not isinstance(it, str) or not it.strip():
+                continue
+            key = _norm_track_item(it)
+            if key in open_norm:
+                if key not in seen_c:
+                    closed.append(open_norm[key])  # канонический текст из файла
+                    seen_c.add(key)
+            else:
+                logger.warning(
+                    "[track-sync] LLM вернул closed-пункт не из списка открытых — отброшен (РАЗМ3): %r",
+                    it[:80],
+                )
+
+    new: list[str] = []
+    seen_n: set[str] = set()
+    new_raw = parsed.get("new")
+    if isinstance(new_raw, list):
+        for it in new_raw:
+            if not isinstance(it, str) or not it.strip():
+                continue
+            # Санитизация входа (ход5): схлопываем переводы строк и повторные
+            # пробелы в одну строку. `new` пишется буллетом `- [ ] {txt}` в трек;
+            # многострочный текст инжектил бы лишние строки/фейковый заголовок
+            # (## ✅ Закрытые) и сломал бы разбор секций при следующем sync.
+            txt = re.sub(r"\s+", " ", it).strip()
+            key = _norm_track_item(txt)
+            if key in open_norm or key in seen_n:
+                continue  # уже открыт / дубль внутри ответа
+            seen_n.add(key)
+            new.append(txt)
+
+    return {"closed": closed, "new": new}
+
+
+def _resolve_one_on_one_stakeholder(
+    meeting_meta: dict, stakeholders: list[dict]
+) -> Optional[dict]:
+    """Стейкхолдер 1:1 встречи (тот же гейт, что `route_tasks`: `expectedParticipants`
+    = Илья + один из реестра). None — если встреча не 1:1 со стейкхолдером."""
+    for stk in stakeholders:
+        if _is_one_on_one_meeting(meeting_meta, stk):
+            return stk
+    return None
+
+
+def sync_stakeholder_track(
+    protocol_md: str,
+    meeting_meta: dict,
+    *,
+    stakeholders_override: Optional[list[dict]] = None,
+    meeting_sid: Optional[str] = None,
+    model: str = STAKEHOLDER_TRACK_SYNC_MODEL,
+    timeout: int = 180,
+) -> dict:
+    """Ф3: по итогам 1:1 встречи закрывает обсуждённые открытые вопросы трека
+    стейкхолдера (перенос «🟢 Открыто» → «✅ Закрытые», обратимо) и добавляет
+    новые на контроль в «🟢 Открыто».
+
+    Гейты:
+      - env `ENABLE_STAKEHOLDER_TRACK_CLOSE` (дефолт ON; OFF = no-op);
+      - скоуп тот же, что у `route_tasks`: встреча 1:1 со стейкхолдером из реестра.
+
+    Решение «что закрыть / что добавить» принимает LLM по протоколу + текущему
+    списку открытых (REQ 4.4). Закрытие — exact-match по дословному тексту
+    открытого пункта (РАЗМ3); закрытие обратимо (REQ 4.5).
+
+    Возвращает: {"enabled": bool, "stakeholder": slug|None, "closed": N,
+    "new": M, "errors": [...]}. Best-effort — не бросает (finalize не валим).
+    """
+    result = {"enabled": True, "stakeholder": None, "closed": 0, "new": 0, "errors": []}
+
+    if not _is_stakeholder_track_close_enabled():
+        result["enabled"] = False
+        logger.info("[track-sync] disabled by ENABLE_STAKEHOLDER_TRACK_CLOSE=0")
+        return result
+    if not protocol_md or not protocol_md.strip():
+        logger.info("[track-sync] meeting=%s протокол пустой — пропуск", meeting_sid or "?")
+        return result
+
+    from . import stakeholders as stk_lib  # lazy
+    from . import stakeholder_track
+    stakeholders = (
+        stakeholders_override
+        if stakeholders_override is not None
+        else stk_lib.load_stakeholders()
+    )
+    if not stakeholders:
+        logger.info("[track-sync] meeting=%s реестр стейкхолдеров пуст — пропуск", meeting_sid or "?")
+        return result
+
+    stk = _resolve_one_on_one_stakeholder(meeting_meta, stakeholders)
+    if stk is None:
+        logger.info(
+            "[track-sync] meeting=%s не 1:1 со стейкхолдером из реестра — skip (вне скоупа)",
+            meeting_sid or "?",
+        )
+        return result
+    result["stakeholder"] = stk.get("slug")
+
+    track_path = stk_lib.stakeholder_abs_track_path(stk)
+    if track_path is None or not track_path.is_file():
+        result["errors"].append(f"track-missing:{stk.get('slug')}")
+        logger.warning("[track-sync] трек стейкхолдера %s не найден: %s", stk.get("slug"), track_path)
+        return result
+
+    try:
+        track_text = track_path.read_text(encoding="utf-8")
+    except OSError as e:
+        result["errors"].append(f"track-read-failed:{stk.get('slug')}")
+        logger.warning("[track-sync] трек %s не читается: %s", track_path, e)
+        return result
+
+    open_items = _extract_open_track_items(track_text)
+    date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
+
+    user_prompt = _build_track_sync_prompt(open_items, protocol_md, meeting_meta)
+    started = time.monotonic()
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=STAKEHOLDER_TRACK_SYNC_SYSTEM_PROMPT,
+            timeout=timeout,
+            model=model,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning("[track-sync] `claude` не в PATH — пропуск")
+        result["errors"].append("claude-cli-missing")
+        return result
+    except ClaudeCliError as e:
+        logger.warning("[track-sync] meeting=%s CLI error: %s", meeting_sid or "?", e)
+        result["errors"].append("claude-cli-error")
+        return result
+    elapsed = time.monotonic() - started
+
+    try:
+        decision = _parse_track_sync_response(raw, open_items)
+    except StakeholderTrackSyncError as e:
+        logger.warning("[track-sync] meeting=%s parse error: %s", meeting_sid or "?", e)
+        result["errors"].append("parse-error")
+        return result
+
+    # Закрываем обсуждённые (перенос Открыто→Закрытые, обратимо).
+    for item in decision["closed"]:
+        ok = stakeholder_track.close_open_item(
+            track_path, item, closed_date=date,
+            note=f"закрыто ботом по встрече {date}",
+        )
+        if ok:
+            result["closed"] += 1
+        # ok=False = no-op (exact-match не прошёл / уже закрыт) — это не ошибка.
+
+    # Добавляем новые на контроль (переиспользуем существующую append-ветку).
+    if decision["new"]:
+        section_title = f"📋 Из встречи {date}"
+        bullet_block = "\n".join(f"- [ ] {t}" for t in decision["new"])
+        ok = stakeholder_track.append_to_open_subsection(
+            track_path, section_title, bullet_block,
+        )
+        if ok:
+            result["new"] = len(decision["new"])
+        else:
+            result["errors"].append(f"track-append-failed:{stk.get('slug')}")
+
+    logger.info(
+        "[track-sync] meeting=%s stakeholder=%s closed=%d new=%d errors=%d elapsed=%.1fs",
+        meeting_sid or "?", result["stakeholder"], result["closed"], result["new"],
+        len(result["errors"]), elapsed,
+    )
+    return result
+
+
 # --- Анти-галлюцинация: clarification к Илье ----------------------------
 
 CLARIFY_TASK_FILTER_CALLBACK_PREFIX = "tf:"
@@ -2805,19 +3117,29 @@ def deliver_protocol(
       meeting_sid: для structured-лога.
 
     Возвращает dict:
-      {status: "sent"|"skipped"|"asked"|"disabled"|"error",
+      {status: "sent"|"skipped"|"asked"|"disabled"|"error"|"partial-skipped",
        chat_id: int|None,
        message_ids: list[int],
        parts_count: int,
+       document?: bool,
        error?: str}
 
-    Семантика статусов:
-      - "sent"      — отправили N частей, `delivered.message_ids` обновлён.
-      - "skipped"   — идемпотентный пропуск (уже доставлено в этот chat).
+    Семантика статусов (RISK2: hot-path-потребители завязаны на `{sent,skipped}`):
+      - "sent"      — PDF отправлен (`message_ids=[<id документа>]`,
+                      `delivered` обновлён, флаг `document:true`).
+      - "skipped"   — идемпотентный пропуск (в этот chat уже доставлено —
+                      PDF ИЛИ legacy-текст; RISK3 — не сверяем число частей).
       - "asked"     — `target_chat_id` неизвестен → отправили вопрос Илье,
                       state в `_pending_clarification/<sid>-delivery.json`.
       - "disabled"  — `ENABLE_PROTOCOL_DELIVERY=0`.
-      - "error"     — внутренняя ошибка (нет токена, send упал).
+      - "error"     — сбой сборки/отправки PDF → алерт Илье (REQ 1.4), текстом
+                      протокол НЕ шлём; либо нет токена.
+      - "partial-skipped" — legacy partial-failure: ручное восстановление.
+
+    Доставка — PDF-вложением с 4-строчной подписью (Ф2: `protocol_to_pdf` +
+    `telegram_api.send_document`). Тело протокола текстом НЕ дублируется (REQ
+    3.2). Старый текстовый путь (`format_protocol_as_tg_text`+чанки) убран из
+    боевой доставки — при сбое PDF только алерт (REQ 1.4), без fallback-текста.
     """
     if not _is_protocol_delivery_enabled():
         logger.info("[delivery] disabled by ENABLE_PROTOCOL_DELIVERY=0")
@@ -2882,32 +3204,14 @@ def deliver_protocol(
             "parts_count": 0,
         }
 
-    # Шаг 3: форматирование TG-текста + smart-split (Ф1 доработок, 2026-05-29).
-    # Раньше: raw markdown структурного протокола → split_long_message по 3500.
-    # Сейчас: structured `.md` парсится в TG-формат с эмодзи-заголовками
-    # (1️⃣2️⃣✅📌), маркером `•`, хэштегом `#протоколвстречи` на 2-й строке,
-    # участниками «Имя Фамилия» (через people.md) и реальной длительностью
-    # речи (если меta содержит recording.firstSpeechMs — после Ф3 плана).
-    # Split — `split_protocol_smart` по логическим границам секций; никогда
-    # не рвёт буллет/секцию посредине, для `📌 ЗАДАЧИ` доп. разрыв по именам.
-    tg_text = protocol_to_tg.format_protocol_as_tg_text(protocol_text, meeting_meta)
-    chunks = protocol_to_tg.split_protocol_smart(tg_text, max_len=protocol_to_tg.TG_MAX_LEN)
-    if not chunks:
-        return {
-            "status": "error",
-            "chat_id": chat_id,
-            "message_ids": [],
-            "parts_count": 0,
-            "error": "empty TG text after formatting",
-        }
-    expected_parts = len(chunks)
-
-    # Шаг 4: idempotency check по array-формату `meta.delivered`.
-    # Старый формат `{chat_id, ...}` нормализуется в `[{...}]` через
-    # `_normalize_delivered`. Проверяем доставку для нашего chat_id:
-    # совпало count чанков → skip; partial-failure → skip с warning.
-    # Доставки в другие chat_id не блокируют — позволяет смену
-    # `telegram_chat_id` в watched.yaml без дубля (РИСК5).
+    # Шаг 3: идемпотентность ПЕРЕД дорогой сборкой PDF (RISK3).
+    # Доставка теперь — ОДИН PDF-документ, не N текстовых чанков. «Уже
+    # доставлено» определяем по наличию НЕПУСТОЙ записи для chat_id, а НЕ по
+    # совпадению числа частей: legacy-текст имел N message_ids, PDF — один;
+    # сверка `len==expected` сломала бы миграцию и слала бы PDF-дубль поверх
+    # уже доставленного текста. Доставки в другие chat_id не блокируют (РИСК5 —
+    # смена telegram_chat_id в watched.yaml без дубля в старый). partial-failure
+    # из старого текстового пути по-прежнему НЕ авто-ретраим.
     meta = _read_meta_json(meta_json_path) if meta_json_path else None
     if meta:
         records = _normalize_delivered(meta.get("delivered"))
@@ -2915,90 +3219,159 @@ def deliver_protocol(
         if rec is not None:
             d_msgs = rec.get("message_ids") or []
             d_decision = rec.get("decision")
-            if isinstance(d_msgs, list) and len(d_msgs) == expected_parts and d_decision != "partial-failure":
+            if (d_decision == "partial-failure"
+                    and isinstance(d_msgs, list) and len(d_msgs) > 0):
+                logger.warning(
+                    "[delivery] legacy partial-failure meeting=%s sent=%d — "
+                    "skip auto-retry (manual recovery: clear meta.delivered).",
+                    meeting_sid or "?", len(d_msgs),
+                )
+                return {
+                    "status": "partial-skipped",
+                    "chat_id": chat_id,
+                    "message_ids": list(d_msgs),
+                    "parts_count": len(d_msgs),
+                    "error": "partial-failure-skip",
+                }
+            if isinstance(d_msgs, list) and len(d_msgs) > 0:
                 logger.info(
-                    "[delivery] idempotent skip meeting=%s chat_id=%s parts=%d",
-                    meeting_sid or "?", chat_id, expected_parts,
+                    "[delivery] idempotent skip meeting=%s chat_id=%s "
+                    "(already delivered, %d msg id(s), document=%s)",
+                    meeting_sid or "?", chat_id, len(d_msgs), rec.get("document"),
                 )
                 return {
                     "status": "skipped",
                     "chat_id": chat_id,
                     "message_ids": list(d_msgs),
-                    "parts_count": expected_parts,
-                }
-            if d_decision == "partial-failure" and isinstance(d_msgs, list) and 0 < len(d_msgs) < expected_parts:
-                logger.warning(
-                    "[delivery] partial-failure detected meeting=%s sent=%d/%d — "
-                    "skip auto-retry to avoid duplicate parts. Manual recovery: "
-                    "clear meta.delivered or use correction command.",
-                    meeting_sid or "?", len(d_msgs), expected_parts,
-                )
-                # Н5 хода 1: возвращаем status="partial-skipped", НЕ "skipped" —
-                # collector использует это для решения по cleanup WAV. Чистый
-                # "skipped" означает «idempotent OK» → WAV удаляется. А
-                # partial-skipped НЕ должен триггерить cleanup, иначе теряем
-                # шанс на дозалив оставшихся частей после ручного recovery.
-                return {
-                    "status": "partial-skipped",
-                    "chat_id": chat_id,
-                    "message_ids": list(d_msgs),
-                    "parts_count": expected_parts,
-                    "error": "partial-failure-skip",
+                    "parts_count": 1,
+                    "document": bool(rec.get("document")),
                 }
 
-    # Шаг 5: отправка. Запись `meta.delivered` идёт ПОСЛЕ каждого успешного
-    # send'а (частичный прогресс), replace-for-chat-id=True — обновляет
-    # существующую запись для этого chat_id (не плодит лог из частичных
-    # доставок одной встречи).
+    # Шаг 4: подпись (4 строки, REQ 3.1) + шапка PDF. Чистое время (Ф1) для
+    # СТАРЫХ встреч без recording.* берём из архива транскрипта — путь
+    # `series_dir/_transcripts/<date>.json`, но ТОЛЬКО если он реально есть
+    # (иначе compute_duration_label зашумит legacy warning'ом). series_dir =
+    # директория meta.json (collector/finalize кладут их рядом). FU-2 дайджеста.
+    transcript_json_path = None
+    if meta_json_path is not None:
+        candidate = meta_json_path.parent / "_transcripts" / f"{date}.json"
+        if candidate.is_file():
+            transcript_json_path = candidate
+    caption = protocol_to_tg.build_pdf_caption(
+        protocol_text, meeting_meta, transcript_json_path=transcript_json_path,
+    )
+    pdf_title, pdf_subtitle = protocol_to_tg.build_pdf_title_subtitle(
+        protocol_text, meeting_meta, transcript_json_path=transcript_json_path,
+    )
+
+    # Шаг 5: собрать PDF во временный файл и отправить документом. Любой сбой
+    # (сборка/отправка) → алерт Илье (REQ 1.4), текстом протокол НЕ шлём,
+    # статус "error" (старый текстовый fallback убран — ответ владельца 04.06).
     started = time.monotonic()
-    sent_ids: list[int] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        try:
-            result = telegram_api.send_message(bot_token, chat_id, chunk)
-        except telegram_api.TelegramApiError as e:
-            logger.warning(
-                "[delivery] send failed meeting=%s part=%d/%d: %s",
-                meeting_sid or "?", idx, expected_parts, e,
+    safe_date = re.sub(r"[^0-9A-Za-z._-]", "-", str(date)) or "protokol"
+    pdf_filename = f"protokol-{safe_date}.pdf"
+    try:
+        with tempfile.TemporaryDirectory(prefix="deliver-pdf-") as td:
+            pdf_path = Path(td) / pdf_filename
+            protocol_to_pdf.render_pdf_from_markdown(
+                protocol_text, str(pdf_path),
+                title=pdf_title, subtitle=pdf_subtitle,
             )
-            if sent_ids and meta_json_path:
-                partial = {
-                    "chat_id": chat_id,
-                    "message_ids": sent_ids,
-                    "at": _now_iso(),
-                    "decision": "partial-failure",
-                }
-                _update_meta_delivered(meta_json_path, partial)
-            return {
-                "status": "error",
-                "chat_id": chat_id,
-                "message_ids": sent_ids,
-                "parts_count": expected_parts,
-                "error": str(e),
-            }
-        msg_id = int(result.get("message_id") or 0)
-        sent_ids.append(msg_id)
-        if meta_json_path:
-            partial = {
-                "chat_id": chat_id,
-                "message_ids": sent_ids,
-                "at": _now_iso(),
-            }
-            _update_meta_delivered(meta_json_path, partial)
+            send_result = telegram_api.send_document(
+                bot_token, chat_id, str(pdf_path),
+                caption=caption, filename=pdf_filename,
+            )
+    except (protocol_to_pdf.PdfRenderError, telegram_api.TelegramApiError, OSError) as e:
+        _alert_owner_pdf_failure(meeting_meta, chat_id, meeting_sid, e)
+        logger.error(
+            "[delivery] PDF доставка упала meeting=%s chat_id=%s: %s — алерт Илье, "
+            "текстом НЕ шлём",
+            meeting_sid or "?", chat_id, e,
+        )
+        return {
+            "status": "error",
+            "chat_id": chat_id,
+            "message_ids": [],
+            "parts_count": 0,
+            "error": str(e),
+        }
 
+    msg_id = int(send_result.get("message_id") or 0)
     elapsed = time.monotonic() - started
     at = _now_iso()
+
+    # Шаг 6: запись `meta.delivered` (RISK1 — формат НЕ ломаем, читают 3
+    # потребителя: идемпотентность, _is_success_record/rc=10, cleanup WAV).
+    # PDF метим `document:true` + `decision:"pdf"`. `decision != "partial-failure"`
+    # → _is_success_record видит успех; downstream без правок.
+    if meta_json_path:
+        persisted = _update_meta_delivered(meta_json_path, {
+            "chat_id": chat_id,
+            "message_ids": [msg_id],
+            "at": at,
+            "decision": "pdf",
+            "document": True,
+        })
+        if not persisted:
+            # PDF уже ушёл, но запись `delivered` НЕ легла (flock/запись упали).
+            # Повторный finalize пройдёт идемпотентность мимо (Шаг 3 не найдёт
+            # записи) и пришлёт ДУБЛЬ PDF в чат. Раньше это был только warning
+            # внутри _update_meta_delivered, а наружу уходил status="sent" —
+            # риск дубля молчал. Поднимаем до error: оператор чинит meta.json
+            # ДО следующего finalize. (Цикл5/ход1, Н1.)
+            logger.error(
+                "[delivery] PDF ОТПРАВЛЕН (meeting=%s chat_id=%s msg_id=%s), но "
+                "meta.delivered НЕ записан — повторный finalize пришлёт ДУБЛЬ; "
+                "почини meta.json вручную",
+                meeting_sid or "?", chat_id, msg_id,
+            )
     logger.info(
-        "[delivery] sent meeting=%s chat_id=%s parts=%d message_ids=%s elapsed=%.1fs at=%s",
-        meeting_sid or "?", chat_id, expected_parts, sent_ids, elapsed, at,
+        "[delivery] sent PDF meeting=%s chat_id=%s msg_id=%s elapsed=%.1fs at=%s",
+        meeting_sid or "?", chat_id, msg_id, elapsed, at,
     )
     return {
         "status": "sent",
         "chat_id": chat_id,
-        "message_ids": sent_ids,
-        "parts_count": expected_parts,
+        "message_ids": [msg_id],
+        "parts_count": 1,
+        "document": True,
         "at": at,
         "elapsed_s": round(elapsed, 1),
     }
+
+
+def _alert_owner_pdf_failure(
+    meeting_meta: dict,
+    chat_id: Optional[int],
+    meeting_sid: Optional[str],
+    error: Exception,
+) -> None:
+    """Короткий алерт Илье в личку при сбое PDF-доставки (REQ 1.4, УПУ1).
+
+    Источник owner-chat — `lib.notify.push` (обёртка над `~/.local/bin/tg-send`,
+    тот же путь, что шлёт P0-алерты scheduler/collector — «known-owner chat»).
+    Дедуп по встрече (`pdf-fail:<sid>`): повтор по той же встрече глушится на 6ч,
+    сбой по ДРУГОЙ встрече всегда доходит. Если tg-send недоступен — push вернёт
+    False; мы логируем `error` (НЕ немой отказ, УПУ1). Текстом протокол НЕ шлём.
+    """
+    series = (meeting_meta or {}).get("series") or "?"
+    date = (meeting_meta or {}).get("date") or "?"
+    sid = meeting_sid or (meeting_meta or {}).get("sessionUid") or "?"
+    msg = (
+        f"⚠️ Протокол по встрече «{series}» {date} не ушёл PDF-вложением "
+        f"(chat {chat_id}). Текстом не слал. Посмотри логи: {type(error).__name__}."
+    )
+    try:
+        from .notify import push  # noqa: PLC0415
+        ok = push(msg, dedupe_key=f"pdf-fail:{sid}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("[delivery] алерт Илье о сбое PDF не отправлен (push упал): %s", e)
+        return
+    if not ok:
+        logger.error(
+            "[delivery] алерт Илье о сбое PDF НЕ доставлен (tg-send недоступен?) "
+            "meeting=%s — сбой не немой (УПУ1), см. error выше", sid,
+        )
 
 
 def _now_iso() -> str:

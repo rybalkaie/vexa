@@ -462,7 +462,19 @@ class TestF1IdempotencyIntact(unittest.TestCase):
     def test_deliver_then_revision_then_repeat_deliver_skips(self):
         meta = {"series": "s", "date": "2026-06-02", "sessionUid": "sid",
                 "expectedParticipants": ["Илья Рыбалка"], "participants": []}
+
+        def _fake_render(md_text, out_pdf, *, title, subtitle, **kwargs):
+            p = Path(out_pdf)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"%PDF-1.4\n" + b"x" * 64)
+            return p
+
+        # Ф2: первичная доставка теперь PDF (mock render + sendDocument). Путь
+        # ревизии (redeliver_revised_protocol) — вне скоупа Ф2, остаётся текстом
+        # (send_message), поэтому мокаем и его.
         with mock.patch.object(lp.telegram_api, "send_message", return_value={"message_id": 1}), \
+                mock.patch.object(lp.telegram_api, "send_document", return_value={"message_id": 1}), \
+                mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render), \
                 mock.patch.object(lp, "_compose_revision_summary", return_value="🔁"):
             # 1) Первичная доставка SAMPLE_OLD.
             d1 = lp.deliver_protocol(

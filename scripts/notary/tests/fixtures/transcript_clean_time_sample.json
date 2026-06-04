@@ -1,0 +1,20 @@
+{
+  "session_uid": "fixture-clean-time",
+  "series": "Маркетплейсы (Татьяна)",
+  "date": "2026-06-03",
+  "speechmatics_job_id": "fixture-job",
+  "audio_duration_s": 6120.0,
+  "detected_language": "ru",
+  "_comment": "СИНТЕТИЧЕСКАЯ фикстура (не реальная встреча). Воспроизводит кейс Татьяны: присутствие бота 1ч42 (startTs..endTs), первая реплика в 5:00 (300s), последняя в 102:00 (6120s) -> чистое время речи = 5820s = 1ч37. Содержимое слов выдуманное; важны только тайминги type=word.",
+  "raw_json": {
+    "results": [
+      {"type": "word", "start_time": 300.0, "end_time": 300.4, "alternatives": [{"speaker": "S1", "content": "alpha"}]},
+      {"type": "word", "start_time": 300.5, "end_time": 300.9, "alternatives": [{"speaker": "S1", "content": "beta"}]},
+      {"type": "punctuation", "start_time": 300.9, "end_time": 300.9, "alternatives": [{"speaker": "S1", "content": "."}]},
+      {"type": "word", "start_time": 3000.0, "end_time": 3000.6, "alternatives": [{"speaker": "S2", "content": "gamma"}]},
+      {"type": "word", "start_time": 4500.0, "end_time": 4500.7, "alternatives": [{"speaker": "S1", "content": "delta"}]},
+      {"type": "word", "start_time": 6118.5, "end_time": 6120.0, "alternatives": [{"speaker": "S2", "content": "omega"}]},
+      {"type": "punctuation", "start_time": 6120.0, "end_time": 6120.0, "alternatives": [{"speaker": "S2", "content": "."}]}
+    ]
+  }
+}
