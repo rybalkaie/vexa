@@ -1151,11 +1151,17 @@ def _load_method_text(*, override_dir: Optional[str] = None) -> str:
 def _format_protocol_user_prompt(
     transcript_md: str,
     meeting_meta: dict,
+    *,
+    series_memory: Optional[str] = None,
 ) -> str:
-    """Собирает user-prompt: метаданные + транскрипт.
+    """Собирает user-prompt: метаданные + (Ф7) справка памяти серии + транскрипт.
 
     Метаданные специально дублируют шапку транскрипта (Sonnet не должен полагаться
     на её парсинг — там может не быть `Длительность`, если STT-pipeline её не положил).
+
+    `series_memory` (Ф7 7.3/7.4) — готовый справочный блок выжимок прошлых встреч
+    серии (из `series_memory.format_memory_block`). Идёт ПЕРЕД транскриптом с явной
+    дисциплиной «справка, не факт». None/"" → блок не добавляется.
     """
     series = meeting_meta.get("series") or "—"
     date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
@@ -1207,7 +1213,17 @@ def _format_protocol_user_prompt(
             + "\nУчти её при формировании итогового протокола."
         )
 
-    return "\n".join(meta_block) + correction_block + "\n\nТранскрипт:\n\n" + transcript_md
+    memory_block = ""
+    if isinstance(series_memory, str) and series_memory.strip():
+        memory_block = "\n\n" + series_memory.strip()
+
+    return (
+        "\n".join(meta_block)
+        + memory_block
+        + correction_block
+        + "\n\nТранскрипт:\n\n"
+        + transcript_md
+    )
 
 
 def _is_protocol_generation_enabled() -> bool:
@@ -1223,6 +1239,7 @@ def generate_protocol(
     method_text: Optional[str] = None,
     timeout: int = 180,
     meeting_sid: Optional[str] = None,
+    series_memory: Optional[str] = None,
 ) -> str:
     """Генерирует .md-файл протокола встречи из транскрипта через Claude Sonnet 4.6.
 
@@ -1250,7 +1267,9 @@ def generate_protocol(
         method_text = _load_method_text()
 
     system_prompt = GENERATE_PROTOCOL_BASE_PROMPT + method_text
-    user_prompt = _format_protocol_user_prompt(transcript_md, meeting_meta)
+    user_prompt = _format_protocol_user_prompt(
+        transcript_md, meeting_meta, series_memory=series_memory,
+    )
 
     started = time.monotonic()
     try:
@@ -1333,6 +1352,7 @@ def regenerate_protocol_for_meeting(
     *,
     method_text: Optional[str] = None,
     meeting_sid: Optional[str] = None,
+    series_memory: Optional[str] = None,
 ) -> Path:
     """Высокоуровневая обёртка: читает transcript → генерирует → atomic write.
 
@@ -1370,6 +1390,7 @@ def regenerate_protocol_for_meeting(
         enriched_meta,
         method_text=method_text,
         meeting_sid=meeting_sid,
+        series_memory=series_memory,
     )
     _atomic_write_text(protocol_path, protocol_text)
     return protocol_path
@@ -3774,6 +3795,17 @@ _REVIEW_ROLES_SECTION = """### Секция "roles" — у одного спик
 НЕ помечай: руководителя/владельца, который ПО РОЛИ ведёт много тем сразу — это норма, а не склейка. Один спикер с одной зоной + парой смежных вопросов — норма. Порог высокий: это флаг на РУЧНУЮ сверку, а не утверждение об ошибке. Если зоны смежные или это явно один человек широкого профиля — НЕ помечай."""
 
 
+_REVIEW_MEMORY_SECTION = """### Секция "memory" — протокол не должен втягивать прошлое как факт
+
+Этот протокол мог генерироваться со СПРАВКОЙ о прошлых встречах серии (имена, термины, прошлые числа — как контекст). Дисциплина (Ф7 7.4): факты протокола — решения, задачи, числа, договорённости — должны опираться ТОЛЬКО на текущий транскрипт. Прошлое — лишь для распознавания имён/терминов и понимания динамики чисел.
+
+Помечай, если в протоколе есть СОДЕРЖАТЕЛЬНЫЙ факт (тема, решение, задача, число, договорённость), которого НЕТ в текущем транскрипте — выглядит перенесённым из прошлого контекста, а не сказанным на этой встрече.
+
+`quote` = точная подстрока протокола с неподтверждённым фактом. `note` = коротко (3-7 слов), напр. «нет в записи — из прошлого?». `section` = "memory".
+
+НЕ помечай: имена участников и устоявшиеся термины/названия проектов — их подстановка из памяти серии это НОРМА, а не ошибка. Помечай только факты/числа/решения без опоры на текущую запись. Порог высокий: лучше пропустить сомнительное, чем зашуметь."""
+
+
 def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
     """Собирает system-prompt ревью-прохода из включённых секций.
 
@@ -3784,18 +3816,20 @@ def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
         sections.append(_REVIEW_VALUES_SECTION)
     if "roles" in checks:
         sections.append(_REVIEW_ROLES_SECTION)
-    # Ф7: if "memory" in checks: sections.append(_REVIEW_MEMORY_SECTION)
+    if "memory" in checks:  # Ф7 (7.4): дисциплина «прошлое = справка, не факт»
+        sections.append(_REVIEW_MEMORY_SECTION)
     sections_text = "\n\n".join(sections)
     allowed_sections = ", ".join(f'"{c}"' for c in checks) or '"values"'
+    section_enum = "|".join(checks) or "values"
     return (
         "Ты — придирчивый проверяющий протокола встречи. Тебе дан готовый "
         "протокол и исходный транскрипт. Твоя задача — НАЙТИ подозрительные "
         "места и вернуть их списком. Ты НИЧЕГО не правишь сам.\n\n"
         + sections_text
         + "\n\nОтвет — СТРОГО JSON-объект без markdown-обёртки:\n"
-        '{"findings": [{"section": "values|roles", "quote": "<для values — '
-        'точная подстрока из протокола (буллет/фраза, где проблема); для roles — '
-        'имя спикера ровно как в протоколе>", "note": "<коротко (3-7 слов) что '
+        '{"findings": [{"section": "' + section_enum + '", "quote": "<для values/'
+        'memory — точная подстрока из протокола (буллет/фраза, где проблема); для '
+        'roles — имя спикера ровно как в протоколе>", "note": "<коротко (3-7 слов) что '
         'проверить>"}]}\n'
         f"Поле `section` — одно из: {allowed_sections} (по тому, какая секция "
         "выше дала находку).\n"

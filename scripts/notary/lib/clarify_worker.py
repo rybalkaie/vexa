@@ -38,6 +38,7 @@ from typing import Optional
 from . import clarify_state
 from . import telegram_api
 from . import llm_postprocess
+from . import series_memory  # Ф7: память серии встреч
 
 
 logger = logging.getLogger(__name__)
@@ -196,16 +197,35 @@ def _apply_resolution(
                 llm_postprocess._save_protocol_version(protocol_path)
             except Exception:  # noqa: BLE001
                 pass
+        # Ф7 (7.3/7.4): справку памяти серии подкладываем и в РЕВИЗИЮ — чтобы
+        # пере-генерированный протокол держал ту же дисциплину «прошлое = справка»
+        # и узнавал постоянный состав, как первичная генерация. transcript лежит
+        # в `<root>/<series>/<date>.md` → parent = серия, parent.parent = root.
+        # Best-effort: сбой → без справки (ревизия не страдает).
+        series_memory_block = ""
+        try:
+            if series_memory.is_enabled():
+                _smem = series_memory.resolve_memory(
+                    transcript_path.parent, transcript_path.parent.parent,
+                    current_participants=state.get("name_pool") or [],
+                    current_date=meta_block.get("date") or None,
+                )
+                series_memory_block = series_memory.format_memory_block(_smem)
+        except Exception:  # noqa: BLE001
+            series_memory_block = ""
         try:
             regen_meta = {
                 "series": meta_block.get("series") or "",
                 "date": meta_block.get("date") or "",
                 # sessionUid не критичен для генерации, но передаём для лога.
                 "sessionUid": meta_block.get("sessionUid"),
-                # expected/participants для шапки берём из name_pool
-                # (state хранит итоговый pool, передаваемый Илье в clarify).
+                # expected для шапки берём из name_pool (итоговый pool, что отдавали
+                # Илье в clarify — там и резолвленные имена). Ф5#3: participants
+                # (панель) РАНЬШЕ зануляли — из-за этого шапка «Участники:» ревизии
+                # расходилась с первичной доставкой; теперь берём панель из meta,
+                # как первичная генерация (low-risk выравнивание).
                 "expectedParticipants": state.get("name_pool", []),
-                "participants": [],
+                "participants": meta_block.get("participants") or [],
                 "transcript_filename": transcript_path.name,
             }
             llm_postprocess.regenerate_protocol_for_meeting(
@@ -213,6 +233,7 @@ def _apply_resolution(
                 protocol_path=protocol_path,
                 meeting_meta=regen_meta,
                 meeting_sid=state.get("meeting_id"),
+                series_memory=series_memory_block,  # Ф7
             )
             protocol_regenerated = True
             logger.info(
@@ -243,7 +264,7 @@ def _apply_resolution(
                 n_flags = llm_postprocess.review_and_flag_protocol_file(
                     protocol_path=protocol_path,
                     transcript_path=transcript_path,
-                    checks=("values", "roles"),
+                    checks=("values", "roles", "memory"),  # Ф7: тем же одним вызовом
                     meeting_sid=state.get("meeting_id"),
                 )
                 if n_flags:

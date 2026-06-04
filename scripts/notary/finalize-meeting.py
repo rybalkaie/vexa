@@ -71,6 +71,7 @@ from lib.llm_postprocess import (  # noqa: E402
 from lib.delivery_grace import wait_for_clarify_grace  # noqa: E402
 from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
+from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
 
 
 def setup_logging(verbose: bool) -> None:
@@ -519,10 +520,41 @@ def main() -> int:
             expanded_expected.append(first_word)
     participants_union: list[str] = list(dict.fromkeys(participants + expanded_expected))
     language = meta.get("language") or "ru"
+
+    # Ф7 (7.2/7.3/7-связка): резолвим память серии ОДИН раз — ДО STT, чтобы
+    # постоянный состав усилил и диаризацию (6.1), и clarify (5.4), и генерацию
+    # (7.3). Резолв дешёвый (json-файлы рядом с протоколами, без claude). Прямая
+    # память той же серии (стабильный slug) → fallback по составу участников
+    # (нерегулярные 1-на-1, напр. Саргин). Best-effort: сбой → пустая память.
+    series_dir, date_part, _md_name_early = _output_dir_for_meta(args, meta)
+    series_memory_digests: list[dict] = []
+    series_memory_block = ""
+    _expected_base = [n for n in expected if n]
+    expected_enriched: list[str] = list(dict.fromkeys(_expected_base))
+    try:
+        if series_memory.is_enabled():
+            series_memory_digests = series_memory.resolve_memory(
+                series_dir, Path(args.output_dir),
+                current_participants=participants_union,
+                current_date=date_part,
+            )
+            for nm in series_memory.permanent_participants(series_memory_digests):
+                if nm not in expected_enriched:
+                    expected_enriched.append(nm)
+            series_memory_block = series_memory.format_memory_block(series_memory_digests)
+            log.info(
+                "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d",
+                session_uid, meta.get("series") or "?", len(series_memory_digests),
+                len(expected_enriched) - len(_expected_base),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("[series-memory] resolve failed (non-fatal): %s", e)
+
     # REQ 6.1: мягкая подсказка диаризации = число РАЗНЫХ ожидаемых участников
-    # (по полному имени, без раздутия first-word'ами из expanded_expected).
+    # (по полному имени, без раздутия first-word'ами). Ф7: состав обогащён
+    # постоянными участниками серии (expected_enriched) → точнее sensitivity.
     # None → состав неизвестен, Speechmatics работает в дефолте.
-    _distinct_expected = [n for n in dict.fromkeys(expected) if n and isinstance(n, str)]
+    _distinct_expected = [n for n in dict.fromkeys(expected_enriched) if n and isinstance(n, str)]
     expected_speaker_count = len(_distinct_expected) if _distinct_expected else None
 
     log.info("Session %s — files.wav=%s → stt-audio=%s (temp=%s), "
@@ -593,7 +625,7 @@ def main() -> int:
     if mapping_result.unresolved_clusters:
         llm_decided = map_speaker_names(
             turns,
-            expected_participants=expected,
+            expected_participants=expected_enriched,
             panel_participants=participants,
             already_mapped=cluster_to_name,
             meeting_sid=session_uid,
@@ -691,6 +723,7 @@ def main() -> int:
                 protocol_path=protocol_path,
                 meeting_meta=protocol_meta,
                 meeting_sid=session_uid,
+                series_memory=series_memory_block,  # Ф7 (7.3/7.4): справка серии
             )
             log.info("Protocol generated → %s", protocol_path)
         except ProtocolGenerationError as e:
@@ -805,7 +838,7 @@ def main() -> int:
             turns=turns,
             speaker_confidence=speaker_confidence,
             cluster_to_name=cluster_to_name,
-            expected_participants=expected,
+            expected_participants=expected_enriched,
             panel_participants=participants,
             meta=clarify_meta,
             transcript_path=md_path,
@@ -825,19 +858,45 @@ def main() -> int:
     # Ф6 (6.2): объединено с 5.2 в ОДИН claude-вызов — checks=("values","roles")
     # (НЕ плодим второй проход в hot-path). roles помечает спикеров со
     # смешанными ролями/темами (признак склейки двух людей в один кластер).
-    # Ф7 добавит сюда "memory" тем же одним вызовом.
+    # Ф7 (7.4): добавлена "memory" — ТЕМ ЖЕ одним вызовом (НЕ 3-й проход). Секция
+    # ловит факты протокола без опоры на текущий транскрипт (утечку прошлого из
+    # справки памяти серии). Сверяет протокол↔транскрипт, доп. данные не нужны.
     if _is_protocol_enabled() and protocol_path.is_file():
         try:
             n_flags = review_and_flag_protocol_file(
                 protocol_path=protocol_path,
                 transcript_path=md_path,
-                checks=("values", "roles"),
+                checks=("values", "roles", "memory"),
                 meeting_sid=session_uid,
             )
             if n_flags:
                 log.info("[review] meeting=%s flagged %d suspicious item(s) ⚠️", session_uid, n_flags)
         except Exception as e:  # noqa: BLE001
             log.warning("[review] failed (non-fatal): %s", e)
+
+    # 4.0.2d. Ф7 (7.1): компактная выжимка-память рядом с протоколом.
+    # Строим из ФИНАЛЬНОГО протокола ДЕТЕРМИНИРОВАННО (без claude). РИСК4 (ПДн):
+    # только производные поля (участники/темы/ключевые пункты), без сырых реплик;
+    # текст не логируем; срок хранения прунится отдельным вызовом ниже. На
+    # СЛЕДУЮЩЕЙ встрече серии эта выжимка подтянется как справка (7.3). Best-effort.
+    if series_memory.is_enabled() and _is_protocol_enabled() and protocol_path.is_file():
+        try:
+            _proto_for_digest = protocol_path.read_text(encoding="utf-8")
+            if _proto_for_digest.strip():
+                _digest_meta = dict(meta)
+                _digest_meta["date"] = date_part
+                _digest_meta["expectedParticipants"] = expected
+                _digest_meta["participants"] = participants
+                _digest = series_memory.build_digest(
+                    _proto_for_digest, _digest_meta, date=date_part,
+                )
+                series_memory.save_digest(series_dir, date_part, _digest)
+                # РИСК4 (срок хранения): прунинг старых выжимок ПО ТЕКУЩЕЙ серии
+                # (свежая, дешёвый скан). Отдельной операцией, а не внутри save —
+                # иначе бэкфилл старых протоколов самоудалял бы результат.
+                series_memory.prune_old_digests(series_dir, series_memory.retention_days())
+        except Exception as e:  # noqa: BLE001
+            log.warning("[series-memory] digest save failed (non-fatal): %s", e)
 
     # 4.0.3. Ф6: доставка протокола в Telegram-группу.
     # Идемпотентность через `meta.delivered` в meta.json. Если привязки
