@@ -98,6 +98,18 @@ def is_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def has_series_slug(series: Optional[str]) -> bool:
+    """True, если у встречи есть осмысленный slug серии (не пусто/пробелы).
+
+    Память серии работает ТОЛЬКО при наличии slug. Встреча без серии (legacy-путь
+    `_output_dir_for_meta` → `<date>-<sid>.md` в КОРНЕ протоколов) папки-серии не
+    имеет: её `series_dir` схлопывается в общий корень. Без этого гейта несвязанные
+    series-less встречи делили бы один пул памяти (ложная «та же серия») — поэтому
+    резолв/сохранение памяти на стороне finalize/clarify гейтятся этим предикатом.
+    """
+    return bool((series or "").strip())
+
+
 def series_memory_depth() -> int:
     """Глубина контекста `SERIES_MEMORY_DEPTH` (число прошлых выжимок, дефолт 3).
 
@@ -423,6 +435,35 @@ def prune_old_digests(series_dir: Path, days: int, *, today: Optional[str] = Non
         logger.info("[series-memory] pruned %d digest(s) older than %s in %s",
                     removed, cutoff, d.name)
     return removed
+
+
+def prune_root(root: Path, days: int, *, today: Optional[str] = None) -> dict:
+    """РИСК4: прунит выжимки старше `days` по ВСЕМ сериям под `root`.
+
+    `prune_old_digests` на финализации чистит только АКТИВНУЮ серию — dormant-
+    серия (встреч больше нет) свои старые выжимки иначе не теряет НИКОГДА, и срок
+    хранения ПДн-производных по такой серии нарушается. Этот проход — для разовой
+    / периодической операции обслуживания (утренний батч владельца): соблюсти
+    retention по всему архиву. Служебные `_*`/`.`-папки пропускаем. `days<=0` →
+    no-op (хранение без ограничения по времени). `today` (YYYY-MM-DD) — для тестов.
+
+    Возвращает {"series": тронуто_серий, "digests": удалено_выжимок}.
+    """
+    r = Path(root)
+    if days <= 0 or not r.is_dir():
+        return {"series": 0, "digests": 0}
+    series_touched = 0
+    digests_removed = 0
+    for entry in sorted(r.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir() or entry.name.startswith("_") or entry.name.startswith("."):
+            continue
+        n = prune_old_digests(entry, days, today=today)
+        if n:
+            series_touched += 1
+            digests_removed += n
+    logger.info("[series-memory] prune_root: series=%d digests=%d (>%dd)",
+                series_touched, digests_removed, days)
+    return {"series": series_touched, "digests": digests_removed}
 
 
 # ---------------------------------------------------------------------------

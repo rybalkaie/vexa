@@ -204,7 +204,7 @@ def _apply_resolution(
         # Best-effort: сбой → без справки (ревизия не страдает).
         series_memory_block = ""
         try:
-            if series_memory.is_enabled():
+            if series_memory.is_enabled() and series_memory.has_series_slug(meta_block.get("series")):
                 _smem = series_memory.resolve_memory(
                     transcript_path.parent, transcript_path.parent.parent,
                     current_participants=state.get("name_pool") or [],

@@ -449,6 +449,13 @@ class TestEnvConfig(unittest.TestCase):
         os.environ["SERIES_MEMORY_RETENTION_DAYS"] = "30"
         self.assertEqual(sm.retention_days(), 30)
 
+    def test_has_series_slug(self):
+        # Гейт против перекрёстного загрязнения series-less встреч (общий корень).
+        self.assertTrue(sm.has_series_slug("marketplaces-tatiana"))
+        self.assertFalse(sm.has_series_slug(""))
+        self.assertFalse(sm.has_series_slug("   "))
+        self.assertFalse(sm.has_series_slug(None))
+
 
 # ==========================================================================
 # срок хранения — прунинг старых выжимок (РИСК4)
@@ -473,6 +480,30 @@ class TestPrune(unittest.TestCase):
             sdir.mkdir()
             sm.save_digest(sdir, "2020-01-01", _digest("2020-01-01", "s", ["Илья"]))
             self.assertEqual(sm.prune_old_digests(sdir, 0, today="2026-06-04"), 0)
+
+    def test_prune_root_across_series_skips_service(self):
+        # РИСК4: глобальный прун соблюдает retention по dormant-сериям тоже.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for s in ("series-a", "series-b", "_archive"):
+                (root / s).mkdir()
+            sm.save_digest(root / "series-a", "2020-01-01", _digest("2020-01-01", "series-a", ["Татьяна"]))
+            sm.save_digest(root / "series-a", "2026-06-01", _digest("2026-06-01", "series-a", ["Татьяна"]))
+            sm.save_digest(root / "series-b", "2019-05-05", _digest("2019-05-05", "series-b", ["Саргин"]))
+            sm.save_digest(root / "_archive", "2018-01-01", _digest("2018-01-01", "_archive", ["X"]))
+            res = sm.prune_root(root, 180, today="2026-06-04")
+            self.assertEqual(res["series"], 2)    # a и b тронуты, служебный _archive пропущен
+            self.assertEqual(res["digests"], 2)   # удалены 2020-01-01 и 2019-05-05
+            self.assertTrue((root / "series-a" / "2026-06-01-memory.json").exists())   # свежая жива
+            self.assertFalse((root / "series-a" / "2020-01-01-memory.json").exists())  # старая удалена
+            self.assertTrue((root / "_archive" / "2018-01-01-memory.json").exists())   # служебная не тронута
+
+    def test_prune_root_zero_days_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "s").mkdir()
+            sm.save_digest(root / "s", "2010-01-01", _digest("2010-01-01", "s", ["Илья"]))
+            self.assertEqual(sm.prune_root(root, 0, today="2026-06-04"), {"series": 0, "digests": 0})
 
 
 # ==========================================================================

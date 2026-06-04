@@ -532,7 +532,7 @@ def main() -> int:
     _expected_base = [n for n in expected if n]
     expected_enriched: list[str] = list(dict.fromkeys(_expected_base))
     try:
-        if series_memory.is_enabled():
+        if series_memory.is_enabled() and series_memory.has_series_slug(meta.get("series")):
             series_memory_digests = series_memory.resolve_memory(
                 series_dir, Path(args.output_dir),
                 current_participants=participants_union,
@@ -879,7 +879,8 @@ def main() -> int:
     # только производные поля (участники/темы/ключевые пункты), без сырых реплик;
     # текст не логируем; срок хранения прунится отдельным вызовом ниже. На
     # СЛЕДУЮЩЕЙ встрече серии эта выжимка подтянется как справка (7.3). Best-effort.
-    if series_memory.is_enabled() and _is_protocol_enabled() and protocol_path.is_file():
+    if (series_memory.is_enabled() and series_memory.has_series_slug(meta.get("series"))
+            and _is_protocol_enabled() and protocol_path.is_file()):
         try:
             _proto_for_digest = protocol_path.read_text(encoding="utf-8")
             if _proto_for_digest.strip():

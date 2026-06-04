@@ -68,6 +68,9 @@ def main() -> int:
     ap.add_argument("--series", default=None, help="имя одной серии (папки); без него — все")
     ap.add_argument("--overwrite", action="store_true", help="пересобрать существующие выжимки")
     ap.add_argument("--dry-run", action="store_true", help="только показать план, без записи")
+    ap.add_argument("--prune-days", type=int, default=0,
+                    help="РИСК4: удалить выжимки старше N дней по ВСЕМ сериям (0=не прунить), "
+                         "включая dormant. Прун идёт ПОСЛЕ бэкфилла; в --dry-run не выполняется.")
     args = ap.parse_args()
 
     root = Path(os.path.expanduser(args.root))
@@ -98,6 +101,9 @@ def main() -> int:
             grand_todo += todo
         print(f"\n[dry-run] серий: {len(series_dirs)}, протоколов: {grand_total}, "
               f"к сбору: {grand_todo} (запись НЕ выполнена)")
+        if args.prune_days and args.prune_days > 0:
+            print(f"[dry-run] прунинг старше {args.prune_days}д НЕ выполняется в dry-run "
+                  f"(запусти без --dry-run для реального удаления).")
         return 0
 
     if not series_memory.is_enabled():
@@ -116,6 +122,14 @@ def main() -> int:
         res = series_memory.backfill_root(root, overwrite=args.overwrite)
         total_series = res["series"]
         total_digests = res["digests"]
+
+    if args.prune_days and args.prune_days > 0:
+        if args.series:
+            removed = series_memory.prune_old_digests(series_dirs[0], args.prune_days)
+            print(f"  🧹 {series_dirs[0].name}: удалено старых выжимок {removed} (>{args.prune_days}д)")
+        else:
+            pres = series_memory.prune_root(root, args.prune_days)
+            print(f"  🧹 прунинг: серий {pres['series']}, выжимок удалено {pres['digests']} (>{args.prune_days}д)")
 
     print(f"\n✅ бэкфилл готов: серий тронуто {total_series}, выжимок записано {total_digests}")
     return 0
