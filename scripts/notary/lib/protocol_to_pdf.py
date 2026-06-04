@@ -136,11 +136,26 @@ def _strip_leading_heading(md_text: str) -> str:
     return "\n".join(lines).strip()
 
 
+# FU-4 (security): тело протокола генерится из транскрипта (НЕДОВЕРЕННЫЙ вход).
+# Allowlist для bleach — только структурные теги, которые реально даёт markdown
+# (tables/sane_lists/fenced_code). Всё прочее (<script>, <img>, on*-атрибуты,
+# <iframe>, <style>) вырезается, иначе headless-Chrome (--no-sandbox, file://)
+# их исполнит/подгрузит → egress-маячок / чтение локальных файлов.
+_PDF_ALLOWED_TAGS = [
+    "p", "br", "hr", "span", "strong", "b", "em", "i", "u",
+    "h1", "h2", "h3", "h4", "ul", "ol", "li", "blockquote",
+    "code", "pre", "a",
+    "table", "thead", "tbody", "tr", "td", "th",
+]
+_PDF_ALLOWED_ATTRS = {"a": ["href", "title"]}
+
+
 def markdown_to_html(md_text: str, title: str, subtitle: str) -> str:
     """MD → полный HTML-документ с фирменным CSS (как мак-образец).
 
     `markdown` импортируется ЛЕНИВО — отсутствие пакета даёт `PdfRenderError`,
     а не ImportError на импорте модуля (см. docstring модуля).
+    Тело протокола санитизируется `bleach` (FU-4) — недоверенный вход.
     """
     try:
         import markdown  # noqa: PLC0415
@@ -152,6 +167,21 @@ def markdown_to_html(md_text: str, title: str, subtitle: str) -> str:
     body_md = _strip_leading_heading(md_text)
     body_html = markdown.markdown(
         body_md, extensions=["tables", "sane_lists", "fenced_code"]
+    )
+    # FU-4 (security): вырезаем сырой HTML из тела (см. _PDF_ALLOWED_TAGS выше).
+    # title/subtitle экранируются htmllib.escape отдельно (это не markdown).
+    try:
+        import bleach  # noqa: PLC0415
+    except ImportError as e:
+        raise PdfRenderError(
+            "python-пакет `bleach` не установлен в этом venv "
+            "(pip install bleach — санитизация HTML протокола, FU-4)"
+        ) from e
+    body_html = bleach.clean(
+        body_html,
+        tags=_PDF_ALLOWED_TAGS,
+        attributes=_PDF_ALLOWED_ATTRS,
+        strip=True,
     )
     return (
         '<!doctype html><html lang="ru"><head><meta charset="utf-8">\n'
