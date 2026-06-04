@@ -76,10 +76,14 @@ MEETING_KEYWORDS = [
     "call",
 ]
 
-# Локальная TZ для отображения. По проекту фиксирован Asia/Dubai (см. CLAUDE.md).
-DISPLAY_TZ = ZoneInfo("Asia/Dubai")
+# Локальная TZ для отображения. Илья живёт в Дубае, но регулярно в Москве —
+# override через env MEETING_NOTARY_DISPLAY_TZ. Полный фикс «брать TZ из самого
+# события календаря» см. в plans/2026-05-27-tz-iz-sobytiya.md.
+DISPLAY_TZ = ZoneInfo(os.environ.get("MEETING_NOTARY_DISPLAY_TZ", "Asia/Dubai"))
 
-STATE_DIR = Path(os.path.expanduser("~/.local/state"))
+STATE_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_STATE_DIR") or "~/.local/state"
+))
 KNOWN_CACHE_FILE = STATE_DIR / "meetings-known-instances.json"
 
 LOG_DIR = Path(os.path.expanduser(
@@ -220,6 +224,20 @@ def main() -> int:
         action="store_true",
         help="Сохранить кэш known-instances. Без флага кэш не пишется — "
              "защита от потери move/cancelled-детекта, если обёртка не отправит сообщение.",
+    )
+    p.add_argument(
+        "--send-tg",
+        choices=["notarius", "main"],
+        help="Отправить блок напрямую через tg-send --bot <BOT> --html (вместо stdout-обёртки). "
+             "Snapshot и кэш всё равно пишутся; stdout остаётся JSON-ом, но дополнительно "
+             "block_text улетает в Telegram. Если block_text пуст — не шлём ничего. "
+             "Используется systemd-юнитом meeting-notary-evening-digest на VPS.",
+    )
+    p.add_argument(
+        "--commit-known-on-send",
+        action="store_true",
+        help="Если --send-tg отправил блок успешно — закоммитить known-instances кэш "
+             "(вместо отдельного запуска с --commit-known). Дефолт: false.",
     )
     args = p.parse_args()
 
@@ -509,6 +527,28 @@ def main() -> int:
         len(cancelled_items),
         calendars_scanned,
     )
+
+    if args.send_tg and block_text:
+        import shutil as _shutil
+        import subprocess as _subprocess
+        tg = _shutil.which("tg-send") or "/srv/meeting-notary/bin/tg-send"
+        try:
+            proc = _subprocess.run(
+                [tg, "--bot", args.send_tg, "--html", block_text],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                logger.error("tg-send --bot %s rc=%d stderr=%s", args.send_tg, proc.returncode, proc.stderr.strip()[:300])
+            else:
+                logger.info("tg-send --bot %s OK (block %d chars)", args.send_tg, len(block_text))
+                if args.commit_known_on_send and not args.commit_known:
+                    save_known(new_known)
+                    logger.info("known-instances committed после успешного --send-tg")
+        except _subprocess.TimeoutExpired:
+            logger.error("tg-send --bot %s timeout 30s", args.send_tg)
+    elif args.send_tg and not block_text:
+        logger.info("--send-tg %s: block_text пуст, ничего не шлём", args.send_tg)
+
     return 0
 
 
