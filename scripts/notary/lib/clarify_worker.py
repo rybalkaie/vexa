@@ -233,6 +233,30 @@ def _apply_resolution(
                 state.get("meeting_id"), e,
             )
 
+        # Ф6 (долг Ф5): перегенерация выше делает протокол ЗАНОВО, без ⚠️-пометок
+        # ревью (5.2 числа + 6.2 роли). Прогоняем тот же объединённый ревью-проход
+        # ПОСЛЕ регена и ДО до-сыла — иначе поздняя ревизия теряет пометки, и
+        # diff «🔁 что изменилось» ложно показал бы «убрали ⚠️». Best-effort:
+        # нет claude / kill-switch → 0 пометок, файл не трогаем.
+        if protocol_regenerated:
+            try:
+                n_flags = llm_postprocess.review_and_flag_protocol_file(
+                    protocol_path=protocol_path,
+                    transcript_path=transcript_path,
+                    checks=("values", "roles"),
+                    meeting_sid=state.get("meeting_id"),
+                )
+                if n_flags:
+                    logger.info(
+                        "[review] meeting=%s ревизия: вернул %d ⚠️-пометок",
+                        state.get("meeting_id"), n_flags,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[review] revision re-flag failed (non-fatal) meeting=%s: %s",
+                    state.get("meeting_id"), e,
+                )
+
         # Ф5 (5.5/5.6): до-сыл обновлённой версии. meta.json лежит рядом с
         # транскриптом. redeliver сам решает: если ещё не доставляли →
         # not-delivered-yet (первичная доставка подхватит); если контент не

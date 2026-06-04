@@ -201,12 +201,86 @@ def _call_with_retry(fn, *, action: str):
         return fn()
 
 
-def _submit_job(client: httpx.Client, headers: dict, wav_path: Path) -> str:
+# REQ 6.1 — диапазон «мягкого» нуджа sensitivity. Speechmatics default = 0.5.
+# Держим потолок 0.7, чтобы не уехать в переосегментацию (дробление одного
+# человека на несколько — обратный баг). См. _build_speaker_diarization_config.
+_SENSITIVITY_DEFAULT = 0.5
+_SENSITIVITY_CEILING = 0.7
+_SENSITIVITY_STEP = 0.05
+
+
+def _build_speaker_diarization_config(expected_speakers: int | None) -> dict:
+    """REQ 6.1: мягкая подсказка диаризации по ожидаемому составу серии.
+
+    Speechmatics Batch v2 НЕ принимает «ожидаемое число спикеров» как
+    soft-hint. `speaker_diarization_config` реально умеет:
+      - `speaker_sensitivity` (0.0–1.0, дефолт 0.5): выше → детектится больше
+        спикеров (меньше склеек разных людей), ниже → меньше (больше склеек);
+      - `max_speakers` — ЖЁСТКИЙ потолок числа спикеров.
+
+    `max_speakers=N` ЗАПРЕЩЁН (РИСК3 плана): незапланированный гость был бы
+    принудительно склеен с кем-то из ожидаемых — это баг #5 наоборот. Поэтому
+    жёсткий потолок НЕ ставим вовсе. Ожидаемый состав используем как
+    НЕ-форсирующий ориентир: при известном составе из ≥2 человек поднимаем
+    `speaker_sensitivity` выше дефолта, чтобы алгоритм меньше склеивал разных
+    ожидаемых участников (наблюдаемый баг #5: Ольга+Дарья ушли в один кластер).
+    Это ГЛОБАЛЬНЫЙ мягкий knob, не привязка к конкретным именам — точную
+    привязку имён делает claude-постмаппинг (`map_speaker_names`) и ревью
+    ролей 6.2. Потолок 0.7 не даёт уехать в дробление одного человека.
+
+    Env:
+      - `SPEECHMATICS_DIARIZATION_HINT` (дефолт ON; `0/false/no` → OFF) —
+        kill-switch на случай, если Speechmatics начнёт отвергать конфиг
+        в проде (отключение без передеплоя).
+      - `SPEECHMATICS_SPEAKER_SENSITIVITY` — явное фиксированное значение
+        (прод-тюнинг), перебивает авто-нудж.
+
+    Возвращает dict для `transcription_config["speaker_diarization_config"]`
+    или `{}` (тогда поле не добавляется — дефолтное поведение Speechmatics).
+    """
+    raw_flag = (os.environ.get("SPEECHMATICS_DIARIZATION_HINT") or "").strip().lower()
+    if raw_flag in ("0", "false", "no"):
+        return {}
+    env_sens = (os.environ.get("SPEECHMATICS_SPEAKER_SENSITIVITY") or "").strip()
+    if env_sens:
+        try:
+            s = max(0.0, min(1.0, float(env_sens)))
+            return {"speaker_sensitivity": round(s, 2)}
+        except ValueError:
+            logger.warning(
+                "SPEECHMATICS_SPEAKER_SENSITIVITY не число (%r) — игнор", env_sens
+            )
+    if not expected_speakers or expected_speakers < 2:
+        # Состав неизвестен / соло-встреча → не вмешиваемся (дефолт API).
+        return {}
+    sensitivity = min(
+        _SENSITIVITY_DEFAULT + _SENSITIVITY_STEP * expected_speakers,
+        _SENSITIVITY_CEILING,
+    )
+    return {"speaker_sensitivity": round(sensitivity, 2)}
+
+
+def _submit_job(
+    client: httpx.Client,
+    headers: dict,
+    wav_path: Path,
+    *,
+    expected_speakers: int | None = None,
+) -> str:
     transcription_config: dict = {
         "language": LANGUAGE,
         "diarization": "speaker",
         "operating_point": OPERATING_POINT,
     }
+    diar_cfg = _build_speaker_diarization_config(expected_speakers)
+    if diar_cfg:
+        transcription_config["speaker_diarization_config"] = diar_cfg
+        # INFO: редкое событие (раз на job), полезно для прод-аудита эффекта 6.1.
+        # Числа/имена участников НЕ логируем — только производный sensitivity.
+        logger.info(
+            "Speechmatics speaker_diarization_config=%s (expected_speakers≈%s)",
+            diar_cfg, expected_speakers,
+        )
     vocab = _load_additional_vocab()
     if vocab:
         transcription_config["additional_vocab"] = vocab
@@ -356,11 +430,19 @@ def _extract_detected_language(raw: dict) -> str:
     return str(code or "unknown")
 
 
-def transcribe_diarize_wav(wav_path: str | Path) -> TranscriptionResult:
+def transcribe_diarize_wav(
+    wav_path: str | Path,
+    *,
+    expected_speakers: int | None = None,
+) -> TranscriptionResult:
     """Прогнать WAV через Speechmatics Batch API и вернуть TranscriptionResult.
 
     Шаги: submit → poll status → fetch json-v2 → parse results.
     На 5xx/timeout — 1 retry через 30 сек на каждом шаге; на `rejected` job → raise.
+
+    `expected_speakers` (REQ 6.1) — ожидаемое число участников серии. Мягкий
+    ориентир диаризации (НЕ жёсткий лимит): подмешивается в job-конфиг через
+    `_build_speaker_diarization_config`. None / <2 → дефолтное поведение API.
 
     Возврат — `TranscriptionResult` NamedTuple с полями utterances, audio_duration_s,
     detected_language, raw_json, job_id. `result.utterances` остаётся `list[Utterance]`
@@ -380,7 +462,7 @@ def transcribe_diarize_wav(wav_path: str | Path) -> TranscriptionResult:
         size_mb = p.stat().st_size / 1024 / 1024
         logger.info("Speechmatics file size: %.1f MB", size_mb)
         with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
-            job_id = _submit_job(client, headers, p)
+            job_id = _submit_job(client, headers, p, expected_speakers=expected_speakers)
             logger.info("Speechmatics job submitted: %s", job_id)
             _poll_until_done(client, headers, job_id)
             logger.info("Speechmatics job done за %.1f сек, тяну transcript", time.time() - t0)

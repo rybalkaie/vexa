@@ -155,8 +155,16 @@ def _run_whisper_pyannote(
 # Ветка Speechmatics (новая, Ф2)
 # ---------------------------------------------------------------------------
 
-def _run_speechmatics(wav_path: str, log: logging.Logger):
+def _run_speechmatics(
+    wav_path: str,
+    log: logging.Logger,
+    *,
+    expected_speakers: int | None = None,
+):
     """Speechmatics-ветка: один HTTP-запрос вместо whisper+pyannote.
+
+    `expected_speakers` (REQ 6.1) — мягкая подсказка состава для диаризации
+    (НЕ жёсткий лимит); прокидывается в `transcribe_diarize_wav`.
 
     Возвращает (turns, extra, sm_result) — `sm_result` это TranscriptionResult
     с raw_json/job_id/duration/lang — используется выше для сохранения в
@@ -172,7 +180,7 @@ def _run_speechmatics(wav_path: str, log: logging.Logger):
     os.environ.pop("HF_TOKEN", None)
 
     log.info("Step 1/3 — Speechmatics submit + transcribe + diarize (один запрос)")
-    sm_result = transcribe_diarize_wav(wav_path)
+    sm_result = transcribe_diarize_wav(wav_path, expected_speakers=expected_speakers)
     log.info(
         "Speechmatics: %d utterances, %d спикеров, %.1f сек аудио, lang=%s, job=%s",
         len(sm_result.utterances),
@@ -511,6 +519,11 @@ def main() -> int:
             expanded_expected.append(first_word)
     participants_union: list[str] = list(dict.fromkeys(participants + expanded_expected))
     language = meta.get("language") or "ru"
+    # REQ 6.1: мягкая подсказка диаризации = число РАЗНЫХ ожидаемых участников
+    # (по полному имени, без раздутия first-word'ами из expanded_expected).
+    # None → состав неизвестен, Speechmatics работает в дефолте.
+    _distinct_expected = [n for n in dict.fromkeys(expected) if n and isinstance(n, str)]
+    expected_speaker_count = len(_distinct_expected) if _distinct_expected else None
 
     log.info("Session %s — files.wav=%s → stt-audio=%s (temp=%s), "
              "%d participants (panel) + %d expected → %d union, lang=%s",
@@ -522,7 +535,9 @@ def main() -> int:
     sm_result = None  # заполняется только в speechmatics-ветке
     try:
         if backend == "speechmatics":
-            turns, extra, sm_result = _run_speechmatics(audio_path, log)
+            turns, extra, sm_result = _run_speechmatics(
+                audio_path, log, expected_speakers=expected_speaker_count,
+            )
         else:
             turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)
     except Exception as e:
@@ -807,14 +822,16 @@ def main() -> int:
     # Прогоняем на ФИНАЛЬНОЙ (после авто/grace-доразметки) версии протокола,
     # ДО доставки. ВОПР1 вариант А: НЕ авто-правим, только помечаем ⚠️ «проверь».
     # Best-effort: нет claude в PATH / сбой → 0 пометок, файл не трогаем.
-    # ЗАМЕТКА: этот claude-проход спроектирован под объединение с 6.2/7.3 в
-    # ОДИН вызов (review_protocol(checks=...)) — см. llm_postprocess.review_protocol.
+    # Ф6 (6.2): объединено с 5.2 в ОДИН claude-вызов — checks=("values","roles")
+    # (НЕ плодим второй проход в hot-path). roles помечает спикеров со
+    # смешанными ролями/темами (признак склейки двух людей в один кластер).
+    # Ф7 добавит сюда "memory" тем же одним вызовом.
     if _is_protocol_enabled() and protocol_path.is_file():
         try:
             n_flags = review_and_flag_protocol_file(
                 protocol_path=protocol_path,
                 transcript_path=md_path,
-                checks=("values",),
+                checks=("values", "roles"),
                 meeting_sid=session_uid,
             )
             if n_flags:
