@@ -660,18 +660,26 @@ def main() -> int:
                 )
                 already_queued = (_failed_dir() / f"{session_uid}.retry-state.json").exists()
                 if not already_queued:
+                    # Пуш «на паузе» — ТОЛЬКО при первом откладывании встречи (когда
+                    # реально кладём её в очередь). На повторных retry-тиках (каждые
+                    # 15 мин; _due_to_attempt при blocked_by_killswitch всегда due)
+                    # finalize снова вернёт rc=5 с already_queued=True — второй раз НЕ
+                    # пушим, иначе один и тот же «на паузе» долбит владельца ~раз в 6 ч
+                    # (окно дедупа notify) на каждую ждущую встречу всё время, пока
+                    # флаг взведён. Регулярное напоминание — консолидированное, из
+                    # недельного монитора (CG9), раз в сутки.
                     _stash_into_failed(
                         session_uid, audio_path, args.meta_json,
                         rejected=False, err_repr="kill-switch active", killswitch=True,
                     )
-                series_label = meta.get("series") or session_uid
-                date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
-                _push_telegram(
-                    f"⏸ Расшифровка на паузе: сработал недельный лимит Speechmatics. "
-                    f"Встреча «{series_label}» ({date_label}) отложена и НЕ потеряна — "
-                    f"обработаю, как только снимешь стоп-флаг (подробности и счётчик "
-                    f"ждущих встреч — в дайджесте)."
-                )
+                    series_label = meta.get("series") or session_uid
+                    date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
+                    _push_telegram(
+                        f"⏸ Расшифровка на паузе: сработал недельный лимит Speechmatics. "
+                        f"Встреча «{series_label}» ({date_label}) отложена и НЕ потеряна — "
+                        f"обработаю, как только снимешь стоп-флаг (подробности и счётчик "
+                        f"ждущих встреч — в дайджесте)."
+                    )
                 return 5
             if isinstance(e, (SpeechmaticsError, SpeechmaticsRejectedError)):
                 rejected = isinstance(e, SpeechmaticsRejectedError)
