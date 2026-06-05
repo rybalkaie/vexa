@@ -21,6 +21,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -43,6 +45,16 @@ LOG_DIR = Path(os.path.expanduser(
     os.environ.get("MEETING_NOTARY_LOG_DIR") or "~/Library/Logs/meeting-notary"
 ))
 LOG_FILE = LOG_DIR / "collector.log"
+
+# CG1 — per-session flock-каталог. Защищает от двойной оплаты Speechmatics, когда
+# два тика collector'а (раз в 5 мин) пересеклись на одной не-доставленной встрече
+# (реальный инцидент 27.05: одна встреча ушла в платный движок 4 раза подряд).
+# Лок берётся НЕБЛОКИРУЮЩЕ: занят (finalize этой встречи ещё идёт) → тик скипает
+# встречу и попробует на следующем заходе. Каталог настраивается через env
+# (тесты подменяют на tmp), дефолт — рядом с логами.
+STATE_DIR = Path(os.path.expanduser(
+    os.environ.get("MEETING_NOTARY_STATE_DIR") or "~/Library/Logs/meeting-notary"
+))
 
 SSH_HOST = "meeting-notary"
 # Абсолютные пути на VPS (user=dev). В LOCAL_FINALIZE=1 collector запускается на VPS
@@ -717,7 +729,59 @@ def _copy_only(session_uid: str, series: str, date_str: str) -> None:
     logger.info("✓ Orphan pickup OK: %s", target_md)
 
 
+def _finalize_lock_path(session_uid: str) -> Path:
+    """Путь per-session lock-файла (CG1). Имя санитизируется: session_uid
+    приходит из meta-файла и теоретически может содержать `/`."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_uid or "unknown")
+    return STATE_DIR / f"finalize-{safe}.lock"
+
+
+@contextlib.contextmanager
+def _session_finalize_lock(session_uid: str):
+    """CG1: неблокирующий flock на встречу. yield True — лок взят (можно
+    финализировать), False — занят другим тиком (надо пропустить).
+
+    Паттерн скопирован с `retry_failed._try_finalize` (тот же finalize-<sid>.lock
+    по смыслу, но там per-VPS, тут per-mac у collector'а). Лок держится на время
+    всего finalize (до 3ч ssh) — параллельный тик увидит занятость и пропустит,
+    не плодя второй платный submit. Освобождается на закрытии fd (выход из with
+    ИЛИ смерть процесса collector'а — ядро снимает flock автоматически)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _finalize_lock_path(session_uid)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o644)
+    locked = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except (BlockingIOError, OSError):
+            locked = False
+        yield locked
+    finally:
+        if locked:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
 def _finalize_and_collect(session_uid: str) -> None:
+    """CG1-обёртка: берёт per-session lock и только под ним финализирует.
+
+    Два пересёкшихся тика по одной встрече → второй видит занятый лок,
+    пишет «уже идёт» и пропускает (один платный job вместо двух+)."""
+    with _session_finalize_lock(session_uid) as locked:
+        if not locked:
+            logger.info(
+                "Скип %s — finalize по этой встрече уже идёт (lock занят), "
+                "жду следующий тик (cost-guard CG1)", session_uid,
+            )
+            return
+        _do_finalize_and_collect(session_uid)
+
+
+def _do_finalize_and_collect(session_uid: str) -> None:
     """Запустить finalize-meeting.py на VPS для sessionUid, потом scp .md на мак."""
     # 1. Финализация на VPS (без claude — на VPS его нет, источник 3 пропустится).
     meta_path = f"{VPS_TRANSCRIPTS}/{session_uid}.meta.json"
@@ -770,6 +834,15 @@ def _finalize_and_collect(session_uid: str) -> None:
             "finalize rc=10 «nothing to do» для %s — WAV отсутствует, "
             "доставка подтверждена в meta.delivered. Никаких действий не требуется.",
             session_uid,
+        )
+        return
+    # rc=5 «kill-switch активен» (CG7): встреча отложена в retry-очередь, НЕ сбой.
+    # Не алертим (об этом уже сказал finalize + дайджест) и не копируем — протокола
+    # ещё нет. finalize сам пушнул владельцу «на паузе».
+    if proc.returncode == 5:
+        logger.info(
+            "finalize rc=5 «kill-switch активен» для %s — встреча отложена в retry, "
+            "ждёт ручного снятия флага. Не сбой, алерт не шлём.", session_uid,
         )
         return
     if proc.returncode != 0:

@@ -94,6 +94,40 @@ class SpeechmaticsRejectedError(SpeechmaticsError):
     """Job отвергнут — это конфиг-ошибка (формат/lang/audio), retry бесполезен."""
 
 
+class SpeechmaticsKillSwitchError(SpeechmaticsError):
+    """CG7: недельный kill-switch взведён — новый ПЛАТНЫЙ сабмит запрещён.
+
+    Подкласс SpeechmaticsError намеренно: финализатор уже умеет ловить
+    SpeechmaticsError и класть встречу в retry-очередь (не теряется). Но
+    main() финализатора обрабатывает этот подтип РАНЬШЕ общей ветки —
+    чтобы не жечь попытки ретрая и слать корректный «на паузе» текст,
+    а не «сервис недоступен». Снимается только вручную (CG8)."""
+
+
+# --- CG6/CG7: kill-switch недельного лимита (флаг-файл) -------------------
+# Существование файла = «расшифровка остановлена». Путь конфигурится через env
+# (тесты подменяют на tmp). Дефолт — рядом с прочим state на VPS. ВЗВОДИТ файл
+# монитор `stt_weekly_guard.py` при ≥STT_WEEKLY_BLOCK_H ч/нед; СНИМАЕТ только
+# человек (`rm`), автоснятия нет нигде в коде (CG8).
+DEFAULT_KILLSWITCH_PATH = "/srv/meeting-notary/state/stt-killswitch.flag"
+
+
+def killswitch_path() -> Path:
+    """Путь флага kill-switch (env STT_KILLSWITCH_PATH, иначе дефолт VPS)."""
+    return Path(os.environ.get("STT_KILLSWITCH_PATH") or DEFAULT_KILLSWITCH_PATH)
+
+
+def killswitch_armed() -> bool:
+    """CG7: взведён ли kill-switch (читается на каждый сабмит, не кэшируется)."""
+    try:
+        return killswitch_path().exists()
+    except OSError:
+        # Недоступность FS трактуем как «не взведён» — не блокируем расшифровку
+        # из-за инфраструктурного сбоя проверки (kill-switch — про деньги, а не
+        # про доступность; ложный блок хуже ложного пропуска здесь).
+        return False
+
+
 def _get_api_key() -> str:
     key = os.environ.get("SPEECHMATICS_API_KEY")
     if not key:
@@ -343,6 +377,43 @@ def _fetch_transcript(client: httpx.Client, headers: dict, job_id: str) -> dict:
     return _call_with_retry(_do, action=f"fetch transcript job={job_id}")
 
 
+def _get_job_status(client: httpx.Client, headers: dict, job_id: str) -> str | None:
+    """CG2: статус существующего job ('running'/'done'/'rejected'/...) либо None.
+
+    None означает «job недоступен» — 404 (истёк ретеншн Speechmatics ~7 дней,
+    либо id не наш): вызывающий тогда сабмитит заново. Сетевые 5xx/timeout
+    проходят через `_call_with_retry` (один ретрай), как и остальные вызовы.
+    """
+    def _do():
+        r = client.get(f"{SPEECHMATICS_BASE_URL}/jobs/{job_id}", headers=headers)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return (r.json().get("job") or {}).get("status")
+
+    try:
+        return _call_with_retry(_do, action=f"status job={job_id}")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return None
+        raise
+
+
+def _classify_existing_job(status: str | None) -> str:
+    """CG2: решение по существующему job_id — чистая функция (легко тестируется).
+
+    Возвращает:
+      'reuse'    — job есть и идёт/готов (running/done) → НЕ сабмитить заново;
+      'rejected' — job отвергнут конфигом → поднять SpeechmaticsRejectedError;
+      'resubmit' — job недоступен (None/истёк/неизвестный статус) → новый сабмит.
+    """
+    if status in ("running", "done"):
+        return "reuse"
+    if status == "rejected":
+        return "rejected"
+    return "resubmit"
+
+
 def _parse_results(results: list[dict]) -> list[Utterance]:
     """Сборка Utterance из results[].
 
@@ -434,6 +505,8 @@ def transcribe_diarize_wav(
     wav_path: str | Path,
     *,
     expected_speakers: int | None = None,
+    existing_job_id: str | None = None,
+    on_job_submitted=None,
 ) -> TranscriptionResult:
     """Прогнать WAV через Speechmatics Batch API и вернуть TranscriptionResult.
 
@@ -443,6 +516,18 @@ def transcribe_diarize_wav(
     `expected_speakers` (REQ 6.1) — ожидаемое число участников серии. Мягкий
     ориентир диаризации (НЕ жёсткий лимит): подмешивается в job-конфиг через
     `_build_speaker_diarization_config`. None / <2 → дефолтное поведение API.
+
+    Cost-guard Ф2:
+      `existing_job_id` (CG2) — id job'а из прошлого прогона той же встречи.
+        Если он ещё running/done — переиспользуем (НЕ платим за второй сабмит),
+        идём сразу на poll+fetch. rejected → raise (конфиг-ошибка). Недоступен
+        (None/истёк ретеншн) → сабмитим заново.
+      `on_job_submitted` (CG3) — callback(job_id), вызывается СРАЗУ после сабмита,
+        ДО поллинга. Финализатор фиксирует им job_id в state, чтобы краш во время
+        поллинга не привёл к потере id (и второму платному сабмиту на рестарте).
+      kill-switch (CG7) — перед КАЖДЫМ новым сабмитом проверяем `killswitch_armed()`;
+        взведён → SpeechmaticsKillSwitchError (переиспользование существующего job
+        НЕ блокируется — деньги уже потрачены).
 
     Возврат — `TranscriptionResult` NamedTuple с полями utterances, audio_duration_s,
     detected_language, raw_json, job_id. `result.utterances` остаётся `list[Utterance]`
@@ -462,8 +547,47 @@ def transcribe_diarize_wav(
         size_mb = p.stat().st_size / 1024 / 1024
         logger.info("Speechmatics file size: %.1f MB", size_mb)
         with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
-            job_id = _submit_job(client, headers, p, expected_speakers=expected_speakers)
-            logger.info("Speechmatics job submitted: %s", job_id)
+            job_id = None
+            # CG2 — попытка переиспользовать существующий job.
+            if existing_job_id:
+                status = _get_job_status(client, headers, existing_job_id)
+                verdict = _classify_existing_job(status)
+                if verdict == "reuse":
+                    job_id = existing_job_id
+                    logger.info(
+                        "Speechmatics: переиспользую существующий job %s (status=%s) "
+                        "— повторный сабмит НЕ делаю (cost-guard CG2)",
+                        job_id, status,
+                    )
+                elif verdict == "rejected":
+                    raise SpeechmaticsRejectedError(
+                        f"Существующий job {existing_job_id} в статусе rejected — "
+                        f"нужен ручной разбор, повторный сабмит бесполезен"
+                    )
+                else:
+                    logger.info(
+                        "Speechmatics: существующий job %s недоступен (status=%s) "
+                        "— сабмичу заново", existing_job_id, status,
+                    )
+            # Новый сабмит (свежая встреча ИЛИ старый job истёк) — здесь и только
+            # здесь тратятся деньги, поэтому здесь же гейт kill-switch (CG7).
+            if job_id is None:
+                if killswitch_armed():
+                    raise SpeechmaticsKillSwitchError(
+                        "kill-switch недельного лимита Speechmatics взведён — "
+                        f"новый сабмит запрещён ({killswitch_path()})"
+                    )
+                job_id = _submit_job(client, headers, p, expected_speakers=expected_speakers)
+                logger.info("Speechmatics job submitted: %s", job_id)
+                # CG3 — отдать job_id наверх ДО поллинга (переживает краш/рестарт).
+                if on_job_submitted is not None:
+                    try:
+                        on_job_submitted(job_id)
+                    except Exception as cb_e:  # noqa: BLE001
+                        logger.warning(
+                            "on_job_submitted callback упал (не фатально, продолжаю): %s",
+                            cb_e,
+                        )
             _poll_until_done(client, headers, job_id)
             logger.info("Speechmatics job done за %.1f сек, тяну transcript", time.time() - t0)
             raw = _fetch_transcript(client, headers, job_id)

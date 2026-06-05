@@ -108,6 +108,13 @@ def _due_to_attempt(state: dict, now: dt.datetime) -> bool:
     """Пора ли запускать ретрай для этого состояния?"""
     if state.get("rejected"):
         return False
+    if state.get("blocked_by_killswitch"):
+        # CG7/CG8: встреча отложена взведённым недельным kill-switch'ем, а не
+        # сбоем. Пробуем КАЖДЫЙ тик (проверка дешёвая — finalize вернёт rc=5 без
+        # сабмита, пока флаг стоит). НЕ упираемся в 24ч-потолок и не выжигаем
+        # attempts: встреча ждёт ручного снятия флага и не теряется. Как только
+        # флаг снимут — finalize на ближайшем тике реально расшифрует (CG8).
+        return bool(state.get("first_failed_at"))
     attempts = int(state.get("attempts") or 0)
     if attempts >= len(SCHEDULE_MIN):
         return False
@@ -127,6 +134,11 @@ def _due_to_attempt(state: dict, now: dt.datetime) -> bool:
 def _final_push_due(state: dict, now: dt.datetime) -> bool:
     """24ч прошло, финальный push ещё не отправлен и встреча не rejected."""
     if state.get("rejected"):
+        return False
+    if state.get("blocked_by_killswitch"):
+        # CG8: пока kill-switch держит встречу, «сутки прошло, нужно ручное
+        # решение» НЕ шлём — это не зависший сбой, а сознательная пауза;
+        # напоминание про ждущие встречи идёт из недельного монитора (CG9).
         return False
     if state.get("final_push_sent"):
         return False
@@ -198,6 +210,27 @@ def _try_finalize(
             logger.info("sid=%s SUCCESS на попытке %s", sid, state["attempts"])
             return
 
+        if proc.returncode == 5:
+            # CG7: kill-switch активен — finalize НЕ сабмитил, это не сбой.
+            # Откатываем счётчик попытки (как при занятом локе) и помечаем встречу
+            # отложенной — чтобы _due_to_attempt пробовал каждый тик, а
+            # _final_push_due не слал «сдались». Ждём ручного снятия флага (CG8).
+            state["attempts"] = max(0, int(state.get("attempts") or 1) - 1)
+            state["blocked_by_killswitch"] = True
+            state.pop("last_error", None)
+            state_path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            logger.info(
+                "sid=%s kill-switch активен — встреча ждёт ручного снятия флага, "
+                "попытку не считаю (attempts=%s)", sid, state["attempts"],
+            )
+            return
+
+        # Сюда дошли — РЕАЛЬНЫЙ сбой (не kill-switch). Если встреча была раньше
+        # отложена kill-switch'ем, а теперь флаг снят и finalize упал по-настоящему —
+        # снимаем метку, чтобы вернулись штатные правила (24ч-потолок, attempts).
+        state.pop("blocked_by_killswitch", None)
         # last_error — короткое резюме без сырого stderr-tail:
         # (a) stderr/stdout финализатора может содержать фрагменты транскрипта
         #     (детали ошибок pyannote/whisper), которые мы по плану «опасной

@@ -157,16 +157,62 @@ def _run_whisper_pyannote(
 # Ветка Speechmatics (новая, Ф2)
 # ---------------------------------------------------------------------------
 
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Атомарная запись JSON (tmp + os.replace) — чтобы краш в момент записи
+    не оставил полу-записанный meta. Используется для ранней фиксации job_id."""
+    import tempfile
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=p.name + ".", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(p))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _persist_job_id_to_meta(meta_path: str, meta: dict, job_id: str) -> None:
+    """CG3: записать speechmatics_job_id в meta СРАЗУ после сабмита, до поллинга.
+
+    Источник истины переживания краша — сам meta-файл (`<sid>.meta.json`):
+    он остаётся на диске и на _tmp/ (collector подберёт заново), и в _failed/
+    (retry подберёт). На следующем прогоне main() прочитает job_id и через CG2
+    переиспользует живой job вместо повторной оплаты. Мутируем и in-memory
+    `meta`, чтобы дальнейший код в этом же процессе видел id.
+    """
+    meta["speechmatics_job_id"] = job_id
+    try:
+        _atomic_write_json(meta_path, meta)
+    except OSError as e:
+        # Не валим расшифровку из-за сбоя записи meta — job уже сабмичен,
+        # поллинг продолжится. Худший случай: на краше потеряем дедуп (как было
+        # до CG3). Логируем явно, чтобы было видно в journal.
+        logging.getLogger("finalize-meeting").warning(
+            "CG3: не смог зафиксировать job_id в %s: %s", meta_path, e
+        )
+
+
 def _run_speechmatics(
     wav_path: str,
     log: logging.Logger,
     *,
     expected_speakers: int | None = None,
+    existing_job_id: str | None = None,
+    on_job_submitted=None,
 ):
     """Speechmatics-ветка: один HTTP-запрос вместо whisper+pyannote.
 
     `expected_speakers` (REQ 6.1) — мягкая подсказка состава для диаризации
     (НЕ жёсткий лимит); прокидывается в `transcribe_diarize_wav`.
+
+    `existing_job_id` (CG2) — job из прошлого прогона той же встречи: если ещё
+    жив, переиспользуется без повторной оплаты. `on_job_submitted` (CG3) —
+    callback(job_id), которым main() фиксирует id в meta СРАЗУ после сабмита.
 
     Возвращает (turns, extra, sm_result) — `sm_result` это TranscriptionResult
     с raw_json/job_id/duration/lang — используется выше для сохранения в
@@ -182,7 +228,12 @@ def _run_speechmatics(
     os.environ.pop("HF_TOKEN", None)
 
     log.info("Step 1/3 — Speechmatics submit + transcribe + diarize (один запрос)")
-    sm_result = transcribe_diarize_wav(wav_path, expected_speakers=expected_speakers)
+    sm_result = transcribe_diarize_wav(
+        wav_path,
+        expected_speakers=expected_speakers,
+        existing_job_id=existing_job_id,
+        on_job_submitted=on_job_submitted,
+    )
     log.info(
         "Speechmatics: %d utterances, %d спикеров, %.1f сек аудио, lang=%s, job=%s",
         len(sm_result.utterances),
@@ -256,12 +307,18 @@ def _stash_into_failed(
     *,
     rejected: bool,
     err_repr: str,
+    killswitch: bool = False,
 ) -> Path:
     """Скопировать WAV+meta в `_failed/<sid>.*` и создать retry-state.
 
     Если `rejected=True` (конфиг-ошибка Speechmatics: формат/lang/audio) —
     выставляем `attempts=99` чтобы retry-timer не пробовал; ручной разбор
     нужен. Это решение из плана Ф2 (защита от бесполезных retry).
+
+    Если `killswitch=True` (CG7) — встреча отложена не из-за сбоя, а из-за
+    взведённого недельного kill-switch. Помечаем `blocked_by_killswitch`,
+    чтобы retry_failed не жёг 24ч-бюджет и не слал «нужно ручное решение»,
+    а тихо ждал ручного снятия флага (CG8) и считался в напоминании (CG9).
     """
     log = logging.getLogger("finalize-meeting")
     failed = _failed_dir()
@@ -314,6 +371,8 @@ def _stash_into_failed(
         "original_meta_path": meta_path,
         "original_wav_path": wav_path,
     }
+    if killswitch:
+        state["blocked_by_killswitch"] = True
     state_dst.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("Stashed into %s (rejected=%s)", failed, rejected)
     return failed
@@ -566,17 +625,54 @@ def main() -> int:
     # 2. STT + диаризация (зависит от backend). audio_path может быть временным
     # сконкатенированным/починенным WAV — чистим его в finally после STT.
     sm_result = None  # заполняется только в speechmatics-ветке
+    # CG2/CG3 — дедуп платных job'ов Speechmatics.
+    #   existing: job из прошлого прогона этой встречи (meta переживает рестарт).
+    #   callback: фиксирует job_id в meta СРАЗУ после сабмита, до поллинга.
+    existing_job_id = meta.get("speechmatics_job_id") if isinstance(meta, dict) else None
+
+    def _on_job_submitted(job_id: str) -> None:
+        _persist_job_id_to_meta(args.meta_json, meta, job_id)
+
     try:
         if backend == "speechmatics":
             turns, extra, sm_result = _run_speechmatics(
                 audio_path, log, expected_speakers=expected_speaker_count,
+                existing_job_id=existing_job_id, on_job_submitted=_on_job_submitted,
             )
         else:
             turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)
     except Exception as e:
         # Импорт здесь, чтобы whisper_pyannote-ветка не тянула httpx-исключения.
         if backend == "speechmatics":
-            from lib.speechmatics_client import SpeechmaticsError, SpeechmaticsRejectedError
+            from lib.speechmatics_client import (
+                SpeechmaticsError,
+                SpeechmaticsRejectedError,
+                SpeechmaticsKillSwitchError,
+            )
+            if isinstance(e, SpeechmaticsKillSwitchError):
+                # CG7: недельный kill-switch взведён — НЕ платим за сабмит, кладём
+                # встречу в retry-очередь (не теряется) и ждём ручного снятия (CG8).
+                # rc=5 — отдельный код: collector/retry НЕ считают это сбоем и НЕ
+                # жгут 24ч-бюджет ретраев (см. retry_failed: blocked_by_killswitch).
+                log.warning(
+                    "Speechmatics kill-switch активен — встреча %s отложена в retry "
+                    "без сабмита (ждёт ручного снятия флага)", session_uid,
+                )
+                already_queued = (_failed_dir() / f"{session_uid}.retry-state.json").exists()
+                if not already_queued:
+                    _stash_into_failed(
+                        session_uid, audio_path, args.meta_json,
+                        rejected=False, err_repr="kill-switch active", killswitch=True,
+                    )
+                series_label = meta.get("series") or session_uid
+                date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
+                _push_telegram(
+                    f"⏸ Расшифровка на паузе: сработал недельный лимит Speechmatics. "
+                    f"Встреча «{series_label}» ({date_label}) отложена и НЕ потеряна — "
+                    f"обработаю, как только снимешь стоп-флаг (подробности и счётчик "
+                    f"ждущих встреч — в дайджесте)."
+                )
+                return 5
             if isinstance(e, (SpeechmaticsError, SpeechmaticsRejectedError)):
                 rejected = isinstance(e, SpeechmaticsRejectedError)
                 log.error("Speechmatics %s: %s", "rejected" if rejected else "failed", e)
