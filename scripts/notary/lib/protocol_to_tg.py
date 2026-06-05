@@ -1125,6 +1125,12 @@ def _caption_participants(meta: dict) -> list[str]:
     (управляющая МПервого, единственная «Татьяна» в people.md). Курируемый
     список — источник истины.
 
+    FU-10 (🔴, боевая 02.06): дедуп по first-name применяем ТОЛЬКО к обогащению
+    bare-имён из `participants` (Telemost UI). Курируемые `expectedParticipants`
+    берём ВСЕ как есть, без коллапса по first-name — иначе двое «Михаил»
+    (Еремеев + Саргин) на координации схлопывались в одного, второй молча
+    выпадал из подписи. Точные дубликаты (одна и та же полная строка) убираем.
+
     Имена из `participants` (Telemost UI, часто «голое» имя) обогащаем через
     people.md, как раньше — это исходное назначение правки #4 (bare «Михаил»
     → «Михаил Еремеев»). first-name, уже занятый курируемым именем, UI не
@@ -1137,23 +1143,30 @@ def _caption_participants(meta: dict) -> list[str]:
     people_md = _read_people_md()
     people_names = _extract_names_from_people(people_md) if people_md else []
 
-    best_by_first: dict[str, str] = {}
-    locked: set = set()
-    order: list[str] = []
-
     def _first(name: str) -> str:
         parts = name.split()
         return parts[0] if parts else name
 
-    # Курируемые expected — как есть, и блокируем их first-name от перезаписи.
-    for name in raw_expected:
-        f = _first(name)
-        if f not in best_by_first:
-            best_by_first[f] = name
-            order.append(f)
-        locked.add(f)
+    result: list[str] = []
+    seen_full: set = set()
+    # first-name'ы курируемого состава — UI-обогащение не должно добавлять
+    # ещё одного «Михаила» поверх курируемых (но МЕЖДУ собой курируемые
+    # тёзки НЕ схлопываем — FU-10).
+    locked: set = set()
 
-    # Telemost UI — обогащаем; курируемые first-name не трогаем.
+    # Курируемые expected — ВСЕ как есть, в исходном порядке (только точный
+    # дубль-строку отбрасываем). Тёзки сохраняются оба.
+    for name in raw_expected:
+        locked.add(_first(name))
+        if name not in seen_full:
+            seen_full.add(name)
+            result.append(name)
+
+    # Telemost UI — обогащаем через people.md; курируемые first-name не
+    # трогаем. Среди самих UI-имён одинаковый first-name схлопываем в самый
+    # полный вариант (исходная защита от дублей bare-имени).
+    ui_best_by_first: dict[str, str] = {}
+    ui_order: list[str] = []
     for raw in raw_ui:
         full = _resolve_full_name(raw, people_names)
         if not full or not full.strip():
@@ -1162,20 +1175,18 @@ def _caption_participants(meta: dict) -> list[str]:
         f = _first(full)
         if f in locked:
             continue
-        if f not in best_by_first:
-            best_by_first[f] = full
-            order.append(f)
-        elif len(full.split()) > len(best_by_first[f].split()):
-            best_by_first[f] = full
-
-    result: list[str] = []
-    seen_full: set = set()
-    for f in order:
-        full = best_by_first[f]
+        if f not in ui_best_by_first:
+            ui_best_by_first[f] = full
+            ui_order.append(f)
+        elif len(full.split()) > len(ui_best_by_first[f].split()):
+            ui_best_by_first[f] = full
+    for f in ui_order:
+        full = ui_best_by_first[f]
         if full in seen_full:
             continue
         seen_full.add(full)
         result.append(full)
+
     return result
 
 

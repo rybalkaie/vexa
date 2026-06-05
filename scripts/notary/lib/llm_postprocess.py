@@ -59,6 +59,7 @@ from .claude_cli import (
     call_claude_print,
 )
 from . import clarify_state
+from . import glossary
 from . import protocol_to_tg
 from . import protocol_to_pdf
 from . import telegram_api
@@ -1094,6 +1095,7 @@ GENERATE_PROTOCOL_BASE_PROMPT = """Ты редактор протокола вс
 - Длина: компактнее транскрипта в 5–10 раз.
 - Каждый буллет тематического блока — на отдельной строке с ПУСТОЙ строкой между буллетами (иначе они склеятся в один параграф).
 - Эмодзи-маркеры — только функциональные из стандарта (▪️ ▫️ 🔸 🟠). Никаких декоративных.
+- Доменные термины пиши ТОЧНО по глоссарию проекта (ниже, после методички): не заменяй их на похожие по звучанию обычные слова.
 
 Шапка протокола:
 - Первая строка: `#протоколвстречи DD.MM.YYYY` (дата из метаданных, формат DD.MM.YYYY).
@@ -1233,6 +1235,49 @@ def _is_protocol_generation_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+# Поле `**Длительность:**` в шапке протокола (метод `kak-delat-protokol-vstrechi`).
+# Захватываем префикс «**Длительность:** » и заменяем значение целиком.
+_DURATION_HEADER_RE = re.compile(
+    r"^(\s*\*\*Длительность:\*\*[ \t]*).*$", re.MULTILINE
+)
+
+
+def _normalize_protocol_duration(
+    protocol_text: str,
+    meeting_meta: dict,
+    *,
+    transcript_json_path=None,
+) -> str:
+    """FU-12: тело протокола показывает то же «чистое время», что шапка/подпись.
+
+    Контекст бага (02.06): Sonnet кладёт в `**Длительность:**` тела wall-time из
+    календаря (`meta.duration`, присутствие бота), а подпись PDF / шапка TG-текста
+    показывают `compute_duration_label` (чистое речевое время). Два разных числа в
+    одном документе читаются как ошибка. Здесь приводим тело к ЕДИНОМУ источнику —
+    `protocol_to_tg.compute_duration_label` (тот же, что подпись и `_format_header`).
+
+    Перезаписываем только когда чистое время известно (`!= "—"`): иначе для старой
+    встречи без `recording.*` затёрли бы единственное доступное (календарное)
+    значение на «—». Для свежих встреч `meta.recording.first/lastSpeechMs` уже
+    проставлен в finalize ДО генерации → значение совпадает с подписью точь-в-точь.
+    """
+    if not protocol_text:
+        return protocol_text
+    label = protocol_to_tg.compute_duration_label(
+        meeting_meta or {}, transcript_json_path=transcript_json_path
+    )
+    if not label or label == "—":
+        return protocol_text
+    new_text, n = _DURATION_HEADER_RE.subn(
+        lambda m: f"{m.group(1)}{label}", protocol_text
+    )
+    if n == 0:
+        logger.info(
+            "[protocol] FU-12: поле `**Длительность:**` не найдено — нормализация пропущена"
+        )
+    return new_text
+
+
 def generate_protocol(
     transcript_md: str,
     meeting_meta: dict,
@@ -1267,7 +1312,14 @@ def generate_protocol(
     if method_text is None:
         method_text = _load_method_text()
 
-    system_prompt = GENERATE_PROTOCOL_BASE_PROMPT + method_text
+    # FU-11: глоссарий проекта в КОНЕЦ system-prompt (после методички) —
+    # отдельной секцией, чтобы Sonnet писал доменные термины точно.
+    system_prompt = (
+        GENERATE_PROTOCOL_BASE_PROMPT
+        + method_text
+        + "\n\n---\n\n"
+        + glossary.PROJECT_GLOSSARY_PROMPT_BLOCK
+    )
     user_prompt = _format_protocol_user_prompt(
         transcript_md, meeting_meta, series_memory=series_memory,
     )
@@ -1312,6 +1364,12 @@ def generate_protocol(
             raise ProtocolGenerationError(
                 "Sonnet вернул ответ без шапки протокола (`#протоколвстречи`)"
             )
+
+    # FU-11: детерминированный пост-проход доменных терминов (остаточные
+    # перевирания мимо STT-словаря и подсказки).
+    text = glossary.apply_glossary_corrections(text)
+    # FU-12: тело показывает то же чистое время, что подпись/шапка.
+    text = _normalize_protocol_duration(text, meeting_meta)
 
     logger.info(
         "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s",

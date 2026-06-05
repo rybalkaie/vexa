@@ -536,6 +536,43 @@ class TestCaptionParticipants(unittest.TestCase):
             })
         self.assertEqual(out, ["Татьяна"])
 
+    def test_two_namesakes_in_expected_not_collapsed(self):
+        """FU-10 (🔴): двое «Михаил» в expectedParticipants — оба остаются.
+
+        Боевой кейс координации 02.06: «Михаил Еремеев» + «Михаил Саргин»
+        раньше схлопывались по first-name в одного. Теперь — оба как есть.
+        """
+        out = ptg._caption_participants({
+            "expectedParticipants": [
+                "Илья Рыбалка", "Михаил Еремеев", "Михаил Саргин",
+            ],
+            "participants": [],
+        })
+        self.assertEqual(out, ["Илья Рыбалка", "Михаил Еремеев", "Михаил Саргин"])
+        # Именно «не потеряли тёзку»: оба Михаила на месте.
+        self.assertEqual(sum(1 for n in out if n.startswith("Михаил")), 2)
+
+    def test_exact_duplicate_in_expected_dropped_once(self):
+        """Точный дубль строки в курируемом списке схлопывается (но не тёзки)."""
+        out = ptg._caption_participants({
+            "expectedParticipants": ["Михаил Еремеев", "Михаил Еремеев"],
+            "participants": [],
+        })
+        self.assertEqual(out, ["Михаил Еремеев"])
+
+    def test_namesakes_expected_blocks_bare_ui_namesake(self):
+        """Двое курируемых «Михаил*» + bare «Михаил» из UI → UI-тёзка не лезет."""
+        with mock.patch.object(
+            ptg, "_read_people_md",
+            return_value="- **Михаил Еремеев** — роль\n- **Михаил Саргин** — роль",
+        ):
+            out = ptg._caption_participants({
+                "expectedParticipants": ["Михаил Еремеев", "Михаил Саргин"],
+                "participants": ["Михаил"],
+            })
+        # Оба курируемых Михаила; bare-UI «Михаил» (first-name locked) не добавлен.
+        self.assertEqual(out, ["Михаил Еремеев", "Михаил Саргин"])
+
 
 CAPTION_PROTO = (
     "#протоколвстречи 03.06.2026\n\n"
