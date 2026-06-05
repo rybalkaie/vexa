@@ -364,7 +364,9 @@ def _clean_speech_ms_from_transcript_json(path) -> Optional[int]:
     return clean_speech_ms_from_raw_json(rj)
 
 
-def compute_duration_label(meta: dict, transcript_json_path=None) -> str:
+def compute_duration_label(
+    meta: dict, transcript_json_path=None, *, presence_fallback: bool = True
+) -> str:
     """Возвращает «X ч Y мин» / «Y мин» / «<1 мин».
 
     Приоритет источников (НЕС1 + Ф1-доработки 2026-06-04):
@@ -380,6 +382,11 @@ def compute_duration_label(meta: dict, transcript_json_path=None) -> str:
     РАЗМ1: путь к транскрипту передаётся ЯВНЫМ аргументом, не угадывается с
     диска (функция остаётся чистой относительно meta). `audio_duration_s` из
     архива как длительность встречи НЕ используется (это длина аудио, не речь).
+
+    `presence_fallback=False` (FU-12, нормализация тела протокола): если чистое
+    время недоступно из источников 1–3, вернуть «—» вместо «грязного» присутствия
+    (4) / durationLabel (5). Нужно телу протокола, чтобы оно не уехало на wall-time,
+    пока подпись для старой встречи берёт чистое время из transcript-json.
 
     Если источники 1–2 пусты И `transcript_json_path` передан, но файла нет /
     он битый / нет слов — логируем `warning` и только потом падаем на (4):
@@ -423,6 +430,14 @@ def compute_duration_label(meta: dict, transcript_json_path=None) -> str:
             "fallback to presence (path=%s)",
             transcript_json_path,
         )
+
+    # FU-12 (цикл5): для тела протокола чистое время либо есть (источники 1–3),
+    # либо его нет. Присутствие (4) / durationLabel (5) — это НЕ чистое время;
+    # пускать его в тело нельзя, иначе тело разойдётся с подписью, которая для
+    # старых встреч берёт чистое время из transcript-json. presence_fallback=False
+    # → честное «—», и вызывающий (`_normalize_protocol_duration`) оставит тело.
+    if not presence_fallback:
+        return "—"
 
     # (4) fallback endTs - startTs
     start_ts = meta.get("startTs")

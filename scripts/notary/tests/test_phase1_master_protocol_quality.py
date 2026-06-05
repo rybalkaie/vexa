@@ -145,6 +145,20 @@ class TestDurationNormalization(unittest.TestCase):
         txt = "#протоколвстречи 02.06.2026\n\n**Встреча:** Без поля.\n"
         self.assertEqual(lp._normalize_protocol_duration(txt, _META_42), txt)
 
+    def test_presence_only_not_written_to_body(self):
+        """Регресс цикла5: старая встреча без `recording.*`, но с календарными
+        `startTs/endTs` — тело НЕ переписываем на присутствие (wall-time). Иначе
+        подпись (чистое время из transcript-json) и тело разойдутся — ровно то
+        противоречие «два числа», которое FU-12 призван убрать."""
+        meta_presence = {
+            "series": "x",
+            "date": "2026-06-02",
+            "startTs": "2026-06-02T10:00:00Z",
+            "endTs": "2026-06-02T11:02:00Z",  # присутствие 62 мин, recording.* нет
+        }
+        out = lp._normalize_protocol_duration(_PROTOCOL_62, meta_presence)
+        self.assertEqual(out, _PROTOCOL_62)  # тело не тронуто
+
 
 # ===========================================================================
 # FU-11 + FU-12 вместе — интеграция через generate_protocol (mock LLM)

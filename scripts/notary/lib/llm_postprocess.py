@@ -1256,15 +1256,19 @@ def _normalize_protocol_duration(
     одном документе читаются как ошибка. Здесь приводим тело к ЕДИНОМУ источнику —
     `protocol_to_tg.compute_duration_label` (тот же, что подпись и `_format_header`).
 
-    Перезаписываем только когда чистое время известно (`!= "—"`): иначе для старой
-    встречи без `recording.*` затёрли бы единственное доступное (календарное)
-    значение на «—». Для свежих встреч `meta.recording.first/lastSpeechMs` уже
-    проставлен в finalize ДО генерации → значение совпадает с подписью точь-в-точь.
+    Перезаписываем тело ТОЛЬКО когда доступно именно чистое время (источники 1–3
+    в `compute_duration_label`; `presence_fallback=False` глушит присутствие
+    endTs−startTs и durationLabel). Иначе (старая встреча без `recording.*`) тело
+    НЕ трогаем: вписать «грязный» wall-time нельзя — подпись для таких встреч берёт
+    чистое время из transcript-json, и тело снова разошлось бы с ней (баг, найденный
+    циклом5). Для свежих встреч `meta.recording.first/lastSpeechMs` проставлен в
+    finalize ДО генерации → тело совпадает с подписью точь-в-точь.
     """
     if not protocol_text:
         return protocol_text
     label = protocol_to_tg.compute_duration_label(
-        meeting_meta or {}, transcript_json_path=transcript_json_path
+        meeting_meta or {}, transcript_json_path=transcript_json_path,
+        presence_fallback=False,
     )
     if not label or label == "—":
         return protocol_text
