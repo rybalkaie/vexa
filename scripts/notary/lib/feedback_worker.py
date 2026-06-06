@@ -75,6 +75,31 @@ def is_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def series_allowlist_enabled() -> bool:
+    """Гейт FB8 `ENABLE_FEEDBACK_ALLOWLIST` (дефолт OFF; `1/true/yes/on` → ON).
+
+    Дефолт OFF намеренно: владелец решил 05.06 «правят все» — текущее прод-поведение
+    НЕ меняем без явного включения. Ф9 включит одним env, когда нужно ограничить
+    правки кругом участников серии. Это критично именно с Ф6: rogue-правка персистит
+    как выученный терм через будущие протоколы серии, а не правит один протокол.
+    Семантика «включатель», а НЕ kill-switch — поэтому дефолт OFF, в отличие от
+    `ENABLE_FEEDBACK_EDITS`/`ENABLE_FEEDBACK_LEARNING` (там флаг — аварийный тумблер).
+    """
+    raw = (os.environ.get("ENABLE_FEEDBACK_ALLOWLIST") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def max_edits_per_window() -> int:
+    """FM-13: кап числа правок в одном окне сбора (env `FEEDBACK_MAX_EDITS_PER_WINDOW`).
+
+    Дефолт 30 — щедро для реальной встречи (правок редко >10), но режет флуд/спам.
+    Кап ОБЩИЙ на окно: покрывает и текст, и голос. Каждая голос-правка = транскрипция
+    Groq (деньги), поэтому ограничение частоты реплаев ограничивает и стоимость STT,
+    а не только размер списка `edits`.
+    """
+    return _env_int("FEEDBACK_MAX_EDITS_PER_WINDOW", 30)
+
+
 # --------------------------------------------------------------------------
 # Поиск доставленного протокола по (chat_id, message_id) — FB1
 # --------------------------------------------------------------------------
@@ -297,6 +322,51 @@ def _people_md_path() -> Optional[str]:
     return None
 
 
+def _author_pools(
+    expected_participants: Optional[list], people_md_names: Optional[list]
+) -> list[list[str]]:
+    """Курируемые пулы имён для матчинга автора: expectedParticipants, затем people.md."""
+    pools: list[list[str]] = []
+    if expected_participants:
+        pools.append([str(n).strip() for n in expected_participants if n])
+    if people_md_names:
+        pools.append([str(n).strip() for n in people_md_names if n])
+    return pools
+
+
+def _find_registry_match(from_user: dict, pools: list[list[str]]) -> Optional[str]:
+    """Каноничное имя автора из курируемых пулов, либо None если не сматчился.
+
+    Приоритет: точное совпадение полного имени → уникальное совпадение по first-name.
+    Тёзки (2+ кандидата по first-name) — НЕ угадываем (строгий 1:1), пробуем
+    следующий пул. None = автора в реестре нет (для allowlist это «не вправе слать
+    правки»).
+
+    ЕДИНЫЙ matcher для `resolve_author` (имя для ack/лога) и `author_allowed`
+    (bool-гейт FB8) — нарочно один источник правды: иначе опознание автора и
+    allowlist-гейт могли бы разъехаться (дыра: гейт пускает не того, кого опознали,
+    или режет того, кого пускает атрибуция).
+    """
+    if not isinstance(from_user, dict):
+        return None
+    profile = _profile_name(from_user)
+    full_l = profile.lower()
+    is_profile_handle = profile.startswith("@") or profile.startswith("участник")
+    first = (from_user.get("first_name") or "").strip()
+    fl = first.lower()
+    for pool in pools:
+        if not is_profile_handle:
+            for name in pool:
+                if name.lower() == full_l:
+                    return name
+        if first:
+            matches = [n for n in pool if n.split() and n.split()[0].lower() == fl]
+            if len(matches) == 1:
+                return matches[0]
+            # 2+ тёзки → неоднозначно, не угадываем; следующий pool.
+    return None
+
+
 def resolve_author(
     from_user: dict,
     *,
@@ -310,29 +380,75 @@ def resolve_author(
     (2+ кандидата по first-name) — НЕ угадываем (строгий 1:1, как в репо),
     падаем в профиль.
     """
-    profile = _profile_name(from_user)
-    first = (from_user.get("first_name") or "").strip() if isinstance(from_user, dict) else ""
-    full_l = profile.lower()
-    is_profile_handle = profile.startswith("@") or profile.startswith("участник")
+    pools = _author_pools(expected_participants, people_md_names)
+    return _find_registry_match(from_user, pools) or _profile_name(from_user)
 
-    pools = []
-    if expected_participants:
-        pools.append([str(n).strip() for n in expected_participants if n])
-    if people_md_names:
-        pools.append([str(n).strip() for n in people_md_names if n])
 
-    for pool in pools:
-        if not is_profile_handle:
-            for name in pool:
-                if name.lower() == full_l:
-                    return name
-        if first:
-            fl = first.lower()
-            matches = [n for n in pool if n.split() and n.split()[0].lower() == fl]
-            if len(matches) == 1:
-                return matches[0]
-            # 2+ тёзки → неоднозначно, не угадываем; следующий pool / профиль.
-    return profile
+# --------------------------------------------------------------------------
+# Allowlist авторов — FB8 (Ф7): кто вправе слать правки в серии
+# --------------------------------------------------------------------------
+
+def _explicit_user_id_whitelist(meeting: dict) -> set:
+    """Опц. явный per-series whitelist user_id (задел FB8) — ПОВЕРХ авто-реестра.
+
+    Источники объединяются: `meta.feedbackAllowlistUserIds` конкретной встречи +
+    глобальный env `FEEDBACK_ALLOWLIST_USER_IDS` (comma/space-разделённый). Не-int
+    элементы тихо игнорируются. Пусто → set() (тогда работает только авто-реестр).
+    Это конфиг-канал (meta/env), НЕ хардкод — как требует задел FB8.
+    """
+    out: set = set()
+
+    def _ingest(raw):
+        if raw is None:
+            return
+        items = raw if isinstance(raw, (list, tuple, set)) else re.split(r"[,\s]+", str(raw))
+        for it in items:
+            s = str(it).strip()
+            if not s:
+                continue
+            try:
+                out.add(int(s))
+            except (TypeError, ValueError):
+                continue
+
+    meta = (meeting or {}).get("meta") or {}
+    _ingest(meta.get("feedbackAllowlistUserIds"))
+    _ingest(os.environ.get("FEEDBACK_ALLOWLIST_USER_IDS"))
+    return out
+
+
+def author_allowed(from_user: dict, meeting: dict) -> bool:
+    """FB8: вправе ли автор слать правки в этой серии.
+
+    Гейт `ENABLE_FEEDBACK_ALLOWLIST` ВЫКЛ (дефолт) → всегда True (прежнее поведение
+    «правят все», решение владельца 05.06). ВКЛ → вправе только:
+      1. user_id из явного per-series whitelist (`_explicit_user_id_whitelist`), ЛИБО
+      2. автор, однозначно сматченный с реестром серии (expectedParticipants ∪
+         people.md) ТЕМ ЖЕ `_find_registry_match`, что опознаёт автора для ack.
+    Иначе False (не участник / не опознан → не вправе).
+
+    ОГРАНИЧЕНИЕ (документировано, см. пакет сдачи): матчинг по first-name наследуется
+    от resolve_author, поэтому тёзка участника с тем же first-name может пройти
+    авто-реестр. Жёсткая защита от подмены — явный user_id whitelist (п.1). Allowlist —
+    это ДОПОЛНИТЕЛЬНЫЙ слой ПЕРЕД anti-injection-рамкой Ф4 (правки = ДАННЫЕ), не замена.
+    """
+    if not series_allowlist_enabled():
+        return True
+    if not isinstance(from_user, dict):
+        return False  # allowlist ON, автор не идентифицируется → не вправе
+    uid = from_user.get("id")
+    if uid is not None:
+        explicit = _explicit_user_id_whitelist(meeting)
+        if explicit:
+            try:
+                if int(uid) in explicit:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    meta = (meeting or {}).get("meta") or {}
+    expected = meta.get("expectedParticipants") or meta.get("participants") or []
+    pools = _author_pools(expected, parse_people_md(_people_md_path()))
+    return _find_registry_match(from_user, pools) is not None
 
 
 # --------------------------------------------------------------------------
@@ -426,6 +542,11 @@ def apply_edit(
     tmid = edit.get("tg_message_id")
     if tmid is not None and any(e.get("tg_message_id") == tmid for e in edits):
         return state, "dup"
+    # FM-13: кап числа правок в окне. Сверх капа — дроп (НЕ аппендим; state без
+    # изменений), kind="capped". Дедуп проверяем ДО капа: повторная доставка той же
+    # правки не должна ни считаться в кап, ни вызывать «capped».
+    if len(edits) >= max_edits_per_window():
+        return state, "capped"
     edits.append(edit)
     state["last_edit_at"] = _iso(now)
     started = feedback_state._parse_iso(state.get("window_started_at")) or now
@@ -513,6 +634,18 @@ def handle_feedback_reply(
         logger.info("[feedback] дубль правки tg_message_id=%s fid=%s — ack не шлём", edit.get("tg_message_id"), fid)
         return new_state
 
+    if kind == "capped":
+        # FM-13: окно достигло капа — правку дропаем МОЛЧА (без ack). ack на каждую
+        # сверх-капа правку сам стал бы вектором усиления спама: флудер шлёт N+1 →
+        # бот отвечает N+1 раз, превращаясь в спамера и сжигая send-квоту. Собранные
+        # правки (1..cap) перевыпустятся как есть — теряем только флуд сверх капа.
+        # state не меняли → не пишем.
+        logger.warning(
+            "[feedback] кап правок в окне (%d) достигнут — правка дропнута fid=%s author=%s",
+            max_edits_per_window(), fid, author,
+        )
+        return new_state
+
     feedback_state.write_state(new_state, root=root)
     text = ack_first(author, int(new_state.get("window_min", win))) if kind == "first" else ack_more(author)
     try:
@@ -561,6 +694,25 @@ def _send_voice_fallback(token: str, chat_id: int, msg: dict) -> None:
         logger.warning("[feedback] фолбэк-ack send failed (non-fatal): %s", e)
 
 
+def _window_at_cap(meeting: dict, root: Optional[Path]) -> bool:
+    """FM-13: достигнут ли кап правок в АКТИВНОМ окне этой серии.
+
+    Читает текущий state серии. True только если окно открыто (status=collecting) и
+    число собранных правок ≥ капа. Закрытое/отсутствующее окно → False (входящая
+    правка откроет новый раунд — кап там считается заново). Зовётся в
+    `route_feedback_reply` ДО транскрипции голоса, чтобы голос-спам сверх капа не
+    оплачивался транскрипцией Groq (текстовый сверх-кап ловит сам `apply_edit`).
+    """
+    root = root or feedback_state.resolve_feedback_dir()
+    fid = feedback_state.build_feedback_id(
+        meeting.get("series"), meeting.get("date"), meeting.get("chat_id")
+    )
+    state = feedback_state.read_state(fid, root=root)
+    if not isinstance(state, dict) or state.get("status") != "collecting":
+        return False
+    return len(state.get("edits") or []) >= max_edits_per_window()
+
+
 def route_feedback_reply(
     token: str,
     chat_id: int,
@@ -591,6 +743,22 @@ def route_feedback_reply(
         meeting = find_delivered_protocol(chat_id, reply_to.get("message_id"))
 
     if meeting:
+        from_user = msg.get("from") or {}
+        # FB8 (Ф7): allowlist авторов — ЕДИНЫЙ chokepoint ДО ack/сбора/транскрипции/
+        # самообучения. В группе автор вне реестра серии → молчаливый игнор (как
+        # не-reply, FB1: ни ack, ни сбора). В DM (allowed_chat) автор = владелец,
+        # доверенный канал — не гейтим. Стоит ДО _transcribe_feedback_voice, чтобы
+        # голос-спам не-allowlist автора не оплачивался Groq (FM-13). Отсечение здесь
+        # же закрывает вектор Ф6: дропнутая правка не дойдёт до handle_feedback_reply →
+        # (sweep → reissue_one) → record_learning_from_edits, т.е. rogue НЕ станет
+        # персистентным выученным термом (FB7×Ф6).
+        if chat_id != allowed_chat and not author_allowed(from_user, meeting):
+            logger.info(
+                "[feedback] автор вне allowlist — пропуск (chat=%s series=%s uid=%s)",
+                chat_id, meeting.get("series"), from_user.get("id"),
+            )
+            return True
+
         text = (msg.get("text") or "").strip()
         has_voice = bool(msg.get("voice") or msg.get("audio"))
         if has_voice or not text:
@@ -598,6 +766,16 @@ def route_feedback_reply(
             if chat_id == allowed_chat:
                 return False
             if has_voice:
+                # FM-13: кап правок в окне — ПЕРЕД транскрипцией (Groq = деньги).
+                # Голос-правка сверх капа дропается ДО оплаты STT (текстовая сверх-кап
+                # дропается в apply_edit; голос ловим здесь, иначе платим за транскрипт
+                # правки, которую всё равно отбросим).
+                if _window_at_cap(meeting, root):
+                    logger.warning(
+                        "[feedback] кап правок в окне (%d) достигнут — голос-правка "
+                        "дропнута ДО транскрипции (chat=%s)", max_edits_per_window(), chat_id,
+                    )
+                    return True
                 # FB9 (Ф5): голосовая/аудио правка реплаем в групповом чате серии.
                 # Транскрипт — те же недоверенные ДАННЫЕ, что текст правки: после
                 # подстановки в msg["text"] он идёт через handle_feedback_reply →
