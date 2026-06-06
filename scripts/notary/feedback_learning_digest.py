@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -35,6 +37,33 @@ from notary.lib import feedback_learning  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _send_via_notarius_bot(text: str) -> bool:
+    """Шлёт дайджест ботом `notarius` — ТЕМ ЖЕ, что поллит `meetings_listener`
+    с роутом отката.
+
+    Критично: если слать дефолтным ботом tg-send (как `notify.push` — бот «main»),
+    reply владельца «откати <термин>» уйдёт другому боту, листенер его не увидит,
+    и откат (REQ 2.3, предохранитель ЗАВ1/REQ 2.5) физически не сработает.
+    Образец конвенции — `meetings_evening_block --send-tg notarius` (блок 📅, чей
+    reply ловит тот же листенер). Возвращает True при успешной отправке.
+    """
+    tg = shutil.which("tg-send") or "/srv/meeting-notary/bin/tg-send"
+    try:
+        proc = subprocess.run(
+            [tg, "--bot", "notarius", text],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:  # noqa: BLE001
+        logger.error("[fb-learn-digest] tg-send --bot notarius упал: %s", e)
+        return False
+    if proc.returncode != 0:
+        logger.error("[fb-learn-digest] tg-send --bot notarius rc=%d stderr=%s",
+                     proc.returncode, (proc.stderr or "").strip()[:300])
+        return False
+    logger.info("[fb-learn-digest] tg-send --bot notarius OK (%d chars)", len(text))
+    return True
+
+
 def run_digest(*, dry_run: bool = False) -> str:
     """Строит и (если не dry-run) шлёт блок «Ватсон выучил …». Возвращает текст блока."""
     text, ids = feedback_learning.format_digest_block()
@@ -44,12 +73,7 @@ def run_digest(*, dry_run: bool = False) -> str:
     if dry_run:
         logger.info("[fb-learn-digest dry-run] %s", text.replace("\n", " | "))
         return text
-    sent = False
-    try:
-        from notary.lib import notify  # noqa: PLC0415
-        sent = notify.push(text, dedupe=False)
-    except Exception as e:  # noqa: BLE001
-        logger.error("[fb-learn-digest] отправка не удалась (%s)", e)
+    sent = _send_via_notarius_bot(text)
     if sent:
         # Помечаем озвученными ТОЛЬКО при успешной отправке — иначе при сбое
         # доставки правило промолчит навсегда (как `--commit-known-on-send`).

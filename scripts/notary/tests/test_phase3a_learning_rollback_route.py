@@ -157,5 +157,43 @@ class TestRollbackHelper(_LearnBase):
         self.assertIn("откати", self.last_text)
 
 
+# ===========================================================================
+# 4) Дайджест уходит ботом notarius (тем же, что ловит откат) — анти-дрейф
+# ===========================================================================
+class TestDigestSentViaNotariusBot(_LearnBase):
+    """Дайджест 🧠 обязан уходить ботом `notarius` — ТЕМ ЖЕ, что поллит listener
+    с роутом отката. Если слать дефолтным ботом tg-send (бот «main», как делает
+    notify.push), reply владельца «откати …» уйдёт другому боту, listener его не
+    увидит и откат (ЗАВ1/REQ 2.5) не сработает. Зеркалит meetings_evening_block
+    --send-tg notarius. Тест ловит регресс «отправили не тем ботом»."""
+
+    def test_run_digest_sends_with_bot_notarius(self):
+        from notary import feedback_learning_digest as fld  # noqa: PLC0415
+        self._learn("coord", "Гарсия → Гарсиа")
+
+        calls: list[list] = []
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        def _fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _Proc()
+
+        with mock.patch.object(fld.shutil, "which", return_value="/usr/bin/tg-send"), \
+             mock.patch.object(fld.subprocess, "run", side_effect=_fake_run):
+            out = fld.run_digest()
+
+        self.assertTrue(out.startswith(LEARN_PREFIX))
+        self.assertEqual(len(calls), 1, "дайджест должен уйти ровно одним вызовом tg-send")
+        cmd = calls[0]
+        self.assertIn("--bot", cmd)
+        self.assertEqual(cmd[cmd.index("--bot") + 1], "notarius")
+        self.assertTrue(cmd[-1].startswith(LEARN_PREFIX),
+                        "текст блока — последний позиционный аргумент tg-send")
+
+
 if __name__ == "__main__":
     unittest.main()
