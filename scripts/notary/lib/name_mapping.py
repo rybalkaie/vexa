@@ -111,6 +111,12 @@ def map_from_speech_regex(
     # Считаем голоса.
     votes: dict[tuple[str, str], float] = {}    # (cluster, name) → score
     anti_votes: dict[tuple[str, str], float] = {}
+    # Ф4а: строгие vocative-обращения (запятая/знак после имени в НАЧАЛЕ реплики,
+    # weight 2.0) — отдельным счётчиком. Это самый надёжный НЕГАТИВНЫЙ сигнал:
+    # кто окликнул именем N («Михаил, …»), тот точно НЕ N (себя так не окликают).
+    # На нём решаем кейс ровно-2-спикера, где forward-голос («следующий = N»)
+    # инвертирует авторство (директорат 03.06: Илья↔Михаил перепутались).
+    strict_anti_votes: dict[tuple[str, str], float] = {}
 
     for i, turn in enumerate(turns):
         if not turn.text or not turn.speaker:
@@ -155,12 +161,36 @@ def map_from_speech_regex(
         for name, weight in mentioned:
             # speaker_cluster — НЕ это имя (с весом всегда).
             anti_votes[(speaker_cluster, name)] = anti_votes.get((speaker_cluster, name), 0.0) + weight
+            # Строгий vocative (weight >= 2.0 — запятая/знак после имени) — самый
+            # надёжный anti-сигнал, отдельным счётчиком для 2-спикерного решения.
+            if weight >= 2.0:
+                strict_anti_votes[(speaker_cluster, name)] = (
+                    strict_anti_votes.get((speaker_cluster, name), 0.0) + weight
+                )
             # Vocative-сигнал (weight >= 1) — следующий cluster = это имя.
             # Mention-only (weight < 1) — не назначаем имя, только anti-vote.
             if weight >= 1.0 and next_cluster:
                 votes[(next_cluster, name)] = votes.get((next_cluster, name), 0.0) + weight
 
-    # Greedy назначение.
+    # Ф4а: спец-случай ровно 2 спикера и 2 имени. Forward-голос («следующий
+    # говорящий = названное имя») на двух спикерах ненадёжен и переворачивает
+    # авторство (директорат 03.06: Илья↔Михаил). Решаем по СТРОГИМ vocative-
+    # обращениям (надёжный негативный сигнал), forward-голоса игнорируем. Нет
+    # различающего строгого сигнала → отдаём остаток LLM-добивке (не угадываем
+    # вслепую — лучше «Спикер N» + дисклеймер, чем уверенно неверный автор).
+    if len(available_clusters) == 2 and len(available_names) == 2:
+        two = _resolve_two_speakers(
+            strict_anti_votes, available_clusters, available_names
+        )
+        if two:
+            logger.info("Source 2 (2-speaker strict-vocative): mapped 2 clusters")
+        else:
+            logger.info(
+                "Source 2 (2-speaker): no discriminating strict vocative — defer to LLM"
+            )
+        return two
+
+    # Greedy назначение (3+ спикеров / неполный состав).
     result: dict[str, str] = {}
     remaining_clusters = set(available_clusters)
     remaining_names = set(available_names)
@@ -186,6 +216,42 @@ def map_from_speech_regex(
     else:
         logger.info("Source 2 (regex+pymorphy3): no confident matches")
     return result
+
+
+def _resolve_two_speakers(
+    strict_anti_votes: dict[tuple[str, str], float],
+    clusters: list[str],
+    names: list[str],
+) -> dict[str, str]:
+    """Ф4а: решает ровно 2 cluster ↔ 2 name по строгим vocative-обращениям.
+
+    Идея: «X окликнул именем N запятой → X точно НЕ N». На двух спикерах этого
+    достаточно: тот, у кого строгий anti против N сильнее, — НЕ N, значит он —
+    другое имя. Forward-голос («следующий говорит = N») сюда НЕ заходит: именно
+    он инвертирует авторство (директорат 03.06).
+
+    Сравниваем две раскладки по сумме строгого anti ПРОТИВ выбранных пар —
+    выигрывает меньшая (меньше противоречит «X окликнул N»). Равенство (в т.ч.
+    оба нуля = нет строгого сигнала) → `{}` (пусто): отдаём LLM-добивке, не
+    угадываем неверного автора.
+    """
+    if len(clusters) != 2 or len(names) != 2:
+        return {}
+    c0, c1 = clusters
+    n0, n1 = names
+
+    def _sa(c: str, n: str) -> float:
+        return strict_anti_votes.get((c, n), 0.0)
+
+    # Раскладка A: c0→n0, c1→n1; B: c0→n1, c1→n0. «Противоречие» раскладки —
+    # строгий anti против именно её пар (X назначили имя, которое X окликал).
+    contra_a = _sa(c0, n0) + _sa(c1, n1)
+    contra_b = _sa(c0, n1) + _sa(c1, n0)
+    if contra_a == contra_b:
+        return {}  # нет различающего строгого сигнала
+    if contra_a < contra_b:
+        return {c0: n0, c1: n1}
+    return {c0: n1, c1: n0}
 
 
 # ---------- Оркестрация ----------

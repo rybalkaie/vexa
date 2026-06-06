@@ -65,6 +65,91 @@ TG_MAX_LEN = 4096
 # Хэштег — на 2-й строке шапки (правка #3 владельца).
 HASHTAG = "#протоколвстречи"
 
+# --- Ф4а: постоянный дисклеймер авторства ------------------------------------
+# Бот выпускает лучшую ДОГАДКУ авторства без вопроса-стопа (A1); чтобы читатель
+# не пугался возможной путаницы, в начале КАЖДОГО протокола — постоянное
+# приглашение поправить (A2). Единый текст на все каналы (.md / PDF / TG-текст),
+# чтобы не разъезжался. Правка реактивна реплаем (механика обучения — Ф4б).
+PROTOCOL_DISCLAIMER_SENTINEL = "Авторство реплик"
+_DISCLAIMER_TEXT = (
+    "Авторство реплик бот определил автоматически и мог перепутать, кто что "
+    "сказал. Если заметили ошибку — ответьте на это сообщение с поправкой, "
+    "учту на будущее."
+)
+# .md / PDF — markdown-цитата (blockquote есть в allowlist PDF-санитайзера;
+# курсив = «служебная заметка», а не контент протокола).
+PROTOCOL_DISCLAIMER_MD = f"> ℹ️ _{_DISCLAIMER_TEXT}_"
+# TG-текст (revision-путь) — плоская строка с эмодзи (без markdown-разметки).
+PROTOCOL_DISCLAIMER_TG = f"ℹ️ {_DISCLAIMER_TEXT}"
+
+
+def insert_protocol_disclaimer(md_text: str) -> str:
+    """Вставляет постоянный дисклеймер (Ф4а) в начало ТЕЛА протокола.
+
+    Идемпотентно: если дисклеймер уже присутствует — возвращает текст как есть
+    (повторная генерация не плодит дубль). Точка вставки выбирается так, чтобы
+    дисклеймер стоял ДО первой `## `-секции:
+      1) сразу после шапки (первый разделитель `---`);
+      2) иначе — перед первой секцией `## `;
+      3) иначе — после первой строки (`#протоколвстречи`).
+
+    Позиция «до первой секции» критична для инвариантов Ф4а:
+      - series_memory.build_digest собирает только содержимое `## `-секций и
+        строку `**Участники:**` → дисклеймер в дайджест НЕ попадает;
+      - `_caption_participants` берёт участников из meta, не из тела → не ломается.
+    """
+    text = md_text or ""
+    if PROTOCOL_DISCLAIMER_SENTINEL in text:
+        return text
+    lines = text.splitlines()
+    if not lines:
+        return text
+    insert_at: Optional[int] = None
+    for idx, ln in enumerate(lines):
+        if ln.strip() == "---":
+            insert_at = idx + 1
+            break
+    if insert_at is None:
+        for idx, ln in enumerate(lines):
+            if ln.strip().startswith("## "):
+                insert_at = idx
+                break
+    if insert_at is None:
+        insert_at = 1
+    block = ["", PROTOCOL_DISCLAIMER_MD, ""]
+    new_lines = lines[:insert_at] + block + lines[insert_at:]
+    result = "\n".join(new_lines)
+    if text.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def strip_protocol_disclaimer(md_text: str) -> str:
+    """Убирает строку(и) дисклеймера Ф4а из текста протокола.
+
+    Нужно потребителям, которым дисклеймер мешает (например, если в будущем
+    протокол с дисклеймером пойдёт в LLM как «контент»). Снимает строку-цитату
+    `> …Авторство реплик…` и осиротевшие пустые строки вокруг неё.
+    """
+    text = md_text or ""
+    if PROTOCOL_DISCLAIMER_SENTINEL not in text:
+        return text
+    out: list[str] = []
+    for ln in text.splitlines():
+        if PROTOCOL_DISCLAIMER_SENTINEL in ln and ln.lstrip().startswith(">"):
+            continue
+        out.append(ln)
+    # схлопываем возможную двойную пустую строку на месте удаления
+    cleaned: list[str] = []
+    for ln in out:
+        if ln.strip() == "" and cleaned and cleaned[-1].strip() == "":
+            continue
+        cleaned.append(ln)
+    result = "\n".join(cleaned)
+    if text.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
+
 # Эмодзи-индикаторы основных разделов (1️⃣2️⃣…9️⃣). Хранятся как chars из
 # unicode-keycap range. Если разделов >9 — fallback на «🔟», далее «🔢» (см. ниже).
 _NUMBER_EMOJI = [
@@ -752,7 +837,10 @@ def format_protocol_as_tg_text(protocol_md: str, meta: dict) -> str:
     """
     parsed = _parse_protocol_md(protocol_md or "")
     header = _format_header(parsed["header"], meta or {})
-    blocks = [header]
+    # Ф4а: постоянный дисклеймер авторства сразу после шапки. _parse_protocol_md
+    # отбрасывает текст до первой секции, поэтому в TG-тексте дисклеймер из .md
+    # не виден — добавляем его явно (единый текст, дубля не будет).
+    blocks = [header, PROTOCOL_DISCLAIMER_TG]
     for section in parsed["sections"]:
         if not section["body_lines"] and not section["heading_text"]:
             continue

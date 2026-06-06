@@ -1404,6 +1404,10 @@ def generate_protocol(
     text = glossary.apply_glossary_corrections(text)
     # FU-12: тело показывает то же чистое время, что подпись/шапка.
     text = _normalize_protocol_duration(text, meeting_meta)
+    # Ф4а: постоянный дисклеймер авторства в начало тела (.md + PDF читают тело;
+    # TG-текст инжектит свой вариант). Идемпотентно — повторная генерация не
+    # плодит дубль. Ставится ДО первой секции → не уходит в series_memory-дайджест.
+    text = protocol_to_tg.insert_protocol_disclaimer(text)
 
     logger.info(
         "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s",
