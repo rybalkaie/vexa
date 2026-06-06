@@ -227,6 +227,13 @@ def find_delivered_protocol(
         index = _INDEX_CACHE["index"]
     else:
         index = _build_delivered_index(roots, max_age_days)
+        # Диагностика Ф9 (У2): тихий режим отказа фичи — listener сканирует не тот
+        # каталог (env roots мимо реального meta.delivered) → индекс пуст, ни один
+        # reply не матчится. Лог на DEBUG показывает «сканирую X, нашёл N».
+        logger.debug(
+            "[feedback] индекс delivered перестроен: roots=%s записей=%d",
+            [str(r) for r in roots], len(index),
+        )
         if use_cache:
             _INDEX_CACHE.update(built_at=now_ts, roots=roots_key, index=index)
     return index.get(key)
@@ -474,7 +481,21 @@ def handle_feedback_reply(
 
     fid = feedback_state.build_feedback_id(meeting.get("series"), meeting.get("date"), meeting.get("chat_id"))
     state = feedback_state.read_state(fid, root=root)
+    prior_status = state.get("status") if isinstance(state, dict) else None
+    prior_edits = len(state.get("edits") or []) if isinstance(state, dict) else 0
     new_state, kind = apply_edit(state, edit=edit, meeting=meeting, win_min=win, max_min=mx, now=now)
+
+    # Н1 (race Ф3/Ф4): новый раунд поверх ЕЩЁ НЕ перевыпущенного ready_for_reissue
+    # затирает несъеденные правки прошлого раунда. В Ф3 (без Ф4) не наблюдаемо, но
+    # как только появится Ф4 — это потеря данных в окне между закрытием окна и
+    # reissue. Не делаем тихо: сигналим, чтобы Ф4 реализовала атомарный «claim».
+    if kind == "first" and prior_status == "ready_for_reissue" and prior_edits:
+        logger.warning(
+            "[feedback] новый раунд поверх неперевыпущенного ready_for_reissue "
+            "(fid=%s было_правок=%d) — правки прошлого раунда не применены (нет Ф4 "
+            "или race перед reissue); Ф4 обязана атомарно забирать state до перевыпуска",
+            fid, prior_edits,
+        )
 
     if kind == "dup":
         logger.info("[feedback] дубль правки tg_message_id=%s fid=%s — ack не шлём", edit.get("tg_message_id"), fid)
