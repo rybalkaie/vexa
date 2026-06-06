@@ -590,6 +590,26 @@ def maybe_route_to_clarify_text(token: str, msg: dict[str, Any]) -> bool:
         return False
 
 
+def maybe_route_to_feedback_reply(token: str, chat_id: int, allowed_chat: int, msg: dict[str, Any]) -> bool:
+    """Ф3 шлюз правок (FB1): reply на доставленный протокол бота в чате серии.
+
+    True → сообщение «прожёвано» фичей правок (приложили правку ИЛИ осознанно
+    дропнули в групповом чате) — caller выходит из process_message. False → не
+    наша забота, caller продолжает свой dispatch (DM-flow). Импорт защищён: если
+    модуль не грузится — фича просто выключена, listener работает как раньше.
+    """
+    try:
+        from notary.lib import feedback_worker  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("feedback_worker import failed (feature off?): %s", e)
+        return False
+    try:
+        return feedback_worker.route_feedback_reply(token, chat_id, msg, allowed_chat=allowed_chat)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("feedback routing failed: %s", e)
+        return False
+
+
 def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -> None:
     """Inline-кнопка от Ф3 (clarify спикеров), Ф5 (task_filter) или Ф6 (delivery).
 
@@ -678,11 +698,27 @@ def sweep_clarify_timeouts() -> None:
             logger.info("vocab sweep: %d просроченных авто-отклонено", n4)
     except Exception as e:  # noqa: BLE001
         logger.exception("vocab sweep failed: %s", e)
+    # Ф3 feedback sweep — окно сбора правок закрылось (дебаунс/потолок) →
+    # ready_for_reissue (свой каталог `_feedback_edits/`, не пересекается с clarify).
+    try:
+        from notary.lib import feedback_worker  # noqa: PLC0415
+        n5 = feedback_worker.sweep_timeouts()
+        if n5:
+            logger.info("feedback sweep: %d окон закрыто → ready_for_reissue", n5)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("feedback sweep failed: %s", e)
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     chat = msg.get("chat") or {}
     cid = chat.get("id")
+
+    # Ф3 шлюз правок (FB1): reply на доставленный протокол в ЛЮБОМ чате серии.
+    # Проверяем ДО DM-гейта — правки приходят в групповые чаты (cid != allowed_chat),
+    # которые ниже отсекаются. Шлюз сам логирует «не reply на протокол — пропуск».
+    if maybe_route_to_feedback_reply(token, cid, allowed_chat, msg):
+        return
+
     if cid != allowed_chat:
         logger.info("skip: chat_id=%s ≠ allowed=%s", cid, allowed_chat)
         return
