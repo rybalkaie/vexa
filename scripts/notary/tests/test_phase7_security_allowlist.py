@@ -256,6 +256,29 @@ class TestAllowlistFB8(_Base):
         self.assertEqual(len(send.sent), 1)
         self.assertIsNotNone(self._only_state())
 
+    def test_allowlist_on_empty_registry_fails_closed(self):
+        # Fail-closed (цикл5/ход3): allowlist=ON + ПУСТОЙ реестр серии
+        # (expectedParticipants=[] и people.md недоступен) → блокируются ВСЕ, включая
+        # автора, который при НЕпустом реестре проходил (ср. test_legit_passes_when_
+        # allowlist_on). Инвариант security: пустой список прав ≠ «пускать всех».
+        # Защищает _find_registry_match от регресса «пустой пул → пропуск».
+        self._setup_series(expected=[])
+        send = _FakeSend()
+        with mock.patch.dict(os.environ, {"ENABLE_FEEDBACK_ALLOWLIST": "1"}):
+            handled = self._route(self._msg(561, "131 на доставке", from_user=self._LEGIT), send)
+        self.assertTrue(handled)                                          # прожёвано (дроп в группе)
+        self.assertEqual(send.sent, [])                                   # ack НЕ шлётся
+        self.assertEqual(feedback_state.list_states(root=self.root), [])  # правка НЕ собрана
+        # Контроль: явный whitelist user_id пускает ПОВЕРХ пустого авто-реестра
+        # (запасной канал не ломается fail-closed-логикой).
+        send2 = _FakeSend()
+        with mock.patch.dict(os.environ, {"ENABLE_FEEDBACK_ALLOWLIST": "1",
+                                          "FEEDBACK_ALLOWLIST_USER_IDS": "777"}):
+            handled2 = self._route(self._msg(562, "131 на доставке", from_user=self._LEGIT), send2)
+        self.assertTrue(handled2)
+        self.assertEqual(len(send2.sent), 1)                             # explicit whitelist → проходит
+        self.assertIsNotNone(self._only_state())
+
 
 # ===========================================================================
 # FB8 × Ф6 — не-allowlist автор НЕ доходит до самообучения
