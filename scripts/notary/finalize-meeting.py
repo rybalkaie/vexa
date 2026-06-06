@@ -694,15 +694,19 @@ def main() -> int:
                 date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
                 if rejected:
                     _push_telegram(
-                        f"⛔ Speechmatics отверг встречу `{series_label} {date_label}` "
-                        f"(rejected), retry НЕ запущен — нужен ручной разбор. "
-                        f"WAV+meta в `_failed/{session_uid}.*`. Причина: {type(e).__name__}: {str(e)[:200]}"
+                        f"⛔ Не удалось расшифровать встречу «{series_label}» ({date_label}): "
+                        f"сервис распознавания речи отклонил запрос и повторять не станет — "
+                        f"нужно разобраться вручную. Аудио сохранено, не потеряно. "
+                        f"Что пошло не так: {type(e).__name__}: {str(e)[:200]} "
+                        f"(файлы для разбора: _failed/{session_uid}.*)"
                     )
                 else:
                     _push_telegram(
-                        f"⚠️ Speechmatics упал на встрече `{series_label} {date_label}`. "
-                        f"Аудио в `_failed/{session_uid}.*`, retry-расписание (24ч) запущено. "
-                        f"Причина: {type(e).__name__}: {str(e)[:200]}"
+                        f"⚠️ Пока не получилось расшифровать встречу «{series_label}» ({date_label}): "
+                        f"сервис распознавания речи временно недоступен. Аудио сохранено — "
+                        f"автоматически попробую ещё раз примерно через сутки, от тебя ничего не нужно. "
+                        f"Что пошло не так: {type(e).__name__}: {str(e)[:200]} "
+                        f"(файлы: _failed/{session_uid}.*)"
                     )
                 return 4
         log.exception("STT/диаризация упала: %s", e)
