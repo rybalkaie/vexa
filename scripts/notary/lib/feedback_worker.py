@@ -409,8 +409,12 @@ def apply_edit(
     kind: "first" (старт раунда — первая правка), "more" (правка в окне),
     "dup" (повторная доставка той же правки — без изменений).
     """
-    # Новый раунд: state нет, либо предыдущий уже закрыт (FB12 — сон/пробуждение).
-    if state is None or state.get("status") in ("ready_for_reissue", "dormant"):
+    # Новый раунд: state нет, либо предыдущий уже закрыт/перевыпускается.
+    #   - ready_for_reissue / dormant — FB12 (сон → пробуждение новым reply);
+    #   - reissuing — Ф4 уже «забрала» edits на перевыпуск (claim); reply
+    #     обязан уйти в СЛЕДУЮЩИЙ раунд, а не дозаписаться в съедаемый список
+    #     (Н1/FM-10). conditional-dormant в reissue-воркере не затрёт этот раунд.
+    if state is None or state.get("status") in ("ready_for_reissue", "reissuing", "dormant"):
         rnd = (int(state.get("round", 1)) + 1) if state else 1
         return _new_round_state(meeting, edit, win_min, max_min, now, rnd, state), "first"
 
@@ -485,15 +489,20 @@ def handle_feedback_reply(
     prior_edits = len(state.get("edits") or []) if isinstance(state, dict) else 0
     new_state, kind = apply_edit(state, edit=edit, meeting=meeting, win_min=win, max_min=mx, now=now)
 
-    # Н1 (race Ф3/Ф4): новый раунд поверх ЕЩЁ НЕ перевыпущенного ready_for_reissue
-    # затирает несъеденные правки прошлого раунда. В Ф3 (без Ф4) не наблюдаемо, но
-    # как только появится Ф4 — это потеря данных в окне между закрытием окна и
-    # reissue. Не делаем тихо: сигналим, чтобы Ф4 реализовала атомарный «claim».
+    # Н1 (race Ф3/Ф4): новый раунд поверх ЕЩЁ НЕ заклеймленного ready_for_reissue
+    # затёр бы несъеденные правки прошлого раунда. Ф4 закрывает это claim'ом
+    # (`ready_for_reissue` → `reissuing` ДО чтения edits, см.
+    # `feedback_reissue.process_ready_reissues`): после claim reply попадает в ветку
+    # `reissuing` выше (новый раунд, без затирания). Остаточное окно — между
+    # `sweep_timeouts` и claim в ОДНОМ проходе sweep (без обработки сообщений между
+    # ними), т.е. на практике пустое. Если reissue-воркер отключён/упал и state
+    # завис в `ready_for_reissue` — этот reply открывает новый раунд, и warning
+    # фиксирует, что правки прошлого раунда так и не перевыпустились.
     if kind == "first" and prior_status == "ready_for_reissue" and prior_edits:
         logger.warning(
             "[feedback] новый раунд поверх неперевыпущенного ready_for_reissue "
-            "(fid=%s было_правок=%d) — правки прошлого раунда не применены (нет Ф4 "
-            "или race перед reissue); Ф4 обязана атомарно забирать state до перевыпуска",
+            "(fid=%s было_правок=%d) — reissue-воркер не успел заклеймить (отключён/упал?); "
+            "правки прошлого раунда не перевыпущены",
             fid, prior_edits,
         )
 

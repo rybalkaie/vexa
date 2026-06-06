@@ -1216,6 +1216,17 @@ def _format_protocol_user_prompt(
             + "\nУчти её при формировании итогового протокола."
         )
 
+    # Ф4 (FB5/FB6/FB7): правки участников из чата. В ОТЛИЧИЕ от
+    # `correction_instruction` (доверенная команда владельца, приоритет над
+    # методичкой) — это НЕДОВЕРЕННЫЕ ДАННЫЕ от участников встречи. Блок уже
+    # собран и обрамлён anti-injection-рамкой в `feedback_reissue` (правки =
+    # данные, инструкции внутри текста игнорировать), текст каждой правки
+    # санитизирован. Сюда приходит готовая строка — вставляем как есть.
+    feedback_block_raw = meeting_meta.get("feedback_edits_block")
+    feedback_block = ""
+    if isinstance(feedback_block_raw, str) and feedback_block_raw.strip():
+        feedback_block = "\n\n" + feedback_block_raw.strip()
+
     memory_block = ""
     if isinstance(series_memory, str) and series_memory.strip():
         memory_block = "\n\n" + series_memory.strip()
@@ -1224,6 +1235,7 @@ def _format_protocol_user_prompt(
         "\n".join(meta_block)
         + memory_block
         + correction_block
+        + feedback_block
         + "\n\nТранскрипт:\n\n"
         + transcript_md
     )
@@ -4648,13 +4660,31 @@ def redeliver_revised_protocol(
     *,
     meta_json_path: Optional[Path],
     meeting_sid: Optional[str] = None,
+    delete_previous: bool = False,
 ) -> dict:
-    """До-сыл ИСПРАВЛЕННОЙ версии в ту же группу (5.5 + 5.6).
+    """До-сыл ИСПРАВЛЕННОЙ версии в ту же группу (5.5 + 5.6; Ф4 reissue правок).
 
-    Вызывается из clarify_worker._apply_resolution ПОСЛЕ перегенерации
-    протокола. ОБХОДИТ идемпотентность meta.delivered (это легитимный до-сыл),
-    шлёт блок «🔁 Что изменилось» + новую версию, помечает meta.delivered
-    ревизией (revision++, content_hash) — чтобы повтор не задвоил.
+    Вызывается из:
+      - clarify_worker._apply_resolution (поздний clarify) — `delete_previous=False`
+        (поведение Ф5 не меняется: старое сообщение остаётся, ревизия дослыается);
+      - feedback_reissue (Ф4, правки реплаем) — `delete_previous=True` (FB5: старое
+        доставленное сообщение+файл удаляются, постится новая версия).
+
+    ОБХОДИТ идемпотентность meta.delivered (это легитимный до-сыл), шлёт блок
+    «🔁 Что изменилось» + новую версию, помечает meta.delivered ревизией
+    (revision++, content_hash) — чтобы повтор не задвоил.
+
+    `delete_previous=True` (FB5): перед постингом удаляет прежние message_ids
+    последней записи delivered (в 48-часовом окне Telegram). Старше 48ч / часть не
+    удалилась → не падаем, дописываем в блок «что изменилось» предупреждение, что
+    старая версия осталась выше (как `apply_correction`). Архив `_versions/` на
+    диске пишет caller (Ф4) — здесь не трогаем.
+
+    РИСК2 (перенос #3 bot-notarius-full): шапка ревизии бралась из `meeting_meta`,
+    куда caller (clarify) клал `participants=[]` → пустой список участников в шапке.
+    Чиним на уровне механизма: если в `meeting_meta` нет участников, обогащаем из
+    полного meta.json (тот же источник, что обычная генерация) — фикс для ВСЕХ
+    вызывающих.
 
     Гейты безопасности (РИСК 5.6 «не сломать Ф1»):
       - только если протокол УЖЕ был доставлен (delivered с message_ids) —
@@ -4675,6 +4705,15 @@ def redeliver_revised_protocol(
 
     meta = _read_meta_json(meta_json_path) if meta_json_path else None
     records = _normalize_delivered(meta.get("delivered")) if meta else []
+
+    # РИСК2: обогащаем участников из полного meta.json, если caller их не дал
+    # (clarify клал participants=[]) — иначе шапка ревизии приходит пустой.
+    meeting_meta = dict(meeting_meta or {})
+    if meta:
+        if not meeting_meta.get("expectedParticipants") and meta.get("expectedParticipants"):
+            meeting_meta["expectedParticipants"] = meta.get("expectedParticipants")
+        if not meeting_meta.get("participants") and meta.get("participants"):
+            meeting_meta["participants"] = meta.get("participants")
     # Берём последнюю запись с реально отправленными message_ids.
     last = None
     for rec in reversed(records):
@@ -4706,6 +4745,45 @@ def redeliver_revised_protocol(
             continue
     revision = prev_rev + 1
 
+    # 0) FB5: удаляем прежнее доставленное сообщение(+файл) ДО постинга новой
+    #    версии. Только при delete_previous=True (Ф4 правок); clarify (Ф5) не
+    #    удаляет. Telegram разрешает delete только в окне 48ч — старше / не
+    #    удалилось → не падаем, оставляем предупреждение в шапке «что изменилось».
+    delete_warning = ""
+    if delete_previous:
+        can_delete = False
+        at_iso = last.get("at")
+        if isinstance(at_iso, str):
+            try:
+                at_dt = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
+                if at_dt.tzinfo is None:
+                    at_dt = at_dt.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - at_dt).total_seconds()
+                can_delete = age < DELETE_MESSAGE_WINDOW_SEC
+            except ValueError:
+                pass
+        old_mids = [m for m in (last.get("message_ids") or [])]
+        deleted_n = 0
+        if can_delete:
+            for msg_id in old_mids:
+                try:
+                    if telegram_api.delete_message(bot_token, chat_id, int(msg_id)):
+                        deleted_n += 1
+                except (TypeError, ValueError):
+                    continue
+        if old_mids and (not can_delete or deleted_n < len(old_mids)):
+            # Не смогли убрать всё старое → честно предупреждаем (FB5 фолбэк
+            # «нельзя удалить — постит рядом»). Архив на диске не зависит от этого.
+            delete_warning = (
+                "⚠️ Прежнюю версию протокола выше убрать не удалось "
+                "(Telegram не даёт удалять сообщения старше 48 часов). "
+                "Ниже — актуальная версия.\n\n"
+            )
+        logger.info(
+            "[revision] FB5 delete_previous meeting=%s can_delete=%s deleted=%d/%d",
+            meeting_sid or "?", can_delete, deleted_n, len(old_mids),
+        )
+
     # 1) Блок «🔁 Что изменилось» — отдельным сообщением ПЕРВЫМ.
     summary = _compose_revision_summary(
         old_protocol_text, new_protocol_text,
@@ -4713,7 +4791,7 @@ def redeliver_revised_protocol(
         meeting_sid=meeting_sid,
     )
     try:
-        telegram_api.send_message(bot_token, chat_id, summary)
+        telegram_api.send_message(bot_token, chat_id, delete_warning + summary)
     except telegram_api.TelegramApiError as e:
         logger.warning("[revision] summary send failed meeting=%s: %s", meeting_sid or "?", e)
 

@@ -41,7 +41,7 @@
       "updated_at": "..."
     }
 
-Статусы (контракт для Ф4):
+Статусы (контракт Ф3→Ф4):
   collecting        — окно открыто, копим правки. Когда `now >= deadline_at`
                       (естественный дебаунс или потолок) — sweep переводит в
                       `ready_for_reissue`.
@@ -49,6 +49,11 @@
                       протокол, дописать новый message_id в meta.delivered и
                       перевести state в `dormant`. В Ф3 (без Ф4) state остаётся
                       `ready_for_reissue` до следующего reply (тогда новый раунд).
+  reissuing         — Ф4 «забрала» state на перевыпуск (claim, см.
+                      `claim_for_reissue`). Промежуточный статус: пока он стоит,
+                      конкурентный reply НЕ дозаписывается в съедаемые `edits`, а
+                      открывает СЛЕДУЮЩИЙ раунд (Н1, FM-10 — защита от потери
+                      правок в окне между закрытием окна и перевыпуском).
   dormant           — спит после перевыпуска; новый reply на любую версию серии
                       открывает новый раунд (FB12, многораундовость).
 """
@@ -72,7 +77,13 @@ DEFAULT_VPS_ROOT = "/opt/meeting-notary/_feedback_edits"
 
 STATE_SUFFIX = "-feedback.json"
 
-VALID_STATUSES = ("collecting", "ready_for_reissue", "dormant")
+VALID_STATUSES = ("collecting", "ready_for_reissue", "reissuing", "dormant")
+
+# Н1 (FM-10): потолок попыток перевыпуска одного раунда. После него
+# `process_ready_reissues` перестаёт клеймить state (claude/telegram стабильно
+# падают) — оставляем `ready_for_reissue` владельцу/Ф9, не крутим claude в холостую.
+# Новый reply всё равно откроет свежий раунд (apply_edit: ready_for_reissue → round+1).
+MAX_REISSUE_ATTEMPTS = 3
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
 _FEEDBACK_ID_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
@@ -205,6 +216,32 @@ def mark_status(
     state["status"] = new_status
     if extra:
         state.update(extra)
+    write_state(state, root=root)
+    return state
+
+
+def claim_for_reissue(feedback_id: str, *, root: Optional[Path] = None) -> Optional[dict]:
+    """Н1 (FM-10): атомарно «забирает» state на перевыпуск ДО чтения `edits`.
+
+    `ready_for_reissue` → `reissuing` одной атомарной записью (mkstemp+rename).
+    Возвращает claimed-state (со статусом `reissuing`) если claim удался, иначе
+    None (статус уже не `ready_for_reissue` — кто-то перевёл его раньше, либо
+    конкурентный reply открыл новый раунд).
+
+    Зачем claim ПЕРЕД чтением edits: пока стоит `reissuing`, `apply_edit`
+    трактует входящий reply как НОВЫЙ раунд (а не дозапись в съедаемые edits) —
+    правки текущего раунда уходят в перевыпуск, правки конкурентного reply'я — в
+    следующий раунд. Без claim reply в окне между `ready_for_reissue` и
+    перевыпуском затирал бы несъеденные edits (`_new_round_state`).
+
+    Модель конкуренции: единственный писатель — listener (один процесс); атомарность
+    обеспечивает rename в `write_state` (как и весь остальной feedback_state).
+    """
+    state = read_state(feedback_id, root=root)
+    if state is None or state.get("status") != "ready_for_reissue":
+        return None
+    state["status"] = "reissuing"
+    state["reissue_claimed_at"] = now_iso()
     write_state(state, root=root)
     return state
 

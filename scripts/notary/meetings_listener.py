@@ -707,6 +707,18 @@ def sweep_clarify_timeouts() -> None:
             logger.info("feedback sweep: %d окон закрыто → ready_for_reissue", n5)
     except Exception as e:  # noqa: BLE001
         logger.exception("feedback sweep failed: %s", e)
+    # Ф4 feedback reissue — ready_for_reissue → claim → перевыпуск (удалить старое
+    # сообщение+файл, постить новую версию + «🔁 Что изменилось») → dormant. Идёт
+    # СРАЗУ после feedback-sweep в этом же проходе (без обработки сообщений между),
+    # чтобы claim закрывал гонку Н1. Каждый перевыпуск зовёт claude и блокирует
+    # listener — лимит MAX_REISSUES_PER_SWEEP на проход.
+    try:
+        from notary.lib import feedback_reissue  # noqa: PLC0415
+        n6 = feedback_reissue.process_ready_reissues()
+        if n6:
+            logger.info("feedback reissue: %d протоколов перевыпущено → dormant", n6)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("feedback reissue failed: %s", e)
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
