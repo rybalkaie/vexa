@@ -336,18 +336,12 @@ def reissue_one(
     if new_text.strip() == old_text.strip():
         return {"status": "no-change"}  # правки не изменили содержание — чат не трогаем
 
-    # Архив _versions/ ДО перезаписи (FB5: архив на диске сохраняется).
-    try:
-        save_version_fn(protocol_path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[reissue] архив версии не удался (non-fatal) %s: %s", protocol_path, e)
-
-    try:
-        lp._atomic_write_text(protocol_path, new_text)
-    except OSError as e:
-        return {"status": "error", "error": f"write protocol: {e}"}
-
     # FB5: удалить старое сообщение(+файл) + постить новую версию + «🔁 Что изменилось».
+    # АТОМАРНОСТЬ РЕТРАЯ (цикл5/Н1): доставку делаем ДО мутации диска. redeliver берёт
+    # old/new текстом-аргументом и протокол с диска НЕ читает — переписывать файл заранее
+    # незачем. Если доставка упадёт (сеть/Telegram), на диске остаётся ОРИГИНАЛ: следующий
+    # sweep перечитает корректный old_text и повторит честно. Иначе перезаписанный файл
+    # схлопнул бы ретрай в no-change (new==old) → тихая недосдача протокола.
     redeliver_meta = _meeting_meta_for_redeliver(state, meta)
     try:
         res = redeliver_fn(
@@ -358,12 +352,29 @@ def reissue_one(
         )
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": f"redeliver: {e}"}
-
-    # Ф6 задел: learning-лог применённых правок (append-only, обратимо).
-    append_learning_log(state, edits, root=root)
-
     if not isinstance(res, dict):
         return {"status": "error", "error": "redeliver returned non-dict"}
+
+    # Диск трогаем ТОЛЬКО когда новая версия реально доставлена (status=="sent"):
+    # архив прежней версии (читает ещё-старый файл — корректно) + перезапись протокола.
+    # На любом не-sent (error/skipped/not-delivered-yet/disabled) файл не трогаем —
+    # ретрай/закрытие остаются корректными (Н1, Н2: meta=None → не постит → не мутируем).
+    if res.get("status") == "sent":
+        try:
+            save_version_fn(protocol_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[reissue] архив версии не удался (non-fatal) %s: %s", protocol_path, e)
+        try:
+            lp._atomic_write_text(protocol_path, new_text)
+        except OSError as e:
+            # Доставка УЖЕ прошла (участники видят новую версию) — не валим в error,
+            # иначе ретрай задвоит пост официального протокола. Диск-архив отстанет,
+            # выправится на следующем раунде правок.
+            logger.error("[reissue] протокол доставлен, но запись на диск не удалась "
+                         "(non-fatal, во избежание повторной доставки) %s: %s", protocol_path, e)
+        # Ф6 задел: learning-лог — только по реально применённым (доставленным) правкам.
+        append_learning_log(state, edits, root=root)
+
     return res
 
 

@@ -409,6 +409,39 @@ class TestReissueOne(_ReissueBase):
         self.assertEqual(res["status"], "no-change")
         self.assertEqual(red_called, [])  # чат не трогаем
 
+    def test_delivery_failure_leaves_disk_intact_for_retry(self):
+        # Цикл5/Н1 (атомарность ретрая): если доставка падает ПОСЛЕ перегенерации,
+        # протокол на диске НЕ должен быть перезаписан — иначе повторный sweep
+        # перечитает new как old и схлопнётся в no-change (тихая недосдача протокола).
+        meta_path = self._write_meeting(protocol=PROTO_OLD)
+        st = self._state(meta_path)
+        disk_p = self.protocols / "coord" / "2026-06-02-protokol.md"
+        saved = []
+
+        # 1-я попытка: реген дал новую версию, но доставка падает.
+        res1 = feedback_reissue.reissue_one(
+            st, root=self.root, generate_fn=lambda *a, **k: PROTO_NEW,
+            redeliver_fn=lambda *a, **k: {"status": "error", "error": "tg down"},
+            save_version_fn=lambda p: saved.append(p) or p,
+        )
+        self.assertEqual(res1["status"], "error")
+        self.assertEqual(disk_p.read_text(encoding="utf-8").strip(), PROTO_OLD.strip())  # диск нетронут
+        self.assertEqual(saved, [])  # доставки не было → архив не снимали
+        # learning-лог не пишем на недоставленную правку.
+        self.assertFalse(feedback_reissue.learning_log_path(root=self.root).is_file())
+
+        # 2-я попытка (ретрай): тот же реген → НЕ no-change, снова уходит в доставку.
+        red_calls = []
+        res2 = feedback_reissue.reissue_one(
+            st, root=self.root, generate_fn=lambda *a, **k: PROTO_NEW,
+            redeliver_fn=lambda *a, **k: red_calls.append(1) or {"status": "sent", "message_ids": [9]},
+            save_version_fn=lambda p: saved.append(p) or p,
+        )
+        self.assertEqual(res2["status"], "sent")
+        self.assertEqual(red_calls, [1])  # доставка состоялась, а не схлопнулась в no-change
+        self.assertEqual(disk_p.read_text(encoding="utf-8").strip(), PROTO_NEW.strip())  # теперь записан
+        self.assertEqual(len(saved), 1)  # архив снят только при успешной доставке
+
     def test_no_edits(self):
         meta_path = self._write_meeting()
         st = self._state(meta_path, edits=[{"author": "x", "text": "   "}])
