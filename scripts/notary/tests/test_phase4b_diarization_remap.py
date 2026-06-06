@@ -88,6 +88,17 @@ class TestRemapTranscriptSpeakers(unittest.TestCase):
         out = lp.remap_transcript_speakers(text, {"Спикер 2": "Дарья Набережная"})
         self.assertIn("**[00:00] Дарья Набережная:** Реплика.", out)
 
+    def test_swap_handles_hms_timecode(self):
+        """Часовая встреча (директорат >1ч): таймкод HH:MM:SS тоже своп-безопасно
+        ремапится — регекс рендера `\\[\\d{2}:\\d{2}(?::\\d{2})?\\]` покрывает оба формата."""
+        text = (
+            "**[00:00] Илья:** Старт.\n\n"
+            "**[01:05:30] Михаил:** Через час с лишним.\n"
+        )
+        out = lp.remap_transcript_speakers(text, {"Илья": "Михаил", "Михаил": "Илья"})
+        self.assertIn("**[00:00] Михаил:** Старт.", out)
+        self.assertIn("**[01:05:30] Илья:** Через час с лишним.", out)
+
     def test_unmatched_label_untouched(self):
         out = lp.remap_transcript_speakers(TRANSCRIPT_INVERTED, {"Ольга": "Дарья"})
         self.assertEqual(out, TRANSCRIPT_INVERTED)
@@ -521,6 +532,46 @@ class TestReissueAuthorshipRemap(unittest.TestCase):
         )
         leftovers = [p.name for p in self.series_dir.iterdir() if ".remap." in p.name]
         self.assertEqual(leftovers, [])
+
+    def test_no_tmp_leak_on_write_failure(self):
+        """Цикл5 Н1: запись remapped-транскрипта упала (диск/IO) → temp-файл НЕ
+        остаётся в папке серии (ранний return минует finally — чистим в except)."""
+        import os as _os
+
+        orig_fdopen = fr.os.fdopen
+
+        def boom_fdopen(fd, *a, **k):
+            _os.close(fd)  # не течём реальным fd из mkstemp
+
+            class _F:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *e):
+                    return False
+
+                def write(self, _s):
+                    raise OSError("smoke: disk full на записи remap")
+
+            return _F()
+
+        fr.os.fdopen = boom_fdopen
+        try:
+            res = fr.reissue_one(
+                self._state([{"author": "Илья", "text": "это не Илья, а Михаил"}]),
+                root=self.root,
+                generate_fn=lambda *a, **k: "x",
+                redeliver_fn=lambda *a, **k: {"status": "sent", "message_ids": [1]},
+                save_version_fn=lambda p: p,
+            )
+        finally:
+            fr.os.fdopen = orig_fdopen
+        self.assertEqual(res["status"], "error")
+        self.assertIn("remap tmp", res["error"])
+        leftovers = [p.name for p in self.series_dir.iterdir() if ".remap." in p.name]
+        self.assertEqual(leftovers, [])
+        # Исходный транскрипт не тронут (доставки не было).
+        self.assertEqual(self.transcript_path.read_text(encoding="utf-8"), TRANSCRIPT_INVERTED)
 
 
 if __name__ == "__main__":

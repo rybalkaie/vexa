@@ -525,12 +525,20 @@ def reissue_one(
                 prefix=f".{transcript_path.name}.remap.", suffix=".tmp",
                 dir=str(transcript_path.parent),
             )
+            # Привязываем путь СРАЗУ после mkstemp: если запись ниже упадёт (диск/IO),
+            # ранний return минует finally этой функции → без явной уборки временный
+            # файл утёк бы в папку серии. С remap_tmp чистим его в except.
+            remap_tmp = Path(tmp_s)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(new_transcript_text)
-            remap_tmp = Path(tmp_s)
             gen_input_path = remap_tmp
         except OSError as e:
             # Не смогли подготовить remapped-вход — не молча теряем правку авторства.
+            if remap_tmp is not None:
+                try:
+                    remap_tmp.unlink()
+                except OSError:
+                    pass
             return {"status": "error", "error": f"remap tmp: {e}"}
 
     try:
