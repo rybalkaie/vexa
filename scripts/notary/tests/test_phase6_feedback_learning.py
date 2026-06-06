@@ -187,6 +187,23 @@ class TestDigestAndRollback(_Base):
         self.assertIn("learn", ops)
         self.assertIn("rollback", ops)
 
+    def test_relearn_after_rollback_reannounces(self):
+        # Цикл5/Н1: откаченное владельцем правило, выученное заново, ОБЯЗАНО снова
+        # попасть в дайджест — иначе вернулось бы в работу молча (мимо контроля).
+        self._learn("coord", "это не РСЯ, а РЕЦ")
+        _, ids = fl.format_digest_block(root=self.root)
+        fl.mark_announced(ids, root=self.root)
+        # Озвучено → повторно не звучит (steady state).
+        self.assertEqual(fl.format_digest_block(root=self.root), ("", []))
+        # Владелец откатил.
+        self.assertEqual(len(fl.apply_rollback_reply("откати РЕЦ", root=self.root)), 1)
+        self.assertEqual(fl.active_rules("coord", root=self.root), [])
+        # Та же правка применена снова → правило активно И снова озвучивается.
+        self._learn("coord", "это не РСЯ, а РЕЦ")
+        text2, ids2 = fl.format_digest_block(root=self.root)
+        self.assertIn("РЕЦ", text2)
+        self.assertEqual(len(ids2), 1)
+
 
 # ===========================================================================
 # Критерий 3 — append-only лог на серию, обратимый, переживает рестарт

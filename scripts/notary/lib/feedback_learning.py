@@ -295,7 +295,10 @@ def _fold(events: list[dict]) -> dict:
 
     rule = {id, series, wrong, right, active, author, at}. Последнее событие для
     id побеждает: `learn` (пере)активирует и обновляет терм-пару, `rollback`
-    деактивирует. `announced` — множество id, уже озвученных в дайджесте.
+    деактивирует. `announced` — множество id, уже озвученных в дайджесте; новый
+    `learn` сбрасывает озвученность id (правило, откаченное владельцем и затем
+    выученное заново, обязано снова попасть в дайджест — иначе вернулось бы в
+    работу молча, в обход контроля постфактум).
     """
     rules: dict[str, dict] = {}
     announced: set[str] = set()
@@ -312,6 +315,9 @@ def _fold(events: list[dict]) -> dict:
                 "author": ev.get("author"),
                 "at": ev.get("at"),
             }
+            # Новый learn инвалидирует прежнюю озвучку: правило, откаченное и
+            # выученное заново, должно снова попасть в дайджест (контроль постфактум).
+            announced.discard(rid)
         elif op == "rollback" and rid:
             if rid in rules:
                 rules[rid]["active"] = False
