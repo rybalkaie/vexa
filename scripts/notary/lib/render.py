@@ -58,6 +58,7 @@ def render_protocol(
     sources_used: list[str],
     asr_model: str,
     diarization_model: str = "pyannote/speaker-diarization-3.1",
+    transcript_relpath: Optional[str] = None,
 ) -> str:
     """Возвращает готовый markdown-протокол как строку."""
     if not os.path.exists(template_path):
@@ -129,6 +130,7 @@ def render_protocol(
         "{{ participants_list }}": participants_list,
         "{{ meeting_url }}": raw_url,
         "{{ audio_path }}": audio_path,
+        "{{ transcript_relpath }}": transcript_relpath or "—",
         "{{ transcript_body }}": transcript_body,
         "{{ asr_model }}": asr_model,
         "{{ diarization_model }}": diarization_model,

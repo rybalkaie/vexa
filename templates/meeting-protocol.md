@@ -5,6 +5,7 @@
 **Участники:** {{ participants_list }}
 **Источник:** {{ meeting_url }}
 **Запись:** {{ audio_path }}
+**Транскрипт:** {{ transcript_relpath }}
 
 ---
 
