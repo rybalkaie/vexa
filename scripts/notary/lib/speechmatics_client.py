@@ -534,7 +534,12 @@ def transcribe_diarize_wav(
     с тем же контрактом что зафиксирован в Ф1.
     """
     p = Path(wav_path)
-    if not p.exists():
+    # WAV на диске нужен ТОЛЬКО для сабмита. Если есть живой job для
+    # переиспользования (CG2) — файл не читается; это позволяет восстановить
+    # протокол по одному speechmatics_job_id уже ПОСЛЕ чистки WAV. Когда
+    # переиспользовать нечего (existing_job_id пуст), сабмит неизбежен —
+    # проверяем наличие сразу, сохраняя прежнюю семантику (raw FileNotFoundError).
+    if not existing_job_id and not p.exists():
         raise FileNotFoundError(f"WAV не найден: {p}")
 
     headers = {"Authorization": f"Bearer {_get_api_key()}"}
@@ -542,10 +547,6 @@ def transcribe_diarize_wav(
     t0 = time.time()
 
     try:
-        # stat() внутри try: broken symlink / race с unlink / permission denied
-        # дадут OSError, который ниже завернётся в SpeechmaticsError для _failed/.
-        size_mb = p.stat().st_size / 1024 / 1024
-        logger.info("Speechmatics file size: %.1f MB", size_mb)
         with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
             job_id = None
             # CG2 — попытка переиспользовать существующий job.
@@ -572,6 +573,16 @@ def transcribe_diarize_wav(
             # Новый сабмит (свежая встреча ИЛИ старый job истёк) — здесь и только
             # здесь тратятся деньги, поэтому здесь же гейт kill-switch (CG7).
             if job_id is None:
+                # Сабмит — единственное место, где реально нужен файл на диске.
+                # Если сюда дошли (existing_job_id истёк/недоступен), а WAV уже
+                # почищен — восстановить нельзя: FileNotFoundError завернётся в
+                # SpeechmaticsError (стр. ниже) и встреча уйдёт в _failed.
+                # stat() внутри try: broken symlink / race с unlink / perm denied
+                # дадут OSError, который так же завернётся в SpeechmaticsError.
+                if not p.exists():
+                    raise FileNotFoundError(f"WAV не найден: {p}")
+                size_mb = p.stat().st_size / 1024 / 1024
+                logger.info("Speechmatics file size: %.1f MB", size_mb)
                 if killswitch_armed():
                     raise SpeechmaticsKillSwitchError(
                         "kill-switch недельного лимита Speechmatics взведён — "

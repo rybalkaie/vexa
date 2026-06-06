@@ -210,6 +210,31 @@ class TestClientDedupKillswitch(unittest.TestCase):
         self.assertEqual(self._submit_calls, [1], "истёкший job → новый сабмит")
         self.assertEqual(res.job_id, "NEWJOB")
 
+    # --- Recovery: WAV почищен, но job жив → переиспользуем БЕЗ файла на диске ---
+    def test_reuse_alive_job_without_wav_on_disk(self):
+        sc._get_job_status = lambda *a, **k: "done"
+        gone = self.tmp / "already-cleaned.wav"  # файла НЕТ на диске
+        self.assertFalse(gone.exists())
+        res = sc.transcribe_diarize_wav(str(gone), existing_job_id="ALIVE")
+        self.assertEqual(res.job_id, "ALIVE", "переиспользован job без чтения WAV")
+        self.assertEqual(self._submit_calls, [], "сабмита нет — файл не нужен")
+
+    # --- Семантика сохранена: нет job для переиспользования + нет WAV → FileNotFoundError ---
+    def test_submit_without_wav_raises_filenotfound(self):
+        gone = self.tmp / "missing.wav"
+        self.assertFalse(gone.exists())
+        with self.assertRaises(FileNotFoundError):
+            sc.transcribe_diarize_wav(str(gone))  # свежая встреча, сабмит неизбежен
+        self.assertEqual(self._submit_calls, [], "до сабмита не дошли — файла нет")
+
+    # --- Кромка: job истёк И WAV почищен → восстановить нельзя, чистый SpeechmaticsError ---
+    def test_reuse_expired_without_wav_raises_speechmatics_error(self):
+        sc._get_job_status = lambda *a, **k: None  # истёк ретеншн
+        gone = self.tmp / "missing2.wav"
+        with self.assertRaises(sc.SpeechmaticsError):
+            sc.transcribe_diarize_wav(str(gone), existing_job_id="GONE")
+        self.assertEqual(self._submit_calls, [], "сабмит не вызван — файла нет")
+
     # --- CG3: callback вызывается СРАЗУ после сабмита, ДО поллинга ---
     def test_on_job_submitted_fires_before_poll(self):
         order = []

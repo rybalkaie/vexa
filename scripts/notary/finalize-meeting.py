@@ -537,6 +537,22 @@ def main() -> int:
     # chunks[], ни в files.wav (тогда ниже отрабатывает rc=10/rc=3, как раньше).
     audio_path, audio_is_temp = resolve_wav_for_stt(meta, log=log)
     if audio_path is None:
+        # Recovery: WAV почищен, но в meta есть speechmatics_job_id прошлого
+        # прогона. Если job ещё жив (running/done) — CG2 переиспользует его
+        # транскрипт без повторного STT и без файла на диске (transcribe_diarize_wav
+        # в reuse-ветке WAV не открывает). Длительность/clean-time берутся из
+        # транскрипта + meta.recording, а не из WAV. Job истёк → audio_path так и
+        # останется None, ниже отработает обычная логика rc=3/rc=10.
+        _reuse_job_id = meta.get("speechmatics_job_id") if isinstance(meta, dict) else None
+        if _reuse_job_id:
+            log.info(
+                "WAV отсутствует, но есть speechmatics_job_id=%s — recovery-режим: "
+                "переиспользую существующий job без STT/WAV (files.wav=%s)",
+                _reuse_job_id, wav_path,
+            )
+            audio_path = str(wav_path)  # путь-декларация; в reuse-ветке не читается
+            audio_is_temp = False
+    if audio_path is None:
         # Ф1-доработки (2026-05-29): если протокол УЖЕ доставлен (есть запись
         # в meta.delivered), WAV был легитимно почищен collector'ом — это
         # «nothing to do», не сбой. Возвращаем rc=10, collector интерпретирует
