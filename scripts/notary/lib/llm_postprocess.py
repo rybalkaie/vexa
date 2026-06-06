@@ -1231,9 +1231,27 @@ def _format_protocol_user_prompt(
     if isinstance(series_memory, str) and series_memory.strip():
         memory_block = "\n\n" + series_memory.strip()
 
+    # Ф6 (FB10): выученные из правок участников терм-замены ЭТОЙ серии. Тот же
+    # канал, что `series_memory` — справочный блок-ДАННЫЕ ПЕРЕД транскриптом (не
+    # команда модели, не факт). Источник — append-only лог на серию; активные
+    # правила применяются, откаченные — нет. Single chokepoint: покрывает finalize/
+    # clarify/regenerate/reissue. Best-effort и под собственным гейтом — при
+    # выключенном `ENABLE_FEEDBACK_LEARNING` / отсутствии правил блок пуст (поведение
+    # генерации не меняется, как и до Ф6).
+    learned_block = ""
+    try:
+        from . import feedback_learning  # noqa: PLC0415  (lazy: избегаем цикла импорта)
+
+        lb = feedback_learning.format_learned_terms_block(meeting_meta.get("series"))
+        if lb.strip():
+            learned_block = "\n\n" + lb.strip()
+    except Exception:  # noqa: BLE001  (самообучение не должно ронять генерацию)
+        learned_block = ""
+
     return (
         "\n".join(meta_block)
         + memory_block
+        + learned_block
         + correction_block
         + feedback_block
         + "\n\nТранскрипт:\n\n"

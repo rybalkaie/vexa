@@ -374,6 +374,14 @@ def reissue_one(
                          "(non-fatal, во избежание повторной доставки) %s: %s", protocol_path, e)
         # Ф6 задел: learning-лог — только по реально применённым (доставленным) правкам.
         append_learning_log(state, edits, root=root)
+        # Ф6 (FB10): самообучение — выучить терм-замены из применённых правок в
+        # обратимый append-only лог НА СЕРИЮ. Ленивый импорт (feedback_learning
+        # импортирует этот модуль — иначе цикл). Best-effort: внутри не валит.
+        try:
+            from . import feedback_learning  # noqa: PLC0415
+            feedback_learning.record_learning_from_edits(state, edits, root=root)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[reissue] self-learning hook упал (non-fatal): %s", e)
 
     return res
 
