@@ -92,6 +92,16 @@ class TestExtractMeaning(unittest.TestCase):
         self.assertEqual(fl.extract_meaning_rules("это — хорошо"), [])
         self.assertEqual(fl.extract_meaning_rules("всё — это ерунда"), [])
 
+    def test_opinion_leadin_subject_rejected(self):
+        # Цикл5/Ф3б: зачин-мнение/местоимение → разговорная фраза, НЕ определение
+        # (коннектор-гейт сам по себе её пропускал — закрыто `_MEANING_SUBJECT_LEADINS`).
+        self.assertEqual(fl.extract_meaning_rules("я думаю — это вообще про другое"), [])
+        self.assertEqual(fl.extract_meaning_rules("мы считаем — это важно"), [])
+        self.assertEqual(fl.extract_meaning_rules("по-моему — это ошибка"), [])
+        # А настоящее определение с именным субъектом по-прежнему ловится.
+        out = fl.extract_meaning_rules("июльские проекты — это вывоз Space Projector")
+        self.assertEqual(out, [{"subject": "июльские проекты", "meaning": "вывоз Space Projector"}])
+
 
 # ===========================================================================
 # Метка глобальности
