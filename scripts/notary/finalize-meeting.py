@@ -472,6 +472,27 @@ def _output_dir_for_meta(args, meta: dict) -> tuple[Path, str, str]:
     return base, date_part, f"{date_part}-{sid}.md"
 
 
+def _delivery_marker_meta_path(meta_json_arg: str) -> Path:
+    """Путь к meta-файлу, в который finalize пишет маркер `delivered`.
+
+    Это ИСХОДНАЯ meta встречи (`args.meta_json` = `<transcripts>/<sid>.meta.json`),
+    а НЕ `meta.json` в output-dir рядом с протоколом. Причина (Ф2, REQ 3.1/3.2):
+    маркер обязан лежать в ОДНОМ файле, который читают ОБА потребителя —
+      • дедуп collector'а: `collector._read_meta_obj` → `_delivery_done` берёт
+        ровно `<VPS_TRANSCRIPTS>/<sid>.meta.json` (= `args.meta_json`);
+      • reply-gate правок: `feedback_worker.find_delivered_protocol` сканирует
+        delivered-roots (transcripts-dir в их числе).
+    Туда же пишет `tools/backfill_delivered.py`. Один писатель
+    (`_update_meta_delivered`), один путь, одна форма — НЕ плодить второй (РИСК1).
+
+    РАНЬШЕ путь был `md_path.parent / "meta.json"` (output-dir протокола, который
+    создаётся лениво и `.is_file()` обычно False) → `_update_meta_delivered`
+    получал None, маркер не писался в meta collector'а, и при recovery/повторном
+    тике встреча перевыпускалась дублем (а WAV почищен → ложный rc=3).
+    """
+    return Path(meta_json_arg)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1103,14 +1124,16 @@ def main() -> int:
             delivery_meta = dict(meta)
             delivery_meta["date"] = date_part
             delivery_meta["sessionUid"] = session_uid
-            # meta.json финализированной встречи — для idempotency. Лежит
-            # рядом с транскриптом (collector кладёт meta туда же).
-            meta_json_path = md_path.parent / "meta.json"
+            # Идемпотентность доставки: `delivered` пишем в ИСХОДНУЮ meta встречи
+            # (`args.meta_json`), а не в output-dir рядом с протоколом. Это ровно
+            # тот файл, который читают дедуп collector'а и reply-gate правок —
+            # см. `_delivery_marker_meta_path` (Ф2, REQ 3.1/3.2, РИСК1).
+            meta_json_path = _delivery_marker_meta_path(args.meta_json)
             try:
                 delivery_result = deliver_protocol(
                     meeting_meta=delivery_meta,
                     protocol_text=protocol_text_for_delivery,
-                    meta_json_path=meta_json_path if meta_json_path.is_file() else None,
+                    meta_json_path=meta_json_path,
                     meeting_sid=session_uid,
                 )
             except Exception as e:  # noqa: BLE001
