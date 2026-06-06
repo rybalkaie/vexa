@@ -3269,32 +3269,33 @@ def deliver_protocol(
             "error": "no bot token",
         }
 
-    # Шаг 2: chat_id неизвестен → спрашиваем Илью.
+    # Шаг 2: chat_id неизвестен → правило владельца: нет привязки → доставляем
+    # в личку (TELEGRAM_NOTARIUS_CHAT_ID) АВТОМАТИЧЕСКИ, без вопроса. Привязка серии
+    # (Шаг 1) перебивает это. Старый интерактивный ask_delivery_destination убран:
+    # inline-кнопки (callback_query) листенером не обрабатываются — нажатие «в личку»
+    # не срабатывало, протокол зависал. Правило «нет привязки → личка» однозначно.
     if chat_id is None:
+        owner_chat_raw = (os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID") or "").strip()
         try:
-            ask_path = ask_delivery_destination(
-                meeting_id=meeting_sid or meeting_meta.get("sessionUid") or "unknown",
-                meeting_meta=meeting_meta,
-                bot_token=bot_token,
+            chat_id = int(owner_chat_raw) if owner_chat_raw else None
+        except ValueError:
+            chat_id = None
+        if chat_id is None:
+            logger.warning(
+                "[delivery] meeting=%s нет привязки И TELEGRAM_NOTARIUS_CHAT_ID не задан",
+                meeting_sid or "?",
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[delivery] ask_destination failed: %s", e)
-            ask_path = None
-        if ask_path is None:
             return {
                 "status": "error",
                 "chat_id": None,
                 "message_ids": [],
                 "parts_count": 0,
-                "error": "no chat_id and clarify failed",
+                "error": "no chat_id and no owner fallback",
             }
-        logger.info("[delivery] asked meeting=%s reason=no_binding", meeting_sid or "?")
-        return {
-            "status": "asked",
-            "chat_id": None,
-            "message_ids": [],
-            "parts_count": 0,
-        }
+        logger.info(
+            "[delivery] meeting=%s нет привязки → дефолт в личку chat=%s",
+            meeting_sid or "?", chat_id,
+        )
 
     # Шаг 3: идемпотентность ПЕРЕД дорогой сборкой PDF (RISK3).
     # Доставка теперь — ОДИН PDF-документ, не N текстовых чанков. «Уже
