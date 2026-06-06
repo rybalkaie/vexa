@@ -128,6 +128,18 @@ _PEOPLE_PATHS = (
 # но это редкий путь — обычно meta уже содержит полное имя владельца.
 _OWNER_FALLBACK = {"Илья": "Илья Рыбалка"}
 
+# Латинские/короткие метки владельца из Telemost UI («Ilya R.», «Ilya», «Илья Р.»)
+# — это всегда Илья Рыбалка. Нормализуем (нижний регистр, без точек) и матчим по
+# списку, чтобы шапка протокола не показывала «Илья Рыбалка» и «Ilya R.» как ДВУХ
+# разных участников (баг, замеченный владельцем 2026-06-06).
+_OWNER_CANONICAL = "Илья Рыбалка"
+_OWNER_ALIAS_KEYS = {"илья", "илья р", "ilya", "ilya r", "ilya rybalka"}
+
+
+def _is_owner_alias(name: str) -> bool:
+    key = re.sub(r"[.\s]+", " ", (name or "").strip().lower()).strip()
+    return key in _OWNER_ALIAS_KEYS
+
 
 def _read_people_md() -> Optional[str]:
     """Читает первый существующий people.md из дефолтных путей или env.
@@ -193,6 +205,11 @@ def _resolve_full_name(short_name: str, people_names: list[str]) -> str:
     """
     if not short_name:
         return short_name
+    # Метка владельца («Ilya R.», «Илья Р.» и т.п.) → канон «Илья Рыбалка» ДО
+    # проверки на пробел (иначе «Ilya R.» вернётся как есть и не схлопнется с
+    # курируемым «Илья Рыбалка» — в шапке появятся ДВА участника-владельца).
+    if _is_owner_alias(short_name):
+        return _OWNER_CANONICAL
     if " " in short_name.strip():
         return short_name.strip()
 

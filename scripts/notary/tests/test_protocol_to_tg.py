@@ -324,6 +324,15 @@ class TestResolveFullName(unittest.TestCase):
     def test_owner_fallback_ilia(self):
         """Илья → Илья Рыбалка через _OWNER_FALLBACK, если не в people.md."""
         self.assertEqual(
+            ptg._resolve_full_name("Ilya R.", []), "Илья Рыбалка",
+        )
+        self.assertEqual(
+            ptg._resolve_full_name("Ilya", []), "Илья Рыбалка",
+        )
+        self.assertEqual(
+            ptg._resolve_full_name("Илья Р.", []), "Илья Рыбалка",
+        )
+        self.assertEqual(
             ptg._resolve_full_name("Илья", []),
             "Илья Рыбалка",
         )
@@ -572,6 +581,21 @@ class TestCaptionParticipants(unittest.TestCase):
             })
         # Оба курируемых Михаила; bare-UI «Михаил» (first-name locked) не добавлен.
         self.assertEqual(out, ["Михаил Еремеев", "Михаил Саргин"])
+
+    def test_owner_latin_label_deduped(self):
+        """«Ilya R.» из Telemost UI = владелец → НЕ дублируется с «Илья Рыбалка».
+
+        Боевой кейс 03.06 (директорат/Татьяна): meta.participants=[«Ilya R.», …],
+        expectedParticipants=[«Илья Рыбалка», …] — раньше в шапке появлялись ОБА
+        (латиница не схлопывалась с кириллицей). Замечено владельцем 2026-06-06.
+        """
+        out = ptg._caption_participants({
+            "expectedParticipants": ["Илья Рыбалка", "Михаил Еремеев"],
+            "participants": ["Ilya R.", "Михаил"],
+        })
+        self.assertEqual(out.count("Илья Рыбалка"), 1, "владелец ровно один раз")
+        self.assertNotIn("Ilya R.", out, "латинская метка не должна остаться")
+        self.assertEqual(out[0], "Илья Рыбалка")
 
 
 CAPTION_PROTO = (
