@@ -80,42 +80,28 @@ def _expand_name_forms(name: str) -> set[str]:
     return forms
 
 
-def map_from_speech_regex(
+def _scan_speech_votes(
     turns: list[AlignedTurn],
-    participants: list[str],
-    already_mapped: dict[str, str],
-) -> dict[str, str]:
-    """Ищет vocative обращения «Имя, ...» в начале реплик.
+    name_forms: dict[str, set[str]],
+) -> tuple[
+    dict[tuple[str, str], float],
+    dict[tuple[str, str], float],
+    dict[tuple[str, str], float],
+]:
+    """Сканирует реплики, считает голоса по vocative-обращениям.
 
-    Логика голосования:
-      - Если в реплике cluster A в начале «Имя_X, ...» — A НЕ Имя_X,
-        и следующий speaking cluster B — Имя_X (с весом 1).
-      - Если в реплике cluster A в середине «..., Имя_X, ...» — слабее,
-        тоже даём anti-vote для A (вес 0.5).
+    Возвращает (votes, anti_votes, strict_anti_votes), где ключ — (cluster, name):
+      - votes — «следующий говорящий = это имя» (vocative-сигнал weight >= 1).
+      - anti_votes — «этот cluster упомянул это имя → он НЕ это имя» (любой вес).
+      - strict_anti_votes — то же, но ТОЛЬКО строгий vocative (запятая/знак после
+        имени в начале реплики, weight 2.0). Самый надёжный негативный сигнал:
+        кто окликнул именем N («Михаил, …»), тот точно НЕ N. На нём решается кейс
+        ровно-2-спикера (Ф4а) и валидируется якорь серии (Ф4б).
 
-    В конце greedy: cluster с max(votes_for_name - anti_votes_for_name) > 0
-    получает это имя. Один cluster — одно имя, один name — один cluster.
+    Чистая функция (без IO) — переиспользуется и Source 2, и проверкой якоря.
     """
-    if not participants or len(turns) < 2:
-        return {}
-
-    # Кластеры, для которых уже есть имя — не трогаем.
-    available_clusters = sorted({t.speaker for t in turns if t.speaker and t.speaker not in already_mapped})
-    available_names = [p for p in participants if p not in already_mapped.values()]
-    if not available_clusters or not available_names:
-        return {}
-
-    # Разворачиваем формы имён.
-    name_forms: dict[str, set[str]] = {n: _expand_name_forms(n) for n in available_names}
-
-    # Считаем голоса.
-    votes: dict[tuple[str, str], float] = {}    # (cluster, name) → score
+    votes: dict[tuple[str, str], float] = {}
     anti_votes: dict[tuple[str, str], float] = {}
-    # Ф4а: строгие vocative-обращения (запятая/знак после имени в НАЧАЛЕ реплики,
-    # weight 2.0) — отдельным счётчиком. Это самый надёжный НЕГАТИВНЫЙ сигнал:
-    # кто окликнул именем N («Михаил, …»), тот точно НЕ N (себя так не окликают).
-    # На нём решаем кейс ровно-2-спикера, где forward-голос («следующий = N»)
-    # инвертирует авторство (директорат 03.06: Илья↔Михаил перепутались).
     strict_anti_votes: dict[tuple[str, str], float] = {}
 
     for i, turn in enumerate(turns):
@@ -171,6 +157,38 @@ def map_from_speech_regex(
             # Mention-only (weight < 1) — не назначаем имя, только anti-vote.
             if weight >= 1.0 and next_cluster:
                 votes[(next_cluster, name)] = votes.get((next_cluster, name), 0.0) + weight
+
+    return votes, anti_votes, strict_anti_votes
+
+
+def map_from_speech_regex(
+    turns: list[AlignedTurn],
+    participants: list[str],
+    already_mapped: dict[str, str],
+) -> dict[str, str]:
+    """Ищет vocative обращения «Имя, ...» в начале реплик.
+
+    Логика голосования:
+      - Если в реплике cluster A в начале «Имя_X, ...» — A НЕ Имя_X,
+        и следующий speaking cluster B — Имя_X (с весом 1).
+      - Если в реплике cluster A в середине «..., Имя_X, ...» — слабее,
+        тоже даём anti-vote для A (вес 0.5).
+
+    В конце greedy: cluster с max(votes_for_name - anti_votes_for_name) > 0
+    получает это имя. Один cluster — одно имя, один name — один cluster.
+    """
+    if not participants or len(turns) < 2:
+        return {}
+
+    # Кластеры, для которых уже есть имя — не трогаем.
+    available_clusters = sorted({t.speaker for t in turns if t.speaker and t.speaker not in already_mapped})
+    available_names = [p for p in participants if p not in already_mapped.values()]
+    if not available_clusters or not available_names:
+        return {}
+
+    # Разворачиваем формы имён и считаем голоса (вынесено в _scan_speech_votes).
+    name_forms: dict[str, set[str]] = {n: _expand_name_forms(n) for n in available_names}
+    votes, anti_votes, strict_anti_votes = _scan_speech_votes(turns, name_forms)
 
     # Ф4а: спец-случай ровно 2 спикера и 2 имени. Forward-голос («следующий
     # говорящий = названное имя») на двух спикерах ненадёжен и переворачивает
@@ -254,17 +272,87 @@ def _resolve_two_speakers(
     return {c0: n1, c1: n0}
 
 
+# ---------- Ф4б: якорь авторства из памяти серии ----------
+
+def _apply_series_anchor(
+    turns: list[AlignedTurn],
+    clusters: list[str],
+    participants: list[str],
+    anchor: dict[str, str],
+) -> dict[str, str]:
+    """Ф4б: применяет закреплённое человеком сопоставление спикер→имя из памяти серии.
+
+    `anchor` = `{cluster: name}` из выжимки прошлой встречи серии (REQ 1.2). Человек
+    поправил авторство реплаем → это закрепление БЬЁТ начальную догадку Ф4а. Но
+    применяем ТОЛЬКО валидные и НЕпротиворечивые записи (защита от инверсии,
+    которую Ф4а закрыла; метки S1/S2 нестабильны между джобами — см. РИСК-диаризация):
+      • cluster существует в текущей встрече И имя в составе участников;
+      • НИ ОДНА запись не противоречит строгому vocative ТЕКУЩЕЙ записи. Если в
+        текущей встрече cluster C сам окликнул имя N («N, …») — он точно НЕ N; значит
+        якорь C→N неверен. А так как метки S1/S2 между джобами нестабильны, ЛЮБОЕ
+        такое противоречие означает, что метки этого якоря НЕ соответствуют текущей
+        джобе → ВЕСЬ якорь недостоверен и отбрасывается целиком (иначе уцелевшая
+        половина инвертированного якоря дотянула бы инверсию через Source 1 по
+        исключению). При расхождении current-evidence всегда побеждает — Ф4а-фолбэк
+        чинит авторство сам.
+
+    Возвращает применимые записи `{cluster: name}` (один cluster — одно имя), либо
+    `{}` если якорь невалиден/противоречив.
+    """
+    if not anchor:
+        return {}
+    cluster_set = set(clusters)
+    name_set = set(participants)
+    cands = {
+        str(c): str(n)
+        for c, n in anchor.items()
+        if str(c) in cluster_set and str(n) in name_set
+    }
+    if not cands:
+        return {}
+
+    # Строгий vocative текущей встречи — для проверки на противоречие.
+    name_forms = {n: _expand_name_forms(n) for n in set(cands.values())}
+    _, _, strict_anti_votes = _scan_speech_votes(turns, name_forms)
+    contradicted = any(strict_anti_votes.get((c, n), 0.0) > 0 for c, n in cands.items())
+    if contradicted:
+        logger.info(
+            "Ф4б series anchor: противоречие строгому vocative → отбрасываем весь якорь "
+            "(метки не соответствуют текущей джобе)"
+        )
+        return {}
+
+    out: dict[str, str] = {}
+    used_names: set[str] = set()
+    for cluster, name in cands.items():
+        if name in used_names:
+            continue  # дедуп: одно имя на один cluster
+        out[cluster] = name
+        used_names.add(name)
+    if out:
+        logger.info("Ф4б series anchor: applied=%d cluster(s)", len(out))
+    return out
+
+
 # ---------- Оркестрация ----------
 
 def map_all(
     turns: list[AlignedTurn],
     participants: list[str],
+    *,
+    anchor: Optional[dict[str, str]] = None,
 ) -> MappingResult:
-    """Прогоняет детерминированные источники S1+S2 по очереди.
+    """Прогоняет детерминированные источники по очереди: якорь серии → S1 → S2.
+
+    `anchor` (Ф4б, REQ 1.2) — закреплённое человеком сопоставление спикер→имя из
+    памяти серии. Применяется ПЕРВЫМ (бьёт догадку Ф4а), но лишь валидные и
+    непротиворечивые записи (см. `_apply_series_anchor`). Догадка Ф4а
+    (`map_from_speech_regex`/`_resolve_two_speakers`) остаётся фолбэком для
+    незакреплённых кластеров. `anchor=None` → поведение Ф4а без изменений.
 
     LLM-добивка (бывший Source 3 / Claude Haiku) вынесена в
     `lib/llm_postprocess.py::map_speaker_names` и вызывается отдельно из
-    `finalize-meeting.py` для unresolved'ов после S1+S2.
+    `finalize-meeting.py` для unresolved'ов после якоря+S1+S2.
     """
     clusters = sorted({t.speaker for t in turns if t.speaker})
     cluster_to_name: dict[str, str] = {}
@@ -273,13 +361,22 @@ def map_all(
     if not clusters:
         return MappingResult(cluster_to_name={}, sources_used=[], unresolved_clusters=[])
 
-    # 1) Telemost list
-    delta = map_from_telemost_list(clusters, participants)
+    # 0) Ф4б: якорь авторства из памяти серии (бьёт догадку, но валидируется).
+    if anchor:
+        delta = _apply_series_anchor(turns, clusters, participants, anchor)
+        if delta:
+            cluster_to_name.update(delta)
+            sources_used.append("series_anchor")
+
+    # 1) Telemost list (по свободным от якоря кластерам/именам).
+    free_clusters = [c for c in clusters if c not in cluster_to_name]
+    free_names = [p for p in participants if p not in cluster_to_name.values()]
+    delta = map_from_telemost_list(free_clusters, free_names)
     if delta:
         cluster_to_name.update(delta)
         sources_used.append("telemost_list")
 
-    # 2) Regex + pymorphy3
+    # 2) Regex + pymorphy3 (already_mapped исключает закреплённое якорем/S1).
     delta = map_from_speech_regex(turns, participants, cluster_to_name)
     if delta:
         cluster_to_name.update(delta)

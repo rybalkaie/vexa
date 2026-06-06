@@ -34,7 +34,9 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -127,6 +129,169 @@ def build_edit_instruction(edits: Optional[list]) -> str:
         return ""
     body = "\n".join(f"{i}. [{a}]: {t}" for i, (a, t) in enumerate(items, 1))
     return ANTI_INJECTION_HEADER + "\n\n" + body
+
+
+# --------------------------------------------------------------------------
+# Ф4б (REQ 1.4): детерминированный remap авторства из правок реплаем
+# --------------------------------------------------------------------------
+# Корень: правку авторства («это не Илья, а Михаил») нельзя чинить LLM-правкой-
+# данными — перевыпуск читает транскрипт с запечёнными именами и НЕ пере-мапит
+# спикеров, своп через LLM недетерминирован (РИСК3). Поэтому такие правки
+# распознаём ДО регенерации и применяем как детерминированный remap метки/имени
+# в транскрипте (тот же механизм, что clarify-resolution), а в LLM-блок их НЕ
+# отдаём. Остальные (контентные) правки идут в LLM как прежде.
+#
+# Парсер light (stdlib, без pymorphy3 — listener на системном python3.9): матчим
+# по точному/первословному совпадению с участниками. Незнакомую формулировку НЕ
+# трогаем — она остаётся контентной правкой (фолбэк на LLM, не регресс). Имена в
+# именительном падеже («не Илья, а Михаил») разбираются надёжно; склонённые формы
+# («поменяй Илью и Михаила») парсер может не распознать → фолбэк на LLM.
+
+# Один токен-имя: слово, начинающееся с буквы (Unicode), без захвата соседних слов
+# через разделители («а», «это») — поэтому одно слово; двусловные имена резолвятся
+# по первому слову против пула участников.
+_NAME1 = r"([^\W\d_][\w\-]*)"
+# Разделитель присвоения «Спикер N <sep> Имя».
+_ASSIGN_SEP = r"(?:=>|->|→|—>|=|—|–|-|:|это|—\s*это)"
+
+
+def _norm_author_token(s: str) -> str:
+    return (s or "").strip().strip(",.;:!?\"'«»()[]").lower()
+
+
+def extract_current_speakers(transcript_text: str) -> list[str]:
+    """Отображаемые метки/имена спикеров из тела транскрипта (`**[ts] X:**`).
+
+    Это и валидные ключи remap'а (что реально стоит в файле), и кандидаты на своп.
+    «Спикер ?» (артефакт alignment) исключаем. Порядок сохраняем, без дублей.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\*\*\[\d{2}:\d{2}(?::\d{2})?\] (.+?):\*\*", transcript_text or ""):
+        s = m.group(1).strip()
+        if s and s != "Спикер ?" and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _author_name_pool(meta: Optional[dict]) -> list[str]:
+    """Пул валидных имён-целей для правки авторства: expected ∪ panel из meta."""
+    meta = meta or {}
+    pool: list[str] = []
+    seen: set[str] = set()
+    for n in list(meta.get("expectedParticipants") or []) + list(meta.get("participants") or []):
+        if isinstance(n, str) and n.strip() and n not in seen:
+            seen.add(n)
+            pool.append(n.strip())
+    return pool
+
+
+def parse_authorship_remap(
+    edits: Optional[list],
+    current_speakers: list[str],
+    name_pool: list[str],
+) -> tuple[dict[str, str], set[int]]:
+    """Ф4б: детектит правки авторства и собирает детерминированный remap.
+
+    Возвращает (`remap`, `authorship_idx`):
+      • `remap` — `{текущая_метка_или_имя: новое_имя}` для применения к транскрипту
+        (своп-безопасно через `remap_transcript_speakers`); ключи — РОВНО как стоят
+        в файле (из `current_speakers`), значения — отображаемое имя другого спикера
+        (своп) или имя из пула участников (присвоение).
+      • `authorship_idx` — индексы правок, распознанных как авторские (исключаются
+        из контентного LLM-блока и из term/meaning-обучения, чтобы не отравить его).
+
+    Консервативно: запись попадает в remap только если ОБА конца резолвятся
+    (метка/имя есть на встрече). Иначе правка остаётся контентной.
+    """
+    remap: dict[str, str] = {}
+    matched: set[int] = set()
+    if not edits or not current_speakers:
+        return remap, matched
+
+    cur_exact = {_norm_author_token(c): c for c in current_speakers}
+    cur_first: dict[str, str] = {}
+    for c in current_speakers:
+        fw = c.split()[0] if c.split() else c
+        cur_first.setdefault(_norm_author_token(fw), c)
+    pool_exact = {_norm_author_token(n): n for n in name_pool}
+    pool_first: dict[str, str] = {}
+    for n in name_pool:
+        fw = n.split()[0] if n.split() else n
+        pool_first.setdefault(_norm_author_token(fw), n)
+
+    def resolve_current(tok: str) -> Optional[str]:
+        k = _norm_author_token(tok)
+        if not k:
+            return None
+        return cur_exact.get(k) or cur_first.get(k)
+
+    def resolve_target(tok: str) -> tuple[Optional[str], bool]:
+        """(имя, это_текущий_спикер). Сначала среди отображаемых (→ своп), потом пул."""
+        k = _norm_author_token(tok)
+        if not k:
+            return None, False
+        z = cur_exact.get(k) or cur_first.get(k)
+        if z:
+            return z, True
+        return (pool_exact.get(k) or pool_first.get(k)), False
+
+    def add(x_tok: str, y_tok: str) -> bool:
+        cur = resolve_current(x_tok)
+        tgt, tgt_is_current = resolve_target(y_tok)
+        if not cur or not tgt or cur == tgt:
+            return False
+        if tgt_is_current:
+            # X и target оба отображаются → своп их меток (авторство перепутано).
+            remap.setdefault(cur, tgt)
+            remap.setdefault(tgt, cur)
+        else:
+            remap.setdefault(cur, tgt)  # присвоение нового имени
+        return True
+
+    for idx, e in enumerate(edits):
+        text = (e.get("text") if isinstance(e, dict) else "") or ""
+        if not text.strip():
+            continue
+        hit = False
+
+        # A. Метка: «Спикер N <sep> Имя» (ключ нормализуем к «Спикер N»).
+        for m in re.finditer(r"(?i)спикер\s*(\d+)\s*" + _ASSIGN_SEP + r"\s*" + _NAME1, text):
+            if add(f"Спикер {m.group(1)}", m.group(2)):
+                hit = True
+
+        # B. Отрицание: «(это) не X, (а|это) Y».
+        for m in re.finditer(
+            r"(?i)\bне\s+" + _NAME1 + r"\s*,?\s*(?:а|это)\s+" + _NAME1, text
+        ):
+            if add(m.group(1), m.group(2)):
+                hit = True
+
+        # C. Стрелка/равенство имя→имя: «X -> Y» / «X = Y».
+        for m in re.finditer(
+            r"(?i)" + _NAME1 + r"\s*(?:=>|->|→|—>|=)\s*" + _NAME1, text
+        ):
+            if add(m.group(1), m.group(2)):
+                hit = True
+
+        # D. Своп: «поменяй/перепутаны ... X ... Y» / «X и Y местами/наоборот».
+        if re.search(r"(?i)перепута|помен[яе]|наоборот|местами", text):
+            names = []
+            for m in re.finditer(_NAME1, text):
+                z = resolve_current(m.group(1))
+                if z and z not in names:
+                    names.append(z)
+            if len(names) == 2:
+                a, b = names
+                remap.setdefault(a, b)
+                remap.setdefault(b, a)
+                hit = True
+
+        if hit:
+            matched.add(idx)
+
+    return remap, matched
 
 
 # --------------------------------------------------------------------------
@@ -310,80 +475,150 @@ def reissue_one(
     if not protocol_path or not protocol_path.is_file():
         return {"status": "error", "error": f"protocol missing for {series}/{date}"}
 
-    # FB7: правки → данные (санитизация + anti-injection-рамка) ДО промпта.
-    instruction_block = build_edit_instruction(edits)
-    if not instruction_block:
-        return {"status": "no-edits"}
-
     lp = _lp()
     generate_fn = generate_fn or _default_generate
     redeliver_fn = redeliver_fn or lp.redeliver_revised_protocol
     save_version_fn = save_version_fn or lp._save_protocol_version
 
     try:
+        old_transcript_text = transcript_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return {"status": "error", "error": f"read transcript: {e}"}
+
+    # Ф4б (РИСК3): распознаём правки АВТОРСТВА и применяем их как детерминированный
+    # remap метки/имени в транскрипте ДО регенерации — НЕ через LLM-правку-данные
+    # (своп через LLM недетерминирован: перевыпуск читает запечённые имена и не
+    # пере-мапит). Авторские правки исключаем из контентного LLM-блока И из
+    # term/meaning-обучения (иначе «не Илья, а Михаил» отравит словарь написаний).
+    current_speakers = extract_current_speakers(old_transcript_text)
+    remap, authorship_idx = parse_authorship_remap(
+        edits, current_speakers, _author_name_pool(meta)
+    )
+    content_edits = [e for i, e in enumerate(edits) if i not in authorship_idx]
+
+    # FB7: контентные правки → данные (санитизация + anti-injection-рамка) ДО промпта.
+    instruction_block = build_edit_instruction(content_edits)
+    if not instruction_block and not remap:
+        return {"status": "no-edits"}
+
+    # Remapped транскрипт держим В ПАМЯТИ; на диск коммитим ТОЛЬКО при успешной
+    # доставке (как протокол) — ретрай-безопасно: на сбое транскрипт остаётся
+    # исходным, повторный проход пере-применит remap с нуля (своп не схлопнётся).
+    new_transcript_text = (
+        lp.remap_transcript_speakers(old_transcript_text, remap)
+        if remap else old_transcript_text
+    )
+    transcript_changed = bool(remap) and new_transcript_text != old_transcript_text
+
+    try:
         old_text = protocol_path.read_text(encoding="utf-8")
     except OSError as e:
         return {"status": "error", "error": f"read protocol: {e}"}
 
-    # Перегенерация протокола из транскрипта + правки-как-данные (FB6/FB7).
-    meeting_meta = _meeting_meta_for_regen(state, meta, transcript_path, instruction_block)
-    try:
-        new_text = generate_fn(transcript_path, meeting_meta, state.get("feedback_id"))
-    except Exception as e:  # noqa: BLE001  (claude/CLI/любой сбой регена → revert)
-        return {"status": "error", "error": f"regen: {e}"}
-    if not new_text or not new_text.strip():
-        return {"status": "error", "error": "empty regenerated protocol"}
-    if new_text.strip() == old_text.strip():
-        return {"status": "no-change"}  # правки не изменили содержание — чат не трогаем
-
-    # FB5: удалить старое сообщение(+файл) + постить новую версию + «🔁 Что изменилось».
-    # АТОМАРНОСТЬ РЕТРАЯ (цикл5/Н1): доставку делаем ДО мутации диска. redeliver берёт
-    # old/new текстом-аргументом и протокол с диска НЕ читает — переписывать файл заранее
-    # незачем. Если доставка упадёт (сеть/Telegram), на диске остаётся ОРИГИНАЛ: следующий
-    # sweep перечитает корректный old_text и повторит честно. Иначе перезаписанный файл
-    # схлопнул бы ретрай в no-change (new==old) → тихая недосдача протокола.
-    redeliver_meta = _meeting_meta_for_redeliver(state, meta)
-    try:
-        res = redeliver_fn(
-            redeliver_meta, old_text, new_text,
-            meta_json_path=meta_path if meta_path.is_file() else None,
-            meeting_sid=state.get("feedback_id"),
-            delete_previous=True,
-        )
-    except Exception as e:  # noqa: BLE001
-        return {"status": "error", "error": f"redeliver: {e}"}
-    if not isinstance(res, dict):
-        return {"status": "error", "error": "redeliver returned non-dict"}
-
-    # Диск трогаем ТОЛЬКО когда новая версия реально доставлена (status=="sent"):
-    # архив прежней версии (читает ещё-старый файл — корректно) + перезапись протокола.
-    # На любом не-sent (error/skipped/not-delivered-yet/disabled) файл не трогаем —
-    # ретрай/закрытие остаются корректными (Н1, Н2: meta=None → не постит → не мутируем).
-    if res.get("status") == "sent":
+    # Вход генерации — путь (контракт generate_fn). При remap пишем remapped-текст
+    # во временный sibling и генерим из него; реальный транскрипт не трогаем до sent.
+    gen_input_path = transcript_path
+    remap_tmp: Optional[Path] = None
+    if transcript_changed:
         try:
-            save_version_fn(protocol_path)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[reissue] архив версии не удался (non-fatal) %s: %s", protocol_path, e)
-        try:
-            lp._atomic_write_text(protocol_path, new_text)
+            fd, tmp_s = tempfile.mkstemp(
+                prefix=f".{transcript_path.name}.remap.", suffix=".tmp",
+                dir=str(transcript_path.parent),
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(new_transcript_text)
+            remap_tmp = Path(tmp_s)
+            gen_input_path = remap_tmp
         except OSError as e:
-            # Доставка УЖЕ прошла (участники видят новую версию) — не валим в error,
-            # иначе ретрай задвоит пост официального протокола. Диск-архив отстанет,
-            # выправится на следующем раунде правок.
-            logger.error("[reissue] протокол доставлен, но запись на диск не удалась "
-                         "(non-fatal, во избежание повторной доставки) %s: %s", protocol_path, e)
-        # Ф6 задел: learning-лог — только по реально применённым (доставленным) правкам.
-        append_learning_log(state, edits, root=root)
-        # Ф6 (FB10): самообучение — выучить терм-замены из применённых правок в
-        # обратимый append-only лог НА СЕРИЮ. Ленивый импорт (feedback_learning
-        # импортирует этот модуль — иначе цикл). Best-effort: внутри не валит.
-        try:
-            from . import feedback_learning  # noqa: PLC0415
-            feedback_learning.record_learning_from_edits(state, edits, root=root)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[reissue] self-learning hook упал (non-fatal): %s", e)
+            # Не смогли подготовить remapped-вход — не молча теряем правку авторства.
+            return {"status": "error", "error": f"remap tmp: {e}"}
 
-    return res
+    try:
+        # Перегенерация: remapped транскрипт + контентные правки-как-данные (FB6/FB7).
+        meeting_meta = _meeting_meta_for_regen(state, meta, transcript_path, instruction_block)
+        try:
+            new_text = generate_fn(gen_input_path, meeting_meta, state.get("feedback_id"))
+        except Exception as e:  # noqa: BLE001  (claude/CLI/любой сбой регена → revert)
+            return {"status": "error", "error": f"regen: {e}"}
+        if not new_text or not new_text.strip():
+            return {"status": "error", "error": "empty regenerated protocol"}
+        if new_text.strip() == old_text.strip():
+            return {"status": "no-change"}  # ни remap, ни правки не изменили протокол
+
+        # FB5: удалить старое сообщение(+файл) + постить новую версию + «🔁 Что изменилось».
+        # АТОМАРНОСТЬ РЕТРАЯ (цикл5/Н1): доставку делаем ДО мутации диска. redeliver берёт
+        # old/new текстом-аргументом и протокол с диска НЕ читает. Если доставка упадёт
+        # (сеть/Telegram), на диске остаётся ОРИГИНАЛ (и протокол, и транскрипт):
+        # следующий sweep перечитает корректный old и повторит честно.
+        redeliver_meta = _meeting_meta_for_redeliver(state, meta)
+        try:
+            res = redeliver_fn(
+                redeliver_meta, old_text, new_text,
+                meta_json_path=meta_path if meta_path.is_file() else None,
+                meeting_sid=state.get("feedback_id"),
+                delete_previous=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "error": f"redeliver: {e}"}
+        if not isinstance(res, dict):
+            return {"status": "error", "error": "redeliver returned non-dict"}
+
+        # Диск трогаем ТОЛЬКО когда новая версия реально доставлена (status=="sent"):
+        # архив прежней версии + перезапись протокола (+ Ф4б: коммит remapped транскрипта).
+        # На любом не-sent (error/skipped/not-delivered-yet/disabled) файлы не трогаем.
+        if res.get("status") == "sent":
+            # Ф4б: коммит remapped транскрипта — чтобы исправленное авторство пережило
+            # будущие перевыпуски (протокол всегда генерится из транскрипта).
+            if transcript_changed:
+                try:
+                    lp._atomic_write_text(transcript_path, new_transcript_text)
+                except OSError as e:
+                    logger.error("[reissue] протокол доставлен, но remap транскрипта не "
+                                 "записан (non-fatal) %s: %s", transcript_path, e)
+            try:
+                save_version_fn(protocol_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[reissue] архив версии не удался (non-fatal) %s: %s", protocol_path, e)
+            try:
+                lp._atomic_write_text(protocol_path, new_text)
+            except OSError as e:
+                # Доставка УЖЕ прошла (участники видят новую версию) — не валим в error,
+                # иначе ретрай задвоит пост официального протокола. Диск-архив отстанет,
+                # выправится на следующем раунде правок.
+                logger.error("[reissue] протокол доставлен, но запись на диск не удалась "
+                             "(non-fatal, во избежание повторной доставки) %s: %s", protocol_path, e)
+            # Ф4б (REQ 1.2): память серии несёт исправленное авторство вперёд —
+            # применяем тот же name-remap к speaker_mapping выжимки встречи. Ленивый
+            # импорт (series_memory stdlib), best-effort: сбой не валит перевыпуск.
+            if remap:
+                try:
+                    from . import series_memory  # noqa: PLC0415
+                    series_memory.update_digest_speaker_mapping(
+                        transcript_path.parent, date, remap,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[reissue] digest speaker_mapping update упал (non-fatal): %s", e)
+            # Ф6 задел: learning-лог + самообучение — ТОЛЬКО по реально применённым
+            # КОНТЕНТНЫМ правкам (авторские учтены детерминированным remap'ом; в
+            # term/meaning-лог их НЕ пускаем, иначе «не Илья, а Михаил» отравит
+            # словарь написаний). Чисто-авторский перевыпуск (content_edits пуст) →
+            # не плодим пустую learning-запись.
+            if content_edits:
+                append_learning_log(state, content_edits, root=root)
+                # Ленивый импорт (feedback_learning импортирует этот модуль — иначе цикл).
+                try:
+                    from . import feedback_learning  # noqa: PLC0415
+                    feedback_learning.record_learning_from_edits(state, content_edits, root=root)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[reissue] self-learning hook упал (non-fatal): %s", e)
+
+        return res
+    finally:
+        if remap_tmp is not None and remap_tmp.exists():
+            try:
+                remap_tmp.unlink()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------

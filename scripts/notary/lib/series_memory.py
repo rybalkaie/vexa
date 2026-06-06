@@ -251,11 +251,31 @@ def extract_protocol_sections(protocol_text: str) -> tuple[list[str], list[str]]
     return themes[:_MAX_THEMES], key_points
 
 
+def _norm_speaker_mapping(speaker_mapping: Optional[dict]) -> dict[str, str]:
+    """Ф4б: нормализует cluster→name маппинг для хранения в выжимке.
+
+    Пустые ключи/значения отбрасываем; всё к строкам. Возвращает {} если нечего
+    хранить (тогда build_digest не кладёт ключ — поле остаётся ленивым, УПУ3).
+    """
+    out: dict[str, str] = {}
+    if not isinstance(speaker_mapping, dict):
+        return out
+    for cluster, name in speaker_mapping.items():
+        if cluster is None or name is None:
+            continue
+        c = str(cluster).strip()
+        n = str(name).strip()
+        if c and n:
+            out[c] = n
+    return out
+
+
 def build_digest(
     protocol_text: str,
     meeting_meta: dict,
     *,
     date: Optional[str] = None,
+    speaker_mapping: Optional[dict] = None,
 ) -> dict:
     """7.1: компактная выжимка-память из готового протокола.
 
@@ -265,6 +285,11 @@ def build_digest(
     участники, а не приглашённые-но-отсутствовавшие — важно для матчинга серии
     по составу (7.2) и постоянного состава (7-связка). Работает и для бэкфилла,
     где meta нет. themes/key_points — из протокола. НЕ кладём сырые реплики (РИСК4).
+
+    Ф4б (REQ 1.2): `speaker_mapping` — резолвленное на этой встрече сопоставление
+    cluster→имя (после правок авторства). Кладём ленивым ключом ТОЛЬКО если непусто
+    (нет ключа в старых файлах → resolve_speaker_anchor вернёт {}, миграции/бэкфилл
+    не нужны, УПУ3). НЕ ПДн сверх уже хранимого: имена и так есть в `participants`.
 
     Возвращает dict со схемой v1. `date` — YYYY-MM-DD (из аргумента или meta).
     """
@@ -279,7 +304,7 @@ def build_digest(
         participants = _norm_participants(list(panel) + list(expected))
 
     themes, key_points = extract_protocol_sections(protocol_text or "")
-    return {
+    digest: dict = {
         "schema": SCHEMA_VERSION,
         "date": dt,
         "series": series,
@@ -287,6 +312,10 @@ def build_digest(
         "themes": themes,
         "key_points": key_points,
     }
+    sm = _norm_speaker_mapping(speaker_mapping)
+    if sm:
+        digest["speaker_mapping"] = sm
+    return digest
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +620,62 @@ def resolve_memory(
     except Exception as e:  # noqa: BLE001
         logger.warning("[series-memory] participant-fallback failed (non-fatal): %s", e)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Ф4б — якорь авторства серии (cluster→имя) для диаризации (REQ 1.2)
+# ---------------------------------------------------------------------------
+def resolve_speaker_anchor(digests: list[dict]) -> dict[str, str]:
+    """Ф4б: последнее непустое `speaker_mapping` среди выжимок серии.
+
+    `digests` — как из `resolve_memory` (по дате ВОЗРАСТАНИЮ). Берём самое свежее
+    непустое сопоставление cluster→имя (последняя правка авторства бьёт ранние).
+    Ленивое поле: нет ключа в старых файлах → {} (бэкфилл/миграция не нужны, УПУ3).
+
+    NB (РИСК-диаризация): метки S1/S2 нестабильны между джобами, поэтому якорь —
+    паллиатив; в `map_all` он применяется с валидацией строгим vocative текущей
+    встречи (см. `name_mapping._apply_series_anchor`), чтобы не вернуть инверсию.
+    """
+    anchor: dict[str, str] = {}
+    for dig in digests or []:
+        sm = dig.get("speaker_mapping") if isinstance(dig, dict) else None
+        norm = _norm_speaker_mapping(sm)
+        if norm:
+            anchor = norm  # ascending → последняя непустая выжимка побеждает
+    return anchor
+
+
+def update_digest_speaker_mapping(
+    series_dir: Path, date: str, remap: dict[str, str]
+) -> bool:
+    """Ф4б (REQ 1.2): применяет name-remap к `speaker_mapping` выжимки встречи.
+
+    Зовётся из перевыпуска (`feedback_reissue`) при правке авторства реплаем —
+    чтобы память серии понесла ИСПРАВЛЕННОЕ авторство вперёд. `remap` —
+    `{старое_имя_или_метка: новое_имя}` (тот же, что применён к транскрипту);
+    применяем к ЗНАЧЕНИЯМ (именам) хранимого cluster→имя. Своп-безопасно:
+    каждое значение мапится независимо через `remap.get(v, v)`.
+
+    Ленивое/идемпотентно: нет файла выжимки / нет ключа `speaker_mapping` /
+    remap ничего не меняет → no-op, возвращает False. Бэкфилл не нужен.
+    """
+    if not remap or not date:
+        return False
+    path = digest_path(series_dir, date)
+    dig = load_digest(path)
+    if not dig:
+        return False
+    sm = _norm_speaker_mapping(dig.get("speaker_mapping"))
+    if not sm:
+        return False
+    new_sm = {c: remap.get(n, n) for c, n in sm.items()}
+    if new_sm == sm:
+        return False
+    dig["speaker_mapping"] = new_sm
+    saved = save_digest(series_dir, date, dig)
+    if saved:
+        logger.info("[series-memory] speaker_mapping remapped series=%s date=%s", dig.get("series") or "?", date)
+    return bool(saved)
 
 
 # ---------------------------------------------------------------------------

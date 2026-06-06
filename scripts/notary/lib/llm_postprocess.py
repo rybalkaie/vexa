@@ -578,6 +578,36 @@ def parse_clarify_text_answer(
 
 # --- Atomic apply mapping в transcript-файл ----------------------------
 
+# Строка реплики транскрипта: `**[01:23] <label>:** текст` или
+# `**[01:23:45] <label>:** текст`. Группы: (префикс с таймкодом)(label/имя)(суффикс).
+# `<label>` ленивый до первого `:**` — имена/«Спикер N» двоеточий не содержат.
+_TRANSCRIPT_SPEAKER_RE = re.compile(
+    r"(\*\*\[\d{2}:\d{2}(?::\d{2})?\] )(.+?)(:\*\*)"
+)
+
+
+def remap_transcript_speakers(text: str, remap: dict[str, str]) -> str:
+    """Ф4б: своп-безопасная замена меток/имён спикеров в теле транскрипта.
+
+    `remap`: `{текущая_метка_или_имя: новое_имя}` (напр. `{"Илья": "Михаил",
+    "Михаил": "Илья"}` для свопа авторства, или `{"Спикер 3": "Дарья"}`). В отличие
+    от последовательных `subn` (которые на свопе схлопываются), делаем ОДИН проход:
+    каждую строку `**[ts] X:**` смотрим в `remap` и заменяем X независимо — поэтому
+    своп Илья↔Михаил применяется корректно. Если X нет в `remap` — строку не трогаем.
+    """
+    if not remap or not text:
+        return text
+
+    def _repl(m: "re.Match") -> str:
+        cur = m.group(2)
+        new = remap.get(cur)
+        if new is None:
+            return m.group(0)
+        return m.group(1) + new + m.group(3)
+
+    return _TRANSCRIPT_SPEAKER_RE.sub(_repl, text)
+
+
 def apply_clarify_mapping_to_transcript(
     transcript_path: Path,
     label_to_name: dict[str, str],
@@ -590,7 +620,9 @@ def apply_clarify_mapping_to_transcript(
     Не падает если файла нет — возвращает False.
 
     Завязка на формат `render.py`: `**[<ts>] <label>:**` с label ровно
-    в виде «Спикер N». render.py:_speaker_label это гарантирует.
+    в виде «Спикер N». render.py:_speaker_label это гарантирует. Ф4б: замена
+    своп-безопасна (один проход через `remap_transcript_speakers`) — clarify-кейс
+    (метки→имена, ключи и значения не пересекаются) ведёт себя как прежде.
     """
     if not transcript_path.exists():
         logger.warning("[clarify-apply] transcript missing: %s", transcript_path)
@@ -603,16 +635,9 @@ def apply_clarify_mapping_to_transcript(
         logger.warning("[clarify-apply] read failed: %s", e)
         return False
 
-    new_text = text
-    for label, name in label_to_name.items():
-        # `**[01:23] Спикер 3:**`  → `**[01:23] Дарья Набережная:**`
-        pat = re.compile(
-            r"(\*\*\[\d{2}:\d{2}(?::\d{2})?\] )"
-            + re.escape(label)
-            + r"(:\*\*)"
-        )
-        new_text, n = pat.subn(r"\g<1>" + name + r"\g<2>", new_text)
-        logger.info("[clarify-apply] %s → %s replaced=%d", label, name, n)
+    new_text = remap_transcript_speakers(text, label_to_name)
+    logger.info("[clarify-apply] remap labels=%d changed=%s",
+                len(label_to_name), new_text != text)
 
     if new_text == text:
         return False

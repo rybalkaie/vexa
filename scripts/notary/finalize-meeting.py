@@ -626,6 +626,10 @@ def main() -> int:
     series_dir, date_part, _md_name_early = _output_dir_for_meta(args, meta)
     series_memory_digests: list[dict] = []
     series_memory_block = ""
+    # Ф4б (REQ 1.2): закреплённое человеком сопоставление спикер→имя из памяти серии
+    # (правка авторства реплаем на прошлой встрече). Подаётся якорем в map_all ДО
+    # догадки Ф4а. {} если нет/старые файлы без ключа (ленивое поле, УПУ3).
+    series_speaker_anchor: dict[str, str] = {}
     _expected_base = [n for n in expected if n]
     expected_enriched: list[str] = list(dict.fromkeys(_expected_base))
     try:
@@ -639,6 +643,7 @@ def main() -> int:
                 if nm not in expected_enriched:
                     expected_enriched.append(nm)
             series_memory_block = series_memory.format_memory_block(series_memory_digests)
+            series_speaker_anchor = series_memory.resolve_speaker_anchor(series_memory_digests)
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d",
                 session_uid, meta.get("series") or "?", len(series_memory_digests),
@@ -762,9 +767,9 @@ def main() -> int:
     if getattr(args, "_test_fail_after_stt", False):
         raise RuntimeError("smoke: симуляция exception после STT (тест атомарности)")
 
-    # 3. Маппинг имён: детерминированные S1+S2, затем LLM-добивка для остатка.
-    log.info("Step 4/5 — Name mapping (S1+S2 deterministic, then LLM)")
-    mapping_result = map_all(turns, participants_union)
+    # 3. Маппинг имён: Ф4б якорь серии → детерминированные S1+S2 → LLM-добивка остатка.
+    log.info("Step 4/5 — Name mapping (series-anchor + S1+S2 deterministic, then LLM)")
+    mapping_result = map_all(turns, participants_union, anchor=series_speaker_anchor)
     cluster_to_name: dict[str, str] = dict(mapping_result.cluster_to_name)
     sources_used: list[str] = list(mapping_result.sources_used)
     speaker_confidence: dict[str, float] = {}
@@ -1097,6 +1102,7 @@ def main() -> int:
                 _digest_meta["participants"] = participants
                 _digest = series_memory.build_digest(
                     _proto_for_digest, _digest_meta, date=date_part,
+                    speaker_mapping=cluster_to_name,  # Ф4б (REQ 1.2): несём авторство в память серии
                 )
                 series_memory.save_digest(series_dir, date_part, _digest)
                 # РИСК4 (срок хранения): прунинг старых выжимок ПО ТЕКУЩЕЙ серии
