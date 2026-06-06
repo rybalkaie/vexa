@@ -14,7 +14,10 @@
 
 Перевыпуск протокола и применение правок к содержанию — НЕ здесь (это Ф4).
 Ф3 только собирает правки и переводит state в `ready_for_reissue` по истечении
-окна (sweep). Голос (FB9) — Ф5: правка без текста дропается с логом.
+окна (sweep). Голос/аудио правки (FB9, Ф5) — транскрибируются reuse'ом
+задеплоенного Groq-стека (`_transcribe_feedback_voice` → `voice_input.voice_to_text`)
+и идут ТЕМ ЖЕ путём, что текст (anti-injection/sanitize наследуются от Ф4);
+не распозналось/пусто → ack «пришли текстом», без молчаливого дропа.
 
 Модуль намеренно лёгкий (только stdlib + `feedback_state` + `telegram_api`),
 без импорта `llm_postprocess` — грузится под системным python3 без заглушек.
@@ -523,6 +526,41 @@ def handle_feedback_reply(
     return new_state
 
 
+def _transcribe_feedback_voice(token: str, msg: dict) -> Optional[str]:
+    """FB9 (Ф5): голос/аудио правки → текст через УЖЕ задеплоенный Groq-стек.
+
+    Reuse, НЕ новый STT: делегируем listener-обёртке `transcribe_voice_or_none`,
+    которая зовёт `voice_input.voice_to_text` (transcribe-smart → прямой Groq).
+    Импорт ленивый — модуль намеренно лёгкий (см. docstring), `voice_input`/
+    listener тянут больше. None при любой неудаче (нет модуля / не скачалось /
+    не расшифровалось / это `audio` — reuse-стек берёт только `voice`) → caller
+    ответит фолбэком. Текст транскрипта НЕ логируем (reuse уже это соблюдает).
+    """
+    try:
+        from notary.meetings_listener import transcribe_voice_or_none  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[feedback] транскрибация недоступна (import): %s", type(e).__name__)
+        return None
+    try:
+        return transcribe_voice_or_none(token, msg)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[feedback] транскрибация упала: %s", e)
+        return None
+
+
+def _send_voice_fallback(token: str, chat_id: int, msg: dict) -> None:
+    """Ack «пришли текстом» реплаем на правку (reuse `VOICE_FALLBACK_MSG` listener'а)."""
+    try:
+        from notary.meetings_listener import VOICE_FALLBACK_MSG  # noqa: PLC0415
+        text = VOICE_FALLBACK_MSG
+    except Exception:  # noqa: BLE001
+        text = "🎙 Голос пока не расшифровал. Ответь, пожалуйста, текстом."
+    try:
+        telegram_api.send_message(token, chat_id, text, reply_to_message_id=msg.get("message_id"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[feedback] фолбэк-ack send failed (non-fatal): %s", e)
+
+
 def route_feedback_reply(
     token: str,
     chat_id: int,
@@ -538,8 +576,11 @@ def route_feedback_reply(
 
     Решение:
       • reply на доставленный протокол + есть текст → правка (ack + state) → True.
-      • reply на протокол, но голос/без текста → Ф5 (голос): в группе drop+True,
-        в DM → False (отдаём старому voice/clarify-flow).
+      • reply на протокол голосом/аудио (FB9, Ф5): в DM → False (старый voice/
+        clarify-flow); в группе → транскрибируем reuse'ом Groq → дальше ТЕМ ЖЕ
+        путём, что текст; не распозналось → ack «пришли текстом» + True.
+      • reply на протокол без текста и без голоса (стикер/фото): в DM → False;
+        в группе → молчаливый drop + True.
       • не reply на протокол: в DM → False; в группе → drop с логом FB1 + True.
     """
     if not is_enabled():
@@ -551,12 +592,34 @@ def route_feedback_reply(
 
     if meeting:
         text = (msg.get("text") or "").strip()
-        if msg.get("voice") or msg.get("audio") or not text:
-            # FB9 (голос) — Ф5. Ф3 принимает только текст.
-            if chat_id != allowed_chat:
-                logger.info("[feedback] правка без текста (голос/вложение) — Ф5, пропуск chat=%s", chat_id)
+        has_voice = bool(msg.get("voice") or msg.get("audio"))
+        if has_voice or not text:
+            # DM: голос/clarify уходит существующему voice-flow (Ф4) — не наш путь.
+            if chat_id == allowed_chat:
+                return False
+            if has_voice:
+                # FB9 (Ф5): голосовая/аудио правка реплаем в групповом чате серии.
+                # Транскрипт — те же недоверенные ДАННЫЕ, что текст правки: после
+                # подстановки в msg["text"] он идёт через handle_feedback_reply →
+                # apply_edit → build_edit_instruction (anti-injection + sanitize Ф4).
+                transcript = _transcribe_feedback_voice(token, msg)
+                if transcript and transcript.strip():
+                    voice_msg = dict(msg)
+                    voice_msg["text"] = transcript.strip()
+                    voice_msg.pop("voice", None)
+                    voice_msg.pop("audio", None)
+                    try:
+                        handle_feedback_reply(token, chat_id, voice_msg, meeting=meeting, root=root, now=now)
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("[feedback] handle_feedback_reply (голос) упал: %s", e)
+                    return True
+                # Не распозналось/пусто → ack «пришли текстом», без молчаливого дропа.
+                _send_voice_fallback(token, chat_id, msg)
+                logger.info("[feedback] голос/аудио не расшифрован → фолбэк «пришли текстом» chat=%s", chat_id)
                 return True
-            return False  # DM: пусть отработает существующий voice/clarify-flow
+            # Пусто и не голос (стикер/фото/документ) — прежний молчаливый drop.
+            logger.info("[feedback] правка без текста (не голос) — пропуск chat=%s", chat_id)
+            return True
         try:
             handle_feedback_reply(token, chat_id, msg, meeting=meeting, root=root, now=now)
         except Exception as e:  # noqa: BLE001
