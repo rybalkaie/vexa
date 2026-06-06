@@ -66,6 +66,17 @@ def call_claude_print(
     if not claude_bin:
         raise ClaudeCliNotInstalled("`claude` не найден в PATH")
 
+    # Глобальный пол таймаута через env: на длинных встречах (45+ мин транскрипт)
+    # зашитые в вызовы лимиты (90/180с) не успевают, claude обрывается и протокол
+    # уходит в деградированный режим. CLAUDE_MIN_TIMEOUT поднимает пол всех вызовов
+    # без правки каждого call-site. 0/unset → поведение прежнее.
+    try:
+        _floor = int(os.environ.get("CLAUDE_MIN_TIMEOUT", "0") or "0")
+    except ValueError:
+        _floor = 0
+    if _floor > timeout:
+        timeout = _floor
+
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
 
     cmd = [claude_bin, "--print"]
@@ -146,6 +157,17 @@ def call_claude_print_json(
     claude_bin = shutil.which("claude")
     if not claude_bin:
         raise ClaudeCliNotInstalled("`claude` не найден в PATH")
+
+    # Глобальный пол таймаута через env: на длинных встречах (45+ мин транскрипт)
+    # зашитые в вызовы лимиты (90/180с) не успевают, claude обрывается и протокол
+    # уходит в деградированный режим. CLAUDE_MIN_TIMEOUT поднимает пол всех вызовов
+    # без правки каждого call-site. 0/unset → поведение прежнее.
+    try:
+        _floor = int(os.environ.get("CLAUDE_MIN_TIMEOUT", "0") or "0")
+    except ValueError:
+        _floor = 0
+    if _floor > timeout:
+        timeout = _floor
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
     cmd = [claude_bin, "--print", "--output-format", "json"]
