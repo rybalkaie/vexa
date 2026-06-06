@@ -648,12 +648,12 @@ def maybe_route_to_learning_rollback(token: str, chat_id: int, msg: dict[str, An
                      reply_to=msg.get("message_id"))
         return True
     if rolled:
-        items = "; ".join(
-            f"[{r.get('series')}] «{r.get('wrong')}» → «{r.get('right')}»" for r in rolled
-        )
+        # describe_rule — kind/scope-aware (терм серии / [везде] глобальное / смысл),
+        # иначе смысловое/глобальное правило отрисовалось бы как ««None» → «None»».
+        items = "; ".join(feedback_learning.describe_rule(r) for r in rolled)
         logger.info("learning rollback: снято правил=%d (%s)", len(rolled), items)
         send_message(token, chat_id,
-                     f"Откатил ({len(rolled)}): {items}. Вернул прежнее написание.",
+                     f"Откатил ({len(rolled)}): {items}. Вернул прежнее состояние.",
                      reply_to=msg.get("message_id"))
     else:
         logger.info("learning digest reply без отката (подтверждение / нет совпадения)")
