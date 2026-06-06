@@ -610,6 +610,59 @@ def maybe_route_to_feedback_reply(token: str, chat_id: int, allowed_chat: int, m
         return False
 
 
+def _learning_digest_prefix() -> str:
+    """Префикс 🧠 дайджеста самообучения — из `feedback_learning.DIGEST_PREFIX`
+    (один источник истины). Fallback на литерал, если модуль не импортируется."""
+    try:
+        from notary.lib.feedback_learning import DIGEST_PREFIX  # noqa: PLC0415
+        return DIGEST_PREFIX
+    except Exception:
+        return "\U0001F9E0"
+
+
+def maybe_route_to_learning_rollback(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
+    """Ф3а (REQ 2.3): reply на дайджест самообучения «🧠 Ватсон выучил …» → откат.
+
+    Reply именно на этот дайджест обрабатывает ТОЛЬКО самообучение, не apply_reply
+    встреч (📅): «откати <термин>» снимает совпавшие правила (`feedback_learning.
+    apply_rollback_reply` — append-only `rollback`-событие, видно в логе), любой
+    другой ответ («да»/«ок») — подтверждение, реестр не трогаем. Всегда True
+    (сообщение прожёвано — caller выходит), кроме недоступного модуля → False
+    (фича off, прежнее поведение). Импорт защищён, как у остальных роутов."""
+    reply_text = (msg.get("text") or "").strip()
+    if not reply_text:
+        send_message(token, chat_id,
+                     "Пустой ответ. Чтобы откатить выученное — «откати <термин>».",
+                     reply_to=msg.get("message_id"))
+        return True
+    try:
+        from notary.lib import feedback_learning  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("feedback_learning import failed (feature off?): %s", e)
+        return False
+    try:
+        rolled = feedback_learning.apply_rollback_reply(reply_text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("learning rollback failed: %s", e)
+        send_message(token, chat_id, "Не смог обработать откат — посмотри логи.",
+                     reply_to=msg.get("message_id"))
+        return True
+    if rolled:
+        items = "; ".join(
+            f"[{r.get('series')}] «{r.get('wrong')}» → «{r.get('right')}»" for r in rolled
+        )
+        logger.info("learning rollback: снято правил=%d (%s)", len(rolled), items)
+        send_message(token, chat_id,
+                     f"Откатил ({len(rolled)}): {items}. Вернул прежнее написание.",
+                     reply_to=msg.get("message_id"))
+    else:
+        logger.info("learning digest reply без отката (подтверждение / нет совпадения)")
+        send_message(token, chat_id,
+                     "Принял, оставляю как выучил. Если что-то неверно — «откати <термин>».",
+                     reply_to=msg.get("message_id"))
+    return True
+
+
 def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -> None:
     """Inline-кнопка от Ф3 (clarify спикеров), Ф5 (task_filter) или Ф6 (delivery).
 
@@ -779,6 +832,11 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
             logger.info(
                 "skip clarify Reply: no pending state (already resolved/expired)"
             )
+            return
+        # Ф3а: reply на дайджест самообучения «🧠 Ватсон выучил …» → откат/подтверждение.
+        # ДО проверки 📅, чтобы не утечь в apply_reply встреч (разные каналы).
+        if orig_text.startswith(_learning_digest_prefix()):
+            maybe_route_to_learning_rollback(token, cid, msg)
             return
         if not orig_text.startswith(TRIGGER_PREFIX):
             return

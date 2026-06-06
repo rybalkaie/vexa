@@ -59,6 +59,11 @@ LEARNING_DIRNAME = "_learning"
 SERIES_LOG_PREFIX = "terms-"
 SERIES_LOG_SUFFIX = ".jsonl"
 
+# Префикс первой строки дайджеста «🧠 Ватсон выучил …» — ЕДИНЫЙ источник истины.
+# Листенер опознаёт reply на дайджест по этому префиксу и роутит его в откат
+# (`meetings_listener._learning_digest_prefix`), не плодя второй литерал.
+DIGEST_PREFIX = "\U0001F9E0"  # 🧠
+
 # Терм — короткий токен. Длиннее/многословнее = это уже фраза/содержание, не терм.
 _MAX_TERM_LEN = 40
 _MAX_TERM_WORDS = 2
@@ -454,7 +459,7 @@ def format_digest_block(*, root: Optional[Path] = None) -> tuple[str, list[str]]
     pend = pending_announcements(root=root)
     if not pend:
         return "", []
-    lines = ["🧠 Ватсон выучил из правок участников (применяю сразу — подтверди или откати):"]
+    lines = [f"{DIGEST_PREFIX} Ватсон выучил из правок участников (применяю сразу — подтверди или откати):"]
     ids: list[str] = []
     for r in pend:
         series = r.get("series") or "—"
