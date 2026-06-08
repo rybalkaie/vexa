@@ -1093,6 +1093,7 @@ def split_protocol_smart(text: str, max_len: int = TG_MAX_LEN) -> list[str]:
 _SERIES_DISPLAY_OVERRIDES = {
     "marketplaces-tatiana": "Маркетплейсы (Татьяна)",
     "anzhee-direktorat": "Директорат Anzhee",
+    "mpervyi-pn-koord-finplan": "МПервый — закупки и финплан",
 }
 
 # Разделитель «короткое имя — расшифровка» в теме протокола (em/en-dash/дефис
