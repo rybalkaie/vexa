@@ -771,6 +771,56 @@ def claim_ready_reissues(
     return claimed_list
 
 
+def _rescue_unapplied_edits(
+    fid: str, claimed: dict, cur: Optional[dict], *, root: Optional[Path] = None
+) -> int:
+    """Спасает правки упавшего раунда, когда ПОКА фоновый перевыпуск падал —
+    конкурентный reply открыл новый раунд (Ф8/У1).
+
+    Гонка только в async-пути (фоновость, Ф2): генерация идёт минуты, листенер
+    отзывчив → reply во время `reissuing` открывает round+1, а `_new_round_state`
+    стартует с `edits:[reply]` — правки claimed-раунда выпадают из state-файла.
+    Если этот claimed-раунд затем ПРОВАЛИЛСЯ (claude error/timeout), его правки
+    НЕ доставлены (reissue_one пишет диск/шлёт только на `sent`) И уже не в state →
+    тихая потеря. (В старом синхронном коде reply не мог прийти во время заморозки,
+    finalize видел `still_reissuing=True` и ревертил — потери не было.)
+
+    Чиним: переносим неприменённые правки claimed-раунда в ТЕКУЩИЙ собирающий раунд
+    (`collecting`/`ready_for_reissue`), дедуп по `tg_message_id`/`edit_id`, старые —
+    ВПЕРЁД (они раньше по времени). Статус/дедлайн не трогаем — правки уедут со
+    следующим перевыпуском текущего раунда. Возвращает число спасённых.
+
+    R9: лог только число/раунд/fid — без текста правок.
+    """
+    lost = [e for e in (claimed.get("edits") or []) if isinstance(e, dict)]
+    if not lost or not isinstance(cur, dict):
+        return 0
+    # Перечитываем СВЕЖИЙ state (единый писатель — главный поток, но безопаснее).
+    fresh = feedback_state.read_state(fid, root=root)
+    if not isinstance(fresh, dict) or fresh.get("status") not in ("collecting", "ready_for_reissue"):
+        return 0  # другой раунд не в собирающем состоянии — не вмешиваемся
+    existing = fresh.setdefault("edits", [])
+    have_tmids = {e.get("tg_message_id") for e in existing if isinstance(e, dict)}
+    have_eids = {e.get("edit_id") for e in existing if isinstance(e, dict)}
+    rescued: list = []
+    for e in lost:
+        tm = e.get("tg_message_id")
+        eid = e.get("edit_id")
+        if (tm is not None and tm in have_tmids) or (eid is not None and eid in have_eids):
+            continue  # уже есть в текущем раунде (дедуп) — не дублируем
+        rescued.append(e)
+    if not rescued:
+        return 0
+    fresh["edits"] = rescued + existing  # старые правки впереди (раньше по времени)
+    feedback_state.write_state(fresh, root=root)
+    logger.warning(
+        "[reissue] спасено %d неприменённых правок упавшего раунда fid=%s round=%s → "
+        "текущий раунд %s (без потери после провала перевыпуска)",
+        len(rescued), fid, claimed.get("round"), fresh.get("round"),
+    )
+    return len(rescued)
+
+
 def finalize_reissue(
     fid: str, claimed: dict, res: Optional[dict], *, root: Optional[Path] = None
 ) -> Optional[str]:
@@ -816,6 +866,12 @@ def finalize_reissue(
                     "last_reissue_error": str((res or {}).get("error"))[:300],
                 },
             )
+        else:
+            # Провал перевыпуска, а статус уже НЕ reissuing → конкурентный reply
+            # открыл новый раунд, пока генерация падала (У1, только async-путь).
+            # Правки упавшего раунда не доставлены и выпали из state — спасаем их в
+            # текущий раунд, иначе тихая потеря коррекций участника.
+            _rescue_unapplied_edits(fid, claimed, cur, root=root)
         logger.warning(
             "[reissue] fid=%s перевыпуск не удался status=%s err=%s (attempt %d/%d)",
             fid, status, (res or {}).get("error"), base_attempts + 1,

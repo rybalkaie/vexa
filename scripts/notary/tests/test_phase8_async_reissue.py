@@ -316,5 +316,93 @@ class TestCleanupDormantStates(_Base):
         self.assertEqual(removed, 0)
 
 
+# ===========================================================================
+# У1 (цикл5/ход3): спасение правок упавшего раунда при конкурентном новом раунде
+# ===========================================================================
+class TestRescueUnappliedEditsOnFailure(_Base):
+    """Async-регрессия: пока фоновый перевыпуск round1 ПАДАЛ, пришёл reply →
+    открыл round2 (collecting, edits=[e3]); правки round1 [e1,e2] выпали из state.
+    finalize(error) при still_reissuing=False обязан СПАСТИ их в текущий раунд,
+    иначе тихая потеря коррекций участника."""
+
+    def _claimed_round1(self, fid):
+        return {
+            "feedback_id": fid, "series": "coord", "date": "2026-06-02",
+            "chat_id": -1001, "meta_path": "/x/meta.json", "round": 1,
+            "reissue_attempts": 0,
+            "edits": [
+                {"author": "M", "text": "правка-1", "tg_message_id": 11, "edit_id": "e1"},
+                {"author": "M", "text": "правка-2", "tg_message_id": 12, "edit_id": "e2"},
+            ],
+        }
+
+    def test_failed_round_edits_rescued_into_new_round(self):
+        fid = feedback_state.build_feedback_id("coord", "2026-06-02", -1001)
+        claimed = self._claimed_round1(fid)
+        # Конкурентный reply открыл round2 (collecting) с одной новой правкой.
+        feedback_state.write_state({
+            "feedback_id": fid, "series": "coord", "date": "2026-06-02",
+            "chat_id": -1001, "round": 2, "status": "collecting",
+            "edits": [{"author": "K", "text": "правка-3", "tg_message_id": 13, "edit_id": "e3"}],
+        }, root=self.root)
+        # round1 перевыпуск провалился.
+        feedback_reissue.finalize_reissue(
+            fid, claimed, {"status": "error", "error": "claude timeout"}, root=self.root,
+        )
+        final = feedback_state.read_state(fid, root=self.root)
+        # round2 жив (не затёрт), статус не менялся.
+        self.assertEqual(final["status"], "collecting")
+        self.assertEqual(final["round"], 2)
+        # Все три правки на месте, старые ВПЕРЁД (раньше по времени).
+        tmids = [e["tg_message_id"] for e in final["edits"]]
+        self.assertEqual(tmids, [11, 12, 13])
+
+    def test_rescue_dedup_by_tg_message_id(self):
+        fid = feedback_state.build_feedback_id("coord", "2026-06-02", -1001)
+        claimed = self._claimed_round1(fid)
+        # round2 уже содержит одну из правок round1 (e2/12) — не дублировать.
+        feedback_state.write_state({
+            "feedback_id": fid, "series": "coord", "date": "2026-06-02",
+            "chat_id": -1001, "round": 2, "status": "ready_for_reissue",
+            "edits": [{"author": "M", "text": "правка-2", "tg_message_id": 12, "edit_id": "e2"}],
+        }, root=self.root)
+        feedback_reissue.finalize_reissue(
+            fid, claimed, {"status": "error", "error": "boom"}, root=self.root,
+        )
+        final = feedback_state.read_state(fid, root=self.root)
+        tmids = sorted(e["tg_message_id"] for e in final["edits"])
+        self.assertEqual(tmids, [11, 12])  # 12 не задвоился
+
+    def test_no_rescue_when_round_succeeded(self):
+        # terminal-OK + новый раунд → НЕ спасаем (правки уже применены/доставлены).
+        fid = feedback_state.build_feedback_id("coord", "2026-06-02", -1001)
+        claimed = self._claimed_round1(fid)
+        feedback_state.write_state({
+            "feedback_id": fid, "series": "coord", "date": "2026-06-02",
+            "chat_id": -1001, "round": 2, "status": "collecting",
+            "edits": [{"author": "K", "text": "правка-3", "tg_message_id": 13, "edit_id": "e3"}],
+        }, root=self.root)
+        feedback_reissue.finalize_reissue(
+            fid, claimed, {"status": "sent", "message_ids": [9001]}, root=self.root,
+        )
+        final = feedback_state.read_state(fid, root=self.root)
+        # round2 не тронут — только своя правка (никакого re-apply round1).
+        tmids = [e["tg_message_id"] for e in final["edits"]]
+        self.assertEqual(tmids, [13])
+
+    def test_still_reissuing_failure_unchanged_no_rescue(self):
+        # Контроль: статус всё ещё reissuing (нет конкурентного раунда) →
+        # обычный revert в ready, attempts++; rescue не вмешивается.
+        st = self._state(status="reissuing")
+        fid = st["feedback_id"]
+        claimed = feedback_state.read_state(fid, root=self.root)
+        feedback_reissue.finalize_reissue(
+            fid, claimed, {"status": "error", "error": "down"}, root=self.root,
+        )
+        final = feedback_state.read_state(fid, root=self.root)
+        self.assertEqual(final["status"], "ready_for_reissue")
+        self.assertEqual(final["reissue_attempts"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
