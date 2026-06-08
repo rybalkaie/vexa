@@ -265,12 +265,19 @@ def cleanup_dormant_states(
     max_age_days: int = 30,
     now: Optional[datetime] = None,
 ) -> int:
-    """R10 (Ф8): удаляет служебные state-файлы `*-feedback.json` в статусе
-    `dormant` старше `max_age_days` (по `updated_at`). Возвращает число удалённых.
+    """R10 (Ф8) + I9 (И1): удаляет служебные state-файлы `*-feedback.json` старше
+    `max_age_days` (по `updated_at`). Возвращает число удалённых. Удаляемые статусы:
+
+      • `dormant` — терминальный успех «давно отдыхает» (R10);
+      • `ready_for_reissue` с `reissue_attempts >= MAX_REISSUE_ATTEMPTS` (I9) —
+        перманентно-провальный перевыпуск (claude падал MAX раз подряд, попытки
+        исчерпаны, владельцу/Ф9 уже отдано). `ready_for_reissue` с attempts<MAX —
+        ещё ретраится, НЕ трогаем (даже старый — он живой кандидат на следующий
+        sweep). Новый reply откроет свежий раунд независимо от удаления.
 
     Скоуп жёстко ограничен: путь — ТОЛЬКО `resolve_feedback_dir()` (или переданный
     `root`), удаляем ТОЛЬКО файлы с суффиксом `STATE_SUFFIX`. Транскрипты и протоколы
-    в `~/Projects/me/встречи/` по построению недостижимы. Не-`dormant` и свежие
+    в `~/Projects/me/встречи/` по построению недостижимы. Прочие статусы и свежие
     (моложе порога, либо без/битым `updated_at`) — не трогаем. Скрытые tempfile'ы
     (имя на `.`) пропускаем.
 
@@ -290,8 +297,20 @@ def cleanup_dormant_states(
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("[feedback-state] cleanup skip malformed %s: %s", f.name, e)
             continue
-        if not isinstance(state, dict) or state.get("status") != "dormant":
+        if not isinstance(state, dict):
             continue
+        status = state.get("status")
+        # Решаем, кандидат ли файл на удаление по статусу/attempts (свежесть — ниже,
+        # единым cutoff для всех кандидатов).
+        if status == "dormant":
+            pass  # R10: терминальный успех — удаляем по возрасту
+        elif status == "ready_for_reissue":
+            # I9: только исчерпавшие лимит попыток (attempts<MAX ещё ретраится — живой).
+            attempts = int(state.get("reissue_attempts") or 0)
+            if attempts < MAX_REISSUE_ATTEMPTS:
+                continue
+        else:
+            continue  # collecting / reissuing — не наша забота
         updated = _parse_iso(state.get("updated_at"))
         if updated is None:  # без валидной метки — консервативно не удаляем
             continue
@@ -303,8 +322,8 @@ def cleanup_dormant_states(
         except OSError as e:
             logger.warning("[feedback-state] cleanup unlink failed %s: %s", f.name, e)
     if removed:
-        logger.info("[feedback-state] cleanup_dormant_states: удалено %d (старше %dд)",
-                    removed, max_age_days)
+        logger.info("[feedback-state] cleanup_dormant_states: удалено %d (dormant + "
+                    "стухший ready_for_reissue, старше %dд)", removed, max_age_days)
     return removed
 
 

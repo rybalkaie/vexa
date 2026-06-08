@@ -75,6 +75,20 @@ _reissue_inflight: dict[str, tuple[Future, dict, float]] = {}
 # только когда воркер свободен → claimed-but-queued не возникает, state не висит в
 # `reissuing` дольше одной генерации (RECLAIM_STALE_REISSUING_SEC корректен).
 _REISSUE_CAP = 1
+# ── И1: командные claude-пути через ТОТ ЖЕ исполнитель ───────────────────────
+# protocol-команда / correction-команда / apply-reply: heavy-часть (claude +
+# доставка результата) уходит в `_reissue_executor` (max_workers=1) — тот же воркер,
+# что и reissue. Так физически ≤1 claude одновременно (I4/A2: РИСК3 закрыт
+# структурно — гонки за protocol-файл между командой и перевыпуском нет). Каждый job
+# самодостаточен: делает claude-работу + сам шлёт результат + сам шлёт user-facing
+# ошибку при сбое (как раньше синхронный код). Главный поток после ack не блокируется.
+# job_id → (future, краткая-метка, submitted_monotonic). Только главный поток мутирует
+# реестр (submit из process_message, drain из sweep — оба в главном потоке). label и
+# submitted_ts — для лога метаданных (R9: тип операции + длительность, без текста).
+_command_inflight: dict[str, tuple[Future, str, float]] = {}
+# Монотонный счётчик для уникального job_id (метка операции + порядковый номер). Не
+# несёт смысла кроме уникальности ключа реестра; растёт за жизнь процесса.
+_command_job_seq = 0
 # R10: троттл уборки dormant-state'ов — не чаще раза в сутки (модульный timestamp,
 # а не глоб папки каждые 30с). monotonic, None = ещё не запускали в этой жизни.
 _last_dormant_cleanup_mono: Optional[float] = None
@@ -275,6 +289,167 @@ def _reissue_guard_blocks(token: str, chat_id: int, series: str, date_str: str, 
     return False
 
 
+def _executor_busy() -> bool:
+    """I7: True если фоновый воркер сейчас чем-то занят (reissue ИЛИ командный job
+    in-flight) → queue-aware ack добавит «в очереди». max_workers=1, поэтому любой
+    непустой реестр означает, что новый submit встанет в очередь за текущей работой.
+
+    Главный поток читает оба реестра (мутируют тоже только из главного потока:
+    submit/drain командных — здесь; reissue — в `_process_reissues_async`), гонки нет.
+    """
+    return bool(_command_inflight) or bool(_reissue_inflight)
+
+
+def _submit_command_job(
+    executor: Optional[ThreadPoolExecutor],
+    inflight: dict,
+    job_id: str,
+    label: str,
+    fn: Callable[[], Any],
+) -> bool:
+    """И1: отправить самодостаточный командный job в фоновый воркер. Кладёт future в
+    `inflight[job_id] = (future, label, submitted_monotonic)`. True если submit удался.
+
+    Fallback (executor is None — тесты / совместимость): зовём `fn()` СИНХРОННО в
+    главном потоке и возвращаем True. Так старые тесты, не поднимающие executor, видят
+    прежнее блокирующее поведение; боевой `main` всегда создаёт executor.
+
+    R9: логируем только метаданные (label, job_id) — НЕ содержимое job.
+    """
+    if executor is None:
+        # Синхронный fallback: исключение job-функции не должно валить листенер
+        # (боевой путь его и не увидел бы — job сам ловит и шлёт user-facing ошибку,
+        # но на всякий случай страхуемся, как `process_message` оборачивает всё).
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[cmd] синхронный job %s упал: %s", label, e)
+        return True
+    try:
+        future = executor.submit(fn)
+    except Exception as e:  # noqa: BLE001
+        # Submit упал (executor уже shutdown и т.п.) — НЕ оставляем команду без следа.
+        logger.exception("[cmd] submit job %s упал: %s", label, e)
+        return False
+    inflight[job_id] = (future, label, time.monotonic())
+    logger.info("[cmd] submit job=%s label=%s → фон", job_id, label)
+    return True
+
+
+def _next_command_job_id(label: str) -> str:
+    """Уникальный job_id из метки + монотонного счётчика (главный поток, без гонок)."""
+    global _command_job_seq
+    _command_job_seq += 1
+    return f"{label}#{_command_job_seq}"
+
+
+def _drain_command_jobs(*, inflight: dict) -> None:
+    """И1: снять завершённые командные future из реестра (главный поток, рядом с
+    `_process_reissues_async` в sweep). Сам результат/ошибку job уже доставил
+    пользователю изнутри (самодостаточность I5) — здесь только освобождаем слот и
+    логируем метаданные (label, длительность, было ли исключение).
+
+    `future.result()` зовём, чтобы поднять и залогировать необработанное исключение
+    job-функции (не должно случаться — job ловит всё внутри, но не теряем сигнал, как
+    делает drain reissue). R9: логируем только метаданные — без текста реплик/протокола.
+    """
+    for job_id in list(inflight.keys()):
+        future, label, submitted_ts = inflight[job_id]
+        if not future.done():
+            continue
+        err: Optional[BaseException] = None
+        try:
+            future.result()
+        except Exception as e:  # noqa: BLE001
+            err = e
+            logger.exception("[cmd] job=%s label=%s бросил необработанное: %s",
+                             job_id, label, e)
+        inflight.pop(job_id, None)
+        dur = time.monotonic() - submitted_ts
+        logger.info("[cmd] drain job=%s label=%s dur=%.1fs ok=%s",
+                    job_id, label, dur, err is None)
+
+
+def _job_protocol_command(
+    token: str,
+    chat_id: int,
+    msg_id: Optional[int],
+    series: str,
+    date_str: str,
+    transcript_path: Path,
+    protocol_path: Path,
+) -> None:
+    """И1 (I1): heavy-часть protocol-команды — В ФОНОВОМ ВОРКЕРЕ (после ack).
+
+    Самодостаточен (I5): генерация (claude) → read → split → send результата, со
+    ВСЕМИ user-facing ошибками (как раньше синхронный хвост route-функции). Никаких
+    замыканий на нестабильное состояние — всё нужное приходит аргументами. Реестр
+    `_command_inflight` НЕ мутирует (это только главный поток в submit/drain).
+
+    R9: текст протокола/транскрипта НЕ логируем — только метаданные через вызовы ниже.
+    """
+    def _err(text: str) -> None:
+        send_message(token, chat_id, text, reply_to=msg_id)
+
+    try:
+        from notary.lib.llm_postprocess import (  # noqa: PLC0415
+            ProtocolGenerationError,
+            regenerate_protocol_for_meeting,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("import llm_postprocess failed: %s", e)
+        _err(f"❌ Не смог загрузить генератор протоколов: {type(e).__name__}")
+        return
+
+    meta = {
+        "series": series,
+        "date": date_str,
+        "transcript_filename": transcript_path.name,
+    }
+    try:
+        regenerate_protocol_for_meeting(
+            transcript_path=transcript_path,
+            protocol_path=protocol_path,
+            meeting_meta=meta,
+            meeting_sid=f"tg-cmd-{series}-{date_str}",
+        )
+    except ProtocolGenerationError as e:
+        _err(f"❌ Генерация упала: {str(e)[:300]}\nФайл: `{protocol_path}` не обновлён.")
+        return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("protocol generation unexpected error: %s", e)
+        _err(f"❌ Неожиданная ошибка: {type(e).__name__}: {str(e)[:200]}")
+        return
+
+    # Файл готов — пушим результат текстом. Если > лимита — split на части.
+    try:
+        body = protocol_path.read_text(encoding="utf-8")
+    except OSError as e:
+        _err(f"✅ Файл сгенерирован → `{protocol_path}`\n⚠️ Прочесть для отправки не смог: {e}")
+        return
+
+    try:
+        from notary.lib.telegram_api import split_long_message  # noqa: PLC0415
+        chunks = split_long_message(body, max_len=3500)
+    except Exception as e:  # noqa: BLE001
+        # Если split-helper упал (циклический импорт / неожиданная ошибка) —
+        # не молчим: лог + отправляем сообщение Илье, чтобы он узнал что
+        # протокол на диске, но в Telegram не дошёл. НЕ режем `[:max_len]`
+        # незаметно — это была бы тихая потеря данных (РИСК2-стиль).
+        logger.exception("split_long_message failed: %s", e)
+        _err(
+            f"✅ Файл сгенерирован → `{protocol_path}`\n"
+            f"⚠️ Не смог разбить длинный текст для отправки в Telegram: {type(e).__name__}. "
+            f"Открой файл на диске."
+        )
+        return
+
+    header = f"✅ Готово: `{series} {date_str}` → `{protocol_path}`"
+    send_message(token, chat_id, header, reply_to=msg_id)
+    for chunk in chunks:
+        send_message(token, chat_id, chunk)
+
+
 def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
     """Если сообщение Ильи — команда «протокол <series> <date>», запускаем
     регенерацию и шлём результат текстом обратно.
@@ -282,8 +457,10 @@ def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any
     Возвращает True если команда распарсилась и обработана (caller должен
     выйти из process_message без вызова apply_reply). False иначе.
 
-    Если parse OK, но сгенерировать не удалось — отправляем Илье сообщение об
-    ошибке и всё равно True (сообщение «обработано», просто негативно).
+    И1: parse / R12 guard / дедуп / валидация transcript / ack — в ГЛАВНОМ потоке
+    (быстро). Heavy-часть (генерация → read → split → send) — в фоновом воркере через
+    `_job_protocol_command`. Если parse OK, но запустить не удалось — Илье уходит
+    сообщение об ошибке (из job либо синхронно), всё равно True (сообщение «обработано»).
     """
     text = (msg.get("text") or "").strip()
     if not text:
@@ -343,88 +520,25 @@ def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any
     protocol_path = transcript_path.parent / f"{date_str}-protokol.md"
 
     # Транскрипт найден — теперь ack. Sonnet может думать 15-60s, без ack
-    # пользователь не понимает, что бот вообще услышал.
+    # пользователь не понимает, что бот вообще услышал. I7: если воркер занят
+    # (reissue/другая команда) — предупреждаем, что встанем в очередь.
+    queued = " (в очереди за текущей задачей — пришлю, как освобожусь)" if _executor_busy() else ""
     send_message(
         token, chat_id,
-        f"✏️ Генерирую протокол `{series}` `{date_str}`… Sonnet 4.6, обычно 15-60 сек.",
+        f"✏️ Генерирую протокол `{series}` `{date_str}`… Sonnet 4.6, обычно 15-60 сек.{queued}",
         reply_to=msg.get("message_id"),
     )
 
-    try:
-        from notary.lib.llm_postprocess import (  # noqa: PLC0415
-            ProtocolGenerationError,
-            regenerate_protocol_for_meeting,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception("import llm_postprocess failed: %s", e)
-        send_message(
-            token, chat_id,
-            f"❌ Не смог загрузить генератор протоколов: {type(e).__name__}",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-
-    meta = {
-        "series": series,
-        "date": date_str,
-        "transcript_filename": transcript_path.name,
-    }
-    try:
-        regenerate_protocol_for_meeting(
-            transcript_path=transcript_path,
-            protocol_path=protocol_path,
-            meeting_meta=meta,
-            meeting_sid=f"tg-cmd-{series}-{date_str}",
-        )
-    except ProtocolGenerationError as e:
-        send_message(
-            token, chat_id,
-            f"❌ Генерация упала: {str(e)[:300]}\nФайл: `{protocol_path}` не обновлён.",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-    except Exception as e:  # noqa: BLE001
-        logger.exception("protocol generation unexpected error: %s", e)
-        send_message(
-            token, chat_id,
-            f"❌ Неожиданная ошибка: {type(e).__name__}: {str(e)[:200]}",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-
-    # Файл готов — пушим результат текстом. Если > лимита — split на части.
-    try:
-        body = protocol_path.read_text(encoding="utf-8")
-    except OSError as e:
-        send_message(
-            token, chat_id,
-            f"✅ Файл сгенерирован → `{protocol_path}`\n⚠️ Прочесть для отправки не смог: {e}",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-
-    try:
-        from notary.lib.telegram_api import split_long_message  # noqa: PLC0415
-        chunks = split_long_message(body, max_len=3500)
-    except Exception as e:  # noqa: BLE001
-        # Если split-helper упал (циклический импорт / неожиданная ошибка) —
-        # не молчим: лог + отправляем сообщение Илье, чтобы он узнал что
-        # протокол на диске, но в Telegram не дошёл. НЕ режем `[:max_len]`
-        # незаметно — это была бы тихая потеря данных (РИСК2-стиль).
-        logger.exception("split_long_message failed: %s", e)
-        send_message(
-            token, chat_id,
-            f"✅ Файл сгенерирован → `{protocol_path}`\n"
-            f"⚠️ Не смог разбить длинный текст для отправки в Telegram: {type(e).__name__}. "
-            f"Открой файл на диске.",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-
-    header = f"✅ Готово: `{series} {date_str}` → `{protocol_path}`"
-    send_message(token, chat_id, header, reply_to=msg.get("message_id"))
-    for chunk in chunks:
-        send_message(token, chat_id, chunk)
+    # Heavy-часть → фоновый воркер (тот же `_reissue_executor`, max_workers=1 → ≤1
+    # claude одновременно, I4). job самодостаточен: claude + доставка + ошибки.
+    msg_id = msg.get("message_id")
+    job_id = _next_command_job_id(f"protocol:{series}/{date_str}")
+    _submit_command_job(
+        _reissue_executor, _command_inflight, job_id, f"protocol:{series}/{date_str}",
+        lambda: _job_protocol_command(
+            token, chat_id, msg_id, series, date_str, transcript_path, protocol_path,
+        ),
+    )
     return True
 
 
@@ -494,6 +608,74 @@ def _correction_command_is_dupe(series: str, date_str: str, instruction: str) ->
     return False
 
 
+def _job_correction_command(
+    token: str,
+    chat_id: int,
+    msg_id: Optional[int],
+    series: str,
+    date_str: str,
+    instruction: str,
+    kind: str,
+) -> None:
+    """И1 (I2): heavy-часть correction-команды — В ФОНОВОМ ВОРКЕРЕ (после ack).
+
+    Самодостаточен (I5): `apply_correction` (claude) → разбор результата → send
+    статуса/ошибки (как раньше синхронный хвост route-функции). Реестр не мутирует.
+
+    R9: текст инструкции коррекции/протокола НЕ логируем — только метаданные.
+    """
+    def _err(text: str) -> None:
+        send_message(token, chat_id, text, reply_to=msg_id)
+
+    try:
+        from notary.lib.llm_postprocess import apply_correction  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.exception("apply_correction import failed: %s", e)
+        _err(f"❌ Не загрузил correction-модуль: {type(e).__name__}")
+        return
+
+    try:
+        result = apply_correction(
+            series=series,
+            date=date_str,
+            instruction=instruction,
+            in_group=True,
+            meeting_sid=f"corr-{series}-{date_str}",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("apply_correction failed: %s", e)
+        _err(f"❌ Коррекция упала: {type(e).__name__}: {str(e)[:200]}")
+        return
+
+    if result.get("status") == "applied":
+        # У9 (цикл5/ход3): различаем «применил полностью» vs «применил на
+        # диске, в группу пушнуть не смог» — Илье важно понимать что произошло.
+        ig = result.get("in_group_action") or "none"
+        err = result.get("error")
+        version_name = Path(result.get('version_path') or '').name
+        if err:
+            _err(
+                f"⚠️ Применил на диске (version={version_name}, kind={result.get('kind')}), "
+                f"в группу пушнуть не смог: {err}. Проверь права бота / переотправь вручную."
+            )
+        elif ig in ("deleted-old+sent-new", "sent-new-with-warning"):
+            _err(
+                f"✅ Применил полностью. kind={result.get('kind')} version={version_name} "
+                f"group={ig} summary_sent={result.get('summary_sent')}"
+            )
+        elif ig in ("none-no-binding", "none"):
+            _err(
+                f"✅ Применил на диске (version={version_name}, kind={result.get('kind')}). "
+                f"В группу не пушил (group={ig})."
+            )
+        else:
+            _err(f"✅ Применил. kind={result.get('kind')} version={version_name} group={ig}")
+    elif result.get("status") == "file-only":
+        _err(f"✅ Применил (file-only). version={Path(result.get('version_path') or '').name}")
+    else:
+        _err(f"❌ Коррекция не применена: {result.get('error') or 'unknown error'}")
+
+
 def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
     """Ф6: команда коррекции протокола от Ильи в DM.
 
@@ -532,85 +714,24 @@ def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, A
         )
         return True
 
+    # I7: queue-aware ack — если воркер занят (reissue/другая команда), предупреждаем.
+    queued = " (в очереди за текущей задачей — пришлю, как освобожусь)" if _executor_busy() else ""
     send_message(
         token, chat_id,
-        f"✏️ Применяю коррекцию `{series}` `{date_str}` (kind={kind})…",
+        f"✏️ Применяю коррекцию `{series}` `{date_str}` (kind={kind})…{queued}",
         reply_to=msg.get("message_id"),
     )
 
-    try:
-        from notary.lib.llm_postprocess import apply_correction  # noqa: PLC0415
-    except Exception as e:  # noqa: BLE001
-        logger.exception("apply_correction import failed: %s", e)
-        send_message(
-            token, chat_id,
-            f"❌ Не загрузил correction-модуль: {type(e).__name__}",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-
-    try:
-        result = apply_correction(
-            series=series,
-            date=date_str,
-            instruction=instruction,
-            in_group=True,
-            meeting_sid=f"corr-{series}-{date_str}",
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception("apply_correction failed: %s", e)
-        send_message(
-            token, chat_id,
-            f"❌ Коррекция упала: {type(e).__name__}: {str(e)[:200]}",
-            reply_to=msg.get("message_id"),
-        )
-        return True
-
-    if result.get("status") == "applied":
-        # У9 (цикл5/ход3): различаем «применил полностью» vs «применил на
-        # диске, в группу пушнуть не смог» — Илье важно понимать что произошло.
-        ig = result.get("in_group_action") or "none"
-        err = result.get("error")
-        version_name = Path(result.get('version_path') or '').name
-        if err:
-            send_message(
-                token, chat_id,
-                f"⚠️ Применил на диске (version={version_name}, kind={result.get('kind')}), "
-                f"в группу пушнуть не смог: {err}. Проверь права бота / переотправь вручную.",
-                reply_to=msg.get("message_id"),
-            )
-        elif ig in ("deleted-old+sent-new", "sent-new-with-warning"):
-            send_message(
-                token, chat_id,
-                f"✅ Применил полностью. kind={result.get('kind')} version={version_name} "
-                f"group={ig} summary_sent={result.get('summary_sent')}",
-                reply_to=msg.get("message_id"),
-            )
-        elif ig in ("none-no-binding", "none"):
-            send_message(
-                token, chat_id,
-                f"✅ Применил на диске (version={version_name}, kind={result.get('kind')}). "
-                f"В группу не пушил (group={ig}).",
-                reply_to=msg.get("message_id"),
-            )
-        else:
-            send_message(
-                token, chat_id,
-                f"✅ Применил. kind={result.get('kind')} version={version_name} group={ig}",
-                reply_to=msg.get("message_id"),
-            )
-    elif result.get("status") == "file-only":
-        send_message(
-            token, chat_id,
-            f"✅ Применил (file-only). version={Path(result.get('version_path') or '').name}",
-            reply_to=msg.get("message_id"),
-        )
-    else:
-        send_message(
-            token, chat_id,
-            f"❌ Коррекция не применена: {result.get('error') or 'unknown error'}",
-            reply_to=msg.get("message_id"),
-        )
+    # Heavy-часть (apply_correction → claude → доставка) → фоновый воркер (тот же
+    # `_reissue_executor`, ≤1 claude одновременно, I4). job самодостаточен.
+    msg_id = msg.get("message_id")
+    job_id = _next_command_job_id(f"correction:{series}/{date_str}")
+    _submit_command_job(
+        _reissue_executor, _command_inflight, job_id, f"correction:{series}/{date_str}",
+        lambda: _job_correction_command(
+            token, chat_id, msg_id, series, date_str, instruction, kind,
+        ),
+    )
     return True
 
 
@@ -1030,8 +1151,100 @@ def sweep_clarify_timeouts(token: Optional[str] = None) -> None:
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("feedback reissue async failed: %s", e)
+    # И1 — drain командных claude-job'ов (protocol/correction/apply-reply): снимаем
+    # завершённые из реестра (результат job доставил сам, I5), освобождаем слот воркера.
+    # В ТОМ ЖЕ проходе sweep, в главном потоке (R3 — реестр мутирует только главный поток).
+    try:
+        _drain_command_jobs(inflight=_command_inflight)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("command jobs drain failed: %s", e)
     # R10 — уборка старых dormant-state'ов (дешёвый троттл, не чаще раза в сутки).
     _maybe_cleanup_dormant_states()
+
+
+def _job_apply_reply(
+    token: str,
+    chat_id: int,
+    msg_id: Optional[int],
+    reply_text: str,
+    reply_date: Any,
+    snapshot_path: Path,
+) -> None:
+    """И1 (I3): heavy-часть apply-reply — В ФОНОВОМ ВОРКЕРЕ (после проверки snapshot).
+
+    Самодостаточен (I5): subprocess `meetings_apply_reply` (claude --print внутри,
+    до 180с) → parse JSON → send сводки/ошибки (как раньше синхронный хвост
+    process_message). Реестр не мутирует.
+
+    Heartbeat здесь НЕ нужен: главный поток больше не блокируется этим subprocess'ом
+    (он в воркере), он продолжает крутить цикл и бить heartbeat сам — watchdog спокоен.
+
+    R9: НЕ логируем reply_text/сводку. Pre-existing лог `apply-reply rc=… stdout=out[:600]`
+    перенесён КАК ЕСТЬ (он был и до И1 — это не новый код).
+    """
+    cmd = [
+        sys.executable, "-m", "notary.meetings_apply_reply",
+        "--reply", reply_text,
+        "--snapshot", str(snapshot_path),
+    ]
+    if reply_date:
+        cmd += ["--reply-date", str(reply_date)]
+
+    logger.info("apply-reply: reply_len=%d reply_date=%s", len(reply_text), reply_date)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        logger.error("meetings_apply_reply timeout 180s")
+        send_message(token, chat_id, "Ответ не применился — таймаут apply-reply (180s).", reply_to=msg_id)
+        return
+    except Exception as e:  # noqa: BLE001
+        logger.exception("meetings_apply_reply subprocess упал: %s", e)
+        send_message(token, chat_id, f"Ответ не применился — сбой apply-reply: {type(e).__name__}.", reply_to=msg_id)
+        return
+
+    out = proc.stdout.strip()
+    err = proc.stderr.strip()
+    logger.info("apply-reply rc=%d stdout=%s stderr=%s", proc.returncode, out[:600], err[:300])
+
+    try:
+        result = json.loads(out) if out else {}
+    except json.JSONDecodeError:
+        result = {"error": "невалидный JSON от apply-reply"}
+
+    summary_lines = result.get("summary_lines") or []
+    pending = result.get("pending_room") or []
+    skipped = result.get("skipped") or []
+    err_msg = result.get("error")
+    no_decisions = result.get("no_decisions")
+
+    if err_msg:
+        send_message(token, chat_id, f"Не применил: {err_msg}", reply_to=msg_id)
+        return
+
+    if no_decisions:
+        send_message(
+            token, chat_id,
+            result.get("hint") or "В ответе не нашёл решений по номерам — переформулируй: «1 да в @t11, 2 нет».",
+            reply_to=msg_id,
+        )
+        return
+
+    parts: list[str] = []
+    if summary_lines:
+        parts.append("Готово:")
+        parts += summary_lines
+    if pending:
+        parts.append("")
+        parts.append("Не хватает переговорки:")
+        for p in pending:
+            parts.append(f"{p.get('n')}. {p.get('title')} ({p.get('when')}) — назови переговорку (например, «{p.get('n')} в @t11»).")
+    if skipped:
+        parts.append("")
+        parts.append("Не применил:")
+        parts += [f"• {s}" for s in skipped]
+
+    text = "\n".join(parts) or "Применил без summary."
+    send_message(token, chat_id, text, reply_to=msg_id)
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
@@ -1124,70 +1337,25 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
         logger.error("snapshot %s отсутствует", snapshot)
         return
 
-    cmd = [
-        sys.executable, "-m", "notary.meetings_apply_reply",
-        "--reply", reply_text,
-        "--snapshot", str(snapshot),
-    ]
-    if reply_date:
-        cmd += ["--reply-date", str(reply_date)]
-
-    logger.info("apply-reply: reply_len=%d reply_date=%s", len(reply_text), reply_date)
-    # Heartbeat ПЕРЕД блокирующим subprocess — apply-reply (claude --print внутри)
-    # может занять до 90s. Watchdog-порог 240s (с запасом). Без свежего heartbeat
-    # watchdog ложно сорвался бы рестартом посередине apply-reply, оставив flock
-    # на watched.yaml до stale-timeout fs.
-    heartbeat()
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    except subprocess.TimeoutExpired:
-        logger.error("meetings_apply_reply timeout 180s")
-        send_message(token, cid, "Ответ не применился — таймаут apply-reply (180s).", reply_to=msg.get("message_id"))
-        return
-
-    out = proc.stdout.strip()
-    err = proc.stderr.strip()
-    logger.info("apply-reply rc=%d stdout=%s stderr=%s", proc.returncode, out[:600], err[:300])
-
-    try:
-        result = json.loads(out) if out else {}
-    except json.JSONDecodeError:
-        result = {"error": "невалидный JSON от apply-reply"}
-
-    summary_lines = result.get("summary_lines") or []
-    pending = result.get("pending_room") or []
-    skipped = result.get("skipped") or []
-    err_msg = result.get("error")
-    no_decisions = result.get("no_decisions")
-
-    if err_msg:
-        send_message(token, cid, f"Не применил: {err_msg}", reply_to=msg.get("message_id"))
-        return
-
-    if no_decisions:
+    # И1 (I3): heavy-часть apply-reply (subprocess meetings_apply_reply, claude --print
+    # внутри, до 180с) → фоновый воркер (тот же `_reissue_executor`, ≤1 claude одновременно,
+    # I4). Главный поток больше НЕ блокируется — heartbeat бьётся из цикла сам, watchdog
+    # спокоен (раньше тут был heartbeat() перед блокирующим subprocess — больше не нужен).
+    # I7: queue-aware ack, если воркер занят. На пустой очереди ack короткий, чтобы не
+    # шуметь на быстром happy-path (раньше ack тут вообще не было — сводка приходила
+    # сразу). При занятом воркере — предупреждаем, иначе пользователь ждёт молча.
+    msg_id = msg.get("message_id")
+    if _executor_busy():
         send_message(
             token, cid,
-            result.get("hint") or "В ответе не нашёл решений по номерам — переформулируй: «1 да в @t11, 2 нет».",
-            reply_to=msg.get("message_id"),
+            "✏️ Принял — применяю ответ. В очереди за текущей задачей, пришлю сводку, как освобожусь.",
+            reply_to=msg_id,
         )
-        return
-
-    parts: list[str] = []
-    if summary_lines:
-        parts.append("Готово:")
-        parts += summary_lines
-    if pending:
-        parts.append("")
-        parts.append("Не хватает переговорки:")
-        for p in pending:
-            parts.append(f"{p.get('n')}. {p.get('title')} ({p.get('when')}) — назови переговорку (например, «{p.get('n')} в @t11»).")
-    if skipped:
-        parts.append("")
-        parts.append("Не применил:")
-        parts += [f"• {s}" for s in skipped]
-
-    text = "\n".join(parts) or "Применил без summary."
-    send_message(token, cid, text, reply_to=msg.get("message_id"))
+    job_id = _next_command_job_id("apply-reply")
+    _submit_command_job(
+        _reissue_executor, _command_inflight, job_id, "apply-reply",
+        lambda: _job_apply_reply(token, cid, msg_id, reply_text, reply_date, snapshot),
+    )
 
 
 def main() -> int:
@@ -1220,7 +1388,9 @@ def main() -> int:
         # вернётся в `ready_for_reissue` на следующем старте. Здесь только лог числа
         # оборванных in-flight (метаданные, R9).
         logger.warning("[reissue] SIGTERM: оборвано in-flight перевыпусков=%d "
-                       "(reclaim вернёт их в очередь ≤900с)", len(_reissue_inflight))
+                       "командных job=%d (reissue: reclaim вернёт ≤900с; командные — "
+                       "Илья переотправит, состояние не повреждено)",
+                       len(_reissue_inflight), len(_command_inflight))
         if _reissue_executor is not None:
             _reissue_executor.shutdown(wait=False)
         # os._exit, а НЕ sys.exit: concurrent.futures.thread регистрирует
