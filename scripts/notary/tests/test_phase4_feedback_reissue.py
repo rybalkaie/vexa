@@ -57,6 +57,26 @@ class _FakeDelete:
         return self.ok
 
 
+class _FakeSendDoc:
+    """Фейк telegram_api.send_document — копит отправленные PDF (chat_id, caption, filename)."""
+    def __init__(self):
+        self.docs = []
+
+    def __call__(self, token, chat_id, path, *, caption=None, filename=None, **kw):
+        self.docs.append({"chat_id": chat_id, "path": str(path), "caption": caption, "filename": filename})
+        return {"message_id": 7000 + len(self.docs)}
+
+
+class _FakeRenderPdf:
+    """Фейк protocol_to_pdf.render_pdf_from_markdown — копит markdown/title/subtitle, пишет заглушку."""
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, markdown, out_path, *, title=None, subtitle=None, **kw):
+        self.calls.append({"markdown": markdown, "title": title, "subtitle": subtitle})
+        Path(out_path).write_text("%PDF-stub", encoding="utf-8")
+
+
 # ===========================================================================
 # FM-11 — санитизация текста правки (недоверенные данные)
 # ===========================================================================
@@ -188,9 +208,11 @@ class TestRedeliverFB5(_RedeliverBase):
     def test_deletes_old_then_posts_new_and_changelog(self):
         at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_meta(mids=(101, 102), at=at)
-        send, dele = _FakeSend(), _FakeDelete(ok=True)
+        send, dele, senddoc, render = _FakeSend(), _FakeDelete(ok=True), _FakeSendDoc(), _FakeRenderPdf()
         with mock.patch.object(lp.telegram_api, "send_message", send), \
              mock.patch.object(lp.telegram_api, "delete_message", dele), \
+             mock.patch.object(lp.telegram_api, "send_document", senddoc), \
+             mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", render), \
              mock.patch.object(lp, "_compose_revision_summary",
                                return_value="🔁 Что изменилось: пункт обновлён"):
             res = lp.redeliver_revised_protocol(
@@ -201,23 +223,28 @@ class TestRedeliverFB5(_RedeliverBase):
         self.assertEqual(res["status"], "sent")
         # FB5: старое доставленное удалено (оба message_id).
         self.assertEqual({d["message_id"] for d in dele.deleted}, {101, 102})
-        # FB5: «🔁 Что изменилось» отправлено.
+        # FB5: «🔁 Что изменилось» отправлено текстом.
         self.assertTrue(any("🔁 Что изменилось" in s["text"] for s in send.sent))
-        # FB5: новая версия отправлена.
-        self.assertTrue(any("Новый пункт после правки" in s["text"] for s in send.sent))
-        # meta.delivered обновлён с revision++.
+        # PDF (2026-06-08): новая версия — PDF-документом; тело в рендере.
+        self.assertEqual(len(senddoc.docs), 1)
+        self.assertIn("Новый пункт после правки", render.calls[0]["markdown"])
+        self.assertTrue(senddoc.docs[0]["filename"].endswith(".pdf"))
+        # meta.delivered обновлён: revision++, document=True, id PDF-документа.
         meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
         last = meta["delivered"][-1]
         self.assertEqual(last["revision"], 1)
         self.assertEqual(last["decision"], "revision")
+        self.assertTrue(last["document"])
         self.assertEqual(last["message_ids"], res["message_ids"])
 
     def test_over_48h_no_delete_but_warns_and_posts(self):
         at = (datetime.now(UTC) - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_meta(mids=(101,), at=at)
-        send, dele = _FakeSend(), _FakeDelete(ok=True)
+        send, dele, senddoc, render = _FakeSend(), _FakeDelete(ok=True), _FakeSendDoc(), _FakeRenderPdf()
         with mock.patch.object(lp.telegram_api, "send_message", send), \
              mock.patch.object(lp.telegram_api, "delete_message", dele), \
+             mock.patch.object(lp.telegram_api, "send_document", senddoc), \
+             mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", render), \
              mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 изменения"):
             res = lp.redeliver_revised_protocol(
                 {"series": "coord", "date": "2026-06-02"},
@@ -226,17 +253,21 @@ class TestRedeliverFB5(_RedeliverBase):
             )
         self.assertEqual(res["status"], "sent")
         self.assertEqual(dele.deleted, [])  # >48ч → не удаляли
-        # Предупреждение «старую версию убрать не удалось» в шапке.
+        # Предупреждение «старую версию убрать не удалось» в шапке (текст).
         self.assertTrue(any("убрать не удалось" in s["text"] for s in send.sent))
-        self.assertTrue(any("Новый пункт после правки" in s["text"] for s in send.sent))
+        # Новая версия — PDF.
+        self.assertEqual(len(senddoc.docs), 1)
+        self.assertIn("Новый пункт после правки", render.calls[0]["markdown"])
 
     def test_default_no_delete_preserves_clarify_behavior(self):
         # delete_previous=False (clarify Ф5) — старое НЕ удаляется (поведение не меняется).
         at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_meta(mids=(101,), at=at)
-        send, dele = _FakeSend(), _FakeDelete(ok=True)
+        send, dele, senddoc, render = _FakeSend(), _FakeDelete(ok=True), _FakeSendDoc(), _FakeRenderPdf()
         with mock.patch.object(lp.telegram_api, "send_message", send), \
              mock.patch.object(lp.telegram_api, "delete_message", dele), \
+             mock.patch.object(lp.telegram_api, "send_document", senddoc), \
+             mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", render), \
              mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 x"):
             res = lp.redeliver_revised_protocol(
                 {"series": "coord", "date": "2026-06-02"},
@@ -244,24 +275,28 @@ class TestRedeliverFB5(_RedeliverBase):
             )
         self.assertEqual(res["status"], "sent")
         self.assertEqual(dele.deleted, [])  # без delete_previous — не трогаем старое
+        self.assertEqual(len(senddoc.docs), 1)  # PDF доставлен
 
 
 class TestRedeliverFB11(_RedeliverBase):
     def test_all_sends_go_to_bound_chat_only(self):
         at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_meta(chat_id=-1001, mids=(101,), at=at)
-        send = _FakeSend()
+        send, senddoc, render = _FakeSend(), _FakeSendDoc(), _FakeRenderPdf()
         with mock.patch.object(lp.telegram_api, "send_message", send), \
              mock.patch.object(lp.telegram_api, "delete_message", _FakeDelete(ok=True)), \
+             mock.patch.object(lp.telegram_api, "send_document", senddoc), \
+             mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", render), \
              mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 x"):
             lp.redeliver_revised_protocol(
                 {"series": "coord", "date": "2026-06-02"},
                 PROTO_OLD, PROTO_NEW, meta_json_path=self.meta_path, delete_previous=True,
             )
-        # FB11: каждое исходящее — только в привязанный чат (-1001), и только
-        # summary + чанки протокола (никаких посторонних адресатов).
-        self.assertTrue(send.sent)
+        # FB11: каждое исходящее (summary-текст И PDF-документ) — только в
+        # привязанный чат (-1001), никаких посторонних адресатов.
+        self.assertTrue(send.sent or senddoc.docs)
         self.assertTrue(all(s["chat_id"] == -1001 for s in send.sent))
+        self.assertTrue(all(d["chat_id"] == -1001 for d in senddoc.docs))
 
 
 class TestRedeliverRisk2Participants(_RedeliverBase):
@@ -271,16 +306,26 @@ class TestRedeliverRisk2Participants(_RedeliverBase):
         at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_meta(mids=(101,), at=at, expected=("Михаил Саргин", "Дарья Набережная"))
         send = _FakeSend()
+        captured = {}
+
+        def fake_title_subtitle(text, meta, **kw):
+            captured["meta"] = dict(meta)
+            return ("T", "S")
+
         with mock.patch.object(lp.telegram_api, "send_message", send), \
              mock.patch.object(lp.telegram_api, "delete_message", _FakeDelete(ok=True)), \
+             mock.patch.object(lp.telegram_api, "send_document", _FakeSendDoc()), \
+             mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", _FakeRenderPdf()), \
+             mock.patch.object(lp.protocol_to_tg, "build_pdf_title_subtitle", fake_title_subtitle), \
              mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 x"):
             lp.redeliver_revised_protocol(
                 {"series": "coord", "date": "2026-06-02",
                  "expectedParticipants": [], "participants": []},  # пусто, как у clarify
                 PROTO_OLD, PROTO_NEW, meta_json_path=self.meta_path, delete_previous=True,
             )
-        joined = "\n".join(s["text"] for s in send.sent)
-        self.assertIn("Михаил Саргин", joined)  # шапка не пустая
+        # РИСК2: meeting_meta для шапки PDF обогащён участниками из meta.json
+        # (caller дал пустой список) — иначе шапка PDF-ревизии пришла бы пустой.
+        self.assertIn("Михаил Саргин", captured["meta"].get("expectedParticipants") or [])
 
 
 # ===========================================================================

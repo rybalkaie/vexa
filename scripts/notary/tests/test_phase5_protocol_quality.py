@@ -361,6 +361,8 @@ class TestRedeliverRevisedProtocol(unittest.TestCase):
         """Доставлено + контент изменился → шлём ревизию (обход идемпотентности)."""
         self._write_delivered({"chat_id": 999, "message_ids": [1], "at": "old"})
         with mock.patch.object(lp.telegram_api, "send_message", return_value={"message_id": 42}) as m, \
+                mock.patch.object(lp.telegram_api, "send_document", return_value={"message_id": 100}), \
+                mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", lambda *a, **k: None), \
                 mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 changed"):
             res = lp.redeliver_revised_protocol(
                 REDELIVER_META, SAMPLE_OLD, SAMPLE_NEW,
@@ -386,12 +388,14 @@ class TestRedeliverRevisedProtocol(unittest.TestCase):
             return {"message_id": len(sent_texts)}
 
         with mock.patch.object(lp.telegram_api, "send_message", side_effect=_capture), \
+                mock.patch.object(lp.telegram_api, "send_document", return_value={"message_id": 100}), \
+                mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", lambda *a, **k: None), \
                 mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 Что изменилось: имя"):
             lp.redeliver_revised_protocol(
                 REDELIVER_META, SAMPLE_OLD, SAMPLE_NEW,
                 meta_json_path=self.meta_path, meeting_sid="sid",
             )
-        self.assertTrue(sent_texts[0].startswith("🔁"))
+        self.assertTrue(sent_texts[0].startswith("🔁"))  # summary текстом — первым, PDF — следом
 
     def test_idempotent_revision_skipped_when_hash_matches(self):
         """Повтор того же ревизионного контента → skipped (не задваиваем)."""
@@ -427,6 +431,8 @@ class TestRedeliverRevisedProtocol(unittest.TestCase):
             "content_hash": lp._protocol_content_hash(SAMPLE_NEW),
         })
         with mock.patch.object(lp.telegram_api, "send_message", return_value={"message_id": 7}), \
+                mock.patch.object(lp.telegram_api, "send_document", return_value={"message_id": 100}), \
+                mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", lambda *a, **k: None), \
                 mock.patch.object(lp, "_compose_revision_summary", return_value="🔁"):
             res = lp.redeliver_revised_protocol(
                 REDELIVER_META, SAMPLE_OLD, new2,

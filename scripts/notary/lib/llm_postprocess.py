@@ -4843,25 +4843,43 @@ def redeliver_revised_protocol(
     except telegram_api.TelegramApiError as e:
         logger.warning("[revision] summary send failed meeting=%s: %s", meeting_sid or "?", e)
 
-    # 2) Новая версия протокола (тот же формат/сплит, что первичная доставка).
-    tg_text = protocol_to_tg.format_protocol_as_tg_text(new_protocol_text, meeting_meta)
-    chunks = protocol_to_tg.split_protocol_smart(tg_text, max_len=protocol_to_tg.TG_MAX_LEN)
-    if not chunks:
-        return {"status": "error", "error": "empty TG text after formatting"}
-    sent_ids: list[int] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        try:
-            result = telegram_api.send_message(bot_token, chat_id, chunk)
-        except telegram_api.TelegramApiError as e:
-            logger.warning(
-                "[revision] send failed meeting=%s part=%d/%d: %s",
-                meeting_sid or "?", idx, len(chunks), e,
+    # 2) Новая версия протокола — PDF-документом, КАК первичная доставка
+    #    (`deliver_protocol`). Решение владельца 2026-06-08: ревизии должны
+    #    приходить в том же виде, что оригинал (PDF), а не текстом. Шапка/подпись/
+    #    рендер — тем же `protocol_to_tg` + `protocol_to_pdf`. Транскрипт-json для
+    #    «чистого времени» берём рядом с meta (как deliver_protocol).
+    date_for_pdf = meeting_meta.get("date")
+    transcript_json_path = None
+    if meta_json_path is not None:
+        candidate = Path(meta_json_path).parent / "_transcripts" / f"{date_for_pdf}.json"
+        if candidate.is_file():
+            transcript_json_path = candidate
+    caption = protocol_to_tg.build_pdf_caption(
+        new_protocol_text, meeting_meta, transcript_json_path=transcript_json_path,
+    )
+    pdf_title, pdf_subtitle = protocol_to_tg.build_pdf_title_subtitle(
+        new_protocol_text, meeting_meta, transcript_json_path=transcript_json_path,
+    )
+    safe_date = re.sub(r"[^0-9A-Za-z._-]", "-", str(date_for_pdf)) or "protokol"
+    pdf_filename = f"protokol-{safe_date}.pdf"
+    try:
+        with tempfile.TemporaryDirectory(prefix="revision-pdf-") as td:
+            pdf_path = Path(td) / pdf_filename
+            protocol_to_pdf.render_pdf_from_markdown(
+                new_protocol_text, str(pdf_path),
+                title=pdf_title, subtitle=pdf_subtitle,
             )
-            return {
-                "status": "error", "chat_id": chat_id,
-                "message_ids": sent_ids, "error": str(e),
-            }
-        sent_ids.append(int(result.get("message_id") or 0))
+            result = telegram_api.send_document(
+                bot_token, chat_id, str(pdf_path),
+                caption=caption, filename=pdf_filename,
+            )
+    except (protocol_to_pdf.PdfRenderError, telegram_api.TelegramApiError, OSError) as e:
+        logger.error(
+            "[revision] PDF доставка упала meeting=%s chat_id=%s: %s",
+            meeting_sid or "?", chat_id, e,
+        )
+        return {"status": "error", "chat_id": chat_id, "message_ids": [], "error": str(e)}
+    sent_ids: list[int] = [int(result.get("message_id") or 0)]
 
     # 3) meta.delivered ← новая запись с revision-маркером и content_hash.
     #    replace_for_chat_id=True: следующий тик collector'а увидит свежие
@@ -4881,6 +4899,7 @@ def redeliver_revised_protocol(
             "decision": "revision",
             "revision": revision,
             "content_hash": new_hash,
+            "document": True,
             "history": prev_history,
         })
     logger.info(
