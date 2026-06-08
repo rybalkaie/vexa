@@ -432,6 +432,87 @@ class TestRisk1LiveFutureNotReclaimed(_ListenerReissueBase):
 
 
 # ===========================================================================
+# Паритет с sync-обёрткой: упавшая встреча НЕ пере-заклеймливается в ТОМ ЖЕ
+# проходе (drained_fids guard в claim). Sync `process_ready_reissues` ведёт
+# `seen_fids` → «одна попытка на встречу за sweep»; async drain делает
+# finalize(error→ready)+pop ДО claim в том же вызове, поэтому без guard'а только
+# что упавшая встреча пере-заклеймилась бы back-to-back, сжигая попытки и держа
+# слот cap=1 в обход других ready_for_reissue.
+# ===========================================================================
+class TestDrainedFidsNotReclaimedSameSweep(_ListenerReissueBase):
+    def test_failed_meeting_yields_slot_to_other_ready_same_sweep(self):
+        """Находка #2: встреча A падает (error→ready_for_reissue) и в ТОМ ЖЕ
+        проходе, где её future дренится, claim НЕ должен пере-заклеймить A —
+        свободный слот (cap=1) уходит другой ready-встрече B, A ждёт следующего
+        sweep. Паритет с sync-обёрткой process_ready_reissues."""
+        fid_a = self._ready(series="alpha", attempts=0)
+
+        release_b = threading.Event()
+        started_b = threading.Event()
+        submitted: list[str] = []
+
+        def reissue_fn(state, *, root=None):
+            submitted.append(state["feedback_id"])
+            if state["feedback_id"] == fid_a:
+                raise RuntimeError("claude процесс умер")  # A → error-revert
+            # B → блокируется как «долгая генерация» (предохранитель по timeout).
+            started_b.set()
+            if not release_b.wait(timeout=_JOIN_TIMEOUT):
+                raise AssertionError("release_b не выставлен")
+            return {"status": "sent", "message_ids": [9001]}
+
+        inflight: dict = {}
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            # Проход 1: только A в ready → claim A, submit, future падает с error.
+            ml._process_reissues_async(
+                executor=executor, inflight=inflight,
+                root=self.root, cap=1, reissue_fn=reissue_fn,
+            )
+            self.assertEqual(submitted, [fid_a])
+            self.assertIn(fid_a, inflight)
+            with self.assertRaises(RuntimeError):
+                inflight[fid_a][0].result(timeout=5)  # детерминированно: future done
+
+            # Теперь добавляем B (ready). Проход 2 в ОДНОМ вызове: drain(A)
+            # error→ready_for_reissue + pop, затем claim со свободным слотом.
+            fid_b = self._ready(series="bravo", attempts=0)
+            ml._process_reissues_async(
+                executor=executor, inflight=inflight,
+                root=self.root, cap=1, reissue_fn=reissue_fn,
+            )
+
+            # Слот достался B, а НЕ повторному A (drained_fids пропустил A).
+            self.assertTrue(started_b.wait(timeout=_JOIN_TIMEOUT))
+            self.assertEqual(submitted, [fid_a, fid_b], "A пере-заклеймлена в том же sweep")
+            self.assertEqual(list(inflight), [fid_b])
+            self.assertEqual(
+                feedback_state.read_state(fid_b, root=self.root)["status"], "reissuing",
+            )
+            # A после error-revert ждёт следующего sweep: ready, attempts инкрементнут.
+            cur_a = feedback_state.read_state(fid_a, root=self.root)
+            self.assertEqual(cur_a["status"], "ready_for_reissue")
+            self.assertEqual(cur_a["reissue_attempts"], 1)
+
+            # Следующий sweep (после освобождения слота B) подхватывает A.
+            release_b.set()
+            inflight[fid_b][0].result(timeout=5)
+            ml._process_reissues_async(
+                executor=executor, inflight=inflight,
+                root=self.root, cap=1, reissue_fn=reissue_fn,
+            )
+            self.assertIn(fid_a, inflight)  # A заклеймлена на след. sweep
+            # дождаться завершения future A (он снова падает) — submitted растёт лишь
+            # ПОСЛЕ реального старта воркера, поэтому сверяем submitted ПОСЛЕ result.
+            with self.assertRaises(RuntimeError):
+                inflight[fid_a][0].result(timeout=5)
+            self.assertEqual(submitted, [fid_a, fid_b, fid_a], "A не подхвачена на след. sweep")
+        finally:
+            release_b.set()
+            executor.shutdown(wait=True)
+
+
+# ===========================================================================
 # R12 — guard ручных команд на reissuing-встрече
 # ===========================================================================
 class TestReissueGuard(_ListenerReissueBase):

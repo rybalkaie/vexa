@@ -881,6 +881,12 @@ def _process_reissues_async(
     from notary.lib import feedback_reissue  # noqa: PLC0415
 
     # 1) DRAIN: завершённые future → finalize (главный поток), снять из реестра.
+    # drained_fids — встречи, прошедшие drain/finalize в ЭТОМ проходе. Передаём их
+    # в claim как skip (паритет с sync-обёрткой process_ready_reissues: «одна
+    # попытка на встречу за sweep»). Иначе только что упавшая встреча (error→ready)
+    # пере-заклеймится в том же проходе и сожжёт попытку back-to-back, держа слот
+    # cap=1 и обделяя другие ready_for_reissue.
+    drained_fids: set = set()
     for fid in list(inflight.keys()):
         future, claimed, submitted_ts = inflight[fid]
         if not future.done():
@@ -897,6 +903,7 @@ def _process_reissues_async(
             logger.exception("[reissue] finalize fid=%s упал: %s", fid, e)
             status = None
         inflight.pop(fid, None)
+        drained_fids.add(fid)
         dur = time.monotonic() - submitted_ts
         logger.info(
             "[reissue] drain fid=%s status=%s round=%s dur=%.1fs",
@@ -914,7 +921,9 @@ def _process_reissues_async(
     free = max(0, cap - len(inflight))
     if free <= 0:
         return
-    skip_fids = set(inflight.keys())
+    # skip = живые in-flight | прошедшие drain в этом проходе (паритет с sync:
+    # упавшая встреча ждёт следующий sweep, не пере-заклеймливается тут же).
+    skip_fids = set(inflight.keys()) | drained_fids
     try:
         claimed_list = feedback_reissue.claim_ready_reissues(
             root=root, max_n=free, skip_fids=skip_fids,
@@ -1209,12 +1218,19 @@ def main() -> int:
         # R8/РИСК2: shutdown — best-effort/наблюдаемость, НЕ гарантия. Реальную
         # целостность даёт reclaim_stale_reissuing (≤900с) — оборванный `reissuing`
         # вернётся в `ready_for_reissue` на следующем старте. Здесь только лог числа
-        # оборванных in-flight (метаданные, R9) + неблокирующий shutdown.
+        # оборванных in-flight (метаданные, R9).
         logger.warning("[reissue] SIGTERM: оборвано in-flight перевыпусков=%d "
                        "(reclaim вернёт их в очередь ≤900с)", len(_reissue_inflight))
         if _reissue_executor is not None:
             _reissue_executor.shutdown(wait=False)
-        sys.exit(143)
+        # os._exit, а НЕ sys.exit: concurrent.futures.thread регистрирует
+        # interpreter-level atexit `_python_exit`, который БЕЗУСЛОВНО join()-ит
+        # воркер-потоки без таймаута. Обычный exit → atexit → процесс зависнет до
+        # конца reissue_one (claude до 600с) или до SIGKILL по grace-периоду
+        # systemd. os._exit минует atexit-join: оборванный future мгновенно
+        # становится reclaim-кейсом (R8: целостность держит reclaim ≤900с, state
+        # уже атомарно на диске, буферить нечего).
+        os._exit(143)
 
     try:
         signal.signal(signal.SIGTERM, _on_term)
