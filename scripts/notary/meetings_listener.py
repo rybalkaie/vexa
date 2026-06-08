@@ -26,18 +26,21 @@ Reply-привязка остаётся опциональной для буду
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
@@ -57,6 +60,31 @@ ERROR_BACKOFF_S = 10
 HEARTBEAT_EVERY_S = 30
 SWEEP_EVERY_S = 30  # частота проверки таймаутов clarify
 TRIGGER_PREFIX = "\U0001F4C5"  # 📅 — вечерний блок (apply_reply flow)
+
+# ── Ф2: фоновый перевыпуск протокола ───────────────────────────────────────
+# Перевыпуск (claude-генерация + доставка PDF, 200–600с на слабом CPU) больше не
+# блокирует главный цикл. Тяжёлая часть (`reissue_one`) уходит в фоновый поток на
+# ОДИН воркер (A2/A4: один claude на CPU за раз; несколько встреч — по очереди).
+# claim и finalize остаются в главном потоке (R3: мутации feedback-state в одном
+# потоке; R2/FM-10: claim в том же проходе sweep, что и feedback-sweep).
+_reissue_executor: Optional[ThreadPoolExecutor] = None
+# fid → (future, claimed_state, submitted_monotonic). claimed нужен finalize'у
+# (base round/attempts), submitted_ts — для лога длительности (метаданные, R9).
+_reissue_inflight: dict[str, tuple[Future, dict, float]] = {}
+# cap=1 (A2): не более одной reissue-генерации одновременно. claim берёт встречу
+# только когда воркер свободен → claimed-but-queued не возникает, state не висит в
+# `reissuing` дольше одной генерации (RECLAIM_STALE_REISSUING_SEC корректен).
+_REISSUE_CAP = 1
+# R10: троттл уборки dormant-state'ов — не чаще раза в сутки (модульный timestamp,
+# а не глоб папки каждые 30с). monotonic, None = ещё не запускали в этой жизни.
+_last_dormant_cleanup_mono: Optional[float] = None
+_DORMANT_CLEANUP_EVERY_S = 24 * 3600
+# R11: фиксированный текст уведомления о старте перевыпуска. Без вставок из правок
+# (R9) — только метаданные не нужны участнику, текст один и тот же.
+_REISSUE_NOTICE_TEXT = (
+    "\U0001F527 Учёл правки, пересобираю протокол — пришлю обновлённую версию "
+    "через пару минут"
+)
 
 
 def _clarify_prefix() -> str:
@@ -220,6 +248,33 @@ def _protokol_root() -> Path:
     return Path(os.path.expanduser(raw))
 
 
+def _reissue_guard_blocks(token: str, chat_id: int, series: str, date_str: str, msg: dict[str, Any]) -> bool:
+    """R12 (РИСК3): если встреча сейчас в фоновом перевыпуске (`reissuing`) —
+    блокируем ручную команду, чтобы параллельная генерация не затёрла protocol-файл.
+
+    Read-only проверка статуса (без claude, без рефактора путей). True → команда
+    заблокирована (caller отвечает «обработано» и выходит); False → можно выполнять.
+    best-effort: сбой чтения state НЕ блокирует команду (пропускаем guard, команда
+    идёт как раньше — отказ от guard безопаснее ложной блокировки легитимной команды).
+    """
+    try:
+        from notary.lib import feedback_state  # noqa: PLC0415
+        fid = feedback_state.build_feedback_id(series, date_str, chat_id)
+        st = feedback_state.read_state(fid)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[reissue] R12 guard read_state упал (пропускаю guard): %s", e)
+        return False
+    if st is not None and st.get("status") == "reissuing":
+        logger.info("[reissue] R12 guard: команда на reissuing-встречу fid=%s — отложена", fid)
+        send_message(
+            token, chat_id,
+            "⏳ Эта встреча сейчас пересобирается по правкам — повтори через пару минут",
+            reply_to=msg.get("message_id"),
+        )
+        return True
+    return False
+
+
 def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
     """Если сообщение Ильи — команда «протокол <series> <date>», запускаем
     регенерацию и шлём результат текстом обратно.
@@ -242,6 +297,11 @@ def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any
     if parsed is None:
         return False
     series, date_str = parsed
+
+    # R12 (РИСК3): встреча в фоновом перевыпуске → откладываем команду (иначе
+    # параллельная генерация молча затрёт protocol-файл). Read-only, до ack/генерации.
+    if _reissue_guard_blocks(token, chat_id, series, date_str, msg):
+        return True
 
     # Дедуп: повтор той же команды в окне 30 сек (Wispr Flow диктовка).
     if _protocol_command_is_dupe(series, date_str):
@@ -458,6 +518,11 @@ def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, A
     if parsed is None:
         return False
     series, date_str, instruction, kind = parsed.series, parsed.date, parsed.instruction, parsed.kind
+
+    # R12 (РИСК3): встреча в фоновом перевыпуске → откладываем коррекцию (иначе
+    # apply_correction молча затрёт protocol-файл параллельно с reissue). Read-only.
+    if _reissue_guard_blocks(token, chat_id, series, date_str, msg):
+        return True
 
     if _correction_command_is_dupe(series, date_str, instruction):
         send_message(
@@ -716,7 +781,189 @@ def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -
         logger.exception("process_callback failed: %s", e)
 
 
-def sweep_clarify_timeouts() -> None:
+def _warm_reissue_imports() -> None:
+    """УПУ1: прогрев ленивых импортов, достижимых из `reissue_one` в фоновом потоке.
+
+    `reissue_one` лениво импортирует `llm_postprocess`, `series_memory`
+    (feedback_reissue.py:~630) и `feedback_learning` (~645). Первый импорт модуля
+    из НЕ-главного потока несёт риск import-lock дедлока (CPython держит блокировку
+    на время выполнения тела модуля; если главный поток в это время держит другой
+    замок — взаимоблокировка). Принудительно импортируем их В ГЛАВНОМ ПОТОКЕ на
+    старте, до создания исполнителя. Best-effort: сбой логируем, не валим старт
+    (фоновый путь тогда импортирует сам — риск ниже, чем не подняться вовсе).
+    """
+    for modname in (
+        "notary.lib.llm_postprocess",
+        "notary.lib.series_memory",
+        "notary.lib.feedback_learning",
+        "notary.lib.feedback_reissue",
+    ):
+        try:
+            __import__(modname)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[reissue] прогрев импорта %s не удался (non-fatal): %s", modname, e)
+
+
+def _send_reissue_start_notice(token: Optional[str], claimed: dict, *, root: Optional[Path] = None) -> None:
+    """R11: уведомление участникам о старте перевыпуска (главный поток, при submit).
+
+    Best-effort (УПУ2): сбой/таймаут send НЕ валит submit перевыпуска. Текст
+    фиксированный (R9 — без вставок из правок). Один раз на раунд: флаг
+    `reissue_notice_sent_round` в state выставляем ПОСЛЕ попытки send; повторный
+    claim того же раунда (обычный поток) второе не шлёт. При reclaim после краша
+    (новый attempt того же раунда — флаг уже стоит, повтор не шлём; новый раунд от
+    конкурентного reply — round вырос, флаг устарел, «пересобираю» уйдёт снова и
+    это желательно).
+
+    R9: логируем только метаданные (fid, round) — без текста.
+    """
+    if not token:
+        return  # тесты/совместимость — токен не передан, R11 не шлём
+    from notary.lib import feedback_state  # noqa: PLC0415
+    fid = claimed.get("feedback_id")
+    rnd = claimed.get("round")
+    chat_id = claimed.get("chat_id")
+    if chat_id is None:
+        return
+    # Проверка «слать ли»: свежий state мог уже пометить этот раунд (повторный
+    # claim того же раунда в обычном потоке). Читаем СВЕЖИЙ, не claimed-снимок.
+    try:
+        cur = feedback_state.read_state(fid, root=root) if fid else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[reissue] R11 read_state упал fid=%s (non-fatal): %s", fid, e)
+        cur = None
+    if cur is not None and cur.get("reissue_notice_sent_round") == rnd:
+        logger.info("[reissue] R11 уже отправлено fid=%s round=%s — пропуск", fid, rnd)
+        return
+    # reply на сообщение протокола, если оно известно (последнее — самое свежее).
+    mids = claimed.get("protocol_message_ids") or []
+    reply_to = mids[-1] if mids else None
+    try:
+        send_message(token, int(chat_id), _REISSUE_NOTICE_TEXT, reply_to=reply_to)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[reissue] R11 send упал fid=%s (non-fatal, submit продолжаем): %s", fid, e)
+    # Флаг ставим ПОСЛЕ попытки send (один раз на раунд). Статус НЕ меняем —
+    # state уже `reissuing` (claim прошёл), пишем только extra-поле через
+    # mark_status на тот же валидный статус (R3 — мутация в главном потоке).
+    if not fid:
+        return
+    try:
+        feedback_state.mark_status(
+            fid, "reissuing", root=root,
+            extra={"reissue_notice_sent_round": rnd},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[reissue] R11 флаг не записан fid=%s (non-fatal): %s", fid, e)
+
+
+def _process_reissues_async(
+    *,
+    executor: Optional[ThreadPoolExecutor],
+    inflight: dict,
+    token: Optional[str] = None,
+    root: Optional[Path] = None,
+    cap: int = _REISSUE_CAP,
+    reissue_fn: Optional[Callable] = None,
+) -> None:
+    """Ф2: неблокирующая обработка перевыпусков. drain → claim → submit.
+
+    Вызывается из `sweep_clarify_timeouts` СРАЗУ после `feedback_worker.sweep_timeouts()`
+    (инвариант FM-10/R2: claim в том же проходе, без обработки сообщений между sweep и
+    claim). Тяжёлый `reissue_one` уходит в `executor` (один воркер); claim и finalize —
+    в главном потоке (R3).
+
+    Параметризовано для тестов Ф3: `executor`/`inflight`/`reissue_fn` инъектируются;
+    sweep зовёт с модульными глобалами и боевым `reissue_one`.
+
+    Реестр `inflight`: fid → (future, claimed_state, submitted_monotonic).
+    R9: логируем только метаданные (fid, status, round, длительность).
+    """
+    from notary.lib import feedback_reissue  # noqa: PLC0415
+
+    # 1) DRAIN: завершённые future → finalize (главный поток), снять из реестра.
+    for fid in list(inflight.keys()):
+        future, claimed, submitted_ts = inflight[fid]
+        if not future.done():
+            continue
+        try:
+            res = future.result()
+        except Exception as e:  # noqa: BLE001
+            # Исключение из reissue_one — как в синхронной обёртке: error-revert.
+            logger.exception("[reissue] фоновый reissue_one упал fid=%s: %s", fid, e)
+            res = {"status": "error", "error": str(e)}
+        try:
+            status = feedback_reissue.finalize_reissue(fid, claimed, res, root=root)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[reissue] finalize fid=%s упал: %s", fid, e)
+            status = None
+        inflight.pop(fid, None)
+        dur = time.monotonic() - submitted_ts
+        logger.info(
+            "[reissue] drain fid=%s status=%s round=%s dur=%.1fs",
+            fid, status, claimed.get("round"), dur,
+        )
+
+    # Без исполнителя (на всякий случай) — claim/submit не делаем: тяжёлую часть
+    # некуда отправить, а синхронно звать нельзя (заблокирует листенер).
+    if executor is None:
+        return
+
+    # 2) CLAIM: только если есть свободная ёмкость. skip_fids = живые in-flight
+    # (РИСК1 — ОБЯЗАТЕЛЬНО: reclaim внутри claim_ready_reissues не должен сбросить
+    # живую генерацию дольше 900с → иначе пере-claim и двойная доставка).
+    free = max(0, cap - len(inflight))
+    if free <= 0:
+        return
+    skip_fids = set(inflight.keys())
+    try:
+        claimed_list = feedback_reissue.claim_ready_reissues(
+            root=root, max_n=free, skip_fids=skip_fids,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[reissue] claim упал: %s", e)
+        return
+
+    # 3) SUBMIT: каждая claimed-встреча → фоновый reissue_one; R11 уведомление.
+    fn = reissue_fn or feedback_reissue.reissue_one
+    for claimed in claimed_list:
+        fid = claimed.get("feedback_id")
+        if not fid:
+            continue
+        # R11 уведомление о старте (best-effort, до submit — участник видит реакцию
+        # сразу). Сбой не валит submit (УПУ2).
+        _send_reissue_start_notice(token, claimed, root=root)
+        try:
+            future = executor.submit(fn, claimed, root=root)
+        except Exception as e:  # noqa: BLE001
+            # Submit упал (например, executor уже shutdown) — НЕ оставляем state в
+            # `reissuing` навсегда: reclaim (≤900с) вернёт в очередь. Логируем и идём.
+            logger.exception("[reissue] submit fid=%s упал: %s", fid, e)
+            continue
+        inflight[fid] = (future, claimed, time.monotonic())
+        logger.info("[reissue] submit fid=%s round=%s → фон", fid, claimed.get("round"))
+
+
+def _maybe_cleanup_dormant_states() -> None:
+    """R10: дешёвый троттл-вызов уборки старых dormant-state'ов (не чаще раза в сутки).
+
+    best-effort: сбой не валит sweep. Логируем число удалённых (без имён, R9).
+    """
+    global _last_dormant_cleanup_mono
+    now_mono = time.monotonic()
+    if _last_dormant_cleanup_mono is not None and \
+            now_mono - _last_dormant_cleanup_mono < _DORMANT_CLEANUP_EVERY_S:
+        return
+    _last_dormant_cleanup_mono = now_mono
+    try:
+        from notary.lib import feedback_state as _fs  # noqa: PLC0415
+        removed = _fs.cleanup_dormant_states()
+        if removed:
+            logger.info("[reissue] dormant cleanup: удалено %d старых state-файлов", removed)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("[reissue] dormant cleanup упал (non-fatal): %s", e)
+
+
+def sweep_clarify_timeouts(token: Optional[str] = None) -> None:
     pending_root = _clarify_pending_root()
     if pending_root is None or not pending_root.exists():
         return
@@ -760,18 +1007,22 @@ def sweep_clarify_timeouts() -> None:
             logger.info("feedback sweep: %d окон закрыто → ready_for_reissue", n5)
     except Exception as e:  # noqa: BLE001
         logger.exception("feedback sweep failed: %s", e)
-    # Ф4 feedback reissue — ready_for_reissue → claim → перевыпуск (удалить старое
-    # сообщение+файл, постить новую версию + «🔁 Что изменилось») → dormant. Идёт
-    # СРАЗУ после feedback-sweep в этом же проходе (без обработки сообщений между),
-    # чтобы claim закрывал гонку Н1. Каждый перевыпуск зовёт claude и блокирует
-    # listener — лимит MAX_REISSUES_PER_SWEEP на проход.
+    # Ф2 feedback reissue — НЕБЛОКИРУЮЩИЙ путь: drain завершённых → finalize
+    # (главный поток), claim ready_for_reissue (СРАЗУ после feedback-sweep в этом
+    # же проходе — инвариант FM-10/R2, без обработки сообщений между sweep и claim),
+    # submit тяжёлого `reissue_one` в фоновый воркер. Генерация claude (200–600с)
+    # больше НЕ блокирует листенер — он остаётся отзывчивым (R1). РИСК1: skip_fids
+    # живых future пробрасывается в claim/reclaim внутри _process_reissues_async.
     try:
-        from notary.lib import feedback_reissue  # noqa: PLC0415
-        n6 = feedback_reissue.process_ready_reissues()
-        if n6:
-            logger.info("feedback reissue: %d протоколов перевыпущено → dormant", n6)
+        _process_reissues_async(
+            executor=_reissue_executor,
+            inflight=_reissue_inflight,
+            token=token,
+        )
     except Exception as e:  # noqa: BLE001
-        logger.exception("feedback reissue failed: %s", e)
+        logger.exception("feedback reissue async failed: %s", e)
+    # R10 — уборка старых dormant-state'ов (дешёвый троттл, не чаще раза в сутки).
+    _maybe_cleanup_dormant_states()
 
 
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
@@ -947,6 +1198,34 @@ def main() -> int:
     logger.info("listener старт: chat_id=%s long-poll=%ds", allowed_chat, POLL_TIMEOUT_S)
     heartbeat()
 
+    # Ф2: фоновый исполнитель перевыпуска. УПУ1 — прогрев ленивых импортов В
+    # ГЛАВНОМ ПОТОКЕ ДО создания исполнителя (снимает риск import-lock дедлока при
+    # первом импорте из фонового потока). Один воркер (A2/A4: один claude за раз).
+    global _reissue_executor
+    _warm_reissue_imports()
+    _reissue_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reissue")
+
+    def _on_term(signum, frame):  # noqa: ANN001, ARG001
+        # R8/РИСК2: shutdown — best-effort/наблюдаемость, НЕ гарантия. Реальную
+        # целостность даёт reclaim_stale_reissuing (≤900с) — оборванный `reissuing`
+        # вернётся в `ready_for_reissue` на следующем старте. Здесь только лог числа
+        # оборванных in-flight (метаданные, R9) + неблокирующий shutdown.
+        logger.warning("[reissue] SIGTERM: оборвано in-flight перевыпусков=%d "
+                       "(reclaim вернёт их в очередь ≤900с)", len(_reissue_inflight))
+        if _reissue_executor is not None:
+            _reissue_executor.shutdown(wait=False)
+        sys.exit(143)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError) as e:  # не главный поток / нет сигналов
+        logger.debug("[reissue] SIGTERM handler не установлен: %s", e)
+
+    def _shutdown_executor() -> None:
+        if _reissue_executor is not None:
+            _reissue_executor.shutdown(wait=False)
+    atexit.register(_shutdown_executor)
+
     offset = load_offset()
     last_hb = time.time()
     last_sweep = 0.0
@@ -955,7 +1234,7 @@ def main() -> int:
         # Периодический sweep clarify-таймаутов (дёшево — только файловые ops).
         now_mono = time.monotonic()
         if now_mono - last_sweep >= SWEEP_EVERY_S:
-            sweep_clarify_timeouts()
+            sweep_clarify_timeouts(token=token)
             last_sweep = now_mono
 
         updates = get_updates(token, offset)
