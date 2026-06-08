@@ -590,5 +590,80 @@ class TestVoiceFeedbackFB9(_Base):
         self.assertEqual(feedback_state.list_states(root=self.root), [])
 
 
+# ===========================================================================
+# FB-now (2026-06-08) — команда «делай сразу»: перевыпуск без ожидания окна.
+# Владелец диктует правки и не хочет ждать 20 мин дебаунса. Доказываем:
+#   • детектор ловит императив («делай сразу», «не жди 20 минут»), но НЕ голое
+#     «сразу» как данные правки («Ольга внесла сразу»);
+#   • правка + «делай сразу» → правка записана БЕЗ команды, окно закрыто сейчас;
+#   • чистая «делай сразу» → без новой правки, окно закрыто; без правок → no-op;
+#   • после флэша sweep немедленно переводит в ready_for_reissue.
+# ===========================================================================
+class TestImmediateReissueFBnow(_Base):
+    def test_detect_and_strip_unit(self):
+        W = feedback_worker.wants_immediate_reissue
+        S = feedback_worker.strip_flush_command
+        self.assertTrue(W("делай сразу"))
+        self.assertTrue(W("перепутал Марию и Татьяну, делай сразу"))
+        self.assertTrue(W("не жди 20 минут"))
+        self.assertTrue(W("применяй сразу"))
+        self.assertTrue(W("перевыпусти сейчас"))
+        # негатив: «сразу» как ДАННЫЕ правки (без императива) — не флэш
+        self.assertFalse(W("Ольга внесла сразу на встрече"))
+        self.assertFalse(W("обычная правка без команды"))
+        self.assertEqual(S("перепутал Марию и Татьяну, делай сразу"), "перепутал Марию и Татьяну")
+        self.assertEqual(S("делай сразу"), "")
+
+    def test_correction_plus_flush_closes_window_now(self):
+        send = _FakeSend()
+        st = feedback_worker.handle_feedback_reply(
+            "tok", -1001, _msg(701, "131 на доставке, делай сразу", reply_mid=101),
+            meeting=_meeting(), root=self.root, now=_dt(12, 0), send=send,
+        )
+        self.assertEqual(len(st["edits"]), 1)
+        self.assertEqual(st["edits"][0]["text"], "131 на доставке")  # команда вырезана
+        self.assertEqual(feedback_state._parse_iso(st["deadline_at"]), _dt(12, 0))  # окно закрыто сейчас
+        self.assertIn("Перевыпускаю сейчас", send.sent[0]["text"])
+        # sweep немедленно → ready_for_reissue
+        self.assertEqual(feedback_worker.sweep_timeouts(self.root, now=_dt(12, 0)), 1)
+        self.assertEqual(
+            feedback_state.read_state(st["feedback_id"], root=self.root)["status"], "ready_for_reissue"
+        )
+
+    def test_pure_flush_after_collected_edits(self):
+        send = _FakeSend()
+        feedback_worker.handle_feedback_reply(
+            "tok", -1001, _msg(702, "первая правка", reply_mid=101),
+            meeting=_meeting(), root=self.root, now=_dt(12, 0), send=send,
+        )
+        st = feedback_worker.handle_feedback_reply(
+            "tok", -1001, _msg(703, "делай сразу", reply_mid=101),
+            meeting=_meeting(), root=self.root, now=_dt(12, 1), send=send,
+        )
+        self.assertEqual(len(st["edits"]), 1)  # новой правки не добавили
+        self.assertEqual(feedback_state._parse_iso(st["deadline_at"]), _dt(12, 1))
+        self.assertIn("Перевыпускаю сейчас", send.sent[1]["text"])
+        self.assertEqual(feedback_worker.sweep_timeouts(self.root, now=_dt(12, 1)), 1)
+
+    def test_pure_flush_no_edits_is_noop(self):
+        send = _FakeSend()
+        feedback_worker.handle_feedback_reply(
+            "tok", -1001, _msg(704, "делай сразу", reply_mid=101),
+            meeting=_meeting(), root=self.root, now=_dt(12, 0), send=send,
+        )
+        self.assertIn("нет накопленных правок", send.sent[0]["text"].lower())
+        self.assertEqual(feedback_state.list_states(root=self.root), [])  # state не создан
+
+    def test_correction_with_srazu_as_data_not_flushed(self):
+        send = _FakeSend()
+        st = feedback_worker.handle_feedback_reply(
+            "tok", -1001, _msg(705, "Ольга внесла сразу на встрече", reply_mid=101),
+            meeting=_meeting(), root=self.root, now=_dt(12, 0), send=send,
+        )
+        self.assertEqual(st["edits"][0]["text"], "Ольга внесла сразу на встрече")
+        self.assertEqual(feedback_state._parse_iso(st["deadline_at"]), _dt(12, 20))  # обычный дебаунс
+        self.assertIn("Жду 20 минут", send.sent[0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

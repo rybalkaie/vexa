@@ -469,6 +469,63 @@ def ack_more(author: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# FB-now: команда «делай сразу» — перевыпуск без ожидания окна дебаунса
+# --------------------------------------------------------------------------
+
+# Явная императивная команда боту «не жди окно, перевыпусти сейчас». Нарочно
+# ТРЕБУЕМ глагол-императив рядом со «сразу/сейчас» (или «не жди…») — голое «сразу»
+# часто встречается в самой правке как ДАННЫЕ («Ольга внесла сразу на встрече»),
+# и матчить его = ложно флэшить. Кейс владельца: диктует правки, в конце —
+# «делай сразу» (отдельным реплаем или в хвосте правки). Работает и текстом, и
+# голосом (голос → транскрипт → тот же handle_feedback_reply).
+_FLUSH_RE = re.compile(
+    r"\b(?:делай|сделай|применяй|примени|применить|перевыпусти|перевыпускай|"
+    r"публикуй|опубликуй|отправляй|отправь|пришли|шли|выпускай|выпусти)\s+"
+    r"(?:сразу|сейчас|уже|немедленно)\b"
+    r"|\bсразу\s+(?:делай|перевыпуск\w*|применяй|публикуй|отправляй)\b"
+    r"|\bне\s+жди(?:те)?(?:\s+\d+\s*мин\w*)?\b"
+    r"|\bне\s+(?:надо|нужно)\s+ждать\b"
+    r"|\bбез\s+ожидани\w*\b",
+    re.IGNORECASE,
+)
+
+
+def wants_immediate_reissue(text: Optional[str]) -> bool:
+    """True, если в тексте правки есть команда «перевыпусти сейчас, не жди окно»."""
+    return bool(text) and bool(_FLUSH_RE.search(text))
+
+
+def strip_flush_command(text: Optional[str]) -> str:
+    """Убирает флэш-команду из текста, оставляя содержательную часть правки.
+
+    «перепутал Марию и Татьяну, делай сразу» → «перепутал Марию и Татьяну».
+    «делай сразу» → «» (чистая команда, без правки).
+    """
+    if not text:
+        return ""
+    cleaned = _FLUSH_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip(" \t\n.,;:—-")
+
+
+def ack_immediate(author: str) -> str:
+    """ack на правку с командой «делай сразу»: правку принял + перевыпускаю немедленно."""
+    return f"✅ Принял, {author}. Перевыпускаю сейчас — обновлённую версию пришлю в ближайшую минуту."
+
+
+def ack_flush(author: str) -> str:
+    """ack на чистую команду «делай сразу» (без новой правки): перевыпускаю сейчас."""
+    return f"🚀 Перевыпускаю сейчас, {author} — обновлённую версию пришлю в ближайшую минуту."
+
+
+def ack_flush_noop(author: str) -> str:
+    """ack на «делай сразу», когда нечего перевыпускать (нет накопленных правок)."""
+    return (
+        f"Пока нет накопленных правок, {author}. Ответьте на протокол с правкой — "
+        f"и добавьте «делай сразу», если не нужно ждать окно."
+    )
+
+
+# --------------------------------------------------------------------------
 # Окно / дебаунс — FB3 (чистая логика, без IO)
 # --------------------------------------------------------------------------
 
@@ -605,9 +662,24 @@ def handle_feedback_reply(
         expected_participants=expected,
         people_md_names=parse_people_md(_people_md_path()),
     )
-    edit = _build_edit(msg, author, now)
 
     fid = feedback_state.build_feedback_id(meeting.get("series"), meeting.get("date"), meeting.get("chat_id"))
+
+    # FB-now: команда «делай сразу». Содержательную часть (если есть) оставляем как
+    # правку, флэш-команду вырезаем, чтобы она не попала в инструкцию перевыпуска.
+    raw_text = (msg.get("text") or "").strip()
+    immediate = wants_immediate_reissue(raw_text)
+    residual = strip_flush_command(raw_text) if immediate else raw_text
+    if immediate and not residual:
+        # Чистая команда без новой правки — не пишем edit, просто закрываем окно
+        # текущего раунда «сейчас» (ближайший sweep → ready_for_reissue → перевыпуск).
+        return _flush_collecting_round(
+            token, chat_id, msg, fid=fid, author=author, root=root, now=now, send=send,
+        )
+
+    edit_msg = msg if residual == raw_text else {**msg, "text": residual}
+    edit = _build_edit(edit_msg, author, now)
+
     state = feedback_state.read_state(fid, root=root)
     prior_status = state.get("status") if isinstance(state, dict) else None
     prior_edits = len(state.get("edits") or []) if isinstance(state, dict) else 0
@@ -646,17 +718,65 @@ def handle_feedback_reply(
         )
         return new_state
 
+    if immediate:
+        # FB-now: правка + «делай сразу» — закрываем окно немедленно (deadline=now),
+        # ближайший sweep (≤30с) переведёт в ready_for_reissue → перевыпуск.
+        new_state["deadline_at"] = _iso(now)
+        new_state["hard_deadline_at"] = _iso(now)
+
     feedback_state.write_state(new_state, root=root)
-    text = ack_first(author, int(new_state.get("window_min", win))) if kind == "first" else ack_more(author)
+    if immediate:
+        text = ack_immediate(author)
+    else:
+        text = ack_first(author, int(new_state.get("window_min", win))) if kind == "first" else ack_more(author)
     try:
         send(token, chat_id, text, reply_to_message_id=msg.get("message_id"))
     except Exception as e:  # noqa: BLE001
         logger.warning("[feedback] ack send failed (non-fatal): %s", e)
     logger.info(
-        "[feedback] правка записана fid=%s round=%s kind=%s author=%s edits=%d deadline=%s",
-        fid, new_state.get("round"), kind, author, len(new_state.get("edits", [])), new_state.get("deadline_at"),
+        "[feedback] правка записана fid=%s round=%s kind=%s author=%s edits=%d deadline=%s immediate=%s",
+        fid, new_state.get("round"), kind, author, len(new_state.get("edits", [])), new_state.get("deadline_at"), immediate,
     )
     return new_state
+
+
+def _flush_collecting_round(
+    token: str,
+    chat_id: int,
+    msg: dict,
+    *,
+    fid: str,
+    author: str,
+    root: Path,
+    now: datetime,
+    send,
+) -> dict:
+    """FB-now: чистая команда «делай сразу» (без новой правки) — закрыть окно сейчас.
+
+    Если есть открытый раунд с правками — выставляем deadline=now (ближайший sweep
+    перевыпустит). Если правок нет/раунд не collecting — ack «нечего перевыпускать».
+    """
+    state = feedback_state.read_state(fid, root=root)
+    if isinstance(state, dict) and state.get("status") == "collecting" and (state.get("edits") or []):
+        state["deadline_at"] = _iso(now)
+        state["hard_deadline_at"] = _iso(now)
+        feedback_state.write_state(state, root=root)
+        text = ack_flush(author)
+        logger.info(
+            "[feedback] флэш-команда «делай сразу» — окно закрыто немедленно fid=%s edits=%d",
+            fid, len(state.get("edits") or []),
+        )
+    else:
+        text = ack_flush_noop(author)
+        logger.info(
+            "[feedback] флэш-команда без накопленных правок fid=%s status=%s",
+            fid, state.get("status") if isinstance(state, dict) else None,
+        )
+    try:
+        send(token, chat_id, text, reply_to_message_id=msg.get("message_id"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[feedback] флэш-ack send failed (non-fatal): %s", e)
+    return state if isinstance(state, dict) else {}
 
 
 def _transcribe_feedback_voice(token: str, msg: dict) -> Optional[str]:
