@@ -343,6 +343,19 @@ def _next_command_job_id(label: str) -> str:
     return f"{label}#{_command_job_seq}"
 
 
+def _command_label_inflight(label: str) -> bool:
+    """У1 (цикл5/ход3): True если job с такой меткой уже в очереди/в работе.
+
+    Дополняет 30-секундный time-дедуп команд: с И1 командный job может стоять в
+    очереди минуты (за длинным reissue), а time-окно (30с) уже протухло → передиктовка
+    Wispr Flow дала бы ВТОРОЙ идентичный job (двойная claude-генерация + двойная
+    доставка). Проверка по живому реестру ловит дубль на всё время выполнения, а не
+    только 30с. (Метка = `protocol:series/date` / `correction:series/date` — одна на
+    встречу-операцию.) Главный поток читает реестр, гонки нет.
+    """
+    return any(lbl == label for (_f, lbl, _ts) in _command_inflight.values())
+
+
 def _drain_command_jobs(*, inflight: dict) -> None:
     """И1: снять завершённые командные future из реестра (главный поток, рядом с
     `_process_reissues_async` в sweep). Сам результат/ошибку job уже доставил
@@ -478,6 +491,16 @@ def maybe_route_to_protocol_command(token: str, chat_id: int, msg: dict[str, Any
     # R12 (РИСК3): встреча в фоновом перевыпуске → откладываем команду (иначе
     # параллельная генерация молча затрёт protocol-файл). Read-only, до ack/генерации.
     if _reissue_guard_blocks(token, chat_id, series, date_str, msg):
+        return True
+
+    # У1 (цикл5): дубль команды, пока прошлая ещё в очереди/в работе (queuing может
+    # держать job минуты — дольше 30с-окна ниже). Ловим по живому реестру.
+    if _command_label_inflight(f"protocol:{series}/{date_str}"):
+        send_message(
+            token, chat_id,
+            f"⏳ Протокол `{series} {date_str}` уже в очереди/собирается — пришлю, как будет готов.",
+            reply_to=msg.get("message_id"),
+        )
         return True
 
     # Дедуп: повтор той же команды в окне 30 сек (Wispr Flow диктовка).
@@ -704,6 +727,15 @@ def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, A
     # R12 (РИСК3): встреча в фоновом перевыпуске → откладываем коррекцию (иначе
     # apply_correction молча затрёт protocol-файл параллельно с reissue). Read-only.
     if _reissue_guard_blocks(token, chat_id, series, date_str, msg):
+        return True
+
+    # У1 (цикл5): дубль коррекции, пока прошлая ещё в очереди/в работе (queuing).
+    if _command_label_inflight(f"correction:{series}/{date_str}"):
+        send_message(
+            token, chat_id,
+            f"⏳ Коррекция `{series} {date_str}` уже в очереди/применяется — пришлю результат.",
+            reply_to=msg.get("message_id"),
+        )
         return True
 
     if _correction_command_is_dupe(series, date_str, instruction):

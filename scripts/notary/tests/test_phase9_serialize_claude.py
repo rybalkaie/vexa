@@ -300,6 +300,34 @@ class TestGuardAndDedupe(unittest.TestCase):
         self.assertFalse(ml._protocol_command_is_dupe("coord", "2026-06-02"))
         self.assertTrue(ml._protocol_command_is_dupe("coord", "2026-06-02"))
 
+    def test_command_label_inflight_detects_queued_job(self):
+        """У1 (цикл5): хелпер видит job с такой меткой в живом реестре."""
+        ml._command_inflight.clear()
+        self.addCleanup(ml._command_inflight.clear)
+        self.assertFalse(ml._command_label_inflight("protocol:coord/2026-06-02"))
+        ml._command_inflight["protocol:coord/2026-06-02#1"] = (
+            mock.Mock(), "protocol:coord/2026-06-02", time.monotonic())
+        self.assertTrue(ml._command_label_inflight("protocol:coord/2026-06-02"))
+        self.assertFalse(ml._command_label_inflight("protocol:coord/2026-06-03"))
+
+    def test_protocol_route_blocks_duplicate_while_inflight(self):
+        """У1 (цикл5): пока job этой встречи в очереди/работе — повтор команды НЕ
+        сабмитит второй job (queuing держит дольше 30с-дедупа). Wispr-дубль не задвоит."""
+        ml._command_inflight.clear()
+        self.addCleanup(ml._command_inflight.clear)
+        # Имитируем уже стоящий в очереди job этой встречи.
+        ml._command_inflight["protocol:coord/2026-06-02#1"] = (
+            mock.Mock(), "protocol:coord/2026-06-02", time.monotonic())
+        submitted: list = []
+        msg = {"text": "протокол coord 2026-06-02", "message_id": 9}
+        with mock.patch.object(ml, "_reissue_guard_blocks", return_value=False), \
+             mock.patch.object(ml, "_submit_command_job",
+                               side_effect=lambda *a, **k: submitted.append(a) or True), \
+             mock.patch.object(ml, "send_message"):
+            handled = ml.maybe_route_to_protocol_command("tok", -1, msg)
+        self.assertTrue(handled)            # обработано (отлуп «уже в очереди»)
+        self.assertEqual(submitted, [], "второй job сабмитнут несмотря на in-flight дубль")
+
 
 # ===========================================================================
 # I9 — уборка stale ready_for_reissue
