@@ -521,16 +521,49 @@ class TestVoiceFeedbackFB9(_Base):
         self.assertEqual(len(send.sent), 1)
         self.assertEqual(feedback_state.list_states(root=self.root), [])
 
-    def test_dm_voice_returns_false_clarify_untouched(self):
-        # РЕГРЕСС: DM (chat_id == allowed_chat) голос на протокол → False, ничего не
-        # шлём, транскрипцию НЕ дёргаем — отдаём существующему voice/clarify-flow.
+    def test_dm_voice_reply_handled(self):
+        # 2026-06-08: голос-правка реплаем на протокол В ЛИЧКЕ (chat_id == allowed_chat)
+        # теперь ОБРАБАТЫВАЕТСЯ как правка (раньше дефёрилась в voice/clarify-flow):
+        # транскрипция дёргается, ack «✅ Замечание принял», правка уходит в сбор.
+        self._write_delivered(chat_id=42, mids=(101,))
+        send = _FakeSend()
+        transcript = "133 — добавить ответственного"
+        with mock.patch.object(
+            feedback_worker, "_transcribe_feedback_voice", return_value=transcript
+        ) as tr:
+            handled = self._route(_msg(605, None, reply_mid=101, voice=True, chat_id=42), send)
+        self.assertTrue(handled)
+        tr.assert_called_once()
+        self.assertEqual(len(send.sent), 1)
+        self.assertIn("Замечание принял", send.sent[0]["text"])
+        self.assertEqual(send.sent[0]["reply_to"], 605)
+        st = self._only_state()
+        self.assertIsNotNone(st)
+        self.assertEqual(st["status"], "collecting")
+        self.assertEqual(len(st["edits"]), 1)
+        self.assertEqual(st["edits"][0]["text"], transcript)
+
+    def test_dm_voice_on_non_protocol_returns_false_clarify_untouched(self):
+        # РЕГРЕСС (шаг 3): голос-реплай в личке на НЕ-протокол (clarify-сообщение 🎙 /
+        # любое не из meta.delivered) → meeting=None → False, ничего не шлём,
+        # транскрипцию НЕ дёргаем — speaker-clarify в личке голосом всё ещё работает.
         self._write_delivered(chat_id=42, mids=(101,))
         send = _FakeSend()
         with mock.patch.object(feedback_worker, "_transcribe_feedback_voice") as tr:
-            handled = self._route(_msg(605, None, reply_mid=101, voice=True, chat_id=42), send)
+            handled = self._route(_msg(608, None, reply_mid=777, voice=True, chat_id=42), send)
         self.assertFalse(handled)
         tr.assert_not_called()
         self.assertEqual(send.sent, [])
+
+    def test_dm_nonvoice_empty_reply_on_protocol_returns_false(self):
+        # Не-голос пустой reply (стикер/фото) на протокол В ЛИЧКЕ → False: только
+        # голос мы перехватываем в DM, остальное по-прежнему уходит старому flow.
+        self._write_delivered(chat_id=42, mids=(101,))
+        send = _FakeSend()
+        handled = self._route(_msg(609, None, reply_mid=101, chat_id=42), send)
+        self.assertFalse(handled)
+        self.assertEqual(send.sent, [])
+        self.assertEqual(feedback_state.list_states(root=self.root), [])
 
     def test_voice_injection_treated_as_data(self):
         # SECURITY: транскрипт с инъекцией уходит в apply_edit как ДАННЫЕ (edits[].text),

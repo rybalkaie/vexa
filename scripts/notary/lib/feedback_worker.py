@@ -728,9 +728,10 @@ def route_feedback_reply(
 
     Решение:
       • reply на доставленный протокол + есть текст → правка (ack + state) → True.
-      • reply на протокол голосом/аудио (FB9, Ф5): в DM → False (старый voice/
-        clarify-flow); в группе → транскрибируем reuse'ом Groq → дальше ТЕМ ЖЕ
-        путём, что текст; не распозналось → ack «пришли текстом» + True.
+      • reply на протокол голосом/аудио (FB9, Ф5): и в DM, и в группе →
+        транскрибируем reuse'ом Groq → дальше ТЕМ ЖЕ путём, что текст; не
+        распозналось → ack «пришли текстом» + True. (Голос в личке включён
+        2026-06-08 — владелец диктует правки голосом.)
       • reply на протокол без текста и без голоса (стикер/фото): в DM → False;
         в группе → молчаливый drop + True.
       • не reply на протокол: в DM → False; в группе → drop с логом FB1 + True.
@@ -762,8 +763,14 @@ def route_feedback_reply(
         text = (msg.get("text") or "").strip()
         has_voice = bool(msg.get("voice") or msg.get("audio"))
         if has_voice or not text:
-            # DM: голос/clarify уходит существующему voice-flow (Ф4) — не наш путь.
-            if chat_id == allowed_chat:
+            # DM: НЕ-голос (стикер/фото/пустой текст) уходит существующему
+            # voice/clarify-flow (Ф4) — не наш путь. Голос-правку (FB9) в личке
+            # ОБРАБАТЫВАЕМ (решение владельца 2026-06-08: Илья диктует голосом,
+            # текстом писать не хочет) — падает в блок `if has_voice:` ниже, как
+            # и в группе. Автор в DM = владелец, allowlist-гейт уже пропустил по
+            # chat_id == allowed_chat. Голос-реплай на clarify-сообщение 🎙 (НЕ
+            # доставленный протокол) сюда не доходит: meeting=None → старый flow.
+            if chat_id == allowed_chat and not has_voice:
                 return False
             if has_voice:
                 # FM-13: кап правок в окне — ПЕРЕД транскрипцией (Groq = деньги).
@@ -776,7 +783,8 @@ def route_feedback_reply(
                         "дропнута ДО транскрипции (chat=%s)", max_edits_per_window(), chat_id,
                     )
                     return True
-                # FB9 (Ф5): голосовая/аудио правка реплаем в групповом чате серии.
+                # FB9 (Ф5): голосовая/аудио правка реплаем в чате серии (с 2026-06-08 —
+                # и в личке владельца, и в группе; раньше только группа).
                 # Транскрипт — те же недоверенные ДАННЫЕ, что текст правки: после
                 # подстановки в msg["text"] он идёт через handle_feedback_reply →
                 # apply_edit → build_edit_instruction (anti-injection + sanitize Ф4).

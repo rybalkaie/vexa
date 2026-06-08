@@ -739,6 +739,36 @@ python3 tools/observe_thresholds.py --journal-host meeting-notary \
 `enabled=false`, но мусор. Удалить запись вручную после ввода в эксплуатацию
 реальных групп.
 
+## Runbook: ребилд бота не должен ронять meta-поля (series / expectedParticipants)
+
+**Инцидент 2026-06-08.** Ребилд образа `vexa-bot:notarius-telemost` (`make build-bot`)
+молча уронил `meta.series` в `null` → встреча осиротела (legacy-путь без серии →
+доставка в личку вместо группы), а `expectedParticipants` стал `[]` → деградировал
+маппинг имён. Корень: апстримовая `BotConfigSchema` (Zod, [docker.ts](../../services/vexa-bot/core/src/docker.ts))
+по умолчанию ВЫРЕЗАЕТ незнакомые ключи; `series`/`expectedParticipants` runner кладёт
+в `BOT_CONFIG`, но в схеме их нет. Фикс — в нашем адаптере [recording.ts](../../services/vexa-bot/core/src/platforms/yandextelemost/recording.ts):
+оба поля читаются из СЫРОГО `process.env.BOT_CONFIG` (Zod его не трогал).
+
+**⚠️ Обязательная проверка ПОСЛЕ `make build-bot`** (у бота нет автотестов — guard ручной):
+
+```bash
+# 1. В скомпилированном образе фикс на месте (читаем из raw env, не из стрипнутого botConfig):
+ssh meeting-notary 'cid=$(docker create vexa-bot:notarius-telemost); \
+  docker cp "$cid:/app/dist/platforms/yandextelemost/recording.js" - | tar -xO | \
+  grep -n "rawBotConfig\|series:"; docker rm "$cid" >/dev/null'
+#   Ждём: series берётся с фолбэком на rawBotConfig (а НЕ «series: botConfig.series || null»).
+
+# 2. После ПЕРВОЙ встречи новым образом — series в meta непустой:
+ssh meeting-notary 'cd /home/dev/meeting-notary/_tmp/transcripts; \
+  python3 -c "import json,glob,os; f=max(glob.glob(\"*.meta.json\"),key=os.path.getmtime); \
+  m=json.load(open(f)); print(f, \"series=\", m.get(\"series\"), \"expected=\", len(m.get(\"expectedParticipants\") or []))"'
+#   series=None → бот опять стрипает; expected=0 → маппинг имён ослеп. Любое из двух = регресс, не катить.
+```
+
+Та же страховка есть в коде: `finalize-meeting.py` логирует громкий `WARNING`, если
+`meta.series` пуст (`grep "series ПУСТ" journalctl -u meeting-notary-listener`), а бот
+на старте пишет `logStep("series_resolved", {...})` — видно, что доехало в meta.
+
 ## Дисциплина «Опасной тройки» (Ф3)
 
 См. [`~/Projects/meeting-notary/CLAUDE.md`](../../../CLAUDE.md), секция

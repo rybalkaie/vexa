@@ -551,6 +551,18 @@ def main() -> int:
         return 2
 
     session_uid = meta.get("sessionUid") or "unknown"
+    # Защита от орфана series=null (2026-06-08): если series пуст, протокол уйдёт
+    # в legacy-fallback (`<date>-<sid>.md` без серии) → не подхватит telegram_chat_id
+    # серии → доставится в личку вместо группы. Корень обычно в боте (Zod-strip
+    # series из BOT_CONFIG — фикс в recording.ts). Громкий WARNING тут делает
+    # будущий орфан видимым в логах finalize, а не тихой потерей серии.
+    if not (meta.get("series") or "").strip():
+        log.warning(
+            "series ПУСТ в meta (sessionUid=%s) — протокол осиротеет (legacy-путь "
+            "без серии, доставка в личку). Проверь, что бот прокидывает series из "
+            "BOT_CONFIG в meta (recording.ts).",
+            session_uid,
+        )
     wav_path = (meta.get("files") or {}).get("wav")
     # Ф2: реальное аудио для STT. Склеивает все meta.recording.chunks[] (Ф5
     # multichunk) в один WAV и чинит placeholder-шапку (data_size=0 у WAV, на

@@ -408,6 +408,25 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const startedFromCommit = rawCommit && rawCommit !== "unknown" ? rawCommit : null;
   logStep("bot_image_commit", { startedFromCommit });
 
+  // Ф3-фикс (2026-06-08): series / expectedParticipants приходят в BOT_CONFIG от
+  // runner'а, но НЕ объявлены в апстримовой BotConfigSchema (docker.ts) → Zod
+  // .parse() по умолчанию ВЫРЕЗАЕТ незнакомые ключи из botConfig. Из-за этого
+  // meta.series=null → finalize орфанит протокол (не цепляет серию → уходит в личку
+  // вместо группы), а пустой expectedParticipants глушит маппинг имён. Чиним в
+  // НАШЕМ адаптере, не трогая апстрим-схему (иначе merge-конфликт при обновлении
+  // Vexa): читаем оба поля из СЫРОГО env BOT_CONFIG (его Zod не касался), с
+  // фолбэком на botConfig для случая, когда апстрим однажды добавит их в схему.
+  const rawBotConfig: any = (() => {
+    try { return JSON.parse(process.env.BOT_CONFIG || "{}"); } catch { return {}; }
+  })();
+  const series: string | null = (botConfig as any).series ?? rawBotConfig.series ?? null;
+  const expectedParticipants: string[] =
+    (botConfig as any).expectedParticipants ?? rawBotConfig.expectedParticipants ?? [];
+  logStep("series_resolved", {
+    series,
+    expected_count: Array.isArray(expectedParticipants) ? expectedParticipants.length : 0,
+  });
+
   // Participants polling — параллельно встрече.
   const participantsPoll = startParticipantsPolling(page, botName);
 
@@ -459,8 +478,8 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       botName,
       meetingUrl: botConfig.meetingUrl || null,
       nativeMeetingId: (botConfig as any).nativeMeetingId || null,
-      series: (botConfig as any).series || null,
-      expectedParticipants: (botConfig as any).expectedParticipants || [],
+      series: series || null,
+      expectedParticipants: expectedParticipants || [],
       language,
       startTs: new Date(startTs).toISOString(),
       endTs: new Date(endTs).toISOString(),
