@@ -259,6 +259,55 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
     return dt
 
 
+def cleanup_dormant_states(
+    *,
+    root: Optional[Path] = None,
+    max_age_days: int = 30,
+    now: Optional[datetime] = None,
+) -> int:
+    """R10 (Ф8): удаляет служебные state-файлы `*-feedback.json` в статусе
+    `dormant` старше `max_age_days` (по `updated_at`). Возвращает число удалённых.
+
+    Скоуп жёстко ограничен: путь — ТОЛЬКО `resolve_feedback_dir()` (или переданный
+    `root`), удаляем ТОЛЬКО файлы с суффиксом `STATE_SUFFIX`. Транскрипты и протоколы
+    в `~/Projects/me/встречи/` по построению недостижимы. Не-`dormant` и свежие
+    (моложе порога, либо без/битым `updated_at`) — не трогаем. Скрытые tempfile'ы
+    (имя на `.`) пропускаем.
+
+    R9: логируем только число удалённых — без имён участников/текста.
+    """
+    root = root or resolve_feedback_dir()
+    if not root.exists():
+        return 0
+    now = now or datetime.now(timezone.utc)
+    cutoff_sec = max(0, int(max_age_days)) * 86400
+    removed = 0
+    for f in root.glob(f"*{STATE_SUFFIX}"):
+        if f.name.startswith("."):  # скрытые tempfile'ы — не трогаем
+            continue
+        try:
+            state = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("[feedback-state] cleanup skip malformed %s: %s", f.name, e)
+            continue
+        if not isinstance(state, dict) or state.get("status") != "dormant":
+            continue
+        updated = _parse_iso(state.get("updated_at"))
+        if updated is None:  # без валидной метки — консервативно не удаляем
+            continue
+        if (now - updated).total_seconds() < cutoff_sec:
+            continue  # свежий — оставляем
+        try:
+            f.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning("[feedback-state] cleanup unlink failed %s: %s", f.name, e)
+    if removed:
+        logger.info("[feedback-state] cleanup_dormant_states: удалено %d (старше %dд)",
+                    removed, max_age_days)
+    return removed
+
+
 def is_window_expired(state: dict, *, now: Optional[datetime] = None) -> bool:
     """True если окно сбора закрылось (`now >= deadline_at`). `now` инъектируется в тестах."""
     deadline = _parse_iso(state.get("deadline_at"))

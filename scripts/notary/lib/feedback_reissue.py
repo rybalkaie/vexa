@@ -669,7 +669,10 @@ RECLAIM_STALE_REISSUING_SEC = 900
 
 
 def reclaim_stale_reissuing(
-    *, root: Optional[Path] = None, now: Optional[datetime] = None
+    *,
+    root: Optional[Path] = None,
+    now: Optional[datetime] = None,
+    skip_fids: Optional[set] = None,
 ) -> int:
     """Возвращает зависшие `reissuing` в `ready_for_reissue`. Возвращает число.
 
@@ -680,15 +683,28 @@ def reclaim_stale_reissuing(
     (легитимная генерация короче — её не трогаем). reissue_attempts инкрементим:
     иначе вечно-падающая генерация зацикливала бы реклейм; MAX_REISSUE_ATTEMPTS
     ставит потолок (после него — ждёт владельца, как обычный исчерпанный ретрай).
+
+    РИСК1 (Ф8, фоновость): когда генерация уехала в фоновый поток, reclaim
+    крутится в главном цикле ПАРАЛЛЕЛЬНО живой генерации. `skip_fids` — множество
+    fids, чьи future ещё в работе (`_reissue_inflight`); их пропускаем
+    БЕЗУСЛОВНО, не глядя на возраст claim'а. Иначе генерация дольше
+    RECLAIM_STALE_REISSUING_SEC была бы сброшена `reissuing→ready_for_reissue`,
+    finalize увидел бы `still_reissuing=False` и НЕ перевёл в `dormant` →
+    следующий sweep пере-заклеймил бы → повторная генерация + двойная доставка
+    (claude недетерминирован). Вызов без `skip_fids` — как раньше (back-compat).
     """
     root = root or feedback_state.resolve_feedback_dir()
     now = now or datetime.now(timezone.utc)
+    skip_fids = skip_fids or set()
     n = 0
     for state in feedback_state.list_states(root=root, status_filter=["reissuing"]):
+        fid = state.get("feedback_id")
+        # РИСК1: живой future — не трогаем, сколько бы генерация ни шла.
+        if fid in skip_fids:
+            continue
         claimed = feedback_state._parse_iso(state.get("reissue_claimed_at"))
         if claimed is not None and (now - claimed).total_seconds() < RECLAIM_STALE_REISSUING_SEC:
             continue  # ещё в работе — не трогаем
-        fid = state.get("feedback_id")
         if not fid:
             continue
         attempts = int(state.get("reissue_attempts") or 0) + 1
@@ -704,30 +720,40 @@ def reclaim_stale_reissuing(
     return n
 
 
-def process_ready_reissues(
+def claim_ready_reissues(
     *,
     root: Optional[Path] = None,
-    max_per_sweep: int = MAX_REISSUES_PER_SWEEP,
-    reissue_fn: Optional[Callable] = None,
-) -> int:
-    """`ready_for_reissue` → claim → перевыпуск → conditional dormant/revert.
+    max_n: int = MAX_REISSUES_PER_SWEEP,
+    skip_fids: Optional[set] = None,
+) -> list[dict]:
+    """Синхронный claim-этап (главный поток): reclaim → перебор `ready_for_reissue`
+    → атомарный `claim_for_reissue`, до `max_n` штук. Возвращает список
+    claimed-state (статус `reissuing`). Claude/reissue НЕ зовёт.
 
-    Возвращает число успешно перевыпущенных встреч. `reissue_fn` инъектируется
-    в тестах (по умолчанию `reissue_one`).
+    `skip_fids` — fids, чьи future уже в работе (фоновость, Ф8): пробрасываем И в
+    `reclaim_stale_reissuing` (РИСК1 — не сбросить живую генерацию), И в claim-цикл
+    (не клеймить повторно то, что уже считается). Вызов без `skip_fids` — как раньше.
+
+    Декомпозиция монолита `process_ready_reissues` (Ф8): тяжёлый `reissue_one`
+    выносится в фон, а переходы статуса (этот claim и `finalize_reissue`) остаются
+    в главном потоке — мутации feedback-state в одном потоке (R3), атомарность claim
+    в том же проходе sweep (R2/FM-10).
     """
     root = root or feedback_state.resolve_feedback_dir()
-    reissue_fn = reissue_fn or reissue_one
+    skip_fids = skip_fids or set()
     # Сначала вернуть зависшие reissuing в очередь (краш/рестарт/таймаут посреди
-    # прошлой генерации) — иначе они держатся вечно (ход3/У3).
-    reclaim_stale_reissuing(root=root)
-    done = 0       # успешно перевыпущено (возвращаем это)
-    processed = 0  # заклеймлено за проход (бюджет claude-вызовов, лимитим ИМ)
+    # прошлой генерации) — иначе они держатся вечно (ход3/У3). Живые future
+    # (skip_fids) reclaim не трогает (РИСК1).
+    reclaim_stale_reissuing(root=root, skip_fids=skip_fids)
+    claimed_list: list[dict] = []
     for state in feedback_state.list_states(root=root, status_filter=["ready_for_reissue"]):
-        if processed >= max_per_sweep:
+        if len(claimed_list) >= max_n:
             break
         fid = state.get("feedback_id")
         if not fid:
             continue
+        if fid in skip_fids:
+            continue  # уже в работе (фоновый future жив) — не клеймим повторно
         attempts = int(state.get("reissue_attempts") or 0)
         if attempts >= feedback_state.MAX_REISSUE_ATTEMPTS:
             logger.warning(
@@ -741,6 +767,98 @@ def process_ready_reissues(
         claimed = feedback_state.claim_for_reissue(fid, root=root)
         if claimed is None:
             continue  # статус сменился между list и claim (новый раунд / уже занято)
+        claimed_list.append(claimed)
+    return claimed_list
+
+
+def finalize_reissue(
+    fid: str, claimed: dict, res: Optional[dict], *, root: Optional[Path] = None
+) -> Optional[str]:
+    """Синхронный finalize-этап (главный поток): перевод статуса по результату
+    `reissue_one`. Claude НЕ зовёт. Возвращает итоговый статус результата (или None).
+
+    Conditional dormant/revert: статус трогаем ТОЛЬКО если он всё ещё `reissuing`
+    (если конкурентный reply открыл новый раунд — не затираем его, FB12+Н1+R7).
+      • terminal-OK + still_reissuing → `dormant` (reissue_attempts:0,
+        protocol_message_ids из res["message_ids"] или claimed-state);
+      • не-terminal + still_reissuing → `ready_for_reissue` (reissue_attempts++,
+        last_reissue_error) для ретрая.
+
+    R9: логируем только метаданные (fid, status, round) — без текста правок/протокола.
+    """
+    base_attempts = int(claimed.get("reissue_attempts") or 0)
+    status = (res or {}).get("status")
+
+    cur = feedback_state.read_state(fid, root=root)
+    still_reissuing = bool(cur) and cur.get("status") == "reissuing"
+
+    if status in _TERMINAL_OK:
+        if still_reissuing:
+            new_mids = (res.get("message_ids") if isinstance(res, dict) else None) \
+                or claimed.get("protocol_message_ids") or []
+            feedback_state.mark_status(
+                fid, "dormant", root=root,
+                extra={
+                    "last_reissue_at": feedback_state.now_iso(),
+                    "last_reissue_status": status,
+                    "reissue_attempts": 0,
+                    "protocol_message_ids": list(new_mids),
+                },
+            )
+        logger.info("[reissue] fid=%s перевыпущен status=%s round=%s",
+                    fid, status, claimed.get("round"))
+    else:
+        if still_reissuing:
+            feedback_state.mark_status(
+                fid, "ready_for_reissue", root=root,
+                extra={
+                    "reissue_attempts": base_attempts + 1,
+                    "last_reissue_error": str((res or {}).get("error"))[:300],
+                },
+            )
+        logger.warning(
+            "[reissue] fid=%s перевыпуск не удался status=%s err=%s (attempt %d/%d)",
+            fid, status, (res or {}).get("error"), base_attempts + 1,
+            feedback_state.MAX_REISSUE_ATTEMPTS,
+        )
+    return status
+
+
+def process_ready_reissues(
+    *,
+    root: Optional[Path] = None,
+    max_per_sweep: int = MAX_REISSUES_PER_SWEEP,
+    reissue_fn: Optional[Callable] = None,
+) -> int:
+    """`ready_for_reissue` → claim → перевыпуск → conditional dormant/revert.
+
+    Возвращает число успешно перевыпущенных встреч. `reissue_fn` инъектируется
+    в тестах (по умолчанию `reissue_one`).
+
+    Ф8: теперь это тонкая СИНХРОННАЯ композиция трёх чистых операций
+    (`claim_ready_reissues → reissue_one → finalize_reissue`) — поведение
+    идентично прежнему монолиту (back-compat-обёртка для тестов и как fallback;
+    фоновый путь живёт в листенере, Ф2). Композиция per-item (claim→reissue→
+    finalize по одному) сохраняет защиту от затирания конкурентного раунда: новый
+    раунд, открытый внутри `reissue_fn`, finalize не трогает (still_reissuing=False).
+    """
+    root = root or feedback_state.resolve_feedback_dir()
+    reissue_fn = reissue_fn or reissue_one
+    done = 0       # успешно перевыпущено (возвращаем это)
+    processed = 0  # заклеймлено за проход (бюджет claude-вызовов, лимитим ИМ)
+    seen_fids: set = set()  # уже обработанные за этот sweep — не реклеймим повторно
+    while processed < max_per_sweep:
+        # claim по одному (per-item): claimed-state читается СВЕЖИМ перед каждым
+        # reissue → конкурентный reply внутри предыдущего reissue_fn учтён. Уже
+        # обработанные fids пропускаем (skip_fids), иначе error-revert в
+        # `ready_for_reissue` пере-заклеймился бы в этом же проходе (как старый
+        # for-снимок: одна попытка на встречу за sweep).
+        claimed_batch = claim_ready_reissues(root=root, max_n=1, skip_fids=seen_fids)
+        if not claimed_batch:
+            break
+        claimed = claimed_batch[0]
+        fid = claimed.get("feedback_id")
+        seen_fids.add(fid)
         processed += 1  # claim прошёл → reissue_fn зовёт claude; считаем в бюджет
 
         try:
@@ -748,41 +866,8 @@ def process_ready_reissues(
         except Exception as e:  # noqa: BLE001
             logger.exception("[reissue] fid=%s перевыпуск упал: %s", fid, e)
             res = {"status": "error", "error": str(e)}
-        status = (res or {}).get("status")
 
-        # conditional: меняем статус ТОЛЬКО если он всё ещё reissuing (иначе
-        # конкурентный reply открыл новый раунд — не затираем его, FB12+Н1).
-        cur = feedback_state.read_state(fid, root=root)
-        still_reissuing = bool(cur) and cur.get("status") == "reissuing"
-
+        status = finalize_reissue(fid, claimed, res, root=root)
         if status in _TERMINAL_OK:
-            if still_reissuing:
-                new_mids = (res.get("message_ids") if isinstance(res, dict) else None) \
-                    or claimed.get("protocol_message_ids") or []
-                feedback_state.mark_status(
-                    fid, "dormant", root=root,
-                    extra={
-                        "last_reissue_at": feedback_state.now_iso(),
-                        "last_reissue_status": status,
-                        "reissue_attempts": 0,
-                        "protocol_message_ids": list(new_mids),
-                    },
-                )
             done += 1
-            logger.info("[reissue] fid=%s перевыпущен status=%s round=%s",
-                        fid, status, claimed.get("round"))
-        else:
-            if still_reissuing:
-                feedback_state.mark_status(
-                    fid, "ready_for_reissue", root=root,
-                    extra={
-                        "reissue_attempts": attempts + 1,
-                        "last_reissue_error": str((res or {}).get("error"))[:300],
-                    },
-                )
-            logger.warning(
-                "[reissue] fid=%s перевыпуск не удался status=%s err=%s (attempt %d/%d)",
-                fid, status, (res or {}).get("error"), attempts + 1,
-                feedback_state.MAX_REISSUE_ATTEMPTS,
-            )
     return done
