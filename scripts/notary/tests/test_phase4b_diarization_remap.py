@@ -152,6 +152,32 @@ class TestParseAuthorshipRemap(unittest.TestCase):
         )
         self.assertEqual(remap, {"Илья": "Михаил", "Михаил": "Илья"})
 
+    def test_long_conversational_edit_not_consumed(self):
+        """2026-06-08: длинная разговорная правка со словом «перепутал» НЕ должна
+        мис-парситься в remap и НЕ должна проглатываться (иначе контент не дойдёт до
+        LLM). Парсер её пропускает → правка идёт в LLM целиком."""
+        long_text = (
+            "Слушай, ну как будто ты Марию и Татьяну перепутал. Там по поставкам в "
+            "основном говорит Мария, а ты пишешь, что Татьяна. Татьяна, наоборот, "
+            "управляющая, она принимает и задаёт вопросы. Ещё там Engie написано "
+            "неправильно, и задача Ольги — внести зарплату в таблицу планирования."
+        )
+        self.assertGreater(len(long_text), 200)
+        remap, idx = fr.parse_authorship_remap(
+            self._edit(long_text), ["Татьяна", "Ольга"],
+            ["Татьяна Филиппова", "Ольга Новикова", "Мария Михина"],
+        )
+        self.assertEqual(remap, {})   # никакого ложного свопа Татьяна↔Ольга
+        self.assertEqual(idx, set())  # правка не «съедена» — уйдёт в LLM
+
+    def test_terse_swap_still_works(self):
+        """Короткая терсная директива по-прежнему детерминируется."""
+        remap, idx = fr.parse_authorship_remap(
+            self._edit("наоборот, Илья и Михаил"), self.CURRENT, self.POOL
+        )
+        self.assertEqual(remap, {"Илья": "Михаил", "Михаил": "Илья"})
+        self.assertEqual(idx, {0})
+
     def test_content_edit_not_authorship(self):
         """Контентная правка («131 на доставке») НЕ распознаётся как авторская."""
         remap, idx = fr.parse_authorship_remap(
