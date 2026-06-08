@@ -4793,61 +4793,9 @@ def redeliver_revised_protocol(
             continue
     revision = prev_rev + 1
 
-    # 0) FB5: удаляем прежнее доставленное сообщение(+файл) ДО постинга новой
-    #    версии. Только при delete_previous=True (Ф4 правок); clarify (Ф5) не
-    #    удаляет. Telegram разрешает delete только в окне 48ч — старше / не
-    #    удалилось → не падаем, оставляем предупреждение в шапке «что изменилось».
-    delete_warning = ""
-    if delete_previous:
-        can_delete = False
-        at_iso = last.get("at")
-        if isinstance(at_iso, str):
-            try:
-                at_dt = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
-                if at_dt.tzinfo is None:
-                    at_dt = at_dt.replace(tzinfo=timezone.utc)
-                age = (datetime.now(timezone.utc) - at_dt).total_seconds()
-                can_delete = age < DELETE_MESSAGE_WINDOW_SEC
-            except ValueError:
-                pass
-        old_mids = [m for m in (last.get("message_ids") or [])]
-        deleted_n = 0
-        if can_delete:
-            for msg_id in old_mids:
-                try:
-                    if telegram_api.delete_message(bot_token, chat_id, int(msg_id)):
-                        deleted_n += 1
-                except (TypeError, ValueError):
-                    continue
-        if old_mids and (not can_delete or deleted_n < len(old_mids)):
-            # Не смогли убрать всё старое → честно предупреждаем (FB5 фолбэк
-            # «нельзя удалить — постит рядом»). Архив на диске не зависит от этого.
-            delete_warning = (
-                "⚠️ Прежнюю версию протокола выше убрать не удалось "
-                "(Telegram не даёт удалять сообщения старше 48 часов). "
-                "Ниже — актуальная версия.\n\n"
-            )
-        logger.info(
-            "[revision] FB5 delete_previous meeting=%s can_delete=%s deleted=%d/%d",
-            meeting_sid or "?", can_delete, deleted_n, len(old_mids),
-        )
-
-    # 1) Блок «🔁 Что изменилось» — отдельным сообщением ПЕРВЫМ.
-    summary = _compose_revision_summary(
-        old_protocol_text, new_protocol_text,
-        {"series": meeting_meta.get("series"), "date": meeting_meta.get("date")},
-        meeting_sid=meeting_sid,
-    )
-    try:
-        telegram_api.send_message(bot_token, chat_id, delete_warning + summary)
-    except telegram_api.TelegramApiError as e:
-        logger.warning("[revision] summary send failed meeting=%s: %s", meeting_sid or "?", e)
-
-    # 2) Новая версия протокола — PDF-документом, КАК первичная доставка
-    #    (`deliver_protocol`). Решение владельца 2026-06-08: ревизии должны
-    #    приходить в том же виде, что оригинал (PDF), а не текстом. Шапка/подпись/
-    #    рендер — тем же `protocol_to_tg` + `protocol_to_pdf`. Транскрипт-json для
-    #    «чистого времени» берём рядом с meta (как deliver_protocol).
+    # Шапка/подпись + рендер PDF — тем же `protocol_to_tg` + `protocol_to_pdf`, что
+    # первичная доставка (`deliver_protocol`). Решение владельца 2026-06-08: ревизии
+    # приходят в том же виде, что оригинал (PDF), а не текстом.
     date_for_pdf = meeting_meta.get("date")
     transcript_json_path = None
     if meta_json_path is not None:
@@ -4862,24 +4810,89 @@ def redeliver_revised_protocol(
     )
     safe_date = re.sub(r"[^0-9A-Za-z._-]", "-", str(date_for_pdf)) or "protokol"
     pdf_filename = f"protokol-{safe_date}.pdf"
-    try:
-        with tempfile.TemporaryDirectory(prefix="revision-pdf-") as td:
-            pdf_path = Path(td) / pdf_filename
+
+    with tempfile.TemporaryDirectory(prefix="revision-pdf-") as td:
+        pdf_path = Path(td) / pdf_filename
+        # ход1/Н1: РЕНДЕРИМ PDF ДО удаления старого. Рендер — самый хрупкий шаг
+        # (chromium/шрифты, README предупреждает про деградацию после apt upgrade).
+        # Если он упадёт ПОСЛЕ delete — старый протокол уже удалён, новый не
+        # отрендерен → в чате пусто. Поэтому рендерим первым: сбой здесь → return
+        # без удаления, прежняя версия в чате цела.
+        try:
             protocol_to_pdf.render_pdf_from_markdown(
                 new_protocol_text, str(pdf_path),
                 title=pdf_title, subtitle=pdf_subtitle,
             )
+        except (protocol_to_pdf.PdfRenderError, OSError) as e:
+            logger.error(
+                "[revision] PDF render упал — старое НЕ трогаем meeting=%s chat_id=%s: %s",
+                meeting_sid or "?", chat_id, e,
+            )
+            return {"status": "error", "chat_id": chat_id, "message_ids": [], "error": str(e)}
+
+        # 0) FB5: удаляем прежнее доставленное сообщение(+файл) — только теперь, когда
+        #    PDF на руках. Только delete_previous=True (Ф4 правок); clarify (Ф5) не
+        #    удаляет. Telegram разрешает delete в окне 48ч — старше/не удалилось → не
+        #    падаем, предупреждение в шапке «что изменилось».
+        delete_warning = ""
+        if delete_previous:
+            can_delete = False
+            at_iso = last.get("at")
+            if isinstance(at_iso, str):
+                try:
+                    at_dt = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
+                    if at_dt.tzinfo is None:
+                        at_dt = at_dt.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - at_dt).total_seconds()
+                    can_delete = age < DELETE_MESSAGE_WINDOW_SEC
+                except ValueError:
+                    pass
+            old_mids = [m for m in (last.get("message_ids") or [])]
+            deleted_n = 0
+            if can_delete:
+                for msg_id in old_mids:
+                    try:
+                        if telegram_api.delete_message(bot_token, chat_id, int(msg_id)):
+                            deleted_n += 1
+                    except (TypeError, ValueError):
+                        continue
+            if old_mids and (not can_delete or deleted_n < len(old_mids)):
+                # Не смогли убрать всё старое → честно предупреждаем (FB5 фолбэк
+                # «нельзя удалить — постит рядом»). Архив на диске не зависит от этого.
+                delete_warning = (
+                    "⚠️ Прежнюю версию протокола выше убрать не удалось "
+                    "(Telegram не даёт удалять сообщения старше 48 часов). "
+                    "Ниже — актуальная версия.\n\n"
+                )
+            logger.info(
+                "[revision] FB5 delete_previous meeting=%s can_delete=%s deleted=%d/%d",
+                meeting_sid or "?", can_delete, deleted_n, len(old_mids),
+            )
+
+        # 1) Блок «🔁 Что изменилось» — отдельным сообщением ПЕРВЫМ.
+        summary = _compose_revision_summary(
+            old_protocol_text, new_protocol_text,
+            {"series": meeting_meta.get("series"), "date": meeting_meta.get("date")},
+            meeting_sid=meeting_sid,
+        )
+        try:
+            telegram_api.send_message(bot_token, chat_id, delete_warning + summary)
+        except telegram_api.TelegramApiError as e:
+            logger.warning("[revision] summary send failed meeting=%s: %s", meeting_sid or "?", e)
+
+        # 2) Новая версия протокола — PDF-документом (отрендерен выше).
+        try:
             result = telegram_api.send_document(
                 bot_token, chat_id, str(pdf_path),
                 caption=caption, filename=pdf_filename,
             )
-    except (protocol_to_pdf.PdfRenderError, telegram_api.TelegramApiError, OSError) as e:
-        logger.error(
-            "[revision] PDF доставка упала meeting=%s chat_id=%s: %s",
-            meeting_sid or "?", chat_id, e,
-        )
-        return {"status": "error", "chat_id": chat_id, "message_ids": [], "error": str(e)}
-    sent_ids: list[int] = [int(result.get("message_id") or 0)]
+        except telegram_api.TelegramApiError as e:
+            logger.error(
+                "[revision] PDF send упал meeting=%s chat_id=%s: %s",
+                meeting_sid or "?", chat_id, e,
+            )
+            return {"status": "error", "chat_id": chat_id, "message_ids": [], "error": str(e)}
+        sent_ids: list[int] = [int(result.get("message_id") or 0)]
 
     # 3) meta.delivered ← новая запись с revision-маркером и content_hash.
     #    replace_for_chat_id=True: следующий тик collector'а увидит свежие

@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -662,6 +663,47 @@ def reissue_one(
 _TERMINAL_OK = ("sent", "skipped", "no-change", "not-delivered-yet", "disabled", "no-edits")
 
 
+# Потолок «живого» reissuing: заведомо больше макс. времени генерации (claude
+# timeout 600с). Старше — считаем зависшим (краш/рестарт/таймаут посреди перевыпуска).
+RECLAIM_STALE_REISSUING_SEC = 900
+
+
+def reclaim_stale_reissuing(
+    *, root: Optional[Path] = None, now: Optional[datetime] = None
+) -> int:
+    """Возвращает зависшие `reissuing` в `ready_for_reissue`. Возвращает число.
+
+    Без этого статус `reissuing` держится ВЕЧНО: воркер берёт только
+    `ready_for_reissue`, а краш/рестарт/таймаут посреди генерации оставляет
+    `reissuing` навсегда → правки владельца молча не доезжают (инцидент 2026-06-08,
+    сбрасывали вручную). Реклеймим только claim старше RECLAIM_STALE_REISSUING_SEC
+    (легитимная генерация короче — её не трогаем). reissue_attempts инкрементим:
+    иначе вечно-падающая генерация зацикливала бы реклейм; MAX_REISSUE_ATTEMPTS
+    ставит потолок (после него — ждёт владельца, как обычный исчерпанный ретрай).
+    """
+    root = root or feedback_state.resolve_feedback_dir()
+    now = now or datetime.now(timezone.utc)
+    n = 0
+    for state in feedback_state.list_states(root=root, status_filter=["reissuing"]):
+        claimed = feedback_state._parse_iso(state.get("reissue_claimed_at"))
+        if claimed is not None and (now - claimed).total_seconds() < RECLAIM_STALE_REISSUING_SEC:
+            continue  # ещё в работе — не трогаем
+        fid = state.get("feedback_id")
+        if not fid:
+            continue
+        attempts = int(state.get("reissue_attempts") or 0) + 1
+        feedback_state.mark_status(
+            fid, "ready_for_reissue", root=root,
+            extra={"reissue_attempts": attempts, "reclaimed_stale_at": feedback_state.now_iso()},
+        )
+        logger.warning(
+            "[reissue] застрявший reissuing реклейм fid=%s claimed=%s attempts=%d → ready_for_reissue",
+            fid, state.get("reissue_claimed_at"), attempts,
+        )
+        n += 1
+    return n
+
+
 def process_ready_reissues(
     *,
     root: Optional[Path] = None,
@@ -675,6 +717,9 @@ def process_ready_reissues(
     """
     root = root or feedback_state.resolve_feedback_dir()
     reissue_fn = reissue_fn or reissue_one
+    # Сначала вернуть зависшие reissuing в очередь (краш/рестарт/таймаут посреди
+    # прошлой генерации) — иначе они держатся вечно (ход3/У3).
+    reclaim_stale_reissuing(root=root)
     done = 0       # успешно перевыпущено (возвращаем это)
     processed = 0  # заклеймлено за проход (бюджет claude-вызовов, лимитим ИМ)
     for state in feedback_state.list_states(root=root, status_filter=["ready_for_reissue"]):

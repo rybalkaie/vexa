@@ -250,6 +250,31 @@ class TestRedeliverFB5(_RedeliverBase):
         self.assertTrue(last["document"])
         self.assertEqual(last["message_ids"], res["message_ids"])
 
+    def test_pdf_render_failure_does_not_delete_old(self):
+        # ход1/Н1: рендер PDF упал → старое сообщение НЕ удаляем (иначе протокол
+        # исчезнет из чата), summary не шлём, статус error.
+        at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._write_meta(mids=(101, 102), at=at)
+        send, dele, senddoc = _FakeSend(), _FakeDelete(ok=True), _FakeSendDoc()
+
+        def boom(*a, **k):
+            raise lp.protocol_to_pdf.PdfRenderError("chromium down")
+
+        with mock.patch.object(lp.telegram_api, "send_message", send), \
+             mock.patch.object(lp.telegram_api, "delete_message", dele), \
+             mock.patch.object(lp.telegram_api, "send_document", senddoc), \
+             mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", boom), \
+             mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 x"):
+            res = lp.redeliver_revised_protocol(
+                {"series": "coord", "date": "2026-06-02"},
+                PROTO_OLD, PROTO_NEW,
+                meta_json_path=self.meta_path, meeting_sid="fb-x", delete_previous=True,
+            )
+        self.assertEqual(res["status"], "error")
+        self.assertEqual(dele.deleted, [])   # старое НЕ удалено — протокол в чате цел
+        self.assertEqual(send.sent, [])      # summary не слали
+        self.assertEqual(senddoc.docs, [])   # PDF не ушёл
+
     def test_over_48h_no_delete_but_warns_and_posts(self):
         at = (datetime.now(UTC) - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._write_meta(mids=(101,), at=at)
@@ -391,6 +416,37 @@ class _ReissueBase(unittest.TestCase):
             ],
         }
         return st
+
+
+class TestReclaimStaleReissuing(_ReissueBase):
+    def test_stale_reissuing_reclaimed_to_ready(self):
+        # ход3/У3: зависший reissuing (claim старше потолка) → ready_for_reissue,
+        # reissue_attempts++ (иначе вечно-падающая генерация зациклит реклейм).
+        meta_path = self._write_meeting()
+        st = self._state(meta_path, status="reissuing")
+        st["reissue_claimed_at"] = "2026-06-02T10:00:00Z"
+        feedback_state.write_state(st, root=self.root)
+        n = feedback_reissue.reclaim_stale_reissuing(
+            root=self.root, now=datetime(2026, 6, 2, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(n, 1)
+        after = feedback_state.read_state(st["feedback_id"], root=self.root)
+        self.assertEqual(after["status"], "ready_for_reissue")
+        self.assertEqual(after["reissue_attempts"], 1)
+
+    def test_recent_reissuing_left_alone(self):
+        # Легитимная генерация (claim недавно) — НЕ трогаем.
+        meta_path = self._write_meeting()
+        st = self._state(meta_path, status="reissuing")
+        st["reissue_claimed_at"] = "2026-06-02T11:59:00Z"
+        feedback_state.write_state(st, root=self.root)
+        n = feedback_reissue.reclaim_stale_reissuing(
+            root=self.root, now=datetime(2026, 6, 2, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(
+            feedback_state.read_state(st["feedback_id"], root=self.root)["status"], "reissuing"
+        )
 
 
 class TestReissueOne(_ReissueBase):
