@@ -290,5 +290,72 @@ class TestVerdictPersistedInDigest(unittest.TestCase):
         self.assertNotIn(MARIA, json.dumps(meta, ensure_ascii=False))
 
 
+class TestPresentSetIncludesVoices(unittest.TestCase):
+    """Цикл5/Н1: состав гейта = панель ∪ голоса (как шапка протокола), НЕ только
+    панель. Озвучившийся-но-не-в-панели аутсайдер обязан попасть под E5."""
+
+    def test_present_for_gate_unions_panel_and_voices(self):
+        present = pg.present_participants_for_gate(
+            [OWNER, MARIA], [OWNER, MARIA], [MARIA, "Иван Контрагент"])
+        joined = " | ".join(present)
+        self.assertIn("Иван", joined)   # голос-only попал в состав гейта
+        self.assertTrue(any(MARIA.split()[0] in p for p in present))
+
+    def test_voiced_only_outsider_blocked_by_gate(self):
+        # Аутсайдер ТОЛЬКО в голосах (нет в панели) → состав гейта его видит → E5.
+        present = pg.present_participants_for_gate(
+            [OWNER], [OWNER, MARIA, SONA], ["Иван Контрагент"])
+        d = pg.decide_publication(
+            ANZHEE_SLUG, present,
+            visibility="company", company="anzhee", roster_names=ANZHEE_ROSTER)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.reason, "outside-circle")
+
+    def test_present_for_gate_fallback_no_signal_uses_expected(self):
+        # Нет панели и голосов → деградация на expected (как шапка). Не падаем.
+        present = pg.present_participants_for_gate([OWNER, MARIA], [], [])
+        self.assertTrue(present)
+
+    def test_clean_meeting_still_allowed_with_voices(self):
+        # Регрессия: легит-голоса (все в ростере) НЕ ломают публикацию.
+        present = pg.present_participants_for_gate(
+            [OWNER], [OWNER, MARIA], [MARIA, SONA])
+        d = pg.decide_publication(
+            ANZHEE_SLUG, present,
+            visibility="company", company="anzhee", roster_names=ANZHEE_ROSTER)
+        self.assertTrue(d.allowed)
+        self.assertEqual(d.reason, "ok-group")
+
+
+class TestOwnerCountedOnce(unittest.TestCase):
+    """Цикл5/Н2: владелец засчитывается РОВНО один раз — тёзка-аутсайдер владельца
+    НЕ освобождается от предохранителя круга E5."""
+
+    def test_owner_namesake_outsider_not_exempt_from_circle(self):
+        # Второй «Илья» — внешний гость, не владелец и не в ростере → outside-circle.
+        d = pg.decide_publication(
+            ANZHEE_SLUG, [OWNER, "Илья Соколов", MARIA, SONA],
+            visibility="company", company="anzhee", roster_names=ANZHEE_ROSTER)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.reason, "outside-circle")
+
+    def test_single_owner_group_still_allowed(self):
+        # Регрессия: обычная группа (владелец один раз) по-прежнему публикуема.
+        d = pg.decide_publication(
+            ANZHEE_SLUG, [OWNER, MARIA, SONA],
+            visibility="company", company="anzhee", roster_names=ANZHEE_ROSTER)
+        self.assertTrue(d.allowed)
+        self.assertEqual(d.reason, "ok-group")
+
+    def test_owner_plus_namesake_only_not_published(self):
+        # Владелец + тёзка-аутсайдер + Мария: тёзка считается не-владельцем →
+        # 2 не-владельца (не E4), аутсайдер вне круга → private, НЕ ok-group.
+        d = pg.decide_publication(
+            ANZHEE_SLUG, [OWNER, "Илья Гость", MARIA],
+            visibility="company", company="anzhee", roster_names=ANZHEE_ROSTER)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.reason, "outside-circle")
+
+
 if __name__ == "__main__":
     unittest.main()

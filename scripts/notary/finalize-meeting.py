@@ -1137,12 +1137,20 @@ def main() -> int:
             _publication = {"allowed": False, "visibility": "private",
                             "company": None, "reason": "gate-error"}
             try:
-                _decision = publication_gate.decide_for_meeting(meta.get("series"), participants)
+                # A5: гейт судит по тому же составу, что и шапка протокола —
+                # панель Телемоста ∪ реально говорившие (имена кластеров голоса,
+                # cluster_to_name), НЕ только панель. Иначе озвучившийся-но-не-в-
+                # панели аутсайдер минул бы предохранитель круга E5 (fail-open).
+                _voiced_for_gate = [n for n in (cluster_to_name or {}).values()
+                                    if isinstance(n, str) and n.strip()]
+                _present_for_gate = publication_gate.present_participants_for_gate(
+                    expected, participants, _voiced_for_gate)
+                _decision = publication_gate.decide_for_meeting(meta.get("series"), _present_for_gate)
                 _publication = _decision.as_metadata()
                 # Только метаданные (опасная тройка): серия/видимость/причина/счётчик.
                 log.info("[publication] meeting=%s series=%s visibility=%s reason=%s present=%d",
                          session_uid, meta.get("series"), _decision.visibility,
-                         _decision.reason, len(participants or []))
+                         _decision.reason, len(_present_for_gate or []))
             except Exception as _e:  # noqa: BLE001
                 log.warning("[publication] gate failed (non-fatal, fail-closed private): %s", _e)
             # B1: build→save→prune одним вызовом (тестируемая единица, см.

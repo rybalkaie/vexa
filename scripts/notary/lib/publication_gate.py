@@ -188,8 +188,19 @@ def decide_publication(
     readers = reader_names if reader_names is not None else _reader_names()
     present = [str(p).strip() for p in (present_participants or []) if str(p).strip()]
 
-    owner_present = any(_is_owner(p, owners) for p in present)
-    non_owner = [p for p in present if not _is_owner(p, owners)]
+    # Владельца засчитываем РОВНО ОДИН раз: первое совпадение по owner-токенам —
+    # это владелец, ПОСЛЕДУЮЩИЕ совпадения (другой человек с тем же именем — ещё
+    # один «Илья», однофамилец-аутсайдер) остаются НЕ-владельцами и проходят
+    # предохранитель круга E5. Иначе тёзка-аутсайдер владельца минул бы E5 (его
+    # подстрочный owner-матч исключил бы его из non_owner) → fail-OPEN в fail-closed
+    # гейте. Владелец на встрече физически один — этот инвариант здесь и кодируем.
+    owner_present = False
+    non_owner: list[str] = []
+    for p in present:
+        if not owner_present and _is_owner(p, owners):
+            owner_present = True
+            continue
+        non_owner.append(p)
 
     # E4: владелец + РОВНО один → 1-на-1, принудительно private, ПЕРЕБИВАЕТ разметку.
     if owner_present and len(non_owner) == 1:
@@ -247,3 +258,32 @@ def decide_for_meeting(
         series, present_participants,
         visibility=visibility, company=company, roster_names=roster_names,
     )
+
+
+def present_participants_for_gate(
+    expected: Optional[list[str]],
+    panel: Optional[list[str]],
+    voiced: Optional[list[str]],
+) -> list[str]:
+    """A5: состав, по которому СУДИТ гейт = панель Телемоста ∪ реально говорившие
+    (тот же набор, что и шапка протокола — `resolve_present_participants`), а НЕ
+    только панель.
+
+    Иначе озвучившийся, но не попавший в панель участник (аудио-only / промах
+    скрейпа панели / две персоны на одном коннекте) виден в ПРОТОКОЛЕ, но НЕВИДИМ
+    предохранителю круга E5 → если он внешний, знание встречи опубликуется →
+    fail-OPEN в fail-closed гейте. Контракт «панель ∪ голоса» зафиксирован во
+    входной строке `decide_publication`; эта обёртка — ЕДИНЫЙ источник истины «кто
+    присутствовал» вместе с шапкой протокола.
+
+    Деградация (сбой импорта `protocol_to_tg`): отдаём хотя бы панель ∪ голоса без
+    тёзко-дедупа — гейт сам тёзко-safe (`_name_matches_any`), дубли безвредны.
+    """
+    try:
+        from .protocol_to_tg import resolve_present_participants  # noqa: PLC0415
+        return resolve_present_participants(expected or [], panel or [], voiced or [])
+    except Exception as e:  # noqa: BLE001
+        logger.info("[publication] present-resolve fallback (%s)", e)
+        out = [str(p).strip() for p in (panel or []) if str(p).strip()]
+        out.extend(str(v).strip() for v in (voiced or []) if str(v).strip())
+        return out
