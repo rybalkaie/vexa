@@ -264,19 +264,33 @@ def _roster_name_in_pool(name: str, participants: Optional[list[str]]) -> bool:
     Иначе матчим по полному имени ИЛИ по первому слову (состав может быть записан
     полным/коротким именем). Так отсутствующий на встрече ответственный НЕ
     подставляется доменным маппингом (A5: «нет в составе → не автор»).
+
+    Совпадение по первому слову допускаем ТОЛЬКО когда хотя бы одна сторона
+    записана одним словом (примирение короткого/полного: «Мария» ↔ «Мария
+    Михина»). Два РАЗНЫХ полных имени с общим первым словом («Михаил Саргин» vs
+    «Михаил Еремеев») — РАЗНЫЕ люди: иначе отсутствующего ответственного-тёзку
+    подставили бы на кластер присутствующего однофамильца-по-имени (A5-дыра).
     """
     if participants is None:
         return True
     target = name.strip().lower()
     if not target:
         return False
-    target_first = target.split()[0] if target.split() else target
+    t_toks = target.split()
+    target_first = t_toks[0] if t_toks else target
     for p in participants:
         if not p:
             continue
         pn = p.strip().lower()
-        pn_first = pn.split()[0] if pn.split() else pn
-        if pn == target or pn_first == target_first:
+        if not pn:
+            continue
+        p_toks = pn.split()
+        pn_first = p_toks[0] if p_toks else pn
+        if pn == target:
+            return True
+        # Тёзки по первому слову — один человек, лишь если кто-то записан одним
+        # словом; два разных полных имени не схлопываем (A5: не подставить тёзку).
+        if pn_first == target_first and (len(t_toks) <= 1 or len(p_toks) <= 1):
             return True
     return False
 
@@ -489,6 +503,7 @@ def map_all(
     *,
     anchor: Optional[dict[str, str]] = None,
     roster: Optional[list[dict]] = None,
+    present: Optional[list[str]] = None,
 ) -> MappingResult:
     """Прогоняет детерминированные источники по очереди: якорь → S1 → ростер → S2.
 
@@ -502,6 +517,13 @@ def map_all(
     добивает кластеры, по которым домен неоднозначен. `roster=None` → шаг
     пропускается (поведение как до Ф3). Догадка Ф4а
     (`map_from_speech_regex`/`_resolve_two_speakers`) — фолбэк для незакреплённых.
+
+    `present` (Ф3, A5) — РЕАЛЬНО присутствовавшие (панель Телемоста). Доменный
+    маппинг проверяет кандидата-ответственного на присутствие именно по `present`,
+    а НЕ по `participants` (тот = panel ∪ expected и тянет отпускников из
+    watched.yaml: иначе домен отсутствующего владельца, озвученный замещающим, лёг
+    бы на кластер замещающего под именем отсутствующего). `present=None` →
+    присутствие проверяется по `participants` (обратная совместимость/прямой вызов).
 
     LLM-добивка (бывший Source 3 / Claude Haiku) вынесена в
     `lib/llm_postprocess.py::map_speaker_names` и вызывается отдельно из
@@ -530,9 +552,11 @@ def map_all(
         sources_used.append("telemost_list")
 
     # 1.5) Ф3: доменный маппинг по ростеру ролей (высокоточно, A4/B3).
+    # A5-гейт присутствия — по `present` (реальная панель), не по union с expected.
     if roster:
         delta = map_from_roster_domain(
-            turns, roster, cluster_to_name, participants=participants
+            turns, roster, cluster_to_name,
+            participants=present if present is not None else participants,
         )
         if delta:
             cluster_to_name.update(delta)

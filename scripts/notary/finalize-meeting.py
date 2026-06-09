@@ -793,6 +793,9 @@ def main() -> int:
     mapping_result = map_all(
         turns, participants_union,
         anchor=series_speaker_anchor, roster=series_roster_entries,
+        present=participants,  # Ф3 A5: присутствие для доменного маппинга — по
+        # реальной панели Телемоста, не по union (expected-отпускник из
+        # watched.yaml не делает отсутствующего владельца кандидатом).
     )
     cluster_to_name: dict[str, str] = dict(mapping_result.cluster_to_name)
     sources_used: list[str] = list(mapping_result.sources_used)

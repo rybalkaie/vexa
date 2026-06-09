@@ -121,20 +121,63 @@ def domain_for_name(roster: list[RosterEntry], name: str) -> Optional[str]:
     """Обратный индекс: каноничное имя → его домен. Нет в ростере → None.
 
     Матч по полному имени и по первому слову (состав может записываться полным/
-    коротким именем). Для тестов доменной проверки и structured-логов.
+    коротким именем), но первое слово мирит тёзок ТОЛЬКО когда кто-то записан одним
+    словом — два разных полных тёзки доменом не путаем. Для тестов и structured-логов.
     """
     if not roster or not name:
         return None
     target = name.strip().lower()
-    target_first = target.split()[0] if target.split() else target
+    t_toks = target.split()
+    target_first = t_toks[0] if t_toks else target
     for entry in roster:
         cand = entry.get("name", "").strip().lower()
         if not cand:
             continue
-        cand_first = cand.split()[0] if cand.split() else cand
-        if target == cand or target_first == cand_first:
+        c_toks = cand.split()
+        cand_first = c_toks[0] if c_toks else cand
+        if target == cand:
+            return entry.get("domain")
+        if target_first == cand_first and (len(t_toks) <= 1 or len(c_toks) <= 1):
             return entry.get("domain")
     return None
+
+
+def _name_in_names(name: str, names: Optional[list[str]]) -> bool:
+    """Тёзко-безопасное присутствие имени в списке (та же логика, что
+    `name_mapping._roster_name_in_pool`): первое слово мирит тёзок ТОЛЬКО когда
+    кто-то записан одним словом; два разных полных тёзки — разные люди.
+    """
+    target = (name or "").strip().lower()
+    if not target:
+        return False
+    t_toks = target.split()
+    target_first = t_toks[0] if t_toks else target
+    for p in names or []:
+        pn = (p or "").strip().lower()
+        if not pn:
+            continue
+        p_toks = pn.split()
+        pn_first = p_toks[0] if p_toks else pn
+        if pn == target:
+            return True
+        if pn_first == target_first and (len(t_toks) <= 1 or len(p_toks) <= 1):
+            return True
+    return False
+
+
+def filter_roster_to_present(
+    roster: list[RosterEntry], present_names: Optional[list[str]]
+) -> list[RosterEntry]:
+    """A5: оставить записи ростера, чей владелец РЕАЛЬНО присутствует.
+
+    Нужна для LLM-подсказки: подавать в промпт домен→владелец только для
+    присутствующих, иначе хинт подталкивает Claude подставить отсутствующего
+    владельца домена (обход «нет голоса — нет имени»). `present_names` пуст/None →
+    `[]` (нет сигнала присутствия → не подсказываем владельцев вовсе).
+    """
+    if not roster or not present_names:
+        return []
+    return [e for e in roster if _name_in_names(str(e.get("name") or ""), present_names)]
 
 
 def format_roster_hint(roster: list[RosterEntry]) -> str:

@@ -386,5 +386,109 @@ class TestProtocolPromptParticipants(unittest.TestCase):
         self.assertNotIn("Еремеев", line)
 
 
+# ==========================================================================
+# A5 — тёзки по имени: отсутствующего владельца-тёзку не подставляем на
+# присутствующего однофамильца-по-имени; обоих присутствующих тёзок не теряем
+# (цикл5/ход1 — найденные баги namesake-коллизии и A5-гейта по union)
+# ==========================================================================
+class TestNamesakeA5(unittest.TestCase):
+    ROSTER = sr.get_roster(SLUG)
+    EREMEEV = "Михаил Еремеев"  # присутствующий тёзка владельца сервиса (Саргина)
+
+    def test_roster_name_in_pool_rejects_namesake(self):
+        # Саргина (владельца сервиса) на встрече нет; есть лишь ДРУГОЙ полный
+        # тёзка по имени → отсутствующий Саргин НЕ кандидат.
+        self.assertFalse(nm._roster_name_in_pool(SARGIN, [self.EREMEEV, MARIA]))
+        # Панель записала присутствующего Саргина коротко («Михаил») → мирим.
+        self.assertTrue(nm._roster_name_in_pool(SARGIN, ["Михаил", MARIA]))
+        # Точное совпадение полного имени → кандидат.
+        self.assertTrue(nm._roster_name_in_pool(SARGIN, [SARGIN, MARIA]))
+
+    def test_absent_owner_namesake_not_substituted(self):
+        # Сервис озвучивает присутствующий ДРУГОЙ Михаил (Еремеев); Саргина нет в
+        # составе → его имя НЕ ложится на кластер присутствующего тёзки.
+        turns = [_turn("SPEAKER_00", SERVICE_TXT)]
+        pool = [self.EREMEEV, MARIA, OLGA]  # Саргина нет
+        m = nm.map_from_roster_domain(turns, self.ROSTER, {}, participants=pool)
+        self.assertNotIn(SARGIN, m.values())
+        self.assertNotIn("SPEAKER_00", m)
+
+    def test_map_all_present_gate_excludes_expected_only_owner(self):
+        # Саргин — отпускник: есть в expected(watched.yaml)/union, нет в панели.
+        # Сервис озвучивает присутствующий тёзка Еремеев → имя отсутствующего
+        # Саргина не должно лечь ни на один кластер (A5-гейт по `present`=панель).
+        turns = [_turn("SPEAKER_00", SERVICE_TXT), _turn("SPEAKER_01", FINANCE_TXT)]
+        panel = [self.EREMEEV, OLGA]                       # реально присутствовали
+        union = panel + [SARGIN, MARIA, SONA, DARIA]       # + expected-отпускники
+        res = nm.map_all(turns, union, roster=self.ROSTER, present=panel)
+        self.assertNotIn(SARGIN, res.cluster_to_name.values())
+        # Присутствующая Ольга по финансам — маппится штатно.
+        self.assertEqual(res.cluster_to_name.get("SPEAKER_01"), OLGA)
+
+    def test_two_namesakes_both_in_header(self):
+        # Два РАЗНЫХ присутствующих Михаила — оба в составе шапки (не схлопнуть).
+        present = ptg.resolve_present_participants(
+            expected=[],
+            panel=[SARGIN, self.EREMEEV],
+            voiced=[SARGIN, self.EREMEEV],
+        )
+        self.assertIn(SARGIN, present)
+        self.assertIn(self.EREMEEV, present)
+
+
+# ==========================================================================
+# У1 (цикл5/ход3) — СТРАЖ связки render.py (формат строки) ↔ A5-парсер голосов.
+# Падёт, если формат `**[ts] Имя:**` в render.py изменится → A5 не деградирует молча.
+# ==========================================================================
+class TestRenderVoiceCouplingGuard(unittest.TestCase):
+    def test_voiced_parses_real_render_output(self):
+        import tempfile
+        from lib.render import render_protocol
+        turns = [
+            AlignedTurn(start=0.0, end=1.0, speaker="SPEAKER_00",
+                        text="Поставка на досмотре.", display_name=MARIA),
+            AlignedTurn(start=3725.0, end=3726.0, speaker="SPEAKER_01",
+                        text="План платежей.", display_name=OLGA),  # HH:MM:SS-ветка
+            AlignedTurn(start=10.0, end=11.0, speaker="SPEAKER_02",
+                        text="Без имени.", display_name=None),       # → «Спикер 3»
+        ]
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".md", delete=False, encoding="utf-8"
+        ) as fh:
+            fh.write("# {{ meeting_title }}\n\n{{ transcript_body }}\n")
+            tpl = fh.name
+        md = render_protocol(
+            template_path=tpl, turns=turns,
+            meta={"meeting_title": "Координация", "startTs": "2026-06-09T09:00:00Z"},
+            sources_used=["roster_domain"], asr_model="speechmatics-enhanced",
+        )
+        voiced = ptg.voiced_speaker_names_from_transcript(md)
+        self.assertIn(MARIA, voiced)
+        self.assertIn(OLGA, voiced)  # таймкод с часами тоже распарсен
+        self.assertFalse(any(v.startswith("Спикер") for v in voiced))
+
+
+# ==========================================================================
+# У2 (цикл5/ход3) — ростер-подсказка LLM подаётся ТОЛЬКО по присутствующим
+# ==========================================================================
+class TestRosterHintPresentFilter(unittest.TestCase):
+    ROSTER = sr.get_roster(SLUG)
+
+    def test_hint_filtered_to_present_owners(self):
+        flt = sr.filter_roster_to_present(self.ROSTER, [MARIA, OLGA])
+        self.assertEqual({e["name"] for e in flt}, {MARIA, OLGA})
+
+    def test_absent_namesake_owner_not_in_hint(self):
+        # Присутствует другой Михаил (Еремеев), Саргина нет → Саргин не в хинте.
+        flt = sr.filter_roster_to_present(self.ROSTER, ["Михаил Еремеев", MARIA])
+        names = {e["name"] for e in flt}
+        self.assertNotIn(SARGIN, names)
+        self.assertIn(MARIA, names)
+
+    def test_no_present_signal_empty(self):
+        self.assertEqual(sr.filter_roster_to_present(self.ROSTER, []), [])
+        self.assertEqual(sr.filter_roster_to_present(self.ROSTER, None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

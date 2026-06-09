@@ -281,7 +281,11 @@ def map_speaker_names(
         logger.info("[llm-map] meeting=%s no text for unresolved clusters", meeting_sid or "?")
         return {}
 
-    roster_hint = series_roster.format_roster_hint(roster or [])
+    # Ф3 A5: хинт домен→владелец — ТОЛЬКО по реально присутствовавшим (панель).
+    # Иначе подсказка нудит Claude подставить отсутствующего владельца домена
+    # (`name_pool` тянет expected-отпускников) — обход «нет голоса — нет имени».
+    roster_present = series_roster.filter_roster_to_present(roster or [], panel_participants)
+    roster_hint = series_roster.format_roster_hint(roster_present)
     user_prompt = _build_user_prompt(non_empty, name_pool, roster_hint=roster_hint)
 
     started = time.monotonic()

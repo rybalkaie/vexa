@@ -451,11 +451,25 @@ def voiced_speaker_names_from_transcript(transcript_md: str) -> list[str]:
     return out
 
 
-def _first_word_key(name: str) -> str:
-    """Ключ дедупа по первому слову (lower). «Мария Михина» и «Мария» → один ключ."""
+def _name_tokens(name: str) -> list[str]:
+    """Слова имени (lower, без md-разметки) для сравнения людей при дедупе."""
     s = re.sub(r"[*_`]{1,2}", "", name or "").strip().lower()
-    parts = s.split()
-    return parts[0] if parts else s
+    return s.split()
+
+
+def _same_person(a: list[str], b: list[str]) -> bool:
+    """Один ли это человек по двум написаниям имени.
+
+    Разные первые слова → разные люди. Если кто-то записан ОДНИМ словом — мирим
+    короткое с полным («Мария» ↔ «Мария Михина»). Два РАЗНЫХ полных имени с общим
+    первым словом («Михаил Саргин» vs «Михаил Еремеев») — РАЗНЫЕ люди (иначе один
+    реальный участник потерялся бы из шапки).
+    """
+    if not a or not b or a[0] != b[0]:
+        return False
+    if len(a) <= 1 or len(b) <= 1:
+        return True
+    return a == b
 
 
 def resolve_present_participants(
@@ -473,8 +487,10 @@ def resolve_present_participants(
     поведение, лучше показать ожидаемых, чем пустой состав). При наличии любого
     сигнала expected-only отбрасывается.
 
-    Дедуп по первому слову, предпочитаем более полное написание («Мария Михина»
-    важнее «Мария»). Порядок: сначала панель, затем добавленные голоса.
+    Дедуп тёзок-однофамильцев: короткое имя сливаем в полное с тем же первым
+    словом («Мария» ↔ «Мария Михина»), но двух РАЗНЫХ полных тёзок («Михаил
+    Саргин» и «Михаил Еремеев») оставляем обоих — не теряем реального участника.
+    Предпочитаем более полное написание. Порядок: сначала панель, потом голоса.
     """
     panel_clean = filter_participant_names(panel or [])
     voiced_clean = [v.strip() for v in (voiced or []) if isinstance(v, str) and v.strip()]
@@ -488,21 +504,23 @@ def resolve_present_participants(
         # A5: только присутствовавшие (панель) ∪ реально говорившие (голоса).
         merged_src = panel_clean + voiced_clean
 
-    # Дедуп по первому слову с выбором самого полного написания.
-    best_by_key: dict[str, str] = {}
-    order: list[str] = []
+    # Дедуп тёзок с выбором самого полного написания; разных полных тёзок не
+    # схлопываем (два «Михаил*» — два участника, оба в шапке).
+    result: list[str] = []
     for name in merged_src:
-        key = _first_word_key(name)
-        if not key:
+        toks = _name_tokens(name)
+        if not toks:
             continue
-        if key not in best_by_key:
-            best_by_key[key] = name
-            order.append(key)
-        else:
-            # Предпочитаем более длинное (более полное) написание имени.
-            if len(name) > len(best_by_key[key]):
-                best_by_key[key] = name
-    return [best_by_key[k] for k in order]
+        merged = False
+        for i, kept in enumerate(result):
+            if _same_person(toks, _name_tokens(kept)):
+                if len(name) > len(kept):  # предпочесть более полное написание
+                    result[i] = name
+                merged = True
+                break
+        if not merged:
+            result.append(name)
+    return result
 
 
 def _resolve_participants(meta: dict) -> list[str]:
