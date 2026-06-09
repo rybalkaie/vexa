@@ -74,6 +74,7 @@ from lib.protocol_to_tg import filter_participant_names  # noqa: E402  # Ф1 A2.
 from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
 from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
+from lib import series_roster  # noqa: E402  # Ф3: ростер ролей серии (домен→роль)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -783,9 +784,16 @@ def main() -> int:
     if getattr(args, "_test_fail_after_stt", False):
         raise RuntimeError("smoke: симуляция exception после STT (тест атомарности)")
 
-    # 3. Маппинг имён: Ф4б якорь серии → детерминированные S1+S2 → LLM-добивка остатка.
-    log.info("Step 4/5 — Name mapping (series-anchor + S1+S2 deterministic, then LLM)")
-    mapping_result = map_all(turns, participants_union, anchor=series_speaker_anchor)
+    # 3. Маппинг имён: Ф4б якорь серии → S1 → Ф3 ростер-домен → S2 → LLM-добивка.
+    # Ф3 (A4/B3): ростер ролей серии (домен реплики ↔ ответственный). Хардкод
+    # Anzhee-координации; ЗАВ1/Ф5 переключит источник на `*-context`. Незнакомая
+    # серия → [] (доменного маппинга нет, поведение как до Ф3).
+    series_roster_entries = series_roster.get_roster(meta.get("series"))
+    log.info("Step 4/5 — Name mapping (anchor + S1 + roster-domain + S2 deterministic, then LLM)")
+    mapping_result = map_all(
+        turns, participants_union,
+        anchor=series_speaker_anchor, roster=series_roster_entries,
+    )
     cluster_to_name: dict[str, str] = dict(mapping_result.cluster_to_name)
     sources_used: list[str] = list(mapping_result.sources_used)
     speaker_confidence: dict[str, float] = {}
@@ -796,6 +804,7 @@ def main() -> int:
             panel_participants=participants,
             already_mapped=cluster_to_name,
             meeting_sid=session_uid,
+            roster=series_roster_entries,
         )
         if llm_decided:
             for cluster, (name, conf) in llm_decided.items():

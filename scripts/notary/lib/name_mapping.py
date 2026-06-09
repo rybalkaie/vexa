@@ -236,6 +236,153 @@ def map_from_speech_regex(
     return result
 
 
+# ---------- Ф3: доменный маппинг по ростеру ролей серии (A4/B3) ----------
+
+# Минимум РАЗНЫХ доменных ключевых слов в репликах кластера, чтобы признать домен
+# (и его ответственного по ростеру). Ниже — слишком слабый сигнал, не маппим.
+_ROSTER_MIN_DISTINCT_KEYWORDS = 2
+
+
+def _cluster_texts(turns: list[AlignedTurn], clusters: set[str]) -> dict[str, str]:
+    """Склеивает весь текст реплик по каждому cluster'у (lowercase) для матча.
+
+    Только для переданных clusters. Опасная тройка: текст НЕ логируется, живёт
+    в памяти на время маппинга и используется лишь для substring-матча доменной
+    лексики ростера.
+    """
+    acc: dict[str, list[str]] = {c: [] for c in clusters}
+    for t in turns:
+        if t.speaker in acc and t.text and t.text.strip():
+            acc[t.speaker].append(t.text.lower())
+    return {c: " ".join(parts) for c, parts in acc.items()}
+
+
+def _roster_name_in_pool(name: str, participants: Optional[list[str]]) -> bool:
+    """Кандидат ростера допустим, если его имя есть в составе встречи (A5).
+
+    `participants is None` → ограничения нет (удобно тестам/прямому вызову).
+    Иначе матчим по полному имени ИЛИ по первому слову (состав может быть записан
+    полным/коротким именем). Так отсутствующий на встрече ответственный НЕ
+    подставляется доменным маппингом (A5: «нет в составе → не автор»).
+    """
+    if participants is None:
+        return True
+    target = name.strip().lower()
+    if not target:
+        return False
+    target_first = target.split()[0] if target.split() else target
+    for p in participants:
+        if not p:
+            continue
+        pn = p.strip().lower()
+        pn_first = pn.split()[0] if pn.split() else pn
+        if pn == target or pn_first == target_first:
+            return True
+    return False
+
+
+def map_from_roster_domain(
+    turns: list[AlignedTurn],
+    roster: list[dict],
+    already_mapped: dict[str, str],
+    *,
+    participants: Optional[list[str]] = None,
+) -> dict[str, str]:
+    """Ф3 (A4/B3): маппит cluster → ответственного по ДОМЕНУ его реплик.
+
+    На регулярной координации каждый участник стабильно держит свой блок. Если
+    реплики кластера насыщены доменной лексикой зоны X (ростер: домен→ответственный
+    + `keywords`), его автор — почти наверняка ответственный за X. Это
+    ДЕТЕРМИНИРОВАННАЯ опора (РИСК4: основная, в отличие от вероятностной LLM-добивки).
+
+    Высокоточно и консервативно:
+      • домен кластера засчитывается, только если в его репликах ≥
+        `_ROSTER_MIN_DISTINCT_KEYWORDS` РАЗНЫХ ключевых слов этого домена И этот
+        домен — единственный максимум (нет ничьей) → иначе кластер пропускаем;
+      • кандидат-ответственный должен быть в составе встречи (`participants`) — A5:
+        отсутствующего не подставляем;
+      • защита от инверсии: если кластер сам строго окликнул это имя («N, …») —
+        он НЕ N, пару отбрасываем (тот же strict-vocative, что валидирует якорь Ф4б);
+      • назначение one-to-one greedy по силе сигнала (число разных ключевых слов).
+
+    `already_mapped` исключает занятые кластеры/имена (якорь+S1 идут раньше).
+    Пустой `roster` → `{}`. Имя в маппинге — КАНОНИЧНОЕ из ростера (стабильное
+    написание, чинит и разнобой имён в составе).
+    """
+    if not roster or not turns:
+        return {}
+
+    free_clusters = sorted(
+        {t.speaker for t in turns if t.speaker and t.speaker not in already_mapped}
+    )
+    if not free_clusters:
+        return {}
+
+    # Кандидаты ростера: имя свободно (не занято) и присутствует в составе (A5).
+    used_names = set(already_mapped.values())
+    candidates: list[dict] = []
+    for entry in roster:
+        name = str(entry.get("name") or "").strip()
+        kws = [str(k).lower() for k in (entry.get("keywords") or []) if str(k).strip()]
+        if not name or not kws or name in used_names:
+            continue
+        if not _roster_name_in_pool(name, participants):
+            continue
+        candidates.append({"name": name, "keywords": kws})
+    if not candidates:
+        return {}
+
+    texts = _cluster_texts(turns, set(free_clusters))
+
+    # strict-vocative ТЕКУЩЕЙ встречи — защита от инверсии (кластер окликнул имя N
+    # → он не N). Обращения почти всегда по ИМЕНИ («Мария, …»), поэтому формы
+    # разворачиваем от ПЕРВОГО слова каноничного имени, но ключуем полным именем.
+    def _first(n: str) -> str:
+        parts = n.split()
+        return parts[0] if parts else n
+
+    name_forms = {c["name"]: _expand_name_forms(_first(c["name"])) for c in candidates}
+    _, _, strict_anti_votes = _scan_speech_votes(turns, name_forms)
+
+    # Для каждого свободного кластера — лучший домен (по числу РАЗНЫХ ключевых слов).
+    pairs: list[tuple[float, str, str]] = []  # (score, cluster, name)
+    for cluster in free_clusters:
+        text = texts.get(cluster, "")
+        if not text:
+            continue
+        scored: list[tuple[int, str]] = []  # (distinct_kw, name)
+        for cand in candidates:
+            distinct = sum(1 for kw in set(cand["keywords"]) if kw in text)
+            scored.append((distinct, cand["name"]))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_count, best_name = scored[0]
+        if best_count < _ROSTER_MIN_DISTINCT_KEYWORDS:
+            continue
+        # Единственный максимум (строгое доминирование) — иначе домен неоднозначен.
+        if len(scored) > 1 and scored[1][0] >= best_count:
+            continue
+        # Защита от инверсии: кластер сам строго окликнул это имя → он НЕ оно.
+        if strict_anti_votes.get((cluster, best_name), 0.0) > 0:
+            continue
+        pairs.append((float(best_count), cluster, best_name))
+
+    # Greedy one-to-one по силе сигнала.
+    pairs.sort(key=lambda x: x[0], reverse=True)
+    result: dict[str, str] = {}
+    taken_clusters: set[str] = set()
+    taken_names: set[str] = set()
+    for _score, cluster, name in pairs:
+        if cluster in taken_clusters or name in taken_names:
+            continue
+        result[cluster] = name
+        taken_clusters.add(cluster)
+        taken_names.add(name)
+
+    if result:
+        logger.info("Ф3 roster-domain: mapped %d cluster(s) by domain", len(result))
+    return result
+
+
 def _resolve_two_speakers(
     strict_anti_votes: dict[tuple[str, str], float],
     clusters: list[str],
@@ -341,18 +488,24 @@ def map_all(
     participants: list[str],
     *,
     anchor: Optional[dict[str, str]] = None,
+    roster: Optional[list[dict]] = None,
 ) -> MappingResult:
-    """Прогоняет детерминированные источники по очереди: якорь серии → S1 → S2.
+    """Прогоняет детерминированные источники по очереди: якорь → S1 → ростер → S2.
 
     `anchor` (Ф4б, REQ 1.2) — закреплённое человеком сопоставление спикер→имя из
     памяти серии. Применяется ПЕРВЫМ (бьёт догадку Ф4а), но лишь валидные и
-    непротиворечивые записи (см. `_apply_series_anchor`). Догадка Ф4а
-    (`map_from_speech_regex`/`_resolve_two_speakers`) остаётся фолбэком для
-    незакреплённых кластеров. `anchor=None` → поведение Ф4а без изменений.
+    непротиворечивые записи (см. `_apply_series_anchor`).
+
+    `roster` (Ф3, A4/B3) — ростер ролей серии (домен→ответственный+keywords из
+    `series_roster.get_roster`). Доменный маппинг идёт ПОСЛЕ якоря+S1, но ПЕРЕД
+    vocative-greedy S2: он высокоточно закрывает «перепутал людей» (A4), а S2
+    добивает кластеры, по которым домен неоднозначен. `roster=None` → шаг
+    пропускается (поведение как до Ф3). Догадка Ф4а
+    (`map_from_speech_regex`/`_resolve_two_speakers`) — фолбэк для незакреплённых.
 
     LLM-добивка (бывший Source 3 / Claude Haiku) вынесена в
     `lib/llm_postprocess.py::map_speaker_names` и вызывается отдельно из
-    `finalize-meeting.py` для unresolved'ов после якоря+S1+S2.
+    `finalize-meeting.py` для unresolved'ов после якоря+S1+ростера+S2.
     """
     clusters = sorted({t.speaker for t in turns if t.speaker})
     cluster_to_name: dict[str, str] = {}
@@ -376,7 +529,16 @@ def map_all(
         cluster_to_name.update(delta)
         sources_used.append("telemost_list")
 
-    # 2) Regex + pymorphy3 (already_mapped исключает закреплённое якорем/S1).
+    # 1.5) Ф3: доменный маппинг по ростеру ролей (высокоточно, A4/B3).
+    if roster:
+        delta = map_from_roster_domain(
+            turns, roster, cluster_to_name, participants=participants
+        )
+        if delta:
+            cluster_to_name.update(delta)
+            sources_used.append("roster_domain")
+
+    # 2) Regex + pymorphy3 (already_mapped исключает закреплённое якорем/S1/ростером).
     delta = map_from_speech_regex(turns, participants, cluster_to_name)
     if delta:
         cluster_to_name.update(delta)

@@ -61,6 +61,7 @@ from .claude_cli import (
 from . import clarify_state
 from . import glossary
 from . import protocol_to_tg
+from . import series_roster
 from . import protocol_to_pdf
 from . import telegram_api
 
@@ -101,8 +102,15 @@ Vocative-обращения («Михаил, посмотри…»), упоми�
 def _build_user_prompt(
     cluster_to_lines: dict[str, list[str]],
     available_names: list[str],
+    *,
+    roster_hint: str = "",
 ) -> str:
-    """Собирает payload для Claude: список имён + блоки реплик по cluster'ам."""
+    """Собирает payload для Claude: (Ф3 ростер) + список имён + блоки реплик.
+
+    `roster_hint` (Ф3, B3) — блок «зона ответственности → ответственный»
+    (`series_roster.format_roster_hint`). Идёт ПЕРВЫМ как доменная проверка: домен
+    реплики ↔ роль автора. ""/нет ростера → блок не добавляется.
+    """
     parts = []
     for c, lines in cluster_to_lines.items():
         if not lines:
@@ -110,9 +118,13 @@ def _build_user_prompt(
         body = " | ".join(lines)
         parts.append(f"{c}: {body}")
     transcript_block = "\n".join(parts)
+    prefix = ""
+    if roster_hint and roster_hint.strip():
+        prefix = roster_hint.strip() + "\n\n"
     return (
-        f"Список имён участников встречи: {', '.join(available_names)}\n\n"
-        f"Реплики кластеров:\n{transcript_block}"
+        prefix
+        + f"Список имён участников встречи: {', '.join(available_names)}\n\n"
+        + f"Реплики кластеров:\n{transcript_block}"
     )
 
 
@@ -209,6 +221,7 @@ def map_speaker_names(
     *,
     already_mapped: Optional[dict[str, str]] = None,
     meeting_sid: Optional[str] = None,
+    roster: Optional[list[dict]] = None,
 ) -> dict[str, tuple[str, float]]:
     """Маппит cluster label (SPEAKER_NN) на имя из участников через Claude.
 
@@ -219,6 +232,9 @@ def map_speaker_names(
       already_mapped — уже разрешённые Source 1+2 (передаются для исключения
                       из unresolved и из доступных имён).
       meeting_sid — для structured-лога (не передаётся в промт).
+      roster — Ф3 (B3): ростер ролей серии (`series_roster.get_roster`). Подаётся
+                в промпт доменной проверкой (домен реплики ↔ роль автора). None →
+                блок не добавляется.
 
     Возвращает dict[cluster, (name, confidence)] ТОЛЬКО для cluster'ов,
     по которым LLM дал ответ с непустым name. Прочие cluster'ы остаются
@@ -265,7 +281,8 @@ def map_speaker_names(
         logger.info("[llm-map] meeting=%s no text for unresolved clusters", meeting_sid or "?")
         return {}
 
-    user_prompt = _build_user_prompt(non_empty, name_pool)
+    roster_hint = series_roster.format_roster_hint(roster or [])
+    user_prompt = _build_user_prompt(non_empty, name_pool, roster_hint=roster_hint)
 
     started = time.monotonic()
     try:
@@ -1206,18 +1223,14 @@ def _format_protocol_user_prompt(
         duration_str = f"{duration} мин" if not str(duration).endswith("мин") else str(duration)
 
     expected = meeting_meta.get("expectedParticipants") or []
-    # Ф1 A2.1: панель Телемоста чистим от UI-мусора/монограмм, чтобы LLM не
-    # вписала «Скопировать ссылку»/«ДН» в `**Участники:**` шапки протокола.
-    participants = protocol_to_tg.filter_participant_names(
-        meeting_meta.get("participants") or []
-    )
-    # Слияние без дублей с сохранением порядка (expected first).
-    seen: set[str] = set()
-    merged: list[str] = []
-    for n in list(expected) + list(participants):
-        if isinstance(n, str) and n and n not in seen:
-            seen.add(n)
-            merged.append(n)
+    panel = meeting_meta.get("participants") or []
+    # Ф3 A5 «нет голоса — нет имени»: состав шапки = реально присутствовавшие
+    # (панель Телемоста, очищенная Ф1-фильтром от UI-мусора/монограмм) ∪ реально
+    # говорившие (имена из кластеров голоса транскрипта). Приглашённый по
+    # watched.yaml без присутствия и без голоса (отпускник «Еремеев») в состав НЕ
+    # попадает. `expected` — только деградационный фолбэк (нет ни панели, ни голосов).
+    voiced = protocol_to_tg.voiced_speaker_names_from_transcript(transcript_md)
+    merged = protocol_to_tg.resolve_present_participants(expected, panel, voiced)
     participants_str = ", ".join(merged) if merged else "—"
 
     transcript_filename = meeting_meta.get("transcript_filename") or f"{date}.md"

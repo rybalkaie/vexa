@@ -416,6 +416,95 @@ def filter_participant_names(names) -> list[str]:
     return out
 
 
+# Строка реплики транскрипта (формат render.py): «**[MM:SS] Имя:** текст» или
+# «**[HH:MM:SS] Имя:** текст». Группа 1 — отображаемое имя/метка спикера.
+_TRANSCRIPT_VOICE_LINE_RE = re.compile(
+    r"^\*\*\[\d{1,2}:\d{2}(?::\d{2})?\]\s+(.+?):\*\*", re.MULTILINE
+)
+# Метка «Спикер N» / «Спикер ?» — НЕ имя (нераспознанный кластер).
+_SPEAKER_PLACEHOLDER_RE = re.compile(r"^Спикер\s", re.IGNORECASE)
+
+
+def voiced_speaker_names_from_transcript(transcript_md: str) -> list[str]:
+    """Ф3 (A5): отображаемые ИМЕНА спикеров, реально звучавшие в транскрипте.
+
+    Парсит строки реплик «**[ts] Имя:**» рендера и собирает уникальные имена,
+    у которых есть кластер голоса. «Спикер N»/«Спикер ?» (нераспознанный кластер)
+    — НЕ имя, отбрасываем: для правила «нет голоса — нет имени» важны именно
+    распознанные авторы. Порядок появления сохраняем, дубли убираем.
+
+    Опасная тройка: берём только МЕТКУ спикера (имя), сам текст реплик не трогаем
+    и не логируем.
+    """
+    if not transcript_md:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _TRANSCRIPT_VOICE_LINE_RE.finditer(transcript_md):
+        label = (m.group(1) or "").strip()
+        if not label or _SPEAKER_PLACEHOLDER_RE.match(label):
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
+def _first_word_key(name: str) -> str:
+    """Ключ дедупа по первому слову (lower). «Мария Михина» и «Мария» → один ключ."""
+    s = re.sub(r"[*_`]{1,2}", "", name or "").strip().lower()
+    parts = s.split()
+    return parts[0] if parts else s
+
+
+def resolve_present_participants(
+    expected, panel, voiced,
+) -> list[str]:
+    """Ф3 (A5): «нет голоса — нет имени». Состав встречи = кто реально был.
+
+    Участник = присутствовавший в комнате (`panel` — список Телемоста) ИЛИ реально
+    говоривший (`voiced` — имена из кластеров голоса транскрипта). Приглашённый по
+    `expected` (watched.yaml), которого НЕТ ни в панели, ни среди голосов
+    (отпускник «Еремеев»), в состав НЕ попадает — устраняет «подставил отсутствующего».
+
+    `expected` сюда подаётся ТОЛЬКО для деградационного фолбэка: если ни панели, ни
+    голосов нет (нет сигнала присутствия) — возвращаем `expected ∪ panel` (прежнее
+    поведение, лучше показать ожидаемых, чем пустой состав). При наличии любого
+    сигнала expected-only отбрасывается.
+
+    Дедуп по первому слову, предпочитаем более полное написание («Мария Михина»
+    важнее «Мария»). Порядок: сначала панель, затем добавленные голоса.
+    """
+    panel_clean = filter_participant_names(panel or [])
+    voiced_clean = [v.strip() for v in (voiced or []) if isinstance(v, str) and v.strip()]
+    expected_clean = [e.strip() for e in (expected or []) if isinstance(e, str) and e.strip()]
+
+    has_signal = bool(panel_clean) or bool(voiced_clean)
+    if not has_signal:
+        # Деградация: сигнала присутствия нет → прежнее поведение (expected ∪ panel).
+        merged_src = expected_clean + panel_clean
+    else:
+        # A5: только присутствовавшие (панель) ∪ реально говорившие (голоса).
+        merged_src = panel_clean + voiced_clean
+
+    # Дедуп по первому слову с выбором самого полного написания.
+    best_by_key: dict[str, str] = {}
+    order: list[str] = []
+    for name in merged_src:
+        key = _first_word_key(name)
+        if not key:
+            continue
+        if key not in best_by_key:
+            best_by_key[key] = name
+            order.append(key)
+        else:
+            # Предпочитаем более длинное (более полное) написание имени.
+            if len(name) > len(best_by_key[key]):
+                best_by_key[key] = name
+    return [best_by_key[k] for k in order]
+
+
 def _resolve_participants(meta: dict) -> list[str]:
     """Собирает список «Имя Фамилия» для шапки TG.
 
