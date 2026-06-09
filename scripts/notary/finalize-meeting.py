@@ -75,6 +75,7 @@ from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
 from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
 from lib import series_roster  # noqa: E402  # Ф3: ростер ролей серии (домен→роль)
+from lib import publication_gate  # noqa: E402  # Ф6: гейтинг публикации знания (E1–E5)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -1127,6 +1128,23 @@ def main() -> int:
             _digest_meta["date"] = date_part
             _digest_meta["expectedParticipants"] = expected
             _digest_meta["participants"] = participants
+            # Ф6 (E1–E5): вердикт гейта публикации знания — по РЕАЛЬНОМУ составу
+            # (panel `participants`, A5: присутствие, не приглашённые) + разметке
+            # серии (watched.yaml) + ростеру. Оседает в памяти серии как метаданные
+            # (PII-free, без сырья) — это достижимость гейта из реальной
+            # финализации; саму публикацию делает Ф7, читая этот вердикт.
+            # Fail-closed: любой сбой → private (знание НЕ утекает).
+            _publication = {"allowed": False, "visibility": "private",
+                            "company": None, "reason": "gate-error"}
+            try:
+                _decision = publication_gate.decide_for_meeting(meta.get("series"), participants)
+                _publication = _decision.as_metadata()
+                # Только метаданные (опасная тройка): серия/видимость/причина/счётчик.
+                log.info("[publication] meeting=%s series=%s visibility=%s reason=%s present=%d",
+                         session_uid, meta.get("series"), _decision.visibility,
+                         _decision.reason, len(participants or []))
+            except Exception as _e:  # noqa: BLE001
+                log.warning("[publication] gate failed (non-fatal, fail-closed private): %s", _e)
             # B1: build→save→prune одним вызовом (тестируемая единица, см.
             # series_memory.save_meeting_digest). Прунинг старых выжимок ПО ТЕКУЩЕЙ
             # серии — ОТДЕЛЬНОЙ операцией внутри (не в save_digest), иначе бэкфилл
@@ -1137,6 +1155,7 @@ def main() -> int:
                 series_dir, date_part, _proto_for_digest, _digest_meta,
                 speaker_mapping=cluster_to_name,  # Ф4б (REQ 1.2): несём авторство в память серии
                 participant_filter=filter_participant_names,
+                publication=_publication,  # Ф6: вердикт гейта (PII-free) в память серии
                 prune_days=series_memory.retention_days(),
             )
         except Exception as e:  # noqa: BLE001

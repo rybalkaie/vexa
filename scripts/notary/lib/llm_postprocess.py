@@ -59,9 +59,9 @@ from .claude_cli import (
     call_claude_print,
 )
 from . import clarify_state
-from . import context_knowledge
 from . import glossary
 from . import protocol_to_tg
+from . import series_markup
 from . import series_roster
 from . import protocol_to_pdf
 from . import telegram_api
@@ -1393,11 +1393,10 @@ def generate_protocol(
     if method_text is None:
         method_text = _load_method_text()
 
-    # Ф5: компания встречи по slug серии (поиск по оргструктурам `*-context`).
-    # Нет привязки / нет YAML-знания → None → glossary падает на встроенный блок
-    # (поведение как до Ф5). До Ф6 (поле company в разметке серии) это
-    # единственный источник company-scope глоссария.
-    company = context_knowledge.company_for_series(meeting_meta.get("series"))
+    # Ф6 (E6): компания встречи — разметка `watched.yaml` ПЕРВИЧНА (поле company),
+    # оргструктурный поиск `*-context` — fallback переходного периода. Нет привязки
+    # / нет YAML-знания → None → glossary падает на встроенный блок (как до Ф5).
+    company = series_markup.company_for_series(meeting_meta.get("series"))
 
     # FU-11 / Ф5: глоссарий компании в КОНЕЦ system-prompt (после методички) —
     # отдельной секцией, company-scoped (Bolong[mpfirst] не уйдёт в Anzhee-промпт).

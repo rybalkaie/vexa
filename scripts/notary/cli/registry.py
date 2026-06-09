@@ -14,7 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
+# pyyaml импортируется ЛЕНИВО внутри `_read_yaml`/`_atomic_write_yaml` (контракт
+# Ф4 §1.2): системный python3 юнит-тестов pyyaml не несёт, а чистые резолверы
+# разметки (`get_company_for_series`/`get_visibility_for_series`) и валидатор —
+# stdlib-only и должны импортироваться/тестироваться без pyyaml. Прод-venv-cli/VPS
+# несут pyyaml; чтение/запись YAML без него осознанно падает (ImportError) у
+# caller'ов, которые это уже ловят best-effort (series_markup, llm_postprocess).
 
 DEFAULT_REGISTRY_DIR = Path(os.path.expanduser(
     os.environ.get("MEETING_NOTARY_REGISTRY_DIR") or "~/Projects/me/встречи"
@@ -70,6 +75,7 @@ def _release_lock(path: Path) -> None:
 
 
 def _read_yaml(path: Path, default_top_key: str) -> dict[str, Any]:
+    import yaml  # lazy — см. шапку модуля (контракт §1.2)
     if not path.exists():
         return {default_top_key: []}
     with path.open("r", encoding="utf-8") as f:
@@ -88,6 +94,7 @@ def _atomic_write_yaml(path: Path, data: dict[str, Any], default_header: str) ->
     against accidental rm or a malformed save (the YAML files live in ~/Projects/me/,
     which is not a git repo; no other history exists).
     """
+    import yaml  # lazy — см. шапку модуля (контракт §1.2)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_header = _extract_header_comment(path)
     header = existing_header if existing_header.strip() else default_header
@@ -138,6 +145,14 @@ WATCHED_HEADER = """# Реестр отслеживаемых встреч дл�
 #
 # Редактируй через `meeting-watch add/remove/disable/enable`.
 # Полная схема полей — в шапке исходного шаблона watched.yaml.
+#
+# Ф6 (E6): опциональная разметка серии (пер-record, резолв на уровень series):
+#   company:    anzhee | mpfirst   — какой *-context кормит серию (глоссарий/ростер).
+#   visibility: company | private  — можно ли производное ЗНАНИЕ публиковать в
+#               общий мозг компании. ОТСУТСТВИЕ visibility = неразмечено → бот
+#               трактует серию как private (fail-closed): знание НЕ уходит в
+#               *-context (E3). 1-на-1 — всегда private. Сырьё (транскрипт/
+#               протокол) этим полям НЕ подчиняется — оно всегда в me/встречи.
 """
 
 
@@ -220,6 +235,18 @@ def validate_room_record(rec: dict[str, Any]) -> list[str]:
 
 VALID_TYPES = {"google-calendar", "manual", "one-off"}
 
+# Ф6 (E6): разметка серии поверх watched.yaml — «компания» + «видимость».
+# company   — какой `*-context` кормит серию (anzhee → anzhee-context, ...).
+# visibility— можно ли производное ЗНАНИЕ публиковать в общий мозг компании:
+#             `company` (групповая координация — можно) | `private` (1-на-1/
+#             чувствительное — нельзя). ОТСУТСТВИЕ поля = неразмечено → бот
+#             трактует как private (fail-closed, см. lib/publication_gate.py).
+# Оба поля ОПЦИОНАЛЬНЫ и пер-record (резолв на уровень series — как
+# telegram_chat_id: первое непустое среди записей серии). Сырьё (транскрипт/
+# протокол) этим полям не подчиняется — оно всегда остаётся в me/встречи (РИСК1).
+VALID_COMPANIES = {"anzhee", "mpfirst"}
+VALID_VISIBILITY = {"company", "private"}
+
 
 def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[str]:
     errors: list[str] = []
@@ -256,6 +283,15 @@ def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[
     if raw_chat is not None:
         if isinstance(raw_chat, bool) or not isinstance(raw_chat, int):
             errors.append(f"telegram_chat_id={raw_chat!r}: должно быть целым числом (отрицательное для группы)")
+    # Ф6 (E6): company/visibility — опциональны, валидируем значения если заданы.
+    company = rec.get("company")
+    if company is not None:
+        if not isinstance(company, str) or company.strip().lower() not in VALID_COMPANIES:
+            errors.append(f"company={company!r}: допустимо {sorted(VALID_COMPANIES)} или отсутствие")
+    visibility = rec.get("visibility")
+    if visibility is not None:
+        if not isinstance(visibility, str) or visibility.strip().lower() not in VALID_VISIBILITY:
+            errors.append(f"visibility={visibility!r}: допустимо {sorted(VALID_VISIBILITY)} или отсутствие")
     return errors
 
 
@@ -276,6 +312,43 @@ def get_telegram_chat_id_for_series(series: str, watched: dict[str, Any]) -> int
         cid = w.get("telegram_chat_id")
         if isinstance(cid, int) and not isinstance(cid, bool):
             return cid
+    return None
+
+
+def get_company_for_series(series: str, watched: dict[str, Any]) -> str | None:
+    """Ф6 (E6): первая непустая `company` среди записей серии (нормализована lower).
+
+    Пер-record поле, резолвится на уровень series как `telegram_chat_id`.
+    Невалидное/неизвестное значение пропускается (как будто не задано) — резолв
+    устойчив к ручному мусору в watched.yaml. Нет разметки → None (вызыватель
+    уйдёт на переходный резолв по оргструктуре, см. lib/series_markup.py).
+    """
+    if not series:
+        return None
+    for w in watched.get("watched", []):
+        if w.get("series") != series:
+            continue
+        c = w.get("company")
+        if isinstance(c, str) and c.strip().lower() in VALID_COMPANIES:
+            return c.strip().lower()
+    return None
+
+
+def get_visibility_for_series(series: str, watched: dict[str, Any]) -> str | None:
+    """Ф6 (E6): первая непустая `visibility` среди записей серии (lower).
+
+    Нет разметки / невалидное значение → None. Вызыватель (publication_gate)
+    трактует None как НЕразмечено → private (fail-closed): неразмеченная серия
+    НЕ публикует знание в общий мозг (E3).
+    """
+    if not series:
+        return None
+    for w in watched.get("watched", []):
+        if w.get("series") != series:
+            continue
+        v = w.get("visibility")
+        if isinstance(v, str) and v.strip().lower() in VALID_VISIBILITY:
+            return v.strip().lower()
     return None
 
 

@@ -277,6 +277,7 @@ def build_digest(
     date: Optional[str] = None,
     speaker_mapping: Optional[dict] = None,
     participant_filter: Optional[Callable[[list], list]] = None,
+    publication: Optional[dict] = None,
 ) -> dict:
     """7.1: компактная выжимка-память из готового протокола.
 
@@ -291,6 +292,12 @@ def build_digest(
     cluster→имя (после правок авторства). Кладём ленивым ключом ТОЛЬКО если непусто
     (нет ключа в старых файлах → resolve_speaker_anchor вернёт {}, миграции/бэкфилл
     не нужны, УПУ3). НЕ ПДн сверх уже хранимого: имена и так есть в `participants`.
+
+    Ф6 (E1–E5): `publication` — вердикт гейта публикации знания (`publication_gate`):
+    PII-free `{allowed, visibility, company, reason}`, без сырья. Ленивый ключ:
+    кладём ТОЛЬКО если передан (бэкфилл/старые файлы его не несут → Ф7-публикатор
+    трактует отсутствие как private, fail-closed). Это НЕ публикует знание (Ф7) —
+    лишь фиксирует решение рядом с памятью серии, достижимое из реальной финализации.
 
     Ф2 (B2 / Ф1 §5): `participant_filter` — отбраковка UI-мусора скрейпа Телемоста
     («ДН»/монограммы/«Скопировать ссылку») и не-имён из РАЗ имён. Нужен бэкфиллу:
@@ -330,6 +337,8 @@ def build_digest(
     sm = _norm_speaker_mapping(speaker_mapping)
     if sm:
         digest["speaker_mapping"] = sm
+    if isinstance(publication, dict) and publication:
+        digest["publication"] = publication
     return digest
 
 
@@ -394,6 +403,7 @@ def save_meeting_digest(
     *,
     speaker_mapping: Optional[dict] = None,
     participant_filter: Optional[Callable[[list], list]] = None,
+    publication: Optional[dict] = None,
     prune_days: int = 0,
 ) -> Optional[Path]:
     """B1 (finalize 4.0.2d): построить выжимку из ГОТОВОГО протокола и сохранить
@@ -413,6 +423,7 @@ def save_meeting_digest(
     digest = build_digest(
         protocol_text, meeting_meta, date=date,
         speaker_mapping=speaker_mapping, participant_filter=participant_filter,
+        publication=publication,
     )
     saved = save_digest(series_dir, date, digest)
     if prune_days and prune_days > 0:
