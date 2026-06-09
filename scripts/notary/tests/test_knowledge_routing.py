@@ -204,6 +204,17 @@ class TestListenerPromoteHook(_RatchetTempMixin):
         self.assertTrue(handled)
         self.assertTrue(router.classify_destination("оффер", kind="term", company="anzhee").is_private)
 
+    def test_one_time_promote_does_not_broaden(self):
+        # Цикл5 Н1: «переноси ТОЛЬКО ЭТО» на дайджесте не привязано к конкретному
+        # термину (per-fact = Ф8). Раньше listener молча писал kind-level правило
+        # (remember_promotion scope=key, key=None → вырождение в kind) и повышал
+        # ВСЕ будущие термины — вопреки «только это». Теперь правило НЕ пишется.
+        handled = self.ml.maybe_route_to_learning_rollback(
+            "tok", 1, {"text": "переноси только это в контекст anzhee", "message_id": 9})
+        self.assertTrue(handled)
+        self.assertTrue(router.classify_destination("оффер", kind="term", company="anzhee").is_private)
+        self.assertIn("пока не поддержан", self.sent[-1][1])
+
 
 if __name__ == "__main__":
     unittest.main()

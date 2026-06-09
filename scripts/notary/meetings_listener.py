@@ -865,9 +865,22 @@ def maybe_route_to_learning_rollback(token: str, chat_id: int, msg: dict[str, An
         logger.debug("knowledge_ratchet import/parse failed (feature off?): %s", e)
         promo = None
     if promo is not None:
+        scope = promo.get("scope") or "kind"
+        if scope == "key":
+            # «только это»: разовое повышение КОНКРЕТНОГО факта — это per-fact
+            # ре-роутинг, задел Ф8 (handoff §3.3 п.3). У реплая на дайджест нет
+            # привязки к одному термину, поэтому key здесь неизвестен, а
+            # remember_promotion(scope="key", key=None) молча выродился бы в
+            # kind-level и повысил ВСЕ будущие термины — ровно вопреки «только
+            # это» (fail-open). Fail-closed: правило НЕ пишем, объясняем владельцу.
+            send_message(token, chat_id,
+                         "Разовый перенос одного термина пока не поддержан. Чтобы "
+                         "ВПРЕДЬ такие термины уходили в контекст — «переноси в контекст».",
+                         reply_to=msg.get("message_id"))
+            return True
         try:
             knowledge_ratchet.remember_promotion(
-                "term", company=promo.get("company"), scope=promo.get("scope") or "kind")
+                "term", company=promo.get("company"), scope="kind")
         except Exception as e:  # noqa: BLE001
             logger.warning("ratchet promote failed (non-fatal): %s", e)
         where = f" ({promo['company']})" if promo.get("company") else ""
