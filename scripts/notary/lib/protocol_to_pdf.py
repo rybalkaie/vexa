@@ -29,6 +29,7 @@ from __future__ import annotations
 import html as htmllib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,12 +128,27 @@ def find_chrome_binary() -> str:
     )
 
 
+# A2.2: поля шапки протокола, которые УЖЕ напечатаны в визуальной шапке PDF
+# (title = «Серия — дата»; subtitle = «Участники: … · Чистое время: …»). Их
+# строки из тела убираем, иначе участники/длительность печатаются ДВАЖДЫ (раз
+# в subtitle, раз в `**Участники:**` тела — баг владельца «два раза участники
+# написаны»). `**Транскрипт:**` — относительная ссылка, в PDF бесполезна, тоже
+# убираем. `**Встреча:**` (тема) ОСТАВЛЯЕМ — её в визуальной шапке нет.
+_PDF_DROP_HEADER_FIELD_RE = re.compile(
+    r"^\s*\*\*\s*(участ\w*|длител\w*|транскрипт\w*)\s*:\*\*",
+    re.IGNORECASE,
+)
+
+
 def _strip_leading_heading(md_text: str) -> str:
-    """Отрезает «технический» первый заголовок-маркер (`#протоколвстречи …` /
-    `# 📋 Протокол…`) — вместо него рисуем аккуратную шапку (как мак-образец)."""
+    """Готовит тело протокола к PDF: отрезает технический H1-маркер
+    (`#протоколвстречи …`) и ДУБЛИРУЮЩИЕ поля шапки (участники/длительность/
+    транскрипт), которые уже отрисованы в визуальной шапке PDF (title+subtitle).
+    Иначе участники печатаются дважды (A2.2). Тему `**Встреча:**` оставляем."""
     lines = (md_text or "").splitlines()
     if lines and lines[0].lstrip().startswith("#"):
         lines = lines[1:]
+    lines = [ln for ln in lines if not _PDF_DROP_HEADER_FIELD_RE.match(ln)]
     return "\n".join(lines).strip()
 
 

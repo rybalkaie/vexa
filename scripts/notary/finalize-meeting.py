@@ -70,6 +70,7 @@ from lib.llm_postprocess import (  # noqa: E402
     sync_stakeholder_track,
 )
 from lib.delivery_grace import wait_for_clarify_grace  # noqa: E402
+from lib.protocol_to_tg import filter_participant_names  # noqa: E402  # Ф1 A2.1
 from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
 from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
@@ -616,7 +617,10 @@ def main() -> int:
             return 10
         log.error("WAV not found (meta.files.wav=%s)", wav_path)
         return 3
-    participants = meta.get("participants") or []
+    # Ф1 A2.1: единый chokepoint — чистим панель Телемоста от UI-мусора
+    # («Скопировать ссылку», монограммы «ДН») ДО union/маппинга/протокола/
+    # выжимки. Иначе мусор течёт в пул имён map_all и в шапку протокола.
+    participants = filter_participant_names(meta.get("participants") or [])
     expected = meta.get("expectedParticipants") or []
     expanded_expected: list[str] = []
     for full in expected:

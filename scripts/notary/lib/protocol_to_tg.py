@@ -328,6 +328,94 @@ def _resolve_full_name(short_name: str, people_names: list[str]) -> str:
     return needle
 
 
+# --- Фильтр мусора из скрейпа участников Телемоста (Ф1: A2.1) ------------
+#
+# Панель «Участники» Телемоста (scrape в vexa-bot `participants.ts`) иногда
+# отдаёт не имена, а UI-строки кнопок («Скопировать ссылку», «Пригласить») и
+# аватар-монограммы («ДН» = Дарья Набережная, «ИР» = Илья Рыбалка). Node-
+# эвристика `looksLikeName` их пропускает (дыра найдена владельцем 2026-06-09:
+# «скопировать ссылку» не равно стоп-слову «копировать»; «ДН» — валидная по её
+# меркам строка). Чистим на стороне Python — единый chokepoint: чинит и УЖЕ
+# собранные meta.json прошлых встреч, и не требует пересборки/редеплоя vexa-bot.
+# Принцип: лучше выкинуть сомнительное, чем оставить мусор в шапке протокола.
+
+# UI-фразы Телемоста: матч по нормализованной ПОДСТРОКЕ (нижний регистр).
+_UI_PHRASE_SUBSTR = (
+    "скопировать", "копировать ссылк", "ссылка на встреч", "ссылку на встреч",
+    "пригласить", "ожидан", "демонстрац", "поделиться", "показать вс",
+    "ещё участ", "еще участ", "copy link", "invite", "share screen",
+    "waiting room", "admit",
+)
+
+# UI-слова: кандидат, ВСЕ токены которого служебные, — отбраковываем целиком.
+_UI_WORDS = frozenset({
+    "участник", "участники", "ждать", "ожидание", "выйти", "поиск", "найти",
+    "закрыть", "вы", "хост", "ведущий", "микрофон", "камера", "звук", "видео",
+    "чат", "сообщение", "ссылка", "ссылку", "копировать", "пригласить",
+    "host", "you", "search", "close", "leave", "mute", "unmute",
+    "participant", "participants", "share", "more",
+})
+
+# Технические символы, которых в человеческом имени не бывает.
+_NONNAME_TECH_RE = re.compile(r"[<>{}|\\/\[\]=@]")
+
+
+def _is_ui_or_nonname(name: str) -> bool:
+    """True — строку НЕ берём в участники (UI-кнопка Телемоста / не-имя, A2.1).
+
+    Отбраковываем:
+      - UI-фразы кнопок («Скопировать ссылку», «Пригласить») — по подстроке;
+      - строки целиком из служебных слов;
+      - технические символы (`<>{}|\\/[]=@`);
+      - аватар-монограммы / инициалы: один «токен» из ≤3 голых букв, ВСЕ
+        заглавные («ДН», «ИР», «И.Р.») — это инициалы аватара, не имя.
+    Имя из ≥2 слов или со строчными буквами («Мария», «Сона», «Ия») проходит.
+    """
+    s = (name or "").strip()
+    if not s:
+        return True
+    low = re.sub(r"\s+", " ", s).lower()
+    for sub in _UI_PHRASE_SUBSTR:
+        if sub in low:
+            return True
+    words = low.split()
+    if words and all(w in _UI_WORDS for w in words):
+        return True
+    if _NONNAME_TECH_RE.search(s):
+        return True
+    # Монограмма/инициалы: ≤3 голых буквы (точки/дефисы/пробелы срезаны) и ни
+    # одной строчной → «ДН», «И.Р.». Реальное имя такой длины («Ия», «Лев»)
+    # содержит строчные и проходит.
+    letters_only = re.sub(r"[.\s\-]", "", s)
+    if 1 <= len(letters_only) <= 3 and letters_only.isalpha() \
+            and letters_only == letters_only.upper():
+        return True
+    return False
+
+
+def filter_participant_names(names) -> list[str]:
+    """Чистит список участников от UI-мусора скрейпа Телемоста (A2.1) + дедуп.
+
+    Принимает любой iterable; не-строки и пустые отбрасывает. Сохраняет порядок,
+    точные дубли убирает. НЕ резолвит имена (это `_resolve_participants` /
+    `_caption_participants`) — только выкидывает заведомый мусор. Единый
+    chokepoint фильтрации сырых имён панели Телемоста.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in (names or []):
+        if not isinstance(n, str):
+            continue
+        s = n.strip()
+        if not s or _is_ui_or_nonname(s):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def _resolve_participants(meta: dict) -> list[str]:
     """Собирает список «Имя Фамилия» для шапки TG.
 
@@ -335,7 +423,9 @@ def _resolve_participants(meta: dict) -> list[str]:
     (watched.yaml). Резолвим имена-без-фамилии через people.md. Сохраняем
     порядок, дедуп — по полному имени.
     """
-    raw_participants = meta.get("participants") or []
+    # A2.1: чистим сырьё панели Телемоста от UI-мусора («Скопировать ссылку»,
+    # монограмм «ДН») ДО резолва — иначе мусор попадёт в шапку TG.
+    raw_participants = filter_participant_names(meta.get("participants") or [])
     raw_expected = meta.get("expectedParticipants") or []
 
     # Сначала expected (они обычно уже «Имя Фамилия» из watched.yaml),
@@ -811,8 +901,13 @@ def _format_header(parsed_header: dict, meta: dict) -> str:
     if duration == "—" and parsed_header.get("duration"):
         duration = parsed_header["duration"]
 
+    # A1/F1: заголовок — человекочитаемое имя серии (как в PDF-шапке), а не
+    # generic «ПРОТОКОЛ ВСТРЕЧИ». Серия резолвится из `series-display.json` /
+    # хардкод-оверрайдов / темы; fallback на generic, если имя не вычислилось.
+    series_name = resolve_series_display_name(meta, parsed_header=parsed_header)
+    title = series_name if series_name and series_name != "—" else "ПРОТОКОЛ ВСТРЕЧИ"
     lines = [
-        f"📋 ПРОТОКОЛ ВСТРЕЧИ — {date_str}",
+        f"📋 {title} — {date_str}",
         HASHTAG,
         "",
     ]
@@ -1090,10 +1185,16 @@ def split_protocol_smart(text: str, max_len: int = TG_MAX_LEN) -> list[str]:
 # ключ привязки chat_id в watched.yaml. Человекочитаемого поля в watched.yaml
 # НЕТ. Поэтому slug → отображаемое имя резолвим маппингом. Дефолты ниже —
 # эталон владельца; расширяется без правки кода через `_config/series-display.json`.
+# Ф1 (A1): реестр регулярных встреч владельца 2026-06-09 (источник правды —
+# план notary-memory-knowledge-rework). Хардкод-дефолты держим в синхроне с
+# `_config/series-display.json`, чтобы человеческое имя серии работало на VPS
+# ДАЖЕ если json-конфиг ещё не выкачен (деплой кода ≠ деплой данных). Конфиг
+# остаётся слоем override поверх этих дефолтов.
 _SERIES_DISPLAY_OVERRIDES = {
-    "marketplaces-tatiana": "Маркетплейсы (Татьяна)",
-    "anzhee-direktorat": "Директорат Anzhee",
-    "mpervyi-pn-koord-finplan": "МПервый — закупки и финплан",
+    "mpervyi-pn-koord-finplan": "Закупки и финпланирование (МПервый)",
+    "series-ezhenedelnaya-koordinaciya-8399ea": "Еженедельная координация",
+    "marketplaces-tatiana": "1-на-1 с Татьяной Филипповой",
+    "anzhee-direktorat": "Директорат",
 }
 
 # Разделитель «короткое имя — расшифровка» в теме протокола (em/en-dash/дефис
@@ -1267,8 +1368,8 @@ def _caption_participants(meta: dict) -> list[str]:
     """
     raw_expected = [n.strip() for n in (meta.get("expectedParticipants") or [])
                     if isinstance(n, str) and n.strip()]
-    raw_ui = [n.strip() for n in (meta.get("participants") or [])
-              if isinstance(n, str) and n.strip()]
+    # A2.1: панель Телемоста чистим от UI-мусора/монограмм ДО обогащения.
+    raw_ui = filter_participant_names(meta.get("participants") or [])
     people_md = _read_people_md()
     people_names = _extract_names_from_people(people_md) if people_md else []
 

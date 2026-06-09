@@ -269,8 +269,9 @@ class TestDisclaimerInTg(unittest.TestCase):
         text = ptg.format_protocol_as_tg_text(PROTOCOL_WITH_DISCLAIMER, self.META)
         self.assertIn(ptg.PROTOCOL_DISCLAIMER_SENTINEL, text)
         # Шапка по-прежнему первые две строки (дисклеймер — отдельным блоком ниже).
+        # Ф1 (A1/F1): 1-я строка — `📋 <имя серии> — дата` (не generic).
         lines = text.splitlines()
-        self.assertTrue(lines[0].startswith("📋 ПРОТОКОЛ ВСТРЕЧИ"))
+        self.assertTrue(lines[0].startswith("📋 "))
         self.assertEqual(lines[1], "#протоколвстречи")
 
     def test_no_double_disclaimer_in_tg(self):

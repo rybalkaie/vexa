@@ -95,10 +95,17 @@ META_SAMPLE = {
 class TestFormatProtocolAsTgText(unittest.TestCase):
 
     def test_header_first_two_lines(self):
-        """Шапка: 1-я строка — заголовок с датой, 2-я — хэштег (правка #3)."""
+        """Шапка: 1-я строка — `📋 <имя серии> — дата`, 2-я — хэштег.
+
+        Ф1 (A1/F1): заголовок — человеческое имя серии (из темы/маппинга),
+        а не generic «ПРОТОКОЛ ВСТРЕЧИ». Для SAMPLE серия не в маппинге →
+        имя берётся из темы `**Встреча:** Тестовая встреча — …` (до « — »).
+        """
         text = ptg.format_protocol_as_tg_text(SAMPLE_PROTOCOL, META_SAMPLE)
         lines = text.splitlines()
-        self.assertTrue(lines[0].startswith("📋 ПРОТОКОЛ ВСТРЕЧИ — "))
+        self.assertTrue(lines[0].startswith("📋 "))
+        self.assertIn("Тестовая встреча", lines[0])  # имя серии из темы
+        self.assertNotIn("ПРОТОКОЛ ВСТРЕЧИ", lines[0])  # больше не generic
         self.assertIn("29.05.2026", lines[0])  # правка #2: DD.MM.YYYY
         self.assertEqual(lines[1], "#протоколвстречи")  # правка #3
 
@@ -168,7 +175,8 @@ class TestFormatProtocolAsTgText(unittest.TestCase):
             "sessionUid": "real-smoke",
         }
         text = ptg.format_protocol_as_tg_text(raw, meta)
-        self.assertTrue(text.startswith("📋 ПРОТОКОЛ ВСТРЕЧИ"))
+        # Ф1 (A1/F1): шапка — `📋 <имя серии> — дата`, хэштег на 2-й строке.
+        self.assertTrue(text.startswith("📋 "))
         self.assertIn("#протоколвстречи", text.splitlines()[1])
         self.assertIn("Дилерский кабинет".upper(), text.upper())
         self.assertIn("✅ РЕШЕНИЯ", text)
@@ -192,7 +200,7 @@ class TestSplitProtocolSmart(unittest.TestCase):
         text = ptg.format_protocol_as_tg_text(SAMPLE_PROTOCOL, META_SAMPLE)
         # Принудим к разбиению крошечным max_len.
         out = ptg.split_protocol_smart(text, max_len=200)
-        self.assertTrue(out[0].startswith("📋 ПРОТОКОЛ ВСТРЕЧИ"))
+        self.assertTrue(out[0].startswith("📋 "))  # Ф1: `📋 <имя серии> — дата`
         self.assertIn("#протоколвстречи", out[0])
 
     def test_no_chunk_exceeds_max_len(self):
@@ -464,16 +472,29 @@ class TestResolveSeriesDisplayName(unittest.TestCase):
     """РАЗМ2: slug серии → человекочитаемое имя для caption."""
 
     def test_override_marketplaces(self):
-        self.assertEqual(
-            ptg.resolve_series_display_name({"series": "marketplaces-tatiana"}),
-            "Маркетплейсы (Татьяна)",
-        )
+        # Хардкод-дефолт в изоляции от json-конфига (реестр встреч 2026-06-09).
+        with mock.patch.object(ptg, "_load_series_display_config", return_value={}):
+            self.assertEqual(
+                ptg.resolve_series_display_name({"series": "marketplaces-tatiana"}),
+                "1-на-1 с Татьяной Филипповой",
+            )
 
     def test_override_anzhee(self):
-        self.assertEqual(
-            ptg.resolve_series_display_name({"series": "anzhee-direktorat"}),
-            "Директорат Anzhee",
-        )
+        with mock.patch.object(ptg, "_load_series_display_config", return_value={}):
+            self.assertEqual(
+                ptg.resolve_series_display_name({"series": "anzhee-direktorat"}),
+                "Директорат",
+            )
+
+    def test_override_weekly_coord(self):
+        # A1: еженедельная координация — человеческим именем (была транслитом).
+        with mock.patch.object(ptg, "_load_series_display_config", return_value={}):
+            self.assertEqual(
+                ptg.resolve_series_display_name(
+                    {"series": "series-ezhenedelnaya-koordinaciya-8399ea"}
+                ),
+                "Еженедельная координация",
+            )
 
     def test_explicit_meta_field_wins(self):
         self.assertEqual(
@@ -621,9 +642,10 @@ class TestBuildPdfCaption(unittest.TestCase):
 
     def test_caption_matches_owner_etalon(self):
         cap = ptg.build_pdf_caption(CAPTION_PROTO, self.META)
+        # Ф1 (A1): имя серии — по реестру встреч 2026-06-09.
         etalon = (
             "📋 #протоколвстречи\n"
-            "Маркетплейсы (Татьяна) — 03.06.2026\n"
+            "1-на-1 с Татьяной Филипповой — 03.06.2026\n"
             "Участники: Илья Рыбалка, Татьяна\n"
             "Чистое время обсуждения: ~1 ч 37 мин"
         )
@@ -649,7 +671,7 @@ class TestBuildPdfCaption(unittest.TestCase):
 
     def test_title_subtitle(self):
         title, subtitle = ptg.build_pdf_title_subtitle(CAPTION_PROTO, self.META)
-        self.assertEqual(title, "Маркетплейсы (Татьяна) — 03.06.2026")
+        self.assertEqual(title, "1-на-1 с Татьяной Филипповой — 03.06.2026")
         self.assertIn("Участники: Илья Рыбалка, Татьяна", subtitle)
         self.assertIn("Чистое время обсуждения: ~1 ч 37 мин", subtitle)
 
