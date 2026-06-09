@@ -373,14 +373,26 @@ class TestYamlFixtures(unittest.TestCase):
         self.assertEqual(ck.lint_cross_sync(), [])
 
     def test_offer_akb_corrected(self):
-        """A3: «эфир»→«оффер», «АКП»→«АКБ» (cross, исправляются в обеих компаниях)."""
+        """A3 (cross, обе компании): «АКП»→«АКБ» — детерминированный regex (АКП без
+        легитимного значения в домене). «эфир»→«оффер» — на УРОВНЕ ASR-словаря
+        (sounds_like) + промпт-подсказки, НЕ слепым regex по тексту: «эфир» —
+        частотное легитимное слово (прямой эфир/выход в эфир, у МПервый — канал
+        продаж), слепая замена его затёрла бы (инвариант glossary.py:15-23, как
+        «следы»→«лиды»). Демотировано в ходе 1 цикла5 (Н1)."""
         for company in ("anzhee", "mpfirst"):
-            self.assertEqual(
-                glossary.apply_glossary_corrections("эфир для клиентов", company),
-                "оффер для клиентов")
+            # АКП → АКБ: детерминированная замена (домен-безопасно)
             self.assertEqual(
                 glossary.apply_glossary_corrections("АКП выросла", company),
                 "АКБ выросла")
+            # «эфир» как ASR-искажение «оффер» несётся в проекции A (sounds_like)
+            # и в промпт-блоке (подсказка LLM)…
+            va = {e["content"]: e["sounds_like"] for e in sources.glossary_vocab_entries(company)}
+            self.assertIn("эфир", va.get("оффер", []))
+            self.assertIn("«эфир»", glossary.glossary_prompt_block(company))
+            # …но НЕ слепым regex: легитимный «прямой эфир» пост-проход НЕ трогает.
+            self.assertEqual(
+                glossary.apply_glossary_corrections("вышли в прямой эфир", company),
+                "вышли в прямой эфир")
 
     def test_bolong_substitution_company_scoped(self):
         # «Лонг» → Bolong только в МПервый; в Anzhee остаётся «Лонг» (C2)
