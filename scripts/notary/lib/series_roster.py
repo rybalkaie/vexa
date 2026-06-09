@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from typing import Optional, TypedDict
 
+from . import context_knowledge
+
 
 class RosterEntry(TypedDict):
     """Одна зона ответственности серии."""
@@ -106,15 +108,29 @@ _STATIC_ROSTERS: dict[str, list[RosterEntry]] = {
 def get_roster(series_slug: Optional[str]) -> list[RosterEntry]:
     """Ростер ролей серии по её slug. Нет ростера для серии → `[]`.
 
-    ⚠️ ЗАВ1/Ф5 — ЕДИНСТВЕННАЯ ТОЧКА РАСШИРЕНИЯ: сейчас отдаём хардкод из
-    `_STATIC_ROSTERS`; Ф5 заменит тело на чтение оргструктуры компании из
-    `*-context` (по компании встречи). Сигнатура и потребители не меняются.
+    ⚠️ ЗАВ1/Ф5 ВЫПОЛНЕНО — изменено ТОЛЬКО тело (источник данных). Сигнатура и
+    потребители (`map_from_roster_domain`, `format_roster_hint`, finalize-проводка,
+    тесты) не тронуты.
+
+    Источник теперь — оргструктура компании из `*-context`
+    (`context_knowledge.roster_for_series`, поиск slug по оргструктурам всех
+    компаний — теперь и МПервый-координация получает ростер, как только её
+    `org-structure.yaml` появится). Нет YAML-знания (клон `*-context` не
+    забутстраплен — control/Ф8) → **fallback на встроенный `_STATIC_ROSTERS`**
+    (graceful degradation, поведение как в Ф3). Anzhee-ростер вынесен в
+    `anzhee-context/.../org-structure.yaml`; `_STATIC_ROSTERS` остаётся как
+    переходный fallback, не как источник истины.
+
     Пустой/None slug или незнакомая серия → `[]` (доменного маппинга не будет,
     остаются якорь+S1+S2+LLM — поведение как до Ф3).
     """
     if not series_slug or not str(series_slug).strip():
         return []
-    return _STATIC_ROSTERS.get(str(series_slug).strip(), [])
+    slug = str(series_slug).strip()
+    from_context = context_knowledge.roster_for_series(slug)
+    if from_context:
+        return from_context  # type: ignore[return-value]
+    return _STATIC_ROSTERS.get(slug, [])
 
 
 def domain_for_name(roster: list[RosterEntry], name: str) -> Optional[str]:

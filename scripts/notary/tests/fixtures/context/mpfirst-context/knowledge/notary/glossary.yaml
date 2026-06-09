@@ -1,0 +1,74 @@
+# knowledge/notary/glossary.yaml — доменный глоссарий МПервый (бот-нотариус).
+#
+# ⚠️ Артефакт фазы Ф5 (plan notary-memory-knowledge-rework). АВТОРСКИЙ контент,
+# подготовлен ЛОКАЛЬНО (контракт §3.4: боевое размещение в mpfirst-context — владелец/Ф8).
+# Служит И тест-фикстурой, И заготовкой для команды.
+#
+# Schema — см. шапку anzhee-context/knowledge/notary/glossary.yaml.
+# Здесь — термины МПервый (маркетплейсы, проекторы, караоке, контрагенты-производители).
+# Bolong — производитель МПервый: в Anzhee НЕ подставляется (scope: mpfirst, критерий C2).
+#
+# ⚠️ cross-термины (ЭДО/оффер/АКБ) — ДУБЛЬ из anzhee-context, обязаны совпадать по
+# canonical+aliases (lint_cross_sync). Правишь cross здесь — правь и в anzhee-context.
+version: 1
+terms:
+  # --- Компания и бренды МПервый -------------------------------------------
+  - canonical: "МПервый"
+    scope: mpfirst
+    note: "компания (продажи на маркетплейсах: проекторы, караоке и т.п.)"
+    aliases: ["эм первый", "м первый"]
+
+  # --- Контрагент-производитель (ключевой для C2) ---------------------------
+  - canonical: "Bolong"
+    scope: mpfirst
+    note: "контрагент/поставщик МПервый, делает мини-проекторы Space Projector. Standalone «Лонг» в домене МПервый легитимного значения не имеет; «баллон» как ASR — но газовый баллон в спецэффектах Anzhee НЕ трогаем (потому baллон только в ASR-словаре, не в regex)"
+    aliases: ["Лонг", "Лонга", "Лонгу", "Лонге", "Лонгом"]
+    protocol_regex: true
+    protocol_regex_case_sensitive: true   # имя собств. с заглавной — не задеть «лонгслив»/«лонг-рид»
+  - canonical: "Zifriend"
+    scope: mpfirst
+    note: "контрагент МПервый по клавиатурам/взаиморасчётам (пишется Zifriend / Zi Friend); в бизнес-домене психолог Фрейд не фигурирует"
+    aliases: ["Фрейд", "Фрейда", "Фрейде", "Фрейду"]
+    protocol_regex: true
+
+  # --- Продукты-проекторы (маркетплейсы) -----------------------------------
+  - canonical: "Space Projector"
+    scope: mpfirst
+    note: "проектор-планетарий «звёздное небо» (есть Space Projector 18; «мини-проекторы» — его новые маленькие USB-версии). НЕ путать с Dream Story"
+    asr_sounds_like: false
+  - canonical: "Dream Story"
+    scope: mpfirst
+    note: "детский игрушечный мини-проектор со сказками (самостоятельный товар, НЕ Space Projector). «Рестора»/«reStore» — это Dream Story"
+    aliases: ["Рестора", "реСтора", "реСторе", "реСтору", "реСторы", "reStore", "restore"]
+    protocol_regex: true
+
+  # --- Маркетплейс-термины -------------------------------------------------
+  - canonical: "OZON"
+    scope: mpfirst
+    note: "маркетплейс"
+    aliases: ["озон"]
+  - canonical: "маркетплейс"
+    scope: mpfirst
+    aliases: ["маркет плейс"]
+  - canonical: "караоке"
+    scope: mpfirst
+    note: "товарная категория МПервый (ASR-опечатка «карауке»)"
+    aliases: ["карауке"]
+    protocol_regex: true
+
+  # --- Кросс-компанийные термины (ДУБЛЬ из anzhee-context, scope: cross) ----
+  # ОБЯЗАНЫ совпадать с anzhee-context по canonical+aliases (lint_cross_sync).
+  - canonical: "ЭДО"
+    scope: cross
+    note: "электронный документооборот"
+    asr_sounds_like: false
+  - canonical: "оффер"
+    scope: cross
+    note: "предложение/оффер для клиентов (ASR-искажение «эфир»)"
+    aliases: ["эфир"]
+    protocol_regex: true
+  - canonical: "АКБ"
+    scope: cross
+    note: "активная клиентская база (ASR-искажение «АКП»)"
+    aliases: ["АКП"]
+    protocol_regex: true

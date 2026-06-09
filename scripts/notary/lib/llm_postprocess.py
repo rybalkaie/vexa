@@ -59,6 +59,7 @@ from .claude_cli import (
     call_claude_print,
 )
 from . import clarify_state
+from . import context_knowledge
 from . import glossary
 from . import protocol_to_tg
 from . import series_roster
@@ -1392,13 +1393,19 @@ def generate_protocol(
     if method_text is None:
         method_text = _load_method_text()
 
-    # FU-11: глоссарий проекта в КОНЕЦ system-prompt (после методички) —
-    # отдельной секцией, чтобы Sonnet писал доменные термины точно.
+    # Ф5: компания встречи по slug серии (поиск по оргструктурам `*-context`).
+    # Нет привязки / нет YAML-знания → None → glossary падает на встроенный блок
+    # (поведение как до Ф5). До Ф6 (поле company в разметке серии) это
+    # единственный источник company-scope глоссария.
+    company = context_knowledge.company_for_series(meeting_meta.get("series"))
+
+    # FU-11 / Ф5: глоссарий компании в КОНЕЦ system-prompt (после методички) —
+    # отдельной секцией, company-scoped (Bolong[mpfirst] не уйдёт в Anzhee-промпт).
     system_prompt = (
         GENERATE_PROTOCOL_BASE_PROMPT
         + method_text
         + "\n\n---\n\n"
-        + glossary.PROJECT_GLOSSARY_PROMPT_BLOCK
+        + glossary.glossary_prompt_block(company)
     )
     user_prompt = _format_protocol_user_prompt(
         transcript_md, meeting_meta, series_memory=series_memory,
@@ -1445,9 +1452,10 @@ def generate_protocol(
                 "Sonnet вернул ответ без шапки протокола (`#протоколвстречи`)"
             )
 
-    # FU-11: детерминированный пост-проход доменных терминов (остаточные
-    # перевирания мимо STT-словаря и подсказки).
-    text = glossary.apply_glossary_corrections(text)
+    # FU-11 / Ф5: детерминированный пост-проход доменных терминов (остаточные
+    # перевирания мимо STT-словаря и подсказки), company-scoped — тот же источник
+    # `load_glossary(company)`, что и промпт-блок выше (РИСК2: синхронно).
+    text = glossary.apply_glossary_corrections(text, company=company)
     # FU-12: тело показывает то же чистое время, что подпись/шапка.
     text = _normalize_protocol_duration(text, meeting_meta)
     # Ф4а: постоянный дисклеймер авторства в начало тела (.md + PDF читают тело;

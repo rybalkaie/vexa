@@ -43,6 +43,7 @@ from datetime import datetime
 from pathlib import Path
 
 from notary.auto_vocab import state, vocab_io
+from notary.lib import context_knowledge
 
 logger = logging.getLogger(__name__)
 
@@ -337,15 +338,124 @@ def sync(*, dry_run: bool = False, root: Path | None = None) -> dict:
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Ф5 — Проекция A (контракт §4): ASR-словарь из ЕДИНОГО источника знания
+# `context_knowledge.load_glossary(company)`. Тот же источник кормит проекцию B
+# (`glossary.py`: промпт-блок + regex-замены). Перенос ОБЕИХ проекций ОДНИМ шагом
+# — критерий приёмки Ф5 (РИСК2: иначе LLM чинит по новому, ASR по старому).
+#
+# Запись `glossary.yaml` с `asr_sounds_like: true` (дефолт) и непустыми `aliases`
+# эмитит `{content: canonical, sounds_like: aliases}` — формат
+# `speechmatics-vocab.json`. Дедуп против главного+авто (как `sync()` из me/*.md):
+# термин, уже стоящий в vocab руками, повторно не добавляется.
+# ---------------------------------------------------------------------------
+
+
+def glossary_vocab_entries_from_entries(entries: list[dict]) -> list[dict]:
+    """Чистая проекция A: записи glossary → `[{content, sounds_like}]`.
+
+    Берём только записи с `asr_sounds_like` (опц., дефолт **true** — контракт §1.3)
+    и непустыми `aliases`. Тестируется на вход-словаре без YAML.
+    """
+    out: list[dict] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        if not e.get("asr_sounds_like", True):
+            continue
+        content = str(e.get("canonical") or "").strip()
+        if not content:
+            continue
+        aliases = [str(a).strip() for a in (e.get("aliases") or []) if str(a).strip()]
+        if not aliases:
+            continue
+        out.append({"content": content, "sounds_like": aliases})
+    return out
+
+
+def glossary_vocab_entries(company: str | None) -> list[dict]:
+    """Проекция A для компании: `{content, sounds_like}` из `load_glossary(company)`.
+
+    Company-scoped (Bolong[mpfirst] не попадёт в Anzhee-выборку). Нет YAML-знания
+    → []. Синхронна с проекцией B (`glossary.glossary_prompt_block(company)` /
+    `apply_glossary_corrections(.., company)`) — общий источник `load_glossary`.
+    """
+    return glossary_vocab_entries_from_entries(context_knowledge.load_glossary(company))
+
+
+def sync_glossary_vocab(companies: list[str] | None = None, *, dry_run: bool = False) -> dict:
+    """Домержить ASR-проекцию глоссария всех компаний в авто-vocab (best-effort).
+
+    ASR-словарь Speechmatics — ОДИН общий файл (per-job, но физически один), потому
+    берём ОБЪЕДИНЕНИЕ company-scoped проекций (anzhee+mpfirst+cross). Company-scope,
+    который реально важен (подстановка термина в ТЕКСТ протокола), обеспечивает
+    проекция B; в ASR-словаре union безопасен — это лишь смещение распознавания.
+
+    Дедуп по `content` (trim+lower) против главного+авто; уже стоящие руками
+    термины не трогаем. Сбой/нет знания → 0 добавлений, не падаем.
+    Возвращает summary {per_company, total_candidates, added, added_count, dry_run}.
+    """
+    comps = companies if companies is not None else context_knowledge.known_companies()
+    seen: set[str] = set()
+    flat: list[dict] = []
+    per_company: dict[str, int] = {}
+    for company in comps:
+        try:
+            entries = glossary_vocab_entries(company)
+        except Exception as e:  # noqa: BLE001 — best-effort, знание вторично
+            logger.warning("glossary-проекция компании %s не собрана (%s) — пропуск", company, e)
+            entries = []
+        per_company[company] = len(entries)
+        for c in entries:
+            k = vocab_io.normalize(c["content"])
+            if k and k not in seen:
+                seen.add(k)
+                flat.append(c)
+
+    summary: dict = {
+        "per_company": per_company,
+        "total_candidates": len(flat),
+        "added": [],
+        "added_count": 0,
+        "dry_run": dry_run,
+    }
+    if not flat:
+        logger.info("glossary-проекция: кандидатов нет (знание не прочитано?)")
+        return summary
+    if dry_run:
+        logger.info("[dry-run] glossary-проекция добавила бы %d: %s",
+                    len(flat), ", ".join(c["content"] for c in flat))
+        return summary
+    added = vocab_io.add_to_auto(flat)
+    summary["added"] = [e["content"] for e in added]
+    summary["added_count"] = len(added)
+    if added:
+        _append_change_log([e["content"] for e in added], dry_run=False)
+        logger.info("glossary-проекция: +%d терминов с sounds_like в авто-vocab: %s",
+                    len(added), ", ".join(summary["added"]))
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [auto_vocab.sources] %(message)s",
     )
-    ap = argparse.ArgumentParser(description="Пополнить Speechmatics vocab из ~/Projects/me/*")
+    ap = argparse.ArgumentParser(description="Пополнить Speechmatics vocab из ~/Projects/me/* и/или знания *-context")
     ap.add_argument("--dry-run", action="store_true", help="показать кандидатов, ничего не писать")
     ap.add_argument("--me-dir", default=None, help="корень источников (по умолчанию $MEETING_NOTARY_ME_DIR или ~/Projects/me)")
+    ap.add_argument("--glossary", action="store_true",
+                    help="Ф5: ASR-проекция глоссария *-context (sounds_like), вместо чтения me/*")
     args = ap.parse_args(argv)
+    if args.glossary:
+        summary = sync_glossary_vocab(dry_run=args.dry_run)
+        print(
+            f"glossary-проекция: {summary['per_company']}; кандидатов "
+            f"{summary['total_candidates']}; добавлено {summary['added_count']}"
+        )
+        if summary["added"]:
+            print("новые: " + ", ".join(summary["added"]))
+        return 0
     root = Path(args.me_dir).expanduser() if args.me_dir else None
     summary = sync(dry_run=args.dry_run, root=root)
     if summary.get("error"):

@@ -29,6 +29,9 @@
 from __future__ import annotations
 
 import re
+from typing import Optional
+
+from . import context_knowledge
 
 # --- Слой 1: подсказка в промпт генерации -------------------------------------
 #
@@ -95,16 +98,125 @@ _PROTOCOL_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def apply_glossary_corrections(text: str) -> str:
+# --- Ф5: проекция B из единого источника `load_glossary(company)` -------------
+#
+# Контракт Ф4 §4 (РИСК2): ОБА слоя glossary.py (промпт-блок И regex-замены)
+# становятся ФУНКЦИЯМИ от `context_knowledge.load_glossary(company)` — тот же
+# источник, что кормит проекцию A (ASR-словарь, `auto_vocab/sources.py`). Перенос
+# обеих проекций ОДНИМ шагом — критерий приёмки Ф5.
+#
+# Встроенные `PROJECT_GLOSSARY_PROMPT_BLOCK` / `_PROTOCOL_REPLACEMENTS` остаются
+# КАК FALLBACK: company=None или нет YAML-знания (клон `*-context` не
+# забутстраплен — это control/Ф8) → поведение «как до Ф5» (graceful degradation,
+# контракт §2). Когда YAML есть — проекция строится из него, company-scoped
+# (Bolong[mpfirst] не подставляется в Anzhee — критерий C2).
+
+
+def build_prompt_block(entries: list[dict]) -> str:
+    """Промпт-блок глоссария из записей `load_glossary` (чистая проекция B-1).
+
+    Рендер-каркас (заголовок, правило про звучание, финальные «ВАЖНО»/«не
+    добавляй») — это КАК подаётся знание (код-шаблон), а сами термины и их
+    `note`/`aliases` — знание (YAML). Пустой список → "" (вызыватель уходит в
+    fallback на встроенный блок). Тестируется на вход-словаре без YAML.
+    """
+    if not entries:
+        return ""
+    lines = ["Глоссарий проекта (доменные термины — пиши их ТОЧНО так):", ""]
+    rules: list[str] = []
+    for e in entries:
+        canonical = str(e.get("canonical") or "").strip()
+        if not canonical:
+            continue
+        note = str(e.get("note") or "").strip()
+        lines.append(f"- {canonical} — {note}" if note else f"- {canonical}")
+        aliases = [str(a).strip() for a in (e.get("aliases") or []) if str(a).strip()]
+        if aliases:
+            joined = "/".join(f"«{a}»" for a in aliases)
+            rules.append(f"- {joined} → {canonical};")
+    block = "\n".join(lines)
+    if rules:
+        block += (
+            "\n\nПравило: если в транскрипте встретилось слово, похожее ПО ЗВУЧАНИЮ "
+            "на термин из списка, — это почти всегда ошибка распознавания речи. "
+            "Используй правильный термин:\n" + "\n".join(rules)
+        )
+    block += (
+        "\nВАЖНО: названия товаров/моделей/контрагентов, прозвучавшие на встрече, "
+        "НЕ выбрасывай и не обобщай до бренда — сохраняй конкретное название.\n"
+        "Не добавляй термины, которых в транскрипте нет. Глоссарий — про написание "
+        "уже сказанного, а не повод дописать."
+    )
+    return block
+
+
+def build_protocol_replacements(entries: list[dict]) -> list[tuple[re.Pattern, str]]:
+    """Детерминированные regex-замены из записей `load_glossary` (чистая проекция B-2).
+
+    Только записи с `protocol_regex: true` (контракт §1.3, дефолт false — слепая
+    замена опасна). Каждый alias → `\\bALIAS\\b` → canonical. По умолчанию
+    case-insensitive; `protocol_regex_case_sensitive: true` (расширение схемы для
+    имён собственных вроде «Лонг», чтобы не задеть «лонгслив»/«лонг-рид»).
+
+    Склонения и биграммы с РАЗНЫМ написанием каноники (летнее→палетное,
+    летнего→палетного) кодируются ОТДЕЛЬНЫМИ записями YAML — одна запись = один
+    canonical. Пустой список / нет regex-записей → []. Без YAML регрессии нет:
+    вызыватель падает на встроенный `_PROTOCOL_REPLACEMENTS`.
+    """
+    out: list[tuple[re.Pattern, str]] = []
+    for e in entries or []:
+        if not e.get("protocol_regex"):
+            continue
+        canonical = str(e.get("canonical") or "").strip()
+        if not canonical:
+            continue
+        flags = 0 if e.get("protocol_regex_case_sensitive") else re.IGNORECASE
+        for alias in (e.get("aliases") or []):
+            a = str(alias).strip()
+            if not a:
+                continue
+            out.append((re.compile(r"\b" + re.escape(a) + r"\b", flags), canonical))
+    return out
+
+
+def glossary_prompt_block(company: Optional[str] = None) -> str:
+    """Промпт-блок глоссария для компании встречи (проекция B-1, контракт §4).
+
+    Есть YAML-знание компании → блок из него (company-scoped); нет (company=None /
+    клон не забутстраплен / нет pyyaml) → встроенный `PROJECT_GLOSSARY_PROMPT_BLOCK`
+    (поведение как до Ф5). Обе ветки — синхронно с `apply_glossary_corrections`.
+    """
+    entries = context_knowledge.load_glossary(company)
+    if entries:
+        return build_prompt_block(entries)
+    return PROJECT_GLOSSARY_PROMPT_BLOCK
+
+
+def protocol_replacements(company: Optional[str] = None) -> list[tuple[re.Pattern, str]]:
+    """Список regex-замен для компании встречи (проекция B-2). Тот же источник
+    `load_glossary(company)`, что и `glossary_prompt_block` (РИСК2 — синхронно).
+
+    YAML-знание есть → замены из него; нет → встроенный `_PROTOCOL_REPLACEMENTS`.
+    """
+    entries = context_knowledge.load_glossary(company)
+    if entries:
+        return build_protocol_replacements(entries)
+    return _PROTOCOL_REPLACEMENTS
+
+
+def apply_glossary_corrections(text: str, company: Optional[str] = None) -> str:
     """Пост-проход замен доменных терминов по сгенерированному протоколу (FU-11).
 
-    Идемпотентна (повторный прогон ничего не меняет — все замены уже применены).
-    Консервативна: только записи из `_PROTOCOL_REPLACEMENTS`. Пустой/None-вход
-    возвращает как есть.
+    Ф5: company-scoped через `protocol_replacements(company)` — единый источник с
+    промпт-блоком (РИСК2). `company=None` → встроенный список (как до Ф5,
+    back-compat: существующие вызовы/тесты без company не меняют поведение).
+
+    Идемпотентна (повторный прогон ничего не меняет). Консервативна. Пустой/None
+    вход возвращает как есть (без обращения к знанию).
     """
     if not text:
         return text
     out = text
-    for pattern, replacement in _PROTOCOL_REPLACEMENTS:
+    for pattern, replacement in protocol_replacements(company):
         out = pattern.sub(replacement, out)
     return out

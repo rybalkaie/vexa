@@ -1,0 +1,162 @@
+# knowledge/notary/glossary.yaml — доменный глоссарий Anzhee (бот-нотариус).
+#
+# ⚠️ Артефакт фазы Ф5 (plan notary-memory-knowledge-rework). Это АВТОРСКИЙ контент,
+# подготовленный ЛОКАЛЬНО (контракт §3.4: боевое размещение в команду anzhee-context
+# делает владелец/Ф8, не автоном). Здесь файл служит И тест-фикстурой, И заготовкой
+# для команды.
+#
+# ЕДИНЫЙ источник терминов (контракт Ф4 §1.3, §4): из одной записи выводятся ДВЕ
+# проекции — ASR-словарь (sounds_like) и протокол-глоссарий (промпт-блок + regex).
+# Поля: canonical(обяз) / scope(обяз: anzhee|mpfirst|cross) / note / aliases /
+#       asr_sounds_like(дефолт true) / protocol_regex(дефолт false) /
+#       protocol_regex_case_sensitive(дефолт false, расширение Ф5 для имён собств.).
+#
+# Классификация scope — суждение Ф5 (безопасный дефолт: существующий термин → anzhee;
+# бренды/контрагенты МПервый → их репо; общеотраслевое → cross). Журнал решений — в
+# пакете сдачи Ф5. Кросс-термины (ЭДО/оффер/АКБ) ДУБЛИРУЮТСЯ в mpfirst-context —
+# рассинхрон ловит lint_cross_sync().
+version: 1
+terms:
+  # --- Бренды и компании Anzhee --------------------------------------------
+  - canonical: "Anzhee"
+    scope: anzhee
+    note: "компания (аудио-оборудование, дилеры, B2B-портал, локализация YME)"
+    aliases: ["энжи", "анжи", "анжей"]
+  - canonical: "ENVYTON"
+    scope: anzhee
+    note: "B2C-бренд проекторов Anzhee"
+    aliases: ["энвитон", "энвайтон"]
+  - canonical: "ALTRONIX"
+    scope: anzhee
+    note: "аудио-бренд; «ВТБ ALTRONIX»/«счёт на ALTRONIX» = счёт юрлица ООО «Альтроникс»"
+    aliases: ["альтроникс", "алтроникс"]
+  - canonical: "ENVONIX"
+    scope: anzhee
+    note: "бренд (тематика блогера-контрагента KEKTAR — НЕ Anzhee-бренд)"
+    aliases: ["энвоникс"]
+  - canonical: "Сценалогия"
+    scope: anzhee
+    note: "проект (хищение 6 млн)"
+    aliases: ["сценология"]
+  - canonical: "Dealer 360"
+    scope: anzhee
+    note: "B2B-портал для дилеров"
+    aliases: ["дилер 360", "диллер 360", "дилер триста шестьдесят", "дилер три шестьдесят"]
+  - canonical: "YME"
+    scope: anzhee
+    note: "бренд (локализация; владелец — китайский производитель КЕН)"
+    aliases: ["вай эм и", "уай эм и", "имэ"]
+  - canonical: "Bravo"
+    scope: anzhee
+    note: "модель колонок ALTRONIX (Браво); «Алла» рядом с колонкой — вероятно модель Браво, НЕ имя человека (конкретную модель не выдумывай)"
+    asr_sounds_like: false
+  - canonical: "KEKTAR"
+    scope: anzhee
+    note: "блогер-контрагент, давнее сотрудничество, тематика ENVONIX (НЕ Anzhee-бренд)"
+    asr_sounds_like: false
+
+  # --- Аббревиатуры и термины Anzhee ---------------------------------------
+  - canonical: "РСЯ"
+    scope: anzhee
+    note: "рекламная сеть Яндекса (в домене фамилия «Гарсия» не встречается)"
+    aliases: ["Гарсия", "Гарсии", "Гарсию", "Гарсие", "Гарсией", "Гарсиё"]
+    protocol_regex: true
+  - canonical: "СТМ"
+    scope: anzhee
+    note: "собственная торговая марка (про бренды/товары/производство). NB: «СТМ» в контексте юрлиц/оплат рядом с ООО/ИП/суммами — почти всегда ИП; различай по контексту"
+    aliases: ["эс тэ эм", "сэтэмэ"]
+  - canonical: "ДТ"
+    scope: anzhee
+    note: "токен оставляем как есть, без расшифровки"
+    asr_sounds_like: false
+  - canonical: "ВКЛ"
+    scope: anzhee
+    note: "токен оставляем как есть, без расшифровки"
+    asr_sounds_like: false
+  - canonical: "КТК"
+    scope: anzhee
+    note: "код контейнера, формат «NNNктк» (напр. 059ктк)"
+    asr_sounds_like: false
+  - canonical: "ковенанта"
+    scope: anzhee
+    note: "финансовый термин"
+    asr_sounds_like: false
+  - canonical: "лиды"
+    scope: anzhee
+    note: "маркетинговые обращения (лид/лиды) — НЕ «следы»/«следов» (легитимные «следы» в тексте не трогаем: правка ASR-словаря, НЕ слепая замена)"
+    aliases: ["следы", "следов", "след"]
+    protocol_regex: false
+  - canonical: "СТ-1"
+    scope: anzhee
+    note: "сертификат СТ-1 для локализации YME / Минпромторга (РЕАЛЬНЫЙ термин, НЕ «1С»)"
+    aliases: ["эс тэ один", "ст один"]
+
+  # --- Склад и логистика ---------------------------------------------------
+  - canonical: "палетное хранение"
+    scope: anzhee
+    note: "складской термин; «летнее хранение» само по себе бессмысленно"
+    aliases: ["летнее хранение"]
+    asr_sounds_like: false
+    protocol_regex: true
+  - canonical: "палетного хранения"
+    scope: anzhee
+    note: "склонение «палетное хранение» (отдельная запись — каноника склоняется)"
+    aliases: ["летнего хранения"]
+    asr_sounds_like: false
+    protocol_regex: true
+
+  # --- Юрлица и контрагенты Anzhee -----------------------------------------
+  - canonical: "ИП"
+    scope: anzhee
+    note: "индивидуальный предприниматель. В контексте закупок/оплат/юрлиц рядом с ООО/суммами «КЕН» и «СТМ» по звучанию/ошибке распознавания — почти всегда ИП (НО «СТМ» = собственная торговая марка про бренды/товары оставляй как СТМ)"
+    asr_sounds_like: false
+  - canonical: "КС-ТРЕЙД"
+    scope: anzhee
+    note: "наше юрлицо ООО «КС-ТРЕЙД»; «КС» в речи = КС-ТРЕЙД, не человек («уточнить у КС» = уточнить по КС-ТРЕЙД)"
+    asr_sounds_like: false
+  - canonical: "КЕН"
+    scope: anzhee
+    note: "китайский производитель, владелец бренда YME (сам по себе к юрлицам не относится; см. правило ИП для контекста закупок/оплат)"
+    asr_sounds_like: false
+  - canonical: "Ангелина"
+    scope: anzhee
+    note: "наш перевозчик-карго из Китая — НЕ путать с «Анжелика» (это разные люди)"
+    asr_sounds_like: false
+
+  # --- Инструменты (Anzhee-сторона) ----------------------------------------
+  - canonical: "1С"
+    scope: anzhee
+    note: "учётная система"
+    aliases: ["один эс", "одинэс", "одинес"]
+  - canonical: "Битрикс24"
+    scope: anzhee
+    note: "CRM Anzhee (anzhee.bitrix24.ru)"
+    aliases: ["битрикс двадцать четыре", "беатрикс 24"]
+
+  # --- Прочее --------------------------------------------------------------
+  - canonical: "VPS"
+    scope: anzhee
+    note: "наш сервер в Германии («работаю через … Германия» — это VPS, НЕ VPN)"
+    asr_sounds_like: false
+  - canonical: "образцы"
+    scope: anzhee
+    note: "образцы/сэмплы (в контексте заказа / «без … не заказать» — это образцы, НЕ «хендофф»/«handoff»)"
+    asr_sounds_like: false
+
+  # --- Кросс-компанийные термины (ДУБЛЬ в mpfirst-context, scope: cross) ----
+  # Синхронность дублей проверяет lint_cross_sync(). При правке cross-записи —
+  # править В ОБОИХ репо одинаково (canonical+aliases).
+  - canonical: "ЭДО"
+    scope: cross
+    note: "электронный документооборот"
+    asr_sounds_like: false
+  - canonical: "оффер"
+    scope: cross
+    note: "предложение/оффер для клиентов (ASR-искажение «эфир»)"
+    aliases: ["эфир"]
+    protocol_regex: true
+  - canonical: "АКБ"
+    scope: cross
+    note: "активная клиентская база (ASR-искажение «АКП»)"
+    aliases: ["АКП"]
+    protocol_regex: true
