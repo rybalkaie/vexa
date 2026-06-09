@@ -1,16 +1,22 @@
-"""Слой 4 — еженедельный TG-дайджест авто-словаря (Шаг 8.4).
+"""Слой 4 — еженедельный TG-дайджест авто-словаря (Шаг 8.4) + отчёт знания (Ф7 D2).
 
 Запускается systemd-таймером `meeting-notary-vocab-digest.timer` (вс 19:00 МСК).
 Читает `state.week_stats` за текущую ISO-неделю (в вс вечером она и завершается)
 и шлёт владельцу сводку через `notify.push`.
 
-Шаблон (план, строка 379):
+Шаблон ASR-словаря (план, строка 379):
   «За неделю авто-добавлено N, спросил M, ты одобрил K, отклонил L. Доля
   автоматики: auto_added/(auto_added+requested) = X%. Источники: +S терминов.
   Расходы Claude API: $C.»
 
-Пустая неделя (ни встреч, ни источников) → «копим данные» (не молчим — владелец
-должен видеть, что система жива).
+Ф7 D2 — отчёт «внёс вот это, есть корректировки?»: к сводке словаря добавляется
+секция ЗНАНИЯ — что бот ПРЕДЛОЖИЛ в контекст компаний (`knowledge_writeback`
+outbox, адресовано `*-context`) и какая активна версия шаблона протокола
+(`protocol_template`). Это НЕ пред-подтверждение: бот уже внёс/предложил сам, а
+отчёт даёт окно на корректировку (откат / «переноси в контекст»).
+
+Пустая неделя (ни встреч, ни источников, ни знания) → «копим данные» (не молчим —
+владелец должен видеть, что система жива).
 
 CLI:
   python -m notary.auto_vocab.digest [--dry-run] [--week 2026-W22]
@@ -55,9 +61,61 @@ def format_digest(stats: dict) -> str:
     return "\n".join(lines)
 
 
+def format_knowledge_section() -> str:
+    """Ф7 D2: секция «внёс вот это, есть корректировки?» — предложенное знание в
+    контекст компаний (`*-context`, адресовано КОНТЕКСТУ, не коду) + версия шаблона.
+
+    Пусто, если за период ничего не предложено и шаблон на v1 (тогда дайджест —
+    только словарная часть). Best-effort: сбой импорта/чтения → "" (не валим отчёт).
+    Значения — производные термины/роли (не сырьё), безопасны для лички владельца.
+    """
+    lines: list[str] = []
+    try:
+        from notary.lib import knowledge_writeback  # noqa: PLC0415
+        outbox = knowledge_writeback.outbox_digest()
+        provisioned = knowledge_writeback.is_writeback_provisioned()
+    except Exception as e:  # noqa: BLE001
+        logger.info("[digest] knowledge outbox недоступен (%s)", e)
+        outbox = {}
+        provisioned = False
+    if outbox:
+        lines.append("🧩 Знание, предложенное в контекст компаний (внёс сам — есть корректировки?):")
+        for company in sorted(outbox):
+            info = outbox[company]
+            repo = info.get("target_repo") or company
+            parts = []
+            if info.get("terms"):
+                parts.append("термины — " + ", ".join(info["terms"]))
+            if info.get("roles"):
+                parts.append("роли — " + ", ".join(info["roles"]))
+            if parts:
+                lines.append(f"• {repo}: " + "; ".join(parts))
+        lines.append("  (PR откроется при провижининге write-токена — Ф8)" if not provisioned
+                     else "  (предложения уходят в PR в *-context)")
+    try:
+        from notary.lib import protocol_template  # noqa: PLC0415
+        tmpl_text, tmpl_version = protocol_template.digest_block()
+    except Exception as e:  # noqa: BLE001
+        logger.info("[digest] template digest недоступен (%s)", e)
+        tmpl_text = ""
+    if tmpl_text:
+        if lines:
+            lines.append("")
+        lines.append(tmpl_text)
+    if not lines:
+        return ""
+    lines.append("")
+    lines.append("Если что-то неверно — ответь «откати <термин>» или «переноси <…> в контекст».")
+    return "\n".join(lines)
+
+
 def run(*, dry_run: bool = False, week: str | None = None) -> str:
     stats = state.week_stats(week)
     msg = format_digest(stats)
+    # Ф7 D2: пристыковываем секцию знания (предложенное в контекст + версия шаблона).
+    knowledge = format_knowledge_section()
+    if knowledge:
+        msg = msg + "\n\n" + knowledge
     if dry_run:
         logger.info("[digest dry-run] %s", msg.replace("\n", " | "))
         return msg

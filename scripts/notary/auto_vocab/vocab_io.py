@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from notary.lib import cred_filter as _cred_filter
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,12 +148,24 @@ def merge_new(data: dict, candidates: list[dict], *, extra_existing: set[str] | 
     for cand in candidates:
         if not isinstance(cand, dict) or not isinstance(cand.get("content"), str):
             continue
-        key = normalize(cand["content"])
+        # 🔴 D5 (Ф7): жёсткий фильтр кредов — секрет НЕ попадает ни в один слой, в
+        # т.ч. в ASR-словарь. Это единственный write-чокпоинт авто-vocab (sources +
+        # proposer + applier + glossary-проекция льются сюда) → одна проверка
+        # закрывает весь слой. Логируем ТОЛЬКО вид, не значение (опасная тройка).
+        content = cand["content"]
+        sl = cand.get("sounds_like")
+        if not _cred_filter.is_safe_to_store(content) or (
+            isinstance(sl, list) and any(not _cred_filter.is_safe_to_store(x) for x in sl)
+        ):
+            logger.warning("vocab: кандидат отброшен фильтром кредов (вид=%s) — не сохраняем",
+                           _cred_filter.secret_kind(content)
+                           or _cred_filter.secret_kind(" ".join(str(x) for x in (sl or []))))
+            continue
+        key = normalize(content)
         if not key or key in seen:
             continue
         seen.add(key)
-        entry: dict = {"content": cand["content"].strip()}
-        sl = cand.get("sounds_like")
+        entry: dict = {"content": content.strip()}
         if isinstance(sl, list) and sl:
             cleaned = [str(x).strip() for x in sl if str(x).strip()]
             if cleaned:

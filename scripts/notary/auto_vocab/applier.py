@@ -139,6 +139,12 @@ def apply_proposal(session_uid: str, meta: dict, *, pending_root: Path | None = 
             except Exception as e:  # noqa: BLE001
                 logger.warning("[applier] auto_added не обновлён (%s)", e)
             _notify_high(high, high_added)
+            # D1 (Ф7): ДОЛГОВЕЧНОЕ знание адресуем КОНТЕКСТУ КОМПАНИИ (не коду) —
+            # предложение в `*-context/knowledge/notary/glossary.yaml` через PR
+            # (контракт §3.3). Локальный ASR-словарь (commit_terms выше) остаётся —
+            # это немедленная проекция распознавания; контекст — источник истины
+            # знания. Слой решает knowledge_router (company/private/drop). Best-effort.
+            _writeback_high_terms(session_uid, meta, high, high_added)
 
     low_sent = 0
     if low:
@@ -169,6 +175,50 @@ def apply_proposal(session_uid: str, meta: dict, *, pending_root: Path | None = 
         pass
     logger.info("[applier] sid=%s: high+%d low→TG %d", session_uid, len(high_added), low_sent)
     return {"status": "ok", "high_added": high_added, "low_sent": low_sent}
+
+
+def _meeting_present(meta: dict) -> list:
+    """Лучший доступный «кто присутствовал» из meta proposer'а — для
+    публикационного гейта (route_for_meeting). Best-effort, без сырья."""
+    for k in ("participants", "expectedParticipants", "present_participants"):
+        v = meta.get(k)
+        if isinstance(v, list) and v:
+            return [str(x) for x in v]
+    return []
+
+
+def _writeback_high_terms(session_uid: str, meta: dict, high: list[dict], added: list[str]) -> None:
+    """D1: предложить авто-добавленные high-термины в контекст компании (PR, §3.3).
+
+    Слой (company/private) решает `knowledge_router` по серии встречи и
+    публикационному гейту Ф6 — креды уже отфильтрованы (D5). Сбой не валит pipeline.
+    """
+    try:
+        from notary.lib import knowledge_writeback  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.info("[applier] knowledge_writeback недоступен (%s) — пропуск write-back", e)
+        return
+    series = meta.get("series")
+    present = _meeting_present(meta)
+    source = {"series": series, "date": meta.get("date"), "feedback_id": session_uid}
+    addset = {a.lower() for a in added}
+    routed = {"company": 0, "private": 0, "drop": 0, "exists": 0}
+    for c in high:
+        term = (c.get("term") or "").strip()
+        if not term or term.lower() not in addset:
+            continue
+        try:
+            res = knowledge_writeback.propose_term(
+                term, series=series, aliases=c.get("sounds_like") or [],
+                note=(c.get("reason") or None), present_participants=present,
+                source=source,
+            )
+            routed[res.layer] = routed.get(res.layer, 0) + 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[applier] write-back термина не удался (non-fatal): %s", e)
+    logger.info("[applier] write-back high: company=%d private=%d drop=%d exists=%d",
+                routed.get("company", 0), routed.get("private", 0),
+                routed.get("drop", 0), routed.get("exists", 0))
 
 
 def _notify_high(high: list[dict], added: list[str]) -> None:

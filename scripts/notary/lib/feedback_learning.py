@@ -70,6 +70,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from . import cred_filter
 from . import feedback_state
 from . import feedback_reissue
 
@@ -159,6 +160,10 @@ def _pair_from(wrong: str, right: str) -> Optional[dict]:
     if w.casefold() == r.casefold():
         return None
     if not _is_term_like(w) or not _is_term_like(r):
+        return None
+    # D5 (Ф7) defense-in-depth: карточка серии — тоже слой; терм-пара с кредом не
+    # учится (term-like её и так бы отсёк, но барьер ставим явно — «железно»).
+    if not cred_filter.is_safe_to_store(w) or not cred_filter.is_safe_to_store(r):
         return None
     return {"wrong": w, "right": r}
 
@@ -617,6 +622,10 @@ def record_meaning_rule(
     subj = _clean_meaning_subject(subject)
     mean = _clean_meaning_text(meaning)
     if not _meaning_subject_ok(subj) or not mean:
+        return None
+    # D5 (Ф7): смысл-правило с кредом в субъекте/уточнении не сохраняем (карточка
+    # серии — слой; барьер явный).
+    if not cred_filter.is_safe_to_store(subj) or not cred_filter.is_safe_to_store(mean):
         return None
     already = {(r.get("subject") or "").casefold() + ">" + (r.get("meaning") or "").casefold()
                for r in active_meaning_rules(series, root=root)}

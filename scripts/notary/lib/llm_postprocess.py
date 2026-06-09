@@ -1406,6 +1406,18 @@ def generate_protocol(
         + "\n\n---\n\n"
         + glossary.glossary_prompt_block(company)
     )
+
+    # F2 (Ф7): версионируемый шаблон протокола — накопленные пожелания к ФОРМАТУ
+    # (правка формата → новая версия, применяется к БУДУЩИМ протоколам). Блок
+    # ДАННЫЕ-пожеланий в конец system-prompt; пусто на v1 / при выключенном гейте.
+    # Best-effort: самообучение формату не должно ронять генерацию.
+    try:
+        from . import protocol_template  # noqa: PLC0415 (lazy)
+        tmpl_block = protocol_template.format_block()
+        if tmpl_block.strip():
+            system_prompt += "\n\n---\n\n" + tmpl_block.strip()
+    except Exception:  # noqa: BLE001
+        pass
     user_prompt = _format_protocol_user_prompt(
         transcript_md, meeting_meta, series_memory=series_memory,
     )

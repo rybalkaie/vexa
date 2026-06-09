@@ -646,6 +646,17 @@ def reissue_one(
                     feedback_learning.record_learning_from_edits(state, content_edits, root=root)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] self-learning hook упал (non-fatal): %s", e)
+                # D6 (Ф7): маршрутизатор фидбэка по слоям — РОЛИ → оргструктура
+                # компании/приватно, ИМЯ/ФОРМАТ → конфиг/шаблон. Термины/смысл уже
+                # ушли в карточку серии строкой выше (роутер их не дублирует). НЕ
+                # трогает feedback-state, delivered-маркеры, сырьё. Best-effort.
+                try:
+                    from . import feedback_router  # noqa: PLC0415
+                    # template_root НЕ передаём: версии формата пишутся в свой
+                    # store-dir (config/), тот же, что читает generate_protocol.
+                    feedback_router.route_edits(state, content_edits)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[reissue] feedback-router hook упал (non-fatal): %s", e)
 
         return res
     finally:

@@ -853,6 +853,29 @@ def maybe_route_to_learning_rollback(token: str, chat_id: int, msg: dict[str, An
                      "Пустой ответ. Чтобы откатить выученное — «откати <термин>».",
                      reply_to=msg.get("message_id"))
         return True
+    # Ф7 D4: команда «переноси … в контекст» на дайджесте знания — запоминаем
+    # ратчет private→company (kind=term: дайджест самообучения про написания/
+    # термины). Впредь такое знание роутится в `*-context` (через PR §3.3).
+    # Распознаём ДО отката — триггеры не пересекаются («переноси/в контекст» ≠
+    # «откати/забудь»). Best-effort: сбой не валит обработку реплая.
+    try:
+        from notary.lib import knowledge_ratchet  # noqa: PLC0415
+        promo = knowledge_ratchet.parse_promote_command(reply_text)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("knowledge_ratchet import/parse failed (feature off?): %s", e)
+        promo = None
+    if promo is not None:
+        try:
+            knowledge_ratchet.remember_promotion(
+                "term", company=promo.get("company"), scope=promo.get("scope") or "kind")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ratchet promote failed (non-fatal): %s", e)
+        where = f" ({promo['company']})" if promo.get("company") else ""
+        send_message(token, chat_id,
+                     f"Принял: впредь такие термины — в контекст компании{where} (через PR). "
+                     "Если что-то выучено неверно — «откати <термин>».",
+                     reply_to=msg.get("message_id"))
+        return True
     try:
         from notary.lib import feedback_learning  # noqa: PLC0415
     except Exception as e:  # noqa: BLE001
