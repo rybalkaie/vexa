@@ -39,6 +39,7 @@ NOTARY_DIR = THIS_DIR.parent
 sys.path.insert(0, str(NOTARY_DIR))
 
 from lib import series_memory  # noqa: E402
+from lib.protocol_to_tg import filter_participant_names  # noqa: E402  # Ф2/Ф1 §5: чистим мусор шапки
 
 DEFAULT_ROOT = os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR") or os.path.expanduser(
     "~/Projects/me/встречи"
@@ -113,13 +114,18 @@ def main() -> int:
     total_series = 0
     total_digests = 0
     if args.series:
-        n = series_memory.backfill_series(series_dirs[0], overwrite=args.overwrite)
+        n = series_memory.backfill_series(
+            series_dirs[0], overwrite=args.overwrite,
+            participant_filter=filter_participant_names,
+        )
         if n:
             total_series += 1
             total_digests += n
         print(f"  {series_dirs[0].name}: записано выжимок {n}")
     else:
-        res = series_memory.backfill_root(root, overwrite=args.overwrite)
+        res = series_memory.backfill_root(
+            root, overwrite=args.overwrite, participant_filter=filter_participant_names,
+        )
         total_series = res["series"]
         total_digests = res["digests"]
 

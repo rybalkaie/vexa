@@ -556,5 +556,112 @@ class TestBackfill(unittest.TestCase):
             self.assertNotIn("[00:", json.dumps(d, ensure_ascii=False))
 
 
+# ==========================================================================
+# Ф2 B1 — save_meeting_digest: после «финализации» memory.json рядом с протоколом
+# ==========================================================================
+class TestSaveMeetingDigestB1(unittest.TestCase):
+    """REQ B1: критерий «после финализации в папке серии появляется
+    <date>-memory.json». save_meeting_digest — тестируемая единица того инлайна
+    finalize, который раньше нельзя было прогнать без STT/WAV.
+    """
+
+    def test_save_creates_memory_next_to_protocol(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "series-ezhenedelnaya-koordinaciya-8399ea"
+            sdir.mkdir()
+            path = sm.save_meeting_digest(
+                sdir, "2026-06-09", _PROTOCOL, {"series": sdir.name},
+            )
+            self.assertIsNotNone(path)
+            self.assertEqual(path.name, "2026-06-09-memory.json")
+            self.assertTrue((sdir / "2026-06-09-memory.json").is_file())
+            d = sm.load_digest(path)
+            self.assertIn("Татьяна Филиппова", d["participants"])
+
+    def test_empty_protocol_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "s"
+            sdir.mkdir()
+            self.assertIsNone(sm.save_meeting_digest(sdir, "2026-06-09", "   ", {"series": "s"}))
+            self.assertEqual(list(sdir.glob("*-memory.json")), [])
+
+    def test_speaker_mapping_persisted_for_anchor(self):
+        # B-связка: cluster→имя из текущей встречи оседает в память → на следующей
+        # resolve_speaker_anchor его поднимет (Ф4б).
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "s"
+            sdir.mkdir()
+            sm.save_meeting_digest(
+                sdir, "2026-06-09", _PROTOCOL, {"series": "s"},
+                speaker_mapping={"SPEAKER_00": "Татьяна Филиппова"},
+            )
+            d = sm.load_digest(sdir / "2026-06-09-memory.json")
+            self.assertEqual(d["speaker_mapping"], {"SPEAKER_00": "Татьяна Филиппова"})
+            anchor = sm.resolve_speaker_anchor([d])
+            self.assertEqual(anchor, {"SPEAKER_00": "Татьяна Филиппова"})
+
+    def test_prune_runs_after_save(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "s"
+            sdir.mkdir()
+            # старая выжимка, которую прунинг должен снести при сохранении свежей
+            sm.save_digest(sdir, "2020-01-01", _digest("2020-01-01", "s", ["Илья"]))
+            sm.save_meeting_digest(
+                sdir, "2026-06-09", _PROTOCOL, {"series": "s"}, prune_days=180,
+            )
+            self.assertTrue((sdir / "2026-06-09-memory.json").is_file())
+            self.assertFalse((sdir / "2020-01-01-memory.json").is_file())  # старая снесена
+
+
+# ==========================================================================
+# Ф2 (Ф1 §5) — participant_filter: бэкфилл старых протоколов не тащит UI-мусор
+# ==========================================================================
+class TestParticipantFilterInDigest(unittest.TestCase):
+    """Бэкфилл читает шапку СТАРОГО протокола, куда до Ф1-фильтра мог осесть
+    UI-мусор Телемоста («ДН», «Скопировать ссылку»). participant_filter должен
+    отбраковать его до записи в память серии.
+    """
+
+    @staticmethod
+    def _filter(names):
+        from lib.protocol_to_tg import filter_participant_names
+        return filter_participant_names(names)
+
+    def test_build_digest_filters_ui_garbage_from_header(self):
+        text = ("#протоколвстречи 02.06.2026\n\n"
+                "**Участники:** Мария Михина, ДН, Скопировать ссылку, Ольга Новикова\n\n"
+                "---\n\n## 1) Тема\n\n▪️ пункт\n")
+        d = sm.build_digest(text, {"series": "s"}, participant_filter=self._filter)
+        self.assertIn("Мария Михина", d["participants"])
+        self.assertIn("Ольга Новикова", d["participants"])
+        self.assertNotIn("ДН", d["participants"])
+        self.assertFalse(any("Скопировать" in p for p in d["participants"]))
+
+    def test_no_filter_keeps_legacy_behavior(self):
+        # Без participant_filter поведение прежнее — мусор НЕ отфильтрован (обратная
+        # совместимость: 654 старых теста не должны измениться).
+        text = "#протоколвстречи 02.06.2026\n\n**Участники:** Мария, ДН\n\n---\n\n## 1) Т\n\n▪️ x\n"
+        d = sm.build_digest(text, {"series": "s"})
+        self.assertIn("ДН", d["participants"])
+
+    def test_backfill_series_applies_filter(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "s"
+            sdir.mkdir()
+            (sdir / "2026-06-02-protokol.md").write_text(
+                "#протоколвстречи 02.06.2026\n\n"
+                "**Участники:** Сона Енгибарян, ДН, ИР, Дарья Набережная\n\n"
+                "---\n\n## 1) Тема\n\n▪️ пункт\n",
+                encoding="utf-8",
+            )
+            n = sm.backfill_series(sdir, participant_filter=self._filter)
+            self.assertEqual(n, 1)
+            d = sm.load_digest(sdir / "2026-06-02-memory.json")
+            self.assertIn("Сона Енгибарян", d["participants"])
+            self.assertIn("Дарья Набережная", d["participants"])
+            self.assertNotIn("ДН", d["participants"])
+            self.assertNotIn("ИР", d["participants"])
+
+
 if __name__ == "__main__":
     unittest.main()

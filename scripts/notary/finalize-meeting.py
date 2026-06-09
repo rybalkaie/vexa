@@ -1111,20 +1111,22 @@ def main() -> int:
             and _is_protocol_enabled() and protocol_path.is_file()):
         try:
             _proto_for_digest = protocol_path.read_text(encoding="utf-8")
-            if _proto_for_digest.strip():
-                _digest_meta = dict(meta)
-                _digest_meta["date"] = date_part
-                _digest_meta["expectedParticipants"] = expected
-                _digest_meta["participants"] = participants
-                _digest = series_memory.build_digest(
-                    _proto_for_digest, _digest_meta, date=date_part,
-                    speaker_mapping=cluster_to_name,  # Ф4б (REQ 1.2): несём авторство в память серии
-                )
-                series_memory.save_digest(series_dir, date_part, _digest)
-                # РИСК4 (срок хранения): прунинг старых выжимок ПО ТЕКУЩЕЙ серии
-                # (свежая, дешёвый скан). Отдельной операцией, а не внутри save —
-                # иначе бэкфилл старых протоколов самоудалял бы результат.
-                series_memory.prune_old_digests(series_dir, series_memory.retention_days())
+            _digest_meta = dict(meta)
+            _digest_meta["date"] = date_part
+            _digest_meta["expectedParticipants"] = expected
+            _digest_meta["participants"] = participants
+            # B1: build→save→prune одним вызовом (тестируемая единица, см.
+            # series_memory.save_meeting_digest). Прунинг старых выжимок ПО ТЕКУЩЕЙ
+            # серии — ОТДЕЛЬНОЙ операцией внутри (не в save_digest), иначе бэкфилл
+            # самоудалял бы свежий результат. participant_filter — defense-in-depth:
+            # шапка тут уже чистая (Ф1 :623), но фильтр держит инвариант «UI-мусор
+            # в память серии не течёт» единообразно с бэкфиллом (Ф1 §5).
+            series_memory.save_meeting_digest(
+                series_dir, date_part, _proto_for_digest, _digest_meta,
+                speaker_mapping=cluster_to_name,  # Ф4б (REQ 1.2): несём авторство в память серии
+                participant_filter=filter_participant_names,
+                prune_days=series_memory.retention_days(),
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("[series-memory] digest save failed (non-fatal): %s", e)
 

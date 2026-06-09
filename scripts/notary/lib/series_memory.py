@@ -39,7 +39,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger("meeting_notary.series_memory")
 
@@ -276,6 +276,7 @@ def build_digest(
     *,
     date: Optional[str] = None,
     speaker_mapping: Optional[dict] = None,
+    participant_filter: Optional[Callable[[list], list]] = None,
 ) -> dict:
     """7.1: компактная выжимка-память из готового протокола.
 
@@ -291,17 +292,31 @@ def build_digest(
     (нет ключа в старых файлах → resolve_speaker_anchor вернёт {}, миграции/бэкфилл
     не нужны, УПУ3). НЕ ПДн сверх уже хранимого: имена и так есть в `participants`.
 
+    Ф2 (B2 / Ф1 §5): `participant_filter` — отбраковка UI-мусора скрейпа Телемоста
+    («ДН»/монограммы/«Скопировать ссылку») и не-имён из РАЗ имён. Нужен бэкфиллу:
+    он читает шапку СТАРОГО протокола, куда до Ф1-фильтра мог осесть мусор — без
+    фильтра он попал бы в память серии. Применяется ДО нормализации/капа. Инъекция
+    зависимости (обычно `protocol_to_tg.filter_participant_names`) держит модуль
+    stdlib-only. None → прежнее поведение (фильтр не применяется). Best-effort:
+    сбой фильтра не валит выжимку.
+
     Возвращает dict со схемой v1. `date` — YYYY-MM-DD (из аргумента или meta).
     """
     meta = meeting_meta or {}
     dt = (date or meta.get("date") or (meta.get("startTs") or "")[:10] or "").strip()
     series = (meta.get("series") or "").strip()
 
-    participants = _norm_participants(_extract_participants_from_header(protocol_text))
-    if not participants:
+    raw_participants = _extract_participants_from_header(protocol_text)
+    if not raw_participants:
         expected = meta.get("expectedParticipants") or meta.get("expected_participants") or []
         panel = meta.get("participants") or []
-        participants = _norm_participants(list(panel) + list(expected))
+        raw_participants = list(panel) + list(expected)
+    if participant_filter is not None:
+        try:
+            raw_participants = list(participant_filter(raw_participants))
+        except Exception:  # noqa: BLE001 — фильтр best-effort, не валим выжимку
+            pass
+    participants = _norm_participants(raw_participants)
 
     themes, key_points = extract_protocol_sections(protocol_text or "")
     digest: dict = {
@@ -369,6 +384,40 @@ def save_digest(series_dir: Path, date: str, digest: dict) -> Optional[Path]:
                 len(digest.get("themes") or []),
                 len(digest.get("key_points") or []))
     return path
+
+
+def save_meeting_digest(
+    series_dir: Path,
+    date: str,
+    protocol_text: str,
+    meeting_meta: dict,
+    *,
+    speaker_mapping: Optional[dict] = None,
+    participant_filter: Optional[Callable[[list], list]] = None,
+    prune_days: int = 0,
+) -> Optional[Path]:
+    """B1 (finalize 4.0.2d): построить выжимку из ГОТОВОГО протокола и сохранить
+    рядом, затем (опц.) прунинг старых по сроку хранения.
+
+    Тонкая оркестровка `build_digest`→`save_digest`→`prune_old_digests`: hot-path
+    финализации зовёт её ОДНИМ вызовом (вместо инлайна), и она же — тестируемая
+    единица для критерия B1 «после финализации в папке серии появляется
+    `<date>-memory.json`». Пустой протокол → None (нечего сохранять); прунинг при
+    этом НЕ выполняется. Best-effort: сбой save → None, finalize не валим.
+
+    `prune_days` — ОТДЕЛЬНОЙ операцией после save (а не внутри `save_digest`),
+    иначе бэкфилл старых протоколов самоудалял бы свежий результат (см. `save_digest`).
+    """
+    if not protocol_text or not protocol_text.strip():
+        return None
+    digest = build_digest(
+        protocol_text, meeting_meta, date=date,
+        speaker_mapping=speaker_mapping, participant_filter=participant_filter,
+    )
+    saved = save_digest(series_dir, date, digest)
+    if prune_days and prune_days > 0:
+        prune_old_digests(series_dir, prune_days)
+    return saved
 
 
 def load_digest(path: Path) -> Optional[dict]:
@@ -777,6 +826,7 @@ def backfill_series(
     series_dir: Path,
     *,
     overwrite: bool = False,
+    participant_filter: Optional[Callable[[list], list]] = None,
 ) -> int:
     """7.5: собирает выжимки из готовых протоколов `<date>-protokol.md` серии.
 
@@ -784,6 +834,10 @@ def backfill_series(
     строит выжимку и сохраняет рядом. Детерминированно, без claude — безопасно
     гонять разово. `series` и `participants` берём из шапки протокола (meta.json
     рядом не парсим — шапка протокола уже несёт состав).
+
+    Ф2 (Ф1 §5): `participant_filter` пробрасывается в `build_digest` — старые
+    протоколы (до Ф1) могут нести UI-мусор Телемоста в шапке участников; без
+    фильтра он осел бы в памяти серии. Обычно `protocol_to_tg.filter_participant_names`.
 
     Возвращает число записанных выжимок.
     """
@@ -813,7 +867,8 @@ def backfill_series(
             "date": date,
             # participants возьмёт из шапки протокола (meta пуст по составу).
         }
-        digest = build_digest(protocol_text, meta, date=date)
+        digest = build_digest(protocol_text, meta, date=date,
+                              participant_filter=participant_filter)
         if save_digest(d, date, digest):
             written += 1
     if written:
@@ -821,12 +876,17 @@ def backfill_series(
     return written
 
 
-def backfill_root(root: Path, *, overwrite: bool = False) -> dict:
+def backfill_root(
+    root: Path,
+    *,
+    overwrite: bool = False,
+    participant_filter: Optional[Callable[[list], list]] = None,
+) -> dict:
     """7.5: бэкфилл по всем сериям под `root`. Служебные `_*`/`.`-папки пропускаем.
 
     Возвращает {"series": N, "digests": M} — сколько серий тронуто и выжимок
     записано. РЕАЛЬНЫЙ прогон по живым протоколам — операция утреннего деплоя
-    (ПДн): ночью только код+unit на синтетике.
+    (ПДн): ночью только код+unit на синтетике. `participant_filter` — см. `backfill_series`.
     """
     r = Path(root)
     if not r.is_dir():
@@ -836,7 +896,7 @@ def backfill_root(root: Path, *, overwrite: bool = False) -> dict:
     for entry in sorted(r.iterdir(), key=lambda p: p.name):
         if not entry.is_dir() or entry.name.startswith("_") or entry.name.startswith("."):
             continue
-        n = backfill_series(entry, overwrite=overwrite)
+        n = backfill_series(entry, overwrite=overwrite, participant_filter=participant_filter)
         if n:
             series_touched += 1
             digests_written += n
