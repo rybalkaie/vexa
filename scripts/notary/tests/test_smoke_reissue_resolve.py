@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -154,6 +155,34 @@ class TestCheckMeta(unittest.TestCase):
                           "delivered": [{"chat_id": -1, "message_ids": [1], "at": "x"}]},
                          sid="ok1")
         self.assertEqual(smoke.main(["--scan", str(self.transcripts)]), 0)
+
+    def test_main_scan_empty_returns_nonzero(self):
+        # Ход1-Н2: пустой/неверный каталог (0 проверенных delivered-meta) НЕ должен
+        # молча зеленеть — иначе опечатка пути на батч-деплое = ложный зелёный гейт.
+        empty = self.base / "_tmp" / "empty"
+        empty.mkdir(parents=True, exist_ok=True)
+        self.assertNotEqual(smoke.main(["--scan", str(empty)]), 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "root обходит файловые права — тест неинформативен")
+    def test_protocol_unreadable_reported(self):
+        # Ход1-Н1: протокол есть, но нечитаем → reissue_one упал бы на read_text;
+        # smoke должен поймать это (симметрично транскрипту), а не дать «ok».
+        d = self._series_dir()
+        tpath = d / "2026-06-10-2026-06-10-tm-555.md"
+        tpath.write_text("x\n", encoding="utf-8")
+        ppath = d / "2026-06-10-protokol.md"
+        ppath.write_text("#p\n", encoding="utf-8")
+        os.chmod(ppath, 0o000)
+        try:
+            meta = {"series": "coord", "date": "2026-06-10",
+                    "transcript_path": str(tpath), "protocol_path": str(ppath),
+                    "delivered": [{"chat_id": -1, "message_ids": [1], "at": "x"}]}
+            mp = self._write_meta(meta)
+            r = smoke.check_meta(mp)
+            self.assertFalse(r["ok"], r)
+            self.assertEqual(r["status"], "protocol not readable")
+        finally:
+            os.chmod(ppath, 0o644)  # вернуть права, чтобы TemporaryDirectory очистился
 
 
 if __name__ == "__main__":

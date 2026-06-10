@@ -99,6 +99,13 @@ def check_meta(meta_path: Path) -> dict:
                 "ok": False, "error": str(e)}
 
     state = _state_from_meta(meta_path, meta)
+    # Ход1-Н4: reissue_one (feedback_reissue.py:638) бракует встречу без даты ДО
+    # резолва. Smoke не должен быть МЯГЧЕ ворот перевыпуска — иначе на dateless-meta
+    # generic-glob `<date>*-tm-*.md` схлопнется в `*-tm-*.md` и мог бы подцепить
+    # ЧУЖОЙ транскрипт серии → ложный «ok». Тот же ранний выход, что у reissue_one.
+    if not state.get("date"):
+        return {"meta": meta_path.name, "series": state.get("series"),
+                "status": "no date", "ok": False}
     transcript, protocol = feedback_reissue._resolve_paths(state, meta_path, meta)
 
     res: dict = {
@@ -123,6 +130,13 @@ def check_meta(meta_path: Path) -> dict:
         res["bytes"] = None
     if not protocol or not Path(protocol).is_file():
         res["status"] = "protocol missing"
+        return res
+    # Ход1-Н1: reissue_one читает протокол (feedback_reissue.py:689) — нечитаемый,
+    # но существующий протокол валит перевыпуск «read protocol». Симметрично
+    # транскрипту проверяем читаемость, чтобы smoke не дал «ok» там, где reissue
+    # упал бы. os.access — метаданные прав, содержимое не читаем (личные данные).
+    if not os.access(protocol, os.R_OK):
+        res["status"] = "protocol not readable"
         return res
     res["ok"] = True
     res["status"] = "ok"
@@ -222,6 +236,14 @@ def main(argv: Optional[list] = None) -> int:
         print(f"\nИтог: {len(checked)} delivered-meta проверено, "
               f"{len(checked) - len(failed)} PASS, {len(failed)} FAIL, "
               f"{len(results) - len(checked)} SKIP.")
+        # Ход1-Н2: 0 проверенных delivered-meta на батч-деплое — почти всегда НЕ
+        # «всё чисто», а неверный путь --scan (опечатка/не та папка). Молчаливый
+        # exit 0 дал бы ложное зелёное гейта. Возвращаем 2 (≠0 «чисто», ≠1 «есть
+        # провалы»), чтобы оператор проверил путь, а не принял пустоту за успех.
+        if not checked:
+            print(f"[WARN] 0 delivered-meta в {args.scan!r} — верный ли путь? "
+                  f"smoke ничего не проверил: это НЕ зелёный гейт.")
+            return 2
         return 1 if failed else 0
 
     if args.meta:
