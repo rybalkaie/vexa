@@ -43,6 +43,7 @@ from typing import Any, Callable, Optional
 
 from . import feedback_state
 from . import feedback_worker
+from . import paths
 
 
 logger = logging.getLogger(__name__)
@@ -441,28 +442,175 @@ def _default_generate(transcript_path: Path, meeting_meta: dict, meeting_sid: Op
     return lp.generate_protocol(transcript_md, meeting_meta, meeting_sid=meeting_sid)
 
 
-def _resolve_paths(state: dict, meta_path: Path) -> tuple[Optional[Path], Optional[Path]]:
-    """(transcript_path, protocol_path) встречи.
+def _meeting_id_tokens(meta: Optional[dict]) -> list[str]:
+    """Токены-идентификаторы встречи для различения ДВОЙНОЙ встречи одного дня
+    (REQ 1.3). Транскрипт-survivor назван `<date>-<date>-tm-<id>.md` (collision-
+    rename коллектора), где `<id>` — мс-таймстамп из sessionUid (`*-tm-<id>-*`).
 
-    Сначала — рядом с delivered-meta (`<meta_dir>/<date>.md` + `-protokol.md`):
-    delivery пишет `delivered` именно в meta.json рядом с протоколом, так что
-    обычно всё в одной папке. Если там нет — фолбэк на канонический
-    `_resolve_protocol_paths(series, date)` (env `MEETING_NOTARY_PROTOCOLS_DIR`,
-    legacy/new раскладки) — на случай расхождения каталогов VPS (Ф9 деплой-чек).
+    Возвращает подстроки, по любой из которых матчим имя файла:
+      • `tm-<id>` из sessionUid (через `paths._extract_one_off_id`);
+      • `tm-<nativeMeetingId>` и голый `<nativeMeetingId>` (иная форма id).
+    R9: id — не PII; текст транскрипта/правок тут не фигурирует.
     """
-    date = state.get("date")
-    series = state.get("series")
-    cand_t = meta_path.parent / f"{date}.md"
-    cand_p = meta_path.parent / f"{date}-protokol.md"
-    if cand_t.is_file() and cand_p.is_file():
-        return cand_t, cand_p
+    if not isinstance(meta, dict):
+        return []
+    tokens: list[str] = []
     try:
-        t, p, _ = _lp()._resolve_protocol_paths(series, date)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[reissue] _resolve_protocol_paths упал: %s", e)
-        t = p = None
-    return (t or (cand_t if cand_t.is_file() else None),
-            p or (cand_p if cand_p.is_file() else None))
+        oid = paths._extract_one_off_id(meta)  # 'tm-<id>' если sessionUid содержит tm-
+    except Exception:  # noqa: BLE001
+        oid = ""
+    if isinstance(oid, str) and oid.startswith("tm-") and len(oid) > 3:
+        tokens.append(oid)
+    nid = meta.get("nativeMeetingId")
+    if nid is not None:
+        nid_s = str(nid).strip()
+        if nid_s:
+            tokens.append(f"tm-{nid_s}")
+            tokens.append(nid_s)
+    seen: set = set()
+    out: list[str] = []
+    for t in tokens:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _candidate_series_dirs(state: dict, meta_path: Path, meta: Optional[dict]) -> list[Path]:
+    """Папки-кандидаты, где может лежать транскрипт встречи (фолбэк REQ 1.1b).
+
+    От точного к общему: папка persisted-пути → `meta_path.parent` (co-located,
+    тесты/legacy) → `<protocols_root>/<series>/` (new) и `<…>/<series>-<date>/`
+    (legacy), где protocols_root = env `MEETING_NOTARY_PROTOCOLS_DIR` или дефолт.
+    """
+    series = state.get("series") or ""
+    date = state.get("date") or ""
+    dirs: list[Path] = []
+
+    def _add(d: Optional[Path]) -> None:
+        if d is not None and d not in dirs:
+            dirs.append(d)
+
+    tp = (meta or {}).get("transcript_path")
+    if tp:
+        try:
+            _add(Path(str(tp)).parent)
+        except Exception:  # noqa: BLE001
+            pass
+    _add(meta_path.parent)
+    root_env = os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR")
+    root = Path(os.path.expanduser(root_env)) if root_env else Path(paths.DEFAULT_ROOT)
+    if series:
+        _add(root / series)
+        if date:
+            _add(root / f"{series}-{date}")
+    return [d for d in dirs if d.is_dir()]
+
+
+def _is_transcript_file(f: Path) -> bool:
+    """Файл — транскрипт (а не протокол/память/архив рядом)."""
+    n = f.name
+    return f.is_file() and n.endswith(".md") and not n.endswith("-protokol.md")
+
+
+def _glob_transcript_id_match(dirs: list[Path], date: str, tokens: list[str]) -> Optional[Path]:
+    """Транскрипт, чьё имя содержит id-токен встречи (REQ 1.3, double-meeting-safe).
+    Ищем `<dir>/<date>*.md`, среди них — содержащий любой токен; None если нет."""
+    if not tokens:
+        return None
+    for d in dirs:
+        for f in sorted(d.glob(f"{date}*.md")):
+            if _is_transcript_file(f) and any(tok in f.name for tok in tokens):
+                return f
+    return None
+
+
+def _glob_transcript_generic(dirs: list[Path], date: str) -> Optional[Path]:
+    """Фолбэк без id (REQ 1.1b): сначала `<date>*-tm-*.md` (survivor двойной/
+    collision-раскладки), потом ровно `<date>.md`. Если `-tm-`-кандидатов >1 и
+    различить нечем — НЕ угадываем (None), чтобы reissue упал явно, не правя пустышку."""
+    for d in dirs:
+        tm = [f for f in sorted(d.glob(f"{date}*-tm-*.md")) if _is_transcript_file(f)]
+        if len(tm) == 1:
+            return tm[0]
+        if len(tm) > 1:
+            return None  # неоднозначно без id — пусть резолв вернёт «transcript missing»
+    for d in dirs:
+        exact = d / f"{date}.md"
+        if exact.is_file():
+            return exact
+    return None
+
+
+def _protocol_for(transcript_path: Path, meta: Optional[dict], date: str) -> Path:
+    """Путь протокола: persisted `protocol_path` (если файл) или сосед
+    `<date>-protokol.md` рядом с транскриптом."""
+    pp = (meta or {}).get("protocol_path")
+    if pp:
+        ppath = Path(str(pp))
+        if ppath.is_file():
+            return ppath
+    return transcript_path.parent / f"{date}-protokol.md"
+
+
+def _resolve_paths(
+    state: dict, meta_path: Path, meta: Optional[dict] = None,
+) -> tuple[Optional[Path], Optional[Path]]:
+    """(transcript_path, protocol_path) встречи — надёжный резолв (ISS-1).
+
+    Приоритет (REQ 1.1 / 1.1b / 1.3):
+      1. **id-match** — есть id-токен встречи (sessionUid/nativeMeetingId) И в
+         папках серии есть транскрипт с этим id (`…-tm-<id>.md`) → берём его. Это
+         разводит ДВОЙНУЮ встречу одного дня (REQ 1.3) и переживает clobber
+         `<date>.md` (finalize перезаписывает его для каждой встречи дня). Имеет
+         приоритет над persisted ТОЛЬКО когда реально расходится с ним.
+      2. **persisted** — `meta["transcript_path"]`, записанный на финализации
+         (REQ 1.1): берём, если файл есть и нет противоречащего id-match.
+      3. **generic glob** — `<date>*-tm-*.md` (один) или `<date>.md` (REQ 1.1b);
+         закрывает старые/in-flight состояния БЕЗ persisted-поля (вкл. e-147).
+      4. **legacy env** — `_resolve_protocol_paths(series, date)`.
+
+    NB (НЕС2): ветка «рядом с meta» в проде не матчится (delivered → `_tmp/
+    transcripts/<sid>.meta.json`, транскрипт → `<output_dir>/<series>/`); поэтому
+    primary — записанный путь и id-glob, а не угадывание `<date>.md` (тот эфемерен).
+    """
+    date = state.get("date") or ""
+    series = state.get("series")
+    if meta is None:
+        meta = _read_meta(meta_path)
+
+    dirs = _candidate_series_dirs(state, meta_path, meta)
+    tokens = _meeting_id_tokens(meta)
+
+    id_match = _glob_transcript_id_match(dirs, date, tokens)
+    persisted: Optional[Path] = None
+    tp = (meta or {}).get("transcript_path")
+    if tp and Path(str(tp)).is_file():
+        persisted = Path(str(tp))
+
+    transcript: Optional[Path]
+    if id_match is not None and persisted is not None and id_match != persisted and tokens:
+        transcript = id_match            # двойная встреча: id точнее clobber-prone persisted
+    elif persisted is not None:
+        transcript = persisted           # REQ 1.1 primary
+    elif id_match is not None:
+        transcript = id_match            # REQ 1.1b (persisted нет, но id-файл есть)
+    else:
+        transcript = _glob_transcript_generic(dirs, date)  # REQ 1.1b generic
+
+    if transcript is None:
+        # 4: legacy env-резолв (одиночная/legacy раскладка `<date>.md`).
+        try:
+            t, p, _ = _lp()._resolve_protocol_paths(series, date)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[reissue] _resolve_protocol_paths упал: %s", e)
+            t = p = None
+        if t and Path(t).is_file():
+            proto = p if (p and Path(p).is_file()) else (Path(t).parent / f"{date}-protokol.md")
+            return Path(t), Path(proto)
+        return None, None
+
+    return transcript, _protocol_for(transcript, meta, date)
 
 
 def reissue_one(
@@ -496,7 +644,7 @@ def reissue_one(
     if not _scope_ok(state, meta):
         return {"status": "error", "error": "scope mismatch"}
 
-    transcript_path, protocol_path = _resolve_paths(state, meta_path)
+    transcript_path, protocol_path = _resolve_paths(state, meta_path, meta)
     if not transcript_path or not transcript_path.is_file():
         return {"status": "error", "error": f"transcript missing for {series}/{date}"}
     if not protocol_path or not protocol_path.is_file():
@@ -731,6 +879,80 @@ def reclaim_stale_reissuing(
     return n
 
 
+def _notify_owner_reissue_exhausted(state: dict) -> None:
+    """REQ 1.5 (Q2): ОДНОРАЗОВОЕ сообщение владельцу при исчерпании попыток
+    перевыпуска — «не смог применить правки к <серия/дата>, вот они, вручную?».
+
+    Отправляем правки владельцу ТЕКСТОМ (его же правки — лучше, чем потерять).
+    Транспорт — `lib.notify.push` (обёртка над `~/.local/bin/tg-send`, «known-owner
+    chat», тот же путь, что у `_alert_owner_pdf_failure`). Дедуп по встрече
+    (`reissue-exhausted:<fid>`) даёт 6ч-глушилку повторов — но терминализация в
+    `failed` и так делает это one-shot (sweep больше не listнет item).
+
+    R9 (опасная тройка): правки = недоверенный пользовательский контент. tg-send
+    логирует лишь `message[:80]` — это шапка-префикс (серия/дата), текст правок за
+    `\\n\\n` в лог НЕ попадает. В файлы/auto-memory ничего не пишем.
+    """
+    series = state.get("series") or "?"
+    date = state.get("date") or "?"
+    fid = state.get("feedback_id") or "?"
+    edits = state.get("edits") or []
+    lines: list[str] = []
+    for e in edits:
+        if not isinstance(e, dict):
+            continue
+        author = sanitize_edit_text(e.get("author") or "", max_len=120) or "участник"
+        txt = sanitize_edit_text(e.get("text") or "")
+        if txt:
+            lines.append(f"• [{author}] {txt}")
+    body = "\n".join(lines) if lines else "(текст правок не сохранился в state)"
+    msg = (
+        f"⚠️ Не смог применить правки к «{series}» {date} "
+        f"(исчерпал {feedback_state.MAX_REISSUE_ATTEMPTS} попытки перевыпуска). "
+        f"Вот они — применить вручную?\n\n{body}"
+    )
+    try:
+        from .notify import push  # noqa: PLC0415
+        ok = push(msg, dedupe_key=f"reissue-exhausted:{fid}")
+    except Exception as e:  # noqa: BLE001
+        logger.error("[reissue] уведомление владельцу об исчерпании не отправлено "
+                     "(push упал) fid=%s: %s", fid, e)
+        return
+    if not ok:
+        logger.error(
+            "[reissue] уведомление владельцу об исчерпании НЕ доставлено "
+            "(tg-send недоступен?) fid=%s — провал не немой (РИСК3)", fid,
+        )
+
+
+def _terminalize_exhausted(state: dict, *, root: Optional[Path] = None) -> None:
+    """REQ 1.5: исчерпавший попытки item → one-shot уведомление + статус `failed`.
+
+    Порядок: сначала уведомляем владельца (его правки не потеряны), затем
+    терминализируем. Терминализация = выход из очереди `ready_for_reissue`:
+    sweep больше его не listнет → уведомление гарантированно one-shot, claude
+    вхолостую не крутится. Новый reply откроет свежий раунд (`apply_edit:
+    failed → round+1`). R9: логируем только метаданные.
+    """
+    fid = state.get("feedback_id")
+    if not fid:
+        return
+    _notify_owner_reissue_exhausted(state)
+    feedback_state.mark_status(
+        fid, "failed", root=root,
+        extra={
+            "last_reissue_status": "failed",
+            "exhausted_at": feedback_state.now_iso(),
+            "owner_notified_exhausted": True,
+        },
+    )
+    logger.warning(
+        "[reissue] fid=%s исчерпал MAX_REISSUE_ATTEMPTS=%d → терминализован (failed) "
+        "+ владелец уведомлён one-shot; новый reply откроет свежий раунд",
+        fid, feedback_state.MAX_REISSUE_ATTEMPTS,
+    )
+
+
 def claim_ready_reissues(
     *,
     root: Optional[Path] = None,
@@ -767,11 +989,11 @@ def claim_ready_reissues(
             continue  # уже в работе (фоновый future жив) — не клеймим повторно
         attempts = int(state.get("reissue_attempts") or 0)
         if attempts >= feedback_state.MAX_REISSUE_ATTEMPTS:
-            logger.warning(
-                "[reissue] fid=%s превысил MAX_REISSUE_ATTEMPTS=%d — пропуск "
-                "(ждёт владельца/Ф9); новый reply откроет свежий раунд",
-                fid, feedback_state.MAX_REISSUE_ATTEMPTS,
-            )
+            # REQ 1.5 (РИСК3, coordination-баг №3): НЕ оставляем `ready_for_reissue`
+            # (иначе sweep вечно молча его скипает), а ТЕРМИНАЛИЗИРУЕМ в `failed` +
+            # ОДНОРАЗОВО уведомляем владельца его правками. Терминализация делает
+            # уведомление one-shot: следующий sweep этот item уже не listнет.
+            _terminalize_exhausted(state, root=root)
             continue
 
         # Н1 (FM-10): атомарный claim ДО чтения edits.

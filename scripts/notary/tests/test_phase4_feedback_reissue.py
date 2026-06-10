@@ -705,19 +705,40 @@ class TestProcessReadyReissues(_ReissueBase):
         self.assertEqual(final["reissue_attempts"], 1)
         self.assertIn("claude down", final["last_reissue_error"])
 
-    def test_attempts_cap_skips_claim(self):
+    def test_attempts_cap_terminalizes_and_notifies_once(self):
+        # REQ 1.5 (РИСК3, coordination-баг №3): исчерпание MAX_REISSUE_ATTEMPTS →
+        # НЕ остаётся ready_for_reissue (иначе sweep вечно молча скипает), а
+        # терминализуется в `failed` + ОДНО уведомление владельцу. claude не зовётся.
         meta_path = self._write_meeting()
         st = self._state(meta_path, status="ready_for_reissue",
                          attempts=feedback_state.MAX_REISSUE_ATTEMPTS)
         feedback_state.write_state(st, root=self.root)
         called = []
-        n = feedback_reissue.process_ready_reissues(
-            root=self.root, reissue_fn=lambda s, **k: called.append(1) or {"status": "sent"}
+        with mock.patch("notary.lib.notify.push", return_value=True) as push:
+            n = feedback_reissue.process_ready_reissues(
+                root=self.root, reissue_fn=lambda s, **k: called.append(1) or {"status": "sent"}
+            )
+            self.assertEqual(n, 0)
+            self.assertEqual(called, [])  # claude не клеймили/не звали
+            final = feedback_state.read_state(st["feedback_id"], root=self.root)
+            self.assertEqual(final["status"], "failed")  # терминализован, не висит
+            self.assertTrue(final.get("owner_notified_exhausted"))
+            self.assertEqual(push.call_count, 1)  # одно уведомление
+            # Текст уведомления несёт правки владельцу (его же правки текстом).
+            sent_msg = push.call_args.args[0]
+            self.assertIn("131 на доставке", sent_msg)
+            self.assertIn("применить вручную", sent_msg)
+
+            # Второй sweep: failed-item НЕ трогается и НЕ шлёт повторное уведомление.
+            n2 = feedback_reissue.process_ready_reissues(
+                root=self.root, reissue_fn=lambda s, **k: called.append(1) or {"status": "sent"}
+            )
+        self.assertEqual(n2, 0)
+        self.assertEqual(called, [])
+        self.assertEqual(push.call_count, 1)  # one-shot: повторно не слали
+        self.assertEqual(
+            feedback_state.read_state(st["feedback_id"], root=self.root)["status"], "failed"
         )
-        self.assertEqual(n, 0)
-        self.assertEqual(called, [])  # не клеймили
-        final = feedback_state.read_state(st["feedback_id"], root=self.root)
-        self.assertEqual(final["status"], "ready_for_reissue")  # остался владельцу
 
     def test_max_per_sweep_limit(self):
         for i in range(3):

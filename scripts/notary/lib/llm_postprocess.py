@@ -3122,11 +3122,17 @@ def _find_delivery_for_chat(records: list[dict], chat_id: int) -> Optional[dict]
 
 def _update_meta_delivered(
     meta_json_path: Path,
-    new_record: dict,
+    new_record: Optional[dict] = None,
     *,
     replace_for_chat_id: bool = True,
+    extra_meta: Optional[dict] = None,
 ) -> bool:
     """Atomic update поля `delivered` в meta.json (read-merge-write).
+
+    `extra_meta` (Ф1 delivery-fixes, REQ 1.1): top-level ключи, которые надо
+    влить в meta под ТЕМ ЖЕ flock'ом (например `transcript_path`/`protocol_path`,
+    чтобы reissue нашёл транскрипт напрямую, не угадывая `<date>.md`). Если
+    `new_record is None` — только `extra_meta` (запись `delivered` не трогаем).
 
     Новый формат (Ф1, 2026-05-29): `delivered` — массив записей вида
     `{chat_id, message_ids, at[, decision]}`. `new_record` добавляется в
@@ -3162,12 +3168,18 @@ def _update_meta_delivered(
         meta = _read_meta_json(meta_json_path)
         if meta is None:
             meta = {}
-        existing = _normalize_delivered(meta.get("delivered"))
-        chat_id = new_record.get("chat_id")
-        if replace_for_chat_id and chat_id is not None:
-            existing = [r for r in existing if r.get("chat_id") != chat_id]
-        existing.append(new_record)
-        meta["delivered"] = existing
+        if new_record is not None:
+            existing = _normalize_delivered(meta.get("delivered"))
+            chat_id = new_record.get("chat_id")
+            if replace_for_chat_id and chat_id is not None:
+                existing = [r for r in existing if r.get("chat_id") != chat_id]
+            existing.append(new_record)
+            meta["delivered"] = existing
+        if extra_meta:
+            # REQ 1.1: вливаем top-level поля (transcript_path/protocol_path) под flock'ом.
+            for k, v in extra_meta.items():
+                if v is not None:
+                    meta[k] = v
         try:
             _atomic_write_text(meta_json_path, json.dumps(meta, ensure_ascii=False, indent=2))
         except OSError as e:
@@ -3180,6 +3192,35 @@ def _update_meta_delivered(
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+def _persist_transcript_paths(meta_json_path: Optional[Path], meeting_meta: dict) -> None:
+    """REQ 1.1 (ISS-1): персист пути транскрипта/протокола в delivered-marker meta.
+
+    Reissue (`feedback_reissue._resolve_paths`) читает `meta["transcript_path"]`
+    ПЕРВЫМ — иначе угадывает `<date>.md` (эфемерный, подчищен) и падает
+    «transcript missing». Путь известен ровно здесь, на доставке: его кладёт
+    finalize в `meeting_meta["transcript_path"]`/`["protocol_path"]`. Пишем под
+    flock'ом `_update_meta_delivered` (один писатель meta — РИСК1). Идемпотентно:
+    зовётся ДО idempotent-skip, поэтому ре-финализация старой встречи бэкфиллит
+    поле. Best-effort: сбой записи не валит доставку (на резолве есть фолбэк-glob).
+    """
+    if not meta_json_path:
+        return
+    tp = (meeting_meta or {}).get("transcript_path")
+    pp = (meeting_meta or {}).get("protocol_path")
+    extra: dict = {}
+    if tp:
+        extra["transcript_path"] = str(tp)
+        extra["transcript_filename"] = Path(str(tp)).name
+    if pp:
+        extra["protocol_path"] = str(pp)
+    if not extra:
+        return
+    try:
+        _update_meta_delivered(meta_json_path, None, extra_meta=extra)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[delivery] персист transcript_path не удался (non-fatal): %s", e)
 
 
 def _load_watched_for_series(series: str, watched_path: Optional[Path] = None) -> Optional[int]:
@@ -3365,6 +3406,11 @@ def deliver_protocol(
             "[delivery] meeting=%s нет привязки → дефолт в личку chat=%s",
             meeting_sid or "?", chat_id,
         )
+
+    # REQ 1.1 (ISS-1): персист пути транскрипта/протокола в meta ДО idempotent-skip
+    # ниже — чтобы поле легло и при повторной финализации уже-доставленной встречи
+    # (бэкфилл старых meta без `transcript_path`).
+    _persist_transcript_paths(meta_json_path, meeting_meta)
 
     # Шаг 3: идемпотентность ПЕРЕД дорогой сборкой PDF (RISK3).
     # Доставка теперь — ОДИН PDF-документ, не N текстовых чанков. «Уже

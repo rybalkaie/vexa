@@ -56,6 +56,12 @@
                       правок в окне между закрытием окна и перевыпуском).
   dormant           — спит после перевыпуска; новый reply на любую версию серии
                       открывает новый раунд (FB12, многораундовость).
+  failed            — терминальный провал: перевыпуск исчерпал MAX_REISSUE_ATTEMPTS
+                      (claude/telegram стабильно падали). Item ВЫВЕДЕН из очереди
+                      (sweep его больше не клеймит — иначе вечный silent-skip,
+                      coordination-баг №3) И владелец получил one-shot уведомление
+                      «не смог применить правки, вот они». Новый reply открывает
+                      свежий раунд (apply_edit: failed → round+1), как из dormant.
 """
 
 from __future__ import annotations
@@ -77,7 +83,7 @@ DEFAULT_VPS_ROOT = "/opt/meeting-notary/_feedback_edits"
 
 STATE_SUFFIX = "-feedback.json"
 
-VALID_STATUSES = ("collecting", "ready_for_reissue", "reissuing", "dormant")
+VALID_STATUSES = ("collecting", "ready_for_reissue", "reissuing", "dormant", "failed")
 
 # Н1 (FM-10): потолок попыток перевыпуска одного раунда. После него
 # `process_ready_reissues` перестаёт клеймить state (claude/telegram стабильно
@@ -302,10 +308,13 @@ def cleanup_dormant_states(
         status = state.get("status")
         # Решаем, кандидат ли файл на удаление по статусу/attempts (свежесть — ниже,
         # единым cutoff для всех кандидатов).
-        if status == "dormant":
-            pass  # R10: терминальный успех — удаляем по возрасту
+        if status in ("dormant", "failed"):
+            pass  # терминальные: dormant (R10, успех) / failed (исчерпан reissue) —
+                  # удаляем по возрасту. failed уже отдан владельцу one-shot'ом.
         elif status == "ready_for_reissue":
             # I9: только исчерпавшие лимит попыток (attempts<MAX ещё ретраится — живой).
+            # NB (Ф1 delivery-fixes): исчерпавшие теперь терминализуются в `failed`
+            # на claim-этапе, так что эта ветка ловит лишь legacy-состояния до фикса.
             attempts = int(state.get("reissue_attempts") or 0)
             if attempts < MAX_REISSUE_ATTEMPTS:
                 continue

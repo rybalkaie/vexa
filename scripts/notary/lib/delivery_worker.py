@@ -199,81 +199,71 @@ def _finalize_state(
         logger.warning("[delivery] finalize_state write failed: %s", e)
 
 
-def process_callback(cbq: dict[str, Any], pending_root: Path, token: str) -> bool:
-    """Если callback_query — наш `cd:`, обрабатывает и возвращает True.
+# RISK5 (Ф1 delivery-fixes / R-REPLY): интерактивная фича «бот сам спрашивает,
+# куда слать протокол» СНЯТА — `ask_delivery_destination` больше не зовётся
+# (inline-кнопки листенером не обрабатывались, протокол зависал; `deliver_protocol`
+# теперь дефолтит в личку без вопроса, REQ 7.2). Новые `*-delivery.json` не
+# создаются. Но обработчики ответа (`process_text_message`/`process_callback`)
+# ещё в wiring'е листенера — это «полу-живая ask-машинерия», кандидат №1 в
+# «спросил, а на ответ не реагирует»: ОРФАН-state от снятой фичи мог бы
+# перехватить НЕ-reply сообщение владельца (распознать как «куда слать») и
+# проглотить его. Поэтому ниже обработчики НЕ глотают, а ретайрят орфаны и
+# пропускают сообщение дальше — к реальным обработчикам (правки/clarify).
+_ORPHAN_RETIRE_DECISION = "ask-feature-retired"
 
-    Иначе False (вызывающий передаёт дальше в clarify-worker).
+
+def retire_orphan_delivery_states(pending_root: Path) -> int:
+    """RISK5: терминализует осиротевшие pending delivery-state'ы (фича снята).
+
+    Возвращает число ретайрнутых. Идемпотентно (после ретайра status != pending
+    → больше не listится). Диагностика: логируем только число (R9) — без текста/имён.
+    """
+    if not pending_root or not pending_root.exists():
+        return 0
+    n = 0
+    for state in _list_pending_delivery_states(pending_root):
+        sp = Path(state.pop("_path"))
+        _finalize_state(sp, state, status="retired", decision=_ORPHAN_RETIRE_DECISION)
+        n += 1
+    if n:
+        logger.warning(
+            "[delivery] RISK5: ретайрнул %d осиротевших delivery-ask state(s) — фича "
+            "«бот спрашивает куда слать» снята; орфаны больше не перехватывают ответы владельца",
+            n,
+        )
+    return n
+
+
+def process_callback(cbq: dict[str, Any], pending_root: Path, token: str) -> bool:
+    """RISK5: `cd:`-callback от СНЯТОЙ фичи «куда слать». Кнопки осиротели —
+    снимаем крутилку, ретайрим орфаны, НЕ доставляем. True = наш префикс прожёван.
+
+    Иначе (не `cd:`) — False (вызывающий передаёт дальше в clarify-worker).
     """
     data = (cbq.get("data") or "").strip()
     if not data.startswith("cd:"):
         return False
-    body = data[3:]
-    parts = body.split(":")
-    if len(parts) != 2:
-        return True  # наш префикс — но битый формат, не передаём дальше
-    mid_short, action = parts
-    state = _find_state_by_short_id(pending_root, mid_short)
-    if not state:
-        logger.info("[delivery] callback for unknown/expired mid_short=%s", mid_short)
-        # snimaем крутилку.
-        msg = cbq.get("message") or {}
-        chat_id_msg = (msg.get("chat") or {}).get("id")
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.answer_callback_query(
-                token, cbq.get("id") or "",
-                text="Запрос устарел — пропустил.",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    meeting_id = state.get("meeting_id") or ""
-    state_path = _state_path_for(pending_root, meeting_id)
-    series = (state.get("meta") or {}).get("series") or "—"
-    date = (state.get("meta") or {}).get("date") or "—"
-
-    if action == "skip":
-        _finalize_state(state_path, state, status="resolved", decision="skip")
-        logger.info("[delivery] skipped meeting=%s reason=user-skip", meeting_id)
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.answer_callback_query(token, cbq.get("id") or "", text="Принято — не отправляю.")
-            telegram_api.send_message(
-                token, state.get("chat_id") or 0,
-                f"🚫 Не отправил протокол «{series}» {date} (по запросу).",
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[delivery] post-skip notify failed: %s", e)
-        return True
-
-    if action == "dm":
-        dm_chat = state.get("chat_id") or 0
-        ok = _deliver_now(state, token, dm_chat, persist_binding=False)
-        if ok:
-            _finalize_state(state_path, state, status="resolved", decision="dm", chat_id=dm_chat)
-            logger.info("[delivery] dm-only meeting=%s", meeting_id)
-        else:
-            _finalize_state(state_path, state, status="resolved", decision="dm-failed")
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.answer_callback_query(
-                token, cbq.get("id") or "",
-                text="Отправил в личку." if ok else "Ошибка отправки.",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    # Неожиданный action — игнор, но True (наш префикс).
+    retire_orphan_delivery_states(pending_root)
+    logger.warning(
+        "[delivery] RISK5: callback `cd:` при снятой фиче «куда слать» — кнопка "
+        "устарела, ретайрил орфаны (не доставляю)",
+    )
+    try:
+        from . import telegram_api  # noqa: PLC0415
+        telegram_api.answer_callback_query(
+            token, cbq.get("id") or "", text="Кнопка устарела — пропустил.",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
 def process_text_message(msg: dict[str, Any], pending_root: Path, token: str) -> bool:
-    """Текстовый ответ. Возвращает True если обработали (вызывающий выходит).
+    """RISK5: текстовый ответ при снятой фиче «куда слать».
 
-    Работает только если есть РОВНО ОДИН pending delivery; при 2+ просим
-    пользователя нажать кнопку (избегаем неоднозначности).
+    Возвращает ВСЕГДА False — НЕ перехватываем сообщение владельца (иначе «спросил
+    и не реагирует»): любой pending тут — орфан снятой фичи, ретайрим его и
+    пропускаем сообщение дальше к реальным обработчикам (правки/clarify/task).
     """
     text = (msg.get("text") or "").strip()
     if not text:
@@ -281,98 +271,13 @@ def process_text_message(msg: dict[str, Any], pending_root: Path, token: str) ->
     pendings = _list_pending_delivery_states(pending_root)
     if not pendings:
         return False
-    if len(pendings) > 1:
-        # Неоднозначно — просим использовать кнопку (на каждом сообщении свой mid_short).
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.send_message(
-                token, msg.get("chat", {}).get("id") or 0,
-                "⚠️ Несколько висящих вопросов о доставке протокола — нажми кнопку под нужным.",
-                reply_to_message_id=msg.get("message_id"),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    state = pendings[0]
-    state_path = Path(state.pop("_path"))
-    meeting_id = state.get("meeting_id") or ""
-    series = (state.get("meta") or {}).get("series") or "—"
-    date = (state.get("meta") or {}).get("date") or "—"
-    chat_id_user = msg.get("chat", {}).get("id") or 0
-
-    try:
-        from .llm_postprocess import parse_chat_destination_answer  # noqa: PLC0415
-    except Exception as e:  # noqa: BLE001
-        logger.exception("[delivery] llm_postprocess import failed (parse): %s", e)
-        return False
-
-    kind, parsed_chat = parse_chat_destination_answer(text)
-
-    if kind == "skip":
-        _finalize_state(state_path, state, status="resolved", decision="skip")
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.send_message(
-                token, chat_id_user,
-                f"🚫 Не отправил протокол «{series}» {date}.",
-                reply_to_message_id=msg.get("message_id"),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        logger.info("[delivery] skipped meeting=%s reason=user-skip-text", meeting_id)
-        return True
-
-    if kind == "dm":
-        ok = _deliver_now(state, token, chat_id_user, persist_binding=False)
-        if ok:
-            _finalize_state(state_path, state, status="resolved", decision="dm", chat_id=chat_id_user)
-        else:
-            _finalize_state(state_path, state, status="resolved", decision="dm-failed")
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.send_message(
-                token, chat_id_user,
-                "✅ Отправил в личку." if ok else "❌ Не смог отправить.",
-                reply_to_message_id=msg.get("message_id"),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    if kind == "chat" and parsed_chat is not None:
-        ok = _deliver_now(state, token, parsed_chat, persist_binding=True)
-        if ok:
-            _finalize_state(state_path, state, status="resolved", decision="chat", chat_id=parsed_chat)
-        else:
-            _finalize_state(state_path, state, status="resolved", decision="chat-failed", chat_id=parsed_chat)
-        try:
-            from . import telegram_api  # noqa: PLC0415
-            telegram_api.send_message(
-                token, chat_id_user,
-                (
-                    f"✅ Отправил в chat_id={parsed_chat}, привязку «{series}» запомнил."
-                    if ok else
-                    f"❌ Не смог отправить в chat_id={parsed_chat}. Проверь, что бот добавлен в группу."
-                ),
-                reply_to_message_id=msg.get("message_id"),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    # invalid → подсказка.
-    try:
-        from . import telegram_api  # noqa: PLC0415
-        telegram_api.send_message(
-            token, chat_id_user,
-            "❓ Не распознал ответ. Жду: chat_id (число), ссылку https://t.me/c/.../, "
-            "«в личку», «никуда».",
-            reply_to_message_id=msg.get("message_id"),
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return True
+    # Орфаны снятой фичи: ретайрим + диагностика, но НЕ глотаем (return False).
+    retire_orphan_delivery_states(pending_root)
+    logger.warning(
+        "[delivery] RISK5: текстовый ответ при %d орфан-delivery-state(s) снятой фичи "
+        "«куда слать» — не перехватываю, ретайрил орфаны, передаю дальше", len(pendings),
+    )
+    return False
 
 
 def sweep_timeouts(pending_root: Path) -> int:

@@ -1187,6 +1187,11 @@ def main() -> int:
             delivery_meta = dict(meta)
             delivery_meta["date"] = date_part
             delivery_meta["sessionUid"] = session_uid
+            # REQ 1.1 (ISS-1): даём deliver_protocol точные пути транскрипта и
+            # протокола — он персистит их в delivered-marker meta, чтобы reissue
+            # нашёл транскрипт напрямую (не угадывал `<date>.md`, который эфемерен).
+            delivery_meta["transcript_path"] = str(md_path)
+            delivery_meta["protocol_path"] = str(protocol_path)
             # Идемпотентность доставки: `delivered` пишем в ИСХОДНУЮ meta встречи
             # (`args.meta_json`), а не в output-dir рядом с протоколом. Это ровно
             # тот файл, который читают дедуп collector'а и reply-gate правок —

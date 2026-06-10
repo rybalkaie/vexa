@@ -821,11 +821,22 @@ def maybe_route_to_feedback_reply(token: str, chat_id: int, allowed_chat: int, m
     except Exception as e:  # noqa: BLE001
         logger.debug("feedback_worker import failed (feature off?): %s", e)
         return False
+    # R-REPLY диагностика (Ф1 delivery-fixes): точка приёма правок-реплаем — ОБЩАЯ
+    # для лички владельца (chat_id == allowed_chat) и группы участников (≠). Логируем
+    # МЕТАДАННЫЕ приёма (R9: без текста реплая) — чтобы «спросил, а не реагирует» был
+    # виден в логе: видно, что reply дошёл и забрал ли его шлюз правок.
+    reply_to_mid = (msg.get("reply_to_message") or {}).get("message_id")
+    is_dm = chat_id == allowed_chat
     try:
-        return feedback_worker.route_feedback_reply(token, chat_id, msg, allowed_chat=allowed_chat)
+        claimed = feedback_worker.route_feedback_reply(token, chat_id, msg, allowed_chat=allowed_chat)
     except Exception as e:  # noqa: BLE001
         logger.exception("feedback routing failed: %s", e)
         return False
+    logger.info(
+        "[r-reply] приём reply chat=%s dm=%s reply_to=%s → правки-шлюз claimed=%s",
+        chat_id, is_dm, reply_to_mid, claimed,
+    )
+    return claimed
 
 
 def _learning_digest_prefix() -> str:
@@ -1181,8 +1192,13 @@ def sweep_clarify_timeouts(token: Optional[str] = None) -> None:
     except Exception as e:  # noqa: BLE001
         logger.exception("task_clarify sweep failed: %s", e)
     # Ф6 delivery sweep — отдельный модуль, отдельные state-файлы (`-delivery.json`).
+    # RISK5 (Ф1 delivery-fixes): фича «бот спрашивает куда слать» снята; проактивно
+    # ретайрим осиротевшие delivery-state'ы, чтобы они не перехватывали ответы владельца.
     try:
         from notary.lib import delivery_worker  # noqa: PLC0415
+        n_orphan = delivery_worker.retire_orphan_delivery_states(pending_root)
+        if n_orphan:
+            logger.warning("delivery sweep: ретайрнул %d орфан-ask state(s) (фича снята)", n_orphan)
         n3 = delivery_worker.sweep_timeouts(pending_root)
         if n3:
             logger.info("delivery sweep: marked %d as timed_out", n3)

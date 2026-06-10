@@ -104,14 +104,19 @@ class TestClaimReadyReissues(_Base):
             "ready_for_reissue",
         )
 
-    def test_attempts_cap_skipped_not_claimed(self):
+    def test_attempts_cap_terminalized_not_claimed(self):
+        # REQ 1.5 (Ф1 delivery-fixes): исчерпавший MAX item НЕ клеймится И больше НЕ
+        # висит в ready_for_reissue (иначе вечный silent-skip) — терминализуется в
+        # `failed` + one-shot уведомление владельцу (тут мокаем push).
         st = self._state(attempts=feedback_state.MAX_REISSUE_ATTEMPTS)
-        claimed = feedback_reissue.claim_ready_reissues(root=self.root, max_n=5)
+        with mock.patch("notary.lib.notify.push", return_value=True) as push:
+            claimed = feedback_reissue.claim_ready_reissues(root=self.root, max_n=5)
         self.assertEqual(claimed, [])
         self.assertEqual(
             feedback_state.read_state(st["feedback_id"], root=self.root)["status"],
-            "ready_for_reissue",
+            "failed",
         )
+        self.assertEqual(push.call_count, 1)  # одно уведомление
 
     def test_reclaims_stale_before_claiming(self):
         # reissuing старше потолка → reclaim вернёт в ready → его же заклеймим заново.

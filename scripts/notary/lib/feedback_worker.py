@@ -590,7 +590,9 @@ def apply_edit(
     #   - reissuing — Ф4 уже «забрала» edits на перевыпуск (claim); reply
     #     обязан уйти в СЛЕДУЮЩИЙ раунд, а не дозаписаться в съедаемый список
     #     (Н1/FM-10). conditional-dormant в reissue-воркере не затрёт этот раунд.
-    if state is None or state.get("status") in ("ready_for_reissue", "reissuing", "dormant"):
+    #   - failed — терминальный провал предыдущего раунда (исчерпан reissue,
+    #     Ф1 delivery-fixes). Новый reply даёт второй шанс — свежий раунд с нуля.
+    if state is None or state.get("status") in ("ready_for_reissue", "reissuing", "dormant", "failed"):
         rnd = (int(state.get("round", 1)) + 1) if state else 1
         return _new_round_state(meeting, edit, win_min, max_min, now, rnd, state), "first"
 
