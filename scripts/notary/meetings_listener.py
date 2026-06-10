@@ -903,6 +903,14 @@ def maybe_route_to_set_chat_command(
     try:
         watched = load_watched(lock=True)
     except Exception as e:  # noqa: BLE001
+        # ВАЖНО: load_watched(lock=True) захватывает flock ДО чтения yaml; если
+        # сам разбор реестра упал (битый/руками-правленный watched.yaml), лок уже
+        # держится и без явного release утечёт — следующая команда смены чата
+        # повиснет на flock(LOCK_EX) и встанет весь листенер. Освобождаем явно.
+        try:
+            release_watched_lock()
+        except Exception:  # noqa: BLE001
+            pass
         logger.warning("[set-chat] load_watched lock failed: %s", e)
         send_message(
             token, cid,

@@ -308,6 +308,18 @@ class TestSetChatCommandParsing(unittest.TestCase):
         self.assertIsNone(self._parse("привет, как дела"))
         self.assertIsNone(self._parse("шли мне фоточки"))  # нет слова «серию»
 
+    def test_dated_correction_with_send_words_not_set_chat(self):
+        """Цикл5/ход3 У1: датированная правка-tail_negate, чья инструкция содержит
+        «серию … шли … сюда», НЕ должна перехватываться как set_chat (команда смены
+        чата всегда без даты). Иначе правка протокола молча терялась бы."""
+        c = self._parse("anzhee-direktorat 2026-05-27: задачу про серию шли сюда не было")
+        self.assertIsNotNone(c, "датированная правка должна остаться распознанной коррекцией")
+        self.assertNotEqual(c.kind, "set_chat")
+        self.assertEqual(c.kind, "tail_negate")
+        # А бездатная та же фраза — остаётся командой смены чата.
+        c2 = self._parse("серию anzhee-direktorat шли сюда")
+        self.assertEqual(c2.kind, "set_chat")
+
 
 # ---------------------------------------------------------------------------
 # REQ 7.4: запись/чтение привязки (round-trip + перезапись) на уровне registry
@@ -449,6 +461,52 @@ class TestSetChatHandler(unittest.TestCase):
         handled = self.ml.maybe_route_to_set_chat_command("tok", self.OWNER, self.OWNER, msg)
         self.assertFalse(handled)
         self.send.assert_not_called()
+
+    def test_owner_reply_binds_series_from_context(self):
+        """Цикл5/ход3 У5: REQ 7.4 reply-форма «эту серию шли сюда» реплаем на протокол —
+        серия берётся из контекста через find_delivered_protocol; интеграция
+        обработчик→_reply_context_series→find_delivered_protocol под тестом."""
+        msg = {
+            "text": "эту серию шли сюда",          # серия пустая → из реплая
+            "chat": {"id": self.GROUP},
+            "from": {"id": self.OWNER},
+            "message_id": 556,
+            "reply_to_message": {"message_id": 4242},
+        }
+        with mock.patch(
+            "notary.lib.feedback_worker.find_delivered_protocol",
+            return_value={"series": "anzhee-direktorat", "date": "2026-06-11",
+                          "chat_id": self.GROUP},
+        ) as mock_find:
+            handled = self.ml.maybe_route_to_set_chat_command(
+                "tok", self.GROUP, self.OWNER, msg)
+        self.assertTrue(handled)
+        mock_find.assert_called_once()
+        # серия из реплая привязана к ТЕКУЩЕМУ чату (группе, «сюда»).
+        self.assertEqual(reg.get_telegram_chat_id_for_series("anzhee-direktorat", self.saved),
+                         self.GROUP)
+        chat_id, text = self._last_sent_text()
+        self.assertIn("✅", text)
+        self.assertEqual(chat_id, self.GROUP)
+
+    def test_owner_reply_no_protocol_visible_miss(self):
+        """Reply-форма, но реплай НЕ на наш протокол (find_delivered_protocol→None) →
+        видимое «не понял какую серию», без записи (R-REPLY: не молчим)."""
+        msg = {
+            "text": "эту серию шли сюда",
+            "chat": {"id": self.OWNER},
+            "from": {"id": self.OWNER},
+            "message_id": 557,
+            "reply_to_message": {"message_id": 9999},
+        }
+        with mock.patch(
+            "notary.lib.feedback_worker.find_delivered_protocol", return_value=None,
+        ):
+            handled = self.ml.maybe_route_to_set_chat_command(
+                "tok", self.OWNER, self.OWNER, msg)
+        self.assertTrue(handled)
+        self.assertIsNone(self.saved)
+        self.assertTrue(self.send.called)
 
 
 if __name__ == "__main__":

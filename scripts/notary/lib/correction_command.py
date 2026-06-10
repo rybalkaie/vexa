@@ -107,6 +107,14 @@ def _parse_set_chat(raw: str) -> Optional[tuple[str, str]]:
     # случайно встретилось «серию … шли … сюда».
     if _FIX_PROTOCOL_RE.match(raw) or _REMOVE_TASK_RE.match(raw):
         return None
+    # Структурная коррекция (форма 3 «<серия> <дата>: …») и любая датированная
+    # правка несут дату YYYY-MM-DD; команда смены чата — ВСЕГДА без даты (привязка
+    # к серии, не к встрече). Дата в сообщении → это НЕ set_chat: отдаём ниже
+    # датированному парсеру коррекций. Иначе правка-tail_negate, чья инструкция
+    # содержит «серию … шли … сюда», молча перехватилась бы как смена чата —
+    # и правка протокола потерялась бы (ровно класс бага R-REPLY). Цикл5/ход3, У1.
+    if _DATE_RE.search(raw):
+        return None
     low = raw.lower()
     if not _SET_CHAT_SERIES_WORD_RE.search(low):
         return None
