@@ -767,6 +767,219 @@ def maybe_route_to_correction_command(token: str, chat_id: int, msg: dict[str, A
     return True
 
 
+# ----- Ф3 (ISS-7/REQ 7.4): команда смены чата серии -----
+
+
+def _series_display_map() -> dict[str, str]:
+    """slug→отображаемое имя из `protocol_to_tg` (хардкод + JSON-конфиг).
+
+    Best-effort: для резолва человекочитаемой ссылки владельца («Директорат» →
+    `anzhee-direktorat`) и для подтверждения. Сбой импорта → пустой маппинг
+    (резолв по slug всё равно работает)."""
+    try:
+        from notary.lib import protocol_to_tg  # noqa: PLC0415
+        dm = dict(getattr(protocol_to_tg, "_SERIES_DISPLAY_OVERRIDES", {}) or {})
+        try:
+            dm.update(protocol_to_tg._load_series_display_config() or {})
+        except Exception:  # noqa: BLE001
+            pass
+        return dm
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _reply_context_series(cid: int, msg: dict[str, Any]) -> Optional[str]:
+    """Серия из реплая на доставленный протокол (REQ 7.4, форма «эту серию шли сюда»).
+
+    None, если сообщение не reply на наш протокол или резолв не удался."""
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return None
+    try:
+        from notary.lib.feedback_worker import find_delivered_protocol  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        meeting = find_delivered_protocol(cid, reply_to.get("message_id"))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[set-chat] find_delivered_protocol failed: %s", e)
+        return None
+    if isinstance(meeting, dict):
+        s = meeting.get("series")
+        if isinstance(s, str) and s:
+            return s
+    return None
+
+
+def maybe_route_to_set_chat_command(
+    token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """ISS-7/REQ 7.4: команда владельца «серию X шли сюда / в личку / в чат N».
+
+    Переназначает серию→чат в watched.yaml; применяется к будущим протоколам;
+    повторная команда перезаписывает. Вызывается ДО DM-гейта (работает и в
+    группе, и в личке) — поэтому owner-гейт внутри: в группе применяет ТОЛЬКО
+    если отправитель = владелец (его user_id == allowed_chat; в приватном чате
+    chat.id == user.id). Узкий триггер парсера (серию+глагол+цель) + owner-гейт
+    → обычную переписку не перехватывает.
+
+    True = распознано и дана ВИДИМАЯ реакция (R-REPLY: «✅ принял» / «не нашёл») —
+    caller выходит. False = не наша команда / не владелец → обычный dispatch.
+
+    R9 («Опасная тройка»): текст команды/протокола НЕ логируем — только
+    метаданные (серия / chat_id).
+    """
+    if cid is None:
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+    try:
+        from notary.lib.correction_command import parse_correction_command  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[set-chat] correction_command import failed: %s", e)
+        return False
+    parsed = parse_correction_command(text)
+    if parsed is None or parsed.kind != "set_chat":
+        return False
+
+    # Owner-гейт: в группе — только владелец (его user_id == allowed_chat).
+    from_id = (msg.get("from") or {}).get("id")
+    is_dm = cid == allowed_chat
+    if not is_dm and from_id != allowed_chat:
+        logger.info(
+            "[set-chat] не владелец (from=%s chat=%s) — команда смены чата пропущена",
+            from_id, cid,
+        )
+        return False
+
+    msg_id = msg.get("message_id")
+
+    # Целевой chat_id: «сюда»→текущий чат, «в личку»→владелец, иначе явный id.
+    if parsed.target == "here":
+        target_chat: Optional[int] = cid
+    elif parsed.target == "dm":
+        target_chat = allowed_chat
+    else:
+        try:
+            target_chat = int(parsed.target)
+        except (ValueError, TypeError):
+            send_message(
+                token, cid,
+                "🤔 Не понял, в какой чат слать. Скажи «…шли сюда», «…в личку» или «…в чат <id>».",
+                reply_to=msg_id,
+            )
+            return True
+
+    # Серия: явная ссылка ИЛИ из реплая на доставленный протокол.
+    series_ref = (parsed.series or "").strip()
+    reply_slug: Optional[str] = None
+    if not series_ref:
+        reply_slug = _reply_context_series(cid, msg)
+        if reply_slug is None:
+            send_message(
+                token, cid,
+                "🤔 Не понял, какую серию переназначить. Скажи «серию <имя> шли сюда» "
+                "или ответь этой командой на доставленный протокол серии.",
+                reply_to=msg_id,
+            )
+            return True
+
+    try:
+        from notary.cli.registry import (  # noqa: PLC0415
+            load_watched, save_watched, set_telegram_chat_id_for_series,
+            release_watched_lock, resolve_series_ref,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[set-chat] registry import failed: %s", e)
+        send_message(
+            token, cid,
+            "⚠️ Не смог открыть реестр серий — привязку не сохранил. Попробуй ещё раз.",
+            reply_to=msg_id,
+        )
+        return True
+
+    display_map = _series_display_map()
+    try:
+        watched = load_watched(lock=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[set-chat] load_watched lock failed: %s", e)
+        send_message(
+            token, cid,
+            "⚠️ Реестр серий занят — не сохранил привязку. Попробуй ещё раз.",
+            reply_to=msg_id,
+        )
+        return True
+
+    saved = False
+    try:
+        ref_for_resolve = reply_slug if reply_slug is not None else series_ref
+        slug = resolve_series_ref(ref_for_resolve, watched, display_map=display_map)
+        if slug is None and reply_slug is not None:
+            # Серия из реплая может быть one-off вне watched — попробуем как есть.
+            slug = reply_slug if any(
+                w.get("series") == reply_slug for w in watched.get("watched", [])
+            ) else None
+        if slug is None:
+            known = sorted({
+                w.get("series") for w in watched.get("watched", [])
+                if isinstance(w.get("series"), str) and w.get("series")
+            })
+            known_str = ", ".join(known) if known else "—"
+            send_message(
+                token, cid,
+                f"🤔 Не нашёл серию «{ref_for_resolve}» в реестре. Известные серии: "
+                f"{known_str}. Уточни slug или имя.",
+                reply_to=msg_id,
+            )
+            logger.info("[set-chat] серия не найдена в реестре (chat=%s)", cid)
+            return True
+        n = set_telegram_chat_id_for_series(slug, target_chat, watched)
+        if n == 0:
+            send_message(
+                token, cid,
+                f"🤔 Серия «{slug}» есть, но без активной записи для привязки. "
+                "Проверь watched.yaml.",
+                reply_to=msg_id,
+            )
+            logger.warning("[set-chat] set вернул 0 для slug=%s (chat=%s)", slug, cid)
+            return True
+        save_watched(watched)
+        saved = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[set-chat] запись привязки упала: %s", e)
+        send_message(
+            token, cid,
+            "⚠️ Не смог сохранить привязку серии. Попробуй ещё раз.",
+            reply_to=msg_id,
+        )
+        return True
+    finally:
+        if not saved:
+            try:
+                release_watched_lock()
+            except Exception:  # noqa: BLE001
+                pass
+
+    display = display_map.get(slug, slug)
+    if parsed.target == "dm" or target_chat == allowed_chat:
+        where = "в личку"
+    elif parsed.target == "here" or target_chat == cid:
+        where = "в этот чат"
+    else:
+        where = f"в чат {target_chat}"
+    send_message(
+        token, cid,
+        f"✅ Принял. Серия «{display}» теперь идёт {where}. Будущие протоколы — туда.",
+        reply_to=msg_id,
+    )
+    logger.info(
+        "[set-chat] привязка обновлена: series=%s → chat=%s (записей=%d, by_owner)",
+        slug, target_chat, n,
+    )
+    return True
+
+
 # Ф4 (REQ 4.1): фолбэк, когда голос распознать не удалось (транскрибация
 # недоступна / упала). Не молчим — явно говорим, что понимаем текст/кнопки.
 VOICE_FALLBACK_MSG = (
@@ -1334,6 +1547,14 @@ def _job_apply_reply(
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     chat = msg.get("chat") or {}
     cid = chat.get("id")
+
+    # ISS-7/REQ 7.4: команда смены чата серии «серию X шли сюда/в личку/в чат N».
+    # ДО шлюза правок и DM-гейта — команду владелец может дать прямо в целевой
+    # группе (cid != allowed_chat), а шлюз правок ниже «прожевал» бы любое не-reply
+    # сообщение в группе. Owner-гейт и узкий триггер — внутри (обычную переписку и
+    # команды коррекции не перехватывает).
+    if maybe_route_to_set_chat_command(token, cid, allowed_chat, msg):
+        return
 
     # Ф3 шлюз правок (FB1): reply на доставленный протокол в ЛЮБОМ чате серии.
     # Проверяем ДО DM-гейта — правки приходят в групповые чаты (cid != allowed_chat),

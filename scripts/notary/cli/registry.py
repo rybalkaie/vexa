@@ -298,20 +298,104 @@ def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[
 # ----- Ф6: helper'ы для telegram_chat_id привязок -----
 
 
-def get_telegram_chat_id_for_series(series: str, watched: dict[str, Any]) -> int | None:
-    """Возвращает первый встреченный `telegram_chat_id` среди записей с этой series.
+def normalize_series_key(series: Any) -> str:
+    """Каноничный ключ серии для устойчивого сравнения (Ф3 ISS-7, РИСК4).
 
-    Если несколько записей одной series имеют разные chat_id — берётся первый
-    (это аномалия, должна быть одна привязка на series; писатель её не плодит).
+    Корень ISS-7: и чтение (`get_telegram_chat_id_for_series`), и запись
+    (`set_telegram_chat_id_for_series`) матчили серию ТОЧНЫМ `==` по строке.
+    Любой дрейф ключа (регистр, пробелы, кавычки вокруг человекочитаемого
+    имени) → 0 совпадений → привязка молча теряется → протокол уходит в личку.
+    Нормализация: срез пробелов и обрамляющих кавычек + casefold (юникод-aware
+    нижний регистр). Разделители slug (`-`/`_`) НЕ схлопываем — это рискованно
+    (две разные серии могли бы совпасть); межсловарный случай slug↔имя
+    решается отдельно через `resolve_series_ref` + display-маппинг.
+    """
+    if not isinstance(series, str):
+        return ""
+    return series.strip().strip("«»\"'").strip().casefold()
+
+
+def get_telegram_chat_id_for_series(series: str, watched: dict[str, Any]) -> int | None:
+    """Возвращает `telegram_chat_id` для series из watched.yaml или None.
+
+    РИСК4 (ISS-7): сначала ТОЧНОЕ совпадение строки (исторический контракт —
+    если есть точная запись, берём её), затем — нормализованное (`casefold` +
+    срез пробелов/кавычек), чтобы рассинхрон регистра/пробелов в `meta.series`
+    vs `watched.yaml` НЕ ронял привязку молча в личку. Если несколько записей
+    одной series имеют разные chat_id — берётся первый (аномалия; одна привязка
+    на series — инвариант писателя).
     """
     if not series:
         return None
+    norm = normalize_series_key(series)
+    fallback: int | None = None  # нормализованное совпадение, если точного нет
     for w in watched.get("watched", []):
-        if w.get("series") != series:
+        cid = w.get("telegram_chat_id")
+        if not (isinstance(cid, int) and not isinstance(cid, bool)):
             continue
+        ws = w.get("series")
+        if ws == series:
+            return cid  # точное совпадение приоритетно
+        if fallback is None and ws is not None and normalize_series_key(ws) == norm:
+            fallback = cid
+    return fallback
+
+
+def find_series_bindings(watched: dict[str, Any]) -> list[tuple[Any, int]]:
+    """Все пары `(series, telegram_chat_id)` из watched.yaml, где привязка задана.
+
+    Чистая функция для диагностики silent-fallthrough (ISS-7/REQ 7.3): если
+    `get_telegram_chat_id_for_series` вернул None, но привязки в реестре ЕСТЬ —
+    значит ключ серии рассинхронен; caller логирует это (метаданные, без текста).
+    """
+    out: list[tuple[Any, int]] = []
+    if not isinstance(watched, dict):
+        return out
+    for w in watched.get("watched", []):
         cid = w.get("telegram_chat_id")
         if isinstance(cid, int) and not isinstance(cid, bool):
-            return cid
+            out.append((w.get("series"), cid))
+    return out
+
+
+def resolve_series_ref(
+    ref: str, watched: dict[str, Any], *, display_map: dict[str, str] | None = None
+) -> str | None:
+    """Резолвит человекочитаемую ссылку владельца на серию → каноничный slug.
+
+    Для команды смены чата (REQ 7.4): владелец называет серию свободно — slug
+    (`anzhee-direktorat`), отображаемым именем («Директорат») или с дрейфом
+    регистра/кавычек. Возвращаем РЕАЛЬНЫЙ slug, существующий в watched.yaml
+    (привязка цепляется к существующей записи), или None если не нашли.
+
+    Приоритет: точный slug → нормализованный slug → обратный display-маппинг
+    (имя→slug, только если slug есть в watched). None → caller сообщает владельцу
+    «не нашёл серию» (видимая реакция, НЕ молчаливый провал — R-REPLY).
+    """
+    if not ref or not isinstance(ref, str):
+        return None
+    ref_s = ref.strip().strip("«»\"'").strip()
+    if not ref_s:
+        return None
+    series_list = [
+        w.get("series")
+        for w in watched.get("watched", [])
+        if isinstance(w.get("series"), str) and w.get("series")
+    ]
+    # 1. Точный slug.
+    for s in series_list:
+        if s == ref_s:
+            return s
+    # 2. Нормализованный slug (регистр/пробелы/кавычки).
+    nref = normalize_series_key(ref_s)
+    for s in series_list:
+        if normalize_series_key(s) == nref:
+            return s
+    # 3. Обратный display-маппинг: имя → slug (если slug есть в watched).
+    if display_map:
+        for slug, disp in display_map.items():
+            if isinstance(disp, str) and normalize_series_key(disp) == nref and slug in series_list:
+                return slug
     return None
 
 
@@ -357,14 +441,22 @@ def set_telegram_chat_id_for_series(series: str, chat_id: int, watched: dict[str
 
     Возвращает число обновлённых записей. Caller обязан после этого вызвать
     `save_watched(watched)` (atomic + flock уже встроены в save_watched).
+
+    РИСК4 (ISS-7): матч симметричен чтению — точное `==` ИЛИ нормализованное
+    (`casefold`/пробелы/кавычки), чтобы запись и чтение привязки не
+    рассинхронились по дрейфу ключа. Команда смены чата (REQ 7.4) до вызова
+    резолвит ссылку владельца в каноничный slug (`resolve_series_ref`), так что
+    сюда обычно приходит точный slug; нормализация страхует CLI/ручной путь.
     """
     if not series:
         return 0
     if not isinstance(chat_id, int) or isinstance(chat_id, bool):
         raise ValueError(f"chat_id must be int, got {type(chat_id).__name__}")
     n = 0
+    nseries = normalize_series_key(series)
     for w in watched.get("watched", []):
-        if w.get("series") == series:
+        ws = w.get("series")
+        if ws == series or (ws is not None and normalize_series_key(ws) == nseries):
             w["telegram_chat_id"] = chat_id
             n += 1
     return n

@@ -3223,24 +3223,67 @@ def _persist_transcript_paths(meta_json_path: Optional[Path], meeting_meta: dict
         logger.warning("[delivery] персист transcript_path не удался (non-fatal): %s", e)
 
 
-def _load_watched_for_series(series: str, watched_path: Optional[Path] = None) -> Optional[int]:
+def _load_watched_for_series(
+    series: str,
+    watched_path: Optional[Path] = None,
+    *,
+    _watched: Optional[dict] = None,
+) -> Optional[int]:
     """Возвращает `telegram_chat_id` для series из watched.yaml или None.
 
     Импорт `cli.registry` ленивый (`venv-cli` имеет PyYAML, на VPS — тоже).
-    На сбое — None (caller спросит Илью).
+    На сбое — None (caller дефолтит в личку, REQ 7.2).
+
+    ISS-7/REQ 7.3 (РИСК4): если привязка НЕ нашлась, но в watched.yaml ВООБЩЕ
+    есть привязки серий — это silent-fallthrough (рассинхрон ключа серии:
+    `meta.series` ≠ ключу в реестре). Логируем диагностику (только метаданные:
+    серия + ключи/chat_id привязок, БЕЗ текста протокола — «Опасная тройка»),
+    чтобы баг «групповой адрес не подхватился» был ВИДЕН в логе, а не уходил в
+    личку незаметно. Сам фолбэк в личку штатен (REQ 7.2) — диагностика отличает
+    «нет привязок вовсе» от «привязка есть, но к другому ключу».
+
+    `_watched` — инъекция реестра для юнит-тестов (минует ленивый `load_watched`
+    и PyYAML); в проде None → грузим из реестра.
     """
     try:
-        from notary.cli.registry import load_watched, get_telegram_chat_id_for_series
+        from notary.cli.registry import (  # noqa: PLC0415
+            load_watched, get_telegram_chat_id_for_series, find_series_bindings,
+            normalize_series_key,
+        )
     except Exception as e:  # noqa: BLE001
         logger.warning("[delivery] cli.registry import failed: %s", e)
         return None
-    try:
-        watched = load_watched()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[delivery] load_watched failed: %s", e)
-        return None
+    if _watched is not None:
+        watched = _watched
+    else:
+        try:
+            watched = load_watched()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[delivery] load_watched failed: %s", e)
+            return None
     cid = get_telegram_chat_id_for_series(series, watched)
     if cid is None:
+        # Диагностика рассинхрона ключа: предупреждаем ТОЛЬКО про БЛИЗКУЮ привязку
+        # (тот же идентификатор, дрейф формата — дефис/подчёркивание/регистр/пробел),
+        # а не про любую чужую серию с привязкой. Иначе — шум на каждой легитимной
+        # DM-серии, пока ХОТЬ ОДНА другая серия привязана к группе (REQ 7.2 — личка
+        # штатна). Близость = равенство ключей со схлопнутыми разделителями.
+        def _collapse(s: Any) -> str:
+            return normalize_series_key(s).replace("-", "").replace("_", "").replace(" ", "")
+
+        target_norm = _collapse(series)
+        near = [
+            (s, c) for (s, c) in find_series_bindings(watched)
+            if isinstance(s, str) and target_norm and _collapse(s) == target_norm
+        ]
+        if near:
+            logger.warning(
+                "[delivery] silent-fallthrough ISS-7: series=%r НЕ сматчилась точно, но есть "
+                "близкая привязка под ключом(ами) %r — рассинхрон формата ключа серии; "
+                "протокол уйдёт в личку. Проверь slug в реестре или задай адрес командой "
+                "«серию %s шли сюда» в нужном чате.",
+                series, [n[0] for n in near], series,
+            )
         return None
     return cid
 
