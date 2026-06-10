@@ -68,6 +68,22 @@ PROJECT_GLOSSARY_PROMPT_BLOCK = """Глоссарий проекта (домен
 Не добавляй термины, которых в транскрипте нет. Глоссарий — про написание уже сказанного, а не повод дописать."""
 
 
+# --- Cross-cutting базис (Ф8, У1/У2): не-терминные правила, переживающие YAML --
+#
+# При активации YAML-знания `glossary_prompt_block` строит блок ИЗ YAML-записей
+# (term→canonical), но эти записи НЕ выражают свободные cross-cutting правила:
+# контекстную дизамбигуацию (VPN→VPS только про свой сервер; handoff→образцы
+# только в контексте заказа), анти-галлюцинацию чисел, «Ilya R.»=Илья. Без слияния
+# они терялись бы при переходе на YAML (У1/У2). Поэтому этот базис рендерится
+# ВСЕГДА, когда YAML активен, ПОВЕРХ YAML-терминов и (опц.) YAML-секции `guidance`.
+# Намеренно НЕ дублирует финальный «не обобщай/не дописывай» хвост build_prompt_block.
+CROSS_CUTTING_GUIDANCE_BLOCK = """Контекстные правила (поверх списка терминов):
+- «Ilya R.»/«Илья Р.» среди участников — это Илья Рыбалка.
+- VPS — наш сервер в Германии: «работаю через … Германия» это VPS, НЕ VPN; «VPN» в контексте своего сервера → VPS.
+- «образцы»/«сэмплы» (в контексте заказа / «без … не заказать») — НЕ «хендофф»/«handoff»; «хендофф»/«handoff» в контексте заказа/поставки → образцы (сэмплы).
+- Галлюцинации брендов вместо чисел (напр. «Audition» вместо «18 ед.») — НЕ выдумывай бренд, оставь число/смысл из контекста реплики."""
+
+
 # --- Слой 2: детерминированный пост-проход по протоколу ------------------------
 #
 # Каждая запись — (compiled regex, replacement). Только ВЫСОКОТОЧНЫЕ замены:
@@ -182,13 +198,21 @@ def build_protocol_replacements(entries: list[dict]) -> list[tuple[re.Pattern, s
 def glossary_prompt_block(company: Optional[str] = None) -> str:
     """Промпт-блок глоссария для компании встречи (проекция B-1, контракт §4).
 
-    Есть YAML-знание компании → блок из него (company-scoped); нет (company=None /
-    клон не забутстраплен / нет pyyaml) → встроенный `PROJECT_GLOSSARY_PROMPT_BLOCK`
-    (поведение как до Ф5). Обе ветки — синхронно с `apply_glossary_corrections`.
+    Есть YAML-знание компании → блок из него (company-scoped) + опц. YAML-секция
+    `guidance` + стабильный cross-cutting базис `CROSS_CUTTING_GUIDANCE_BLOCK`
+    (Ф8 У1/У2: не-терминные правила не теряются при активации YAML); нет
+    (company=None / клон не забутстраплен / нет pyyaml) → встроенный
+    `PROJECT_GLOSSARY_PROMPT_BLOCK` (поведение как до Ф5; он уже содержит и термины,
+    и cross-cutting правила). Обе ветки — синхронно с `apply_glossary_corrections`.
     """
     entries = context_knowledge.load_glossary(company)
     if entries:
-        return build_prompt_block(entries)
+        parts = [build_prompt_block(entries)]
+        guidance = context_knowledge.load_guidance(company)
+        if guidance:
+            parts.append("Правила команды:\n" + "\n".join(f"- {g}" for g in guidance))
+        parts.append(CROSS_CUTTING_GUIDANCE_BLOCK)
+        return "\n\n".join(p for p in parts if p)
     return PROJECT_GLOSSARY_PROMPT_BLOCK
 
 

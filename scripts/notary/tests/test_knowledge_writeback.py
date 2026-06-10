@@ -242,5 +242,98 @@ class TestOutboxDigest(_IsolatedMixin):
         self.assertIn("Bolong", dig["mpfirst"]["terms"])
 
 
+class TestRunFlushLive(_IsolatedMixin):
+    """Боевой раннер write-back на РЕАЛЬНОМ git (bare origin + клон): deploy-key push
+    ветки + compare-URL, накопительная модель, дедуп против main, инвариант «не main».
+    """
+
+    def setUp(self):
+        super().setUp()
+        import subprocess  # noqa: PLC0415
+        self.sub = subprocess
+        self.ctx = self.base / "ctx"            # = MEETING_NOTARY_CONTEXT_DIR
+        self.ctx.mkdir(parents=True)
+        os.environ["MEETING_NOTARY_CONTEXT_DIR"] = str(self.ctx)
+        self.bare = self.base / "anzhee-context.git"
+        self.clone = self.ctx / "anzhee-context"   # repo_for_company('anzhee')
+        seed = self.base / "seed"
+        kn = seed / "knowledge" / "notary"
+        kn.mkdir(parents=True)
+        # Комментарий-маркер — проверим, что textual-append его НЕ теряет.
+        (kn / "glossary.yaml").write_text(
+            "# COMMENT-MARKER не терять\nversion: 1\n\nterms:\n"
+            "  - canonical: РСЯ\n    scope: cross\n    note: рекламная сеть\n\nguidance: []\n",
+            encoding="utf-8")
+        (kn / "org-structure.yaml").write_text("version: 1\nrosters: {}\n", encoding="utf-8")
+        self._git(seed, "init", "-q", "-b", "main")
+        self._git(seed, "config", "user.email", "t@t"); self._git(seed, "config", "user.name", "T")
+        self._git(seed, "add", "-A"); self._git(seed, "commit", "-q", "-m", "seed")
+        self._git(self.base, "clone", "-q", "--bare", str(seed), str(self.bare))
+        self._git(self.base, "clone", "-q", str(self.bare), str(self.clone))
+        self._git(self.clone, "config", "user.email", "t@t"); self._git(self.clone, "config", "user.name", "T")
+
+    def _git(self, cwd, *args):
+        r = self.sub.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r
+
+    def _bare_branches(self):
+        return self._git(self.bare, "branch", "--format=%(refname:short)").stdout.split()
+
+    def _show(self, ref, path="knowledge/notary/glossary.yaml"):
+        return self._git(self.bare, "show", f"{ref}:{path}").stdout
+
+    def test_push_branch_not_main_and_compare_url(self):
+        wb.propose_term("оффер", series="s1", company="anzhee", publication_allowed=True, note="продажи")
+        res = wb.run_flush("anzhee", clone_path=self.clone)
+        self.assertEqual(res["status"], "pr-pushed")
+        self.assertIn("compare/main...notary/auto-knowledge", res["compare_url"])
+        # 🔴 bot-ветка запушена, main НЕ тронут.
+        self.assertIn("notary/auto-knowledge", self._bare_branches())
+        self.assertNotIn("оффер", self._show("main"))
+        self.assertIn("оффер", self._show("notary/auto-knowledge"))
+        # textual-append сохранил комментарий и существующий термин.
+        self.assertIn("COMMENT-MARKER", self._show("notary/auto-knowledge"))
+        self.assertIn("РСЯ", self._show("notary/auto-knowledge"))
+        # запись стала pr-pending с compare-URL (для дайджеста D2).
+        rec = wb._read_outbox("anzhee")[0]
+        self.assertEqual(rec["status"], "pr-pending")
+        self.assertIn("compare", rec.get("compare_url", ""))
+
+    def test_already_in_main_marks_merged_no_push(self):
+        # РСЯ уже в main → дедуп при flush → merged, ветку не пушим.
+        wb._append_outbox("anzhee", {"kind": "term", "company": "anzhee", "value": "РСЯ",
+                                     "payload": {"canonical": "РСЯ"}, "status": "queued", "at": "x"})
+        res = wb.run_flush("anzhee", clone_path=self.clone)
+        self.assertEqual(res["status"], "already-merged")
+        self.assertEqual(wb._read_outbox("anzhee")[0]["status"], "merged")
+        self.assertNotIn("notary/auto-knowledge", self._bare_branches())
+
+    def test_accumulating_branch_keeps_prior_pending(self):
+        wb.propose_term("оффер", series="s1", company="anzhee", publication_allowed=True)
+        wb.run_flush("anzhee", clone_path=self.clone)              # оффер → pr-pending
+        wb.propose_term("ДемоТерм", series="s1", company="anzhee", publication_allowed=True)
+        res = wb.run_flush("anzhee", clone_path=self.clone)        # копим: оффер + ДемоТерм
+        self.assertEqual(res["status"], "pr-pushed")
+        glos = self._show("notary/auto-knowledge")
+        self.assertIn("оффер", glos)      # прошлый pr-pending не потерян при recreate
+        self.assertIn("ДемоТерм", glos)
+
+    def test_no_clone(self):
+        self.assertEqual(
+            wb.run_flush("anzhee", clone_path=self.base / "nope")["status"], "no-clone")
+
+    def test_compare_url_and_plan_variants(self):
+        self.assertEqual(
+            wb.compare_url("o/r"),
+            "https://github.com/o/r/compare/main...notary/auto-knowledge?expand=1")
+        e = [{"kind": "term", "payload": {"canonical": "x"}, "value": "x"}]
+        push = wb.plan_pr("anzhee", e, pr_via="push")
+        self.assertNotIn("gh pr create", " ".join(" ".join(c) for c in push.commands))
+        self.assertTrue(push.compare_url)
+        gh = wb.plan_pr("anzhee", e)   # дефолт gh
+        self.assertIn("gh pr create", " ".join(" ".join(c) for c in gh.commands))
+
+
 if __name__ == "__main__":
     unittest.main()

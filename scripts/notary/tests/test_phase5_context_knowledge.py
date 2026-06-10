@@ -162,6 +162,45 @@ class TestProjectionBFromEntries(unittest.TestCase):
 
 
 # ===========================================================================
+# Ф8 (У1/У2): merge builtin cross-cutting базис + YAML-секция guidance —
+# не-терминные правила не теряются при активации YAML. Monkeypatch загрузчиков.
+# ===========================================================================
+class TestCrossCuttingGuidanceMerge(unittest.TestCase):
+
+    def test_yaml_active_keeps_cross_cutting_base(self):
+        from unittest import mock
+        anzhee = ck.filter_glossary_by_company(_ENTRIES, "anzhee")
+        with mock.patch.object(ck, "load_glossary", return_value=anzhee), \
+             mock.patch.object(ck, "load_guidance", return_value=[]):
+            block = glossary.glossary_prompt_block("anzhee")
+        self.assertIn("РСЯ", block)                       # YAML-термин на месте
+        self.assertIn("Ilya R.", block)                   # cross-cutting базис не потерян
+        self.assertIn("VPS", block)                       # контекстное правило (VPN→VPS)
+        self.assertNotEqual(block, glossary.PROJECT_GLOSSARY_PROMPT_BLOCK)  # это НЕ builtin-ветка
+
+    def test_yaml_guidance_section_rendered(self):
+        from unittest import mock
+        anzhee = ck.filter_glossary_by_company(_ENTRIES, "anzhee")
+        with mock.patch.object(ck, "load_glossary", return_value=anzhee), \
+             mock.patch.object(ck, "load_guidance", return_value=["сумма всегда в рублях"]):
+            block = glossary.glossary_prompt_block("anzhee")
+        self.assertIn("Правила команды", block)
+        self.assertIn("сумма всегда в рублях", block)
+        self.assertIn("Ilya R.", block)                   # базис всё равно есть
+
+    def test_no_yaml_uses_builtin_unchanged(self):
+        from unittest import mock
+        with mock.patch.object(ck, "load_glossary", return_value=[]), \
+             mock.patch.object(ck, "load_guidance", return_value=["игнор"]):
+            block = glossary.glossary_prompt_block("anzhee")
+        self.assertEqual(block, glossary.PROJECT_GLOSSARY_PROMPT_BLOCK)
+
+    def test_load_guidance_graceful_non_list(self):
+        # load_guidance отдаёт [] при не-списке/мусоре (graceful как load_glossary)
+        self.assertEqual(glossary.context_knowledge.load_guidance(None), [])
+
+
+# ===========================================================================
 # Проекция A (ASR-словарь) из записей — инъекция, всегда
 # ===========================================================================
 class TestProjectionAFromEntries(unittest.TestCase):

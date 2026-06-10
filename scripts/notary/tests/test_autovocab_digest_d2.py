@@ -80,10 +80,24 @@ class TestKnowledgeSection(_IsolatedMixin):
         self.assertIn("Шаблон протокола v2", section)
         self.assertIn("суммы выводи таблицей", section)
 
-    def test_not_provisioned_note(self):
+    def test_queued_shows_awaiting_writeback(self):
+        # Ещё не запушено в bot-ветку → группа «в очереди» + пояснение про прогон.
         wb.propose_term("оффер", series="s1", company="anzhee", publication_allowed=True)
         section = digest.format_knowledge_section()
-        self.assertIn("провижининге", section)
+        self.assertIn("в очереди", section)
+        self.assertIn("write-back", section)
+
+    def test_pending_shows_compare_link(self):
+        # Запись в открытой bot-ветке → показываем compare-URL для открытия PR командой.
+        wb._append_outbox("anzhee", {
+            "kind": "term", "company": "anzhee", "value": "оффер",
+            "payload": {"canonical": "оффер"}, "status": wb.STATUS_PENDING,
+            "compare_url": "https://github.com/anzhee-dev/anzhee-context/compare/main...notary/auto-knowledge?expand=1",
+            "at": "x"})
+        section = digest.format_knowledge_section()
+        self.assertIn("PR-ветка готова", section)
+        self.assertIn("открыть PR:", section)
+        self.assertIn("compare/main...notary/auto-knowledge", section)
 
 
 class TestRunComposition(_IsolatedMixin):

@@ -221,6 +221,10 @@ EDITABLE_FIELDS = {
     "duration_minutes": "int",
     "series": "str",
     "expected_participants": "list",
+    # Ф6/Ф8 (E6): разметка серии для гейта публикации знания. Значения валидируются
+    # в validate_watched_record (company∈{anzhee,mpfirst}, visibility∈{company,private}).
+    "company": "str",
+    "visibility": "str",
 }
 
 

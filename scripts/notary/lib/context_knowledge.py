@@ -58,6 +58,18 @@ _DEFAULT_REPO_MAP = {
     "mpfirst": "mpfirst-context",
 }
 
+# Карта компания → GitHub-владелец репо контекста (Ф8). Репо двух компаний лежат
+# под РАЗНЫМИ владельцами: anzhee-context — в орге `anzhee-dev`, mpfirst-context —
+# в личном аккаунте `rybalkaie`. Поэтому full_repo = `<owner>/<repo>`, а git-токен
+# выдаётся per-company (fine-grained PAT не покрывает двух владельцев одним токеном).
+# Значения совпадают с Makefile (ANZHEE_CONTEXT_REPO/MPFIRST_CONTEXT_REPO) — там
+# источник для read-bootstrap, здесь — для write-back PR. Переопределяемо env
+# `NOTARY_CONTEXT_OWNER_<COMPANY>`.
+_DEFAULT_OWNER_MAP = {
+    "anzhee": "anzhee-dev",
+    "mpfirst": "rybalkaie",
+}
+
 # Допустимые значения поля scope в glossary.yaml.
 SCOPE_CROSS = "cross"
 
@@ -103,6 +115,61 @@ def repo_for_company(company: Optional[str]) -> Optional[str]:
     if not company or not str(company).strip():
         return None
     return _repo_map().get(str(company).strip().lower())
+
+
+def _owner_map() -> dict[str, str]:
+    """company → github-owner с env-переопределением (`NOTARY_CONTEXT_OWNER_ANZHEE=...`)."""
+    out = dict(_DEFAULT_OWNER_MAP)
+    for company in _DEFAULT_OWNER_MAP:
+        override = os.environ.get(f"NOTARY_CONTEXT_OWNER_{company.upper()}")
+        if override and override.strip():
+            out[company] = override.strip()
+    return out
+
+
+def owner_for_company(company: Optional[str]) -> Optional[str]:
+    """GitHub-владелец репо контекста (орг/аккаунт). Неизвестная компания → None."""
+    if not company or not str(company).strip():
+        return None
+    return _owner_map().get(str(company).strip().lower())
+
+
+def full_repo_for_company(company: Optional[str]) -> Optional[str]:
+    """`<owner>/<repo>` для компании (для `gh pr --repo` и git-remote). None, если
+    неизвестен владелец ИЛИ имя репо (write-back на неизвестную компанию невозможен)."""
+    owner = owner_for_company(company)
+    repo = repo_for_company(company)
+    if not owner or not repo:
+        return None
+    return f"{owner}/{repo}"
+
+
+def git_token_for_company(company: Optional[str], *, write: bool = False) -> Optional[str]:
+    """Git-токен per-company (Ф8). fine-grained PAT привязан к одному владельцу,
+    поэтому токен ищется по компании, затем — глобальный фолбэк.
+
+    write=True (push/PR):  `NOTARY_CONTEXT_GIT_WRITE_TOKEN_<CO>` → `..._WRITE_TOKEN`.
+    write=False (clone/fetch): `NOTARY_CONTEXT_GIT_TOKEN_<CO>` → `..._GIT_TOKEN`, а
+      при их отсутствии — write-токен (write implies read, отдельный read-токен
+      опционален). Пусто во всех слоях → None (инертно, как до провижининга)."""
+    co = (str(company).strip().lower() if company and str(company).strip() else "")
+    chain: list[str] = []
+    if write:
+        if co:
+            chain.append(f"NOTARY_CONTEXT_GIT_WRITE_TOKEN_{co.upper()}")
+        chain.append("NOTARY_CONTEXT_GIT_WRITE_TOKEN")
+    else:
+        if co:
+            chain.append(f"NOTARY_CONTEXT_GIT_TOKEN_{co.upper()}")
+        chain.append("NOTARY_CONTEXT_GIT_TOKEN")
+        if co:
+            chain.append(f"NOTARY_CONTEXT_GIT_WRITE_TOKEN_{co.upper()}")
+        chain.append("NOTARY_CONTEXT_GIT_WRITE_TOKEN")
+    for var in chain:
+        val = (os.environ.get(var) or "").strip()
+        if val:
+            return val
+    return None
 
 
 def knowledge_dir(company: Optional[str]) -> Optional[Path]:
@@ -208,6 +275,29 @@ def load_glossary(company: Optional[str]) -> list[GlossaryEntry]:
     Graceful: нет клона/файла/yaml/битый → `[]`.
     """
     return filter_glossary_by_company(_read_glossary_terms(company), company)
+
+
+def load_guidance(company: Optional[str]) -> list[str]:
+    """Опциональная doc-level секция `guidance` из glossary.yaml компании (Ф8, У1/У2).
+
+    Свободные cross-cutting правила, которые НЕ выражаются записью term→canonical
+    (контекстная дизамбигуация, анти-галлюцинация чисел и т.п.) — команда может
+    их вести в YAML рядом с терминами. Схема: `guidance:` — список строк. Любой не-
+    список / отсутствие / нестроковые элементы → `[]` (graceful, как load_glossary).
+
+    Это НАДСТРОЙКА над стабильным встроенным базисом `glossary.CROSS_CUTTING_GUIDANCE_BLOCK`
+    (который рендерится всегда при активном YAML) — потеря базиса при активации YAML
+    исключена даже если секция пустая."""
+    kdir = knowledge_dir(company)
+    if not kdir:
+        return []
+    data = _read_yaml(kdir / GLOSSARY_FILE)
+    if not data:
+        return []
+    raw = data.get("guidance")
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
 
 
 # --- Оргструктура (ростеры серий) ---------------------------------------------

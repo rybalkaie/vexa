@@ -73,25 +73,38 @@ def format_knowledge_section() -> str:
     try:
         from notary.lib import knowledge_writeback  # noqa: PLC0415
         outbox = knowledge_writeback.outbox_digest()
-        provisioned = knowledge_writeback.is_writeback_provisioned()
     except Exception as e:  # noqa: BLE001
         logger.info("[digest] knowledge outbox недоступен (%s)", e)
         outbox = {}
-        provisioned = False
     if outbox:
         lines.append("🧩 Знание, предложенное в контекст компаний (внёс сам — есть корректировки?):")
+        any_pending = False
         for company in sorted(outbox):
             info = outbox[company]
             repo = info.get("target_repo") or company
+            # Группа 1: уже в открытой bot-ветке — команде осталось открыть PR по ссылке.
+            pend = []
+            if info.get("pending_terms"):
+                pend.append("термины — " + ", ".join(info["pending_terms"]))
+            if info.get("pending_roles"):
+                pend.append("роли — " + ", ".join(info["pending_roles"]))
+            if pend:
+                any_pending = True
+                lines.append(f"• {repo} (PR-ветка готова): " + "; ".join(pend))
+                if info.get("pr_url"):
+                    lines.append(f"    открыть PR: {info['pr_url']}")
+            # Группа 2: ждут ближайшего прогона write-back (ещё не в ветке).
             parts = []
             if info.get("terms"):
                 parts.append("термины — " + ", ".join(info["terms"]))
             if info.get("roles"):
                 parts.append("роли — " + ", ".join(info["roles"]))
             if parts:
-                lines.append(f"• {repo}: " + "; ".join(parts))
-        lines.append("  (PR откроется при провижининге write-токена — Ф8)" if not provisioned
-                     else "  (предложения уходят в PR в *-context)")
+                lines.append(f"• {repo} (в очереди): " + "; ".join(parts))
+        if any_pending:
+            lines.append("  (bot-ветка запушена deploy key; открыть PR — клик по ссылке выше, мёрж за командой)")
+        else:
+            lines.append("  (уйдут в bot-ветку на ближайшем прогоне write-back; PR откроет команда по ссылке)")
     try:
         from notary.lib import protocol_template  # noqa: PLC0415
         tmpl_text, tmpl_version = protocol_template.digest_block()
