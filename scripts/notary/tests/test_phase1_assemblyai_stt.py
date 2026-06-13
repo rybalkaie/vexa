@@ -550,5 +550,57 @@ class TestFinalizeBranch(unittest.TestCase):
         self.assertEqual([t.speaker for t in turns], ["SPEAKER_00", "SPEAKER_01"])
 
 
+# ─────── РИСК3: сторож недельных трат и боевой движок (ход3 цикла) ───────
+
+class TestWeeklyGuardCoversActiveBackend(unittest.TestCase):
+    """Сторож трат тянет только Speechmatics jobs. Если боевой STT_BACKEND —
+    assemblyai (дефолт example с Ф1), он НЕ молча предупреждает, что расход
+    активного движка не учитывается и kill-switch по нему не взведётся (РИСК3)."""
+
+    def _run(self, backend):
+        import stt_weekly_guard as g  # top-level модуль notary (sys.path уже включает _NOTARY)
+        pushes = []
+
+        def pusher(msg, *, dedupe_key=None):
+            pushes.append((msg, dedupe_key))
+
+        saved = os.environ.get("STT_BACKEND")
+        if backend is None:
+            os.environ.pop("STT_BACKEND", None)
+        else:
+            os.environ["STT_BACKEND"] = backend
+        kpath = Path(tempfile.gettempdir()) / "nonexistent-stt-killswitch.flag"
+        try:
+            res = g.run_guard(
+                now=g._now_utc(),
+                failed_dir=Path(tempfile.gettempdir()) / "no-such-failed-dir-xyz",
+                warn_h=10.0, block_h=15.0,
+                killswitch_path=kpath,
+                jobs_fetcher=lambda now: [],   # SM ничего не тратил
+                pusher=pusher,
+                dry_run=True,
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("STT_BACKEND", None)
+            else:
+                os.environ["STT_BACKEND"] = saved
+        return res, pushes
+
+    def test_assemblyai_active_triggers_warning(self):
+        res, pushes = self._run("assemblyai")
+        self.assertIn("untallied-backend-warning", res["actions"])
+        self.assertTrue(any("assemblyai" in m for m, _ in pushes),
+                        "предупреждение должно называть активный движок")
+
+    def test_speechmatics_active_no_warning(self):
+        res, pushes = self._run("speechmatics")
+        self.assertNotIn("untallied-backend-warning", res["actions"])
+
+    def test_whisper_active_no_warning(self):
+        res, pushes = self._run("whisper_pyannote")
+        self.assertNotIn("untallied-backend-warning", res["actions"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

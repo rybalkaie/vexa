@@ -49,6 +49,15 @@ DEFAULT_FAILED_DIR = "/srv/meeting-notary/_failed"
 WINDOW_DAYS = 7
 _WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
+# РИСК3: какие STT-движки покрывает недельный счёт. fetch_jobs_speechmatics тянет
+# ТОЛЬКО Speechmatics jobs API, поэтому суммируется лишь он. Любой ДРУГОЙ внешний
+# (платный) движок — например AssemblyAI (боевой дефолт с Ф1 umnyi-protokol-
+# assemblyai) — сторож НЕ видит, и kill-switch по его расходу не взведётся. Пока
+# учёт такого движка не добавлен, об этом предупреждаем НЕ молча (см. run_guard).
+# whisper_pyannote — локальный/бесплатный, в счёте не нуждается.
+_EXTERNAL_STT_BACKENDS = ("speechmatics", "assemblyai")
+_TALLIED_STT_BACKENDS = ("speechmatics",)
+
 
 class WeeklySummary(NamedTuple):
     total_hours: float
@@ -330,6 +339,22 @@ def run_guard(
                dedupe_key=f"stt-killswitch-reminder:{day}")
         actions.append("reminder")
         return {"summary": summary, "actions": actions, "armed": True, "waiting": n_waiting}
+
+    # РИСК3: недельный счёт тянет ТОЛЬКО Speechmatics jobs. Если боевой STT_BACKEND —
+    # внешний платный движок, который сторож не суммирует (assemblyai), его расход
+    # невидим и kill-switch по нему НЕ взведётся. Не молчим об этом, пока учёт такого
+    # движка не добавлен (полный фикс — list-API AAI, нужен живой ключ для валидации).
+    active_backend = (os.environ.get("STT_BACKEND") or "").strip().lower() or "whisper_pyannote"
+    if active_backend in _EXTERNAL_STT_BACKENDS and active_backend not in _TALLIED_STT_BACKENDS:
+        pusher(
+            f"⚠️ Сторож недельных трат STT считает только Speechmatics, а активный "
+            f"движок — {active_backend}: его расход НЕ учитывается и kill-switch по "
+            f"нему НЕ взведётся (РИСК3). Слежение за лимитом сейчас НЕ покрывает "
+            f"боевой движок — добавь учёт {active_backend} в stt_weekly_guard, прежде "
+            f"чем полагаться на автоматический стоп-лимит.",
+            dedupe_key=f"stt-guard-untallied-backend:{active_backend}:{day}",
+        )
+        actions.append("untallied-backend-warning")
 
     if summary.total_hours >= block_h:
         # CG6: ≥block → взвести + пуш «остановлена».
