@@ -272,6 +272,9 @@ def _apply_resolution(
         # ПОСЛЕ регена и ДО до-сыла — иначе поздняя ревизия теряет пометки, и
         # diff «🔁 что изменилось» ложно показал бы «убрали ⚠️». Best-effort:
         # нет claude / kill-switch → 0 пометок, файл не трогаем.
+        # Ф7 (G8): rewrite=True — паритет с finalize. Поздний clarify тоже отдаёт
+        # вычитанный второй проходом протокол (иначе доразметка теряла бы редактуру
+        # критика). ТЕМ ЖЕ одним вызовом, что diarization — не третий вызов.
         if protocol_regenerated:
             try:
                 n_flags = llm_postprocess.review_and_flag_protocol_file(
@@ -279,10 +282,11 @@ def _apply_resolution(
                     transcript_path=transcript_path,
                     checks=("values", "roles", "memory", "diarization"),  # Ф7+Ф4: те же checks, что в finalize, ОДНИМ вызовом
                     meeting_sid=state.get("meeting_id"),
+                    rewrite=True,
                 )
                 if n_flags:
                     logger.info(
-                        "[review] meeting=%s ревизия: вернул %d ⚠️-пометок",
+                        "[review] meeting=%s self-review изменил %d пункт(ов)",
                         state.get("meeting_id"), n_flags,
                     )
             except Exception as e:  # noqa: BLE001

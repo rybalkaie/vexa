@@ -1346,6 +1346,11 @@ def main() -> int:
     # Ф4 (D2/D3): добавлена "diarization" — ТЕМ ЖЕ одним вызовом. Однозначные ошибки
     # деления по спикерам правятся в транскрипте (re-attribution), сомнительные —
     # помечаются «⚠️ спикер под вопросом» в протоколе (реплики на местах).
+    # Ф7 (G8): rewrite=True — второй проход «редактор-критик» ТЕМ ЖЕ одним вызовом
+    # ПЕРЕПИСЫВАЕТ черновик по чек-листу (пропущенное / задачи без владельца /
+    # смешение ролей / плоское / числа-инверсии), владельцу не надо править руками.
+    # 2 тяжёлых вызова суммарно (генерация + этот), НЕ третий. РИСК1: таймаут/сбой
+    # второго прохода → черновик отдаётся как финал (деградация, не потеря встречи).
     if _is_protocol_enabled() and protocol_path.is_file():
         try:
             n_flags = review_and_flag_protocol_file(
@@ -1353,9 +1358,10 @@ def main() -> int:
                 transcript_path=md_path,
                 checks=("values", "roles", "memory", "diarization"),
                 meeting_sid=session_uid,
+                rewrite=True,
             )
             if n_flags:
-                log.info("[review] meeting=%s flagged %d suspicious item(s) ⚠️", session_uid, n_flags)
+                log.info("[review] meeting=%s self-review изменил %d пункт(ов)", session_uid, n_flags)
         except Exception as e:  # noqa: BLE001
             log.warning("[review] failed (non-fatal): %s", e)
 

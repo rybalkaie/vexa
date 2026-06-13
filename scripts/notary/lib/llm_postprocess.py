@@ -43,7 +43,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 # AlignedTurn используется только в сигнатурах типов finalize-path функций
 # (`map_speaker_names`, `clarify_speakers_via_telegram`, `_build_samples_for_cluster`).
@@ -4740,6 +4740,38 @@ def _is_protocol_review_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+# === Ф7 (G8): второй проход «редактор-критик» (двухпроходная генерация) =======
+# Существующий ревью-проход только ФЛАЖИТ (⚠️). Ф7 добавляет РЕЖИМ «переписать
+# черновик по чек-листу» — модель сама вычитывает черновик (пропущенные
+# договорённости / задачи без владельца / смешение ролей / плоские формулировки /
+# числа-инверсии), владельцу не надо править руками. Это ВТОРОЙ из двух тяжёлых
+# вызовов (генерация черновика — первый); идёт на Opus, т.к. производит финал,
+# который читает владелец. ГРАН1/НЕС1: ревизия диаризации (Ф4) сходится в ЭТОТ ЖЕ
+# единственный вызов как секция `checks` — третьего Opus-вызова не заводим.
+PROTOCOL_REWRITE_MODEL = (
+    os.environ.get("PROTOCOL_REWRITE_MODEL") or "claude-opus-4-8"
+).strip()
+
+
+def _selfreview_timeout() -> int:
+    """Таймаут второго прохода (РИСК1): Opus на длинной встрече медленный, как и
+    генерация. Дефолт 600с; env `PROTOCOL_REWRITE_TIMEOUT` переопределяет;
+    глобальный пол `CLAUDE_MIN_TIMEOUT` (claude_cli) применяется ПОВЕРХ."""
+    try:
+        v = int(os.environ.get("PROTOCOL_REWRITE_TIMEOUT", "600") or "600")
+    except ValueError:
+        return 600
+    return v if v > 0 else 600
+
+
+def _is_protocol_selfreview_enabled() -> bool:
+    """Kill-switch второго прохода Ф7: `ENABLE_PROTOCOL_SELFREVIEW` (дефолт ON;
+    `0/false/no` → OFF). OFF → деградация на флаг-only ревью (Sonnet, поведение
+    до Ф7) без передеплоя — отдельный рычаг от общего `ENABLE_PROTOCOL_REVIEW`."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_SELFREVIEW") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
 _REVIEW_VALUES_SECTION = """### Секция "values" — подозрительные числа и инверсии смысла
 
 Сверь КАЖДОЕ число и КАЖДОЕ утверждение в протоколе с транскриптом. Помечай ТОЛЬКО реально подозрительное:
@@ -4841,28 +4873,164 @@ def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
     )
 
 
-def _parse_review_response(raw: str) -> list[dict]:
-    """Парсит JSON-ответ ревью-прохода в список findings. Терпим к обёртке.
+# === Ф7 (G8): промпт и парсер второго прохода «редактор-критик» ===============
 
-    Возвращает список dict'ов `{section, quote, note}`. На мусор — [].
+# Маркеры envelope-ответа второго прохода. РОБАСТНОСТЬ: большой markdown-протокол
+# отдаём СЫРЫМ после маркера (а не строкой внутри JSON) — одна неэкранированная
+# кавычка в 200-строчном протоколе не должна рушить разбор всего ответа.
+_REWRITE_DIAG_MARKER = "===ПРАВКИ==="
+_REWRITE_PROTOCOL_MARKER = "===ПРОТОКОЛ==="
+
+# Счётчики правок критика (для метаданных, G10 — только числа, без текста реплик).
+_REWRITE_EDIT_KEYS = (
+    "added_agreements",   # добавлено пропущенных договорённостей
+    "owners_assigned",    # задач без владельца → проставлен владелец
+    "roles_separated",    # переотнесено к верному человеку (смешение зон)
+    "sharpened",          # плоских формулировок → конкретизировано
+    "numbers_fixed",      # чисел/инверсий поправлено по транскрипту
+)
+
+_REVIEW_REWRITE_CHECKLIST = """Ты — придирчивый редактор-критик протокола встречи (ВТОРОЙ проход). Тебе дан ЧЕРНОВИК протокола (его собрала модель первым проходом) и исходный ТРАНСКРИПТ — источник истины. Задача: вычитать черновик и вернуть УЛУЧШЕННУЮ версию, которую владельцу не придётся править руками.
+
+Пройди по чек-листу и исправь ПРЯМО в тексте протокола:
+1. ПРОПУЩЕННЫЕ ДОГОВОРЁННОСТИ — в транскрипте есть решение / договорённость / задача, которой нет в черновике → добавь её на нужное место (опираясь ТОЛЬКО на транскрипт).
+2. ЗАДАЧИ БЕЗ ВЛАДЕЛЬЦА — задача без ответственного, хотя из транскрипта видно, кто её взял → проставь владельца в формате «<задача> — <Имя>». Если из записи владелец НЕ следует — не выдумывай, оставь как есть.
+3. СМЕШЕНИЕ РОЛЕЙ/ЗОН — задача / решение приписаны не тому человеку (перепутаны функциональные зоны) → переотнеси к верному по транскрипту.
+4. ПЛОСКИЕ ФОРМУЛИРОВКИ — обтекаемый пункт без сути («обсудили вопрос», «решили по складу») → переформулируй конкретно по транскрипту (что именно решили, с какой цифрой / сроком), НЕ добавляя того, чего в записи нет.
+5. ЧИСЛА И ИНВЕРСИИ — число / сумма / процент в черновике не сходится с транскриптом, либо смысл перевёрнут («успеваем» ↔ «не успеваем», «хватает» ↔ «не хватает», «вырос» ↔ «упал») → исправь по транскрипту.
+
+ЖЁСТКИЕ ПРАВИЛА:
+- Источник истины — ТОЛЬКО транскрипт. Ничего не выдумывай и не доноси «из общего знания».
+- СОХРАНИ формат и структуру методички (шапка `#протоколвстречи`, секции, дисклеймер автора в начале тела, эмодзи-маркеры) — это редактура, НЕ пересборка с нуля.
+- Не выхолащивай: не удаляй верные содержательные пункты ради «чистоты». Лучше оставить как было, чем переписать верное в неверное.
+- НЕ трогай деление по спикерам в теле протокола — спорные места деления ты сообщишь отдельным списком (см. формат ниже), их пометит система."""
+
+
+def _build_rewrite_system_prompt(checks: tuple[str, ...]) -> str:
+    """System-prompt второго прохода Ф7: чек-лист критика + (опц.) сообщение о
+    грубых ошибках деления по спикерам (Ф4, ТЕМ ЖЕ вызовом) + контракт envelope.
+
+    Контракт ответа — два блока, разделённых маркерами; протокол отдаётся СЫРЫМ
+    markdown'ом после `===ПРОТОКОЛ===` (без JSON-эскейпа), `===ПРАВКИ===` несёт
+    маленький JSON (только diarization-находки + счётчики правок).
     """
+    has_diar = "diarization" in checks
+    parts = [_REVIEW_REWRITE_CHECKLIST]
+    if has_diar:
+        parts.append(
+            "Кроме редактуры — проверь ГРУБЫЕ ошибки деления по спикерам в "
+            "ТРАНСКРИПТЕ. В теле протокола их НЕ исправляй (реплики на местах) — "
+            "только СООБЩИ списком findings ниже, система обработает отдельно.\n\n"
+            + _REVIEW_DIARIZATION_SECTION
+        )
+    diar_finding = (
+        '{"section": "diarization", "quote": "<подстрока ТЕКСТА реплики транскрипта>", '
+        '"note": "<3-7 слов>", "verdict": "fix|flag", '
+        '"speaker_to": "<только для fix: кому реплика принадлежит>"}'
+        if has_diar else ""
+    )
+    edits_contract = ", ".join(f'"{k}": <int>' for k in _REWRITE_EDIT_KEYS)
+    findings_note = (
+        "`findings` — ТОЛЬКО грубые ошибки деления по спикерам (verdict fix|flag)."
+        if has_diar else
+        "`findings` сейчас не запрошен — оставь пустым массивом."
+    )
+    return (
+        "\n\n".join(parts)
+        + "\n\n=== ФОРМАТ ОТВЕТА (СТРОГО) ===\n"
+        "Верни РОВНО два блока, разделённых строками-маркерами, без markdown-обёртки "
+        "и без пояснений вокруг:\n\n"
+        + _REWRITE_DIAG_MARKER + "\n"
+        + '{"findings": [' + diar_finding + '], "edits": {' + edits_contract + "}}\n"
+        + _REWRITE_PROTOCOL_MARKER + "\n"
+        "<полный улучшенный протокол целиком, начиная со строки #протоколвстречи>\n\n"
+        "В блоке ПРАВКИ: `edits` — СЧЁТЧИКИ (целые числа) того, что ты поправил по "
+        "пунктам чек-листа (без текста, только количества). " + findings_note + " "
+        "В блоке ПРОТОКОЛ — финальный markdown-текст, который увидит владелец "
+        "(никаких ⚠️-пометок от себя не добавляй — спорное деление спикеров "
+        "пометит система по твоему списку findings)."
+    )
+
+
+def _parse_rewrite_response(
+    raw: str,
+) -> tuple[list[dict], Optional[str], dict]:
+    """Разбирает envelope-ответ второго прохода Ф7.
+
+    Возвращает `(findings, rewritten_protocol|None, edits)`:
+      - findings — diarization-находки (через общий `_normalize_findings_list`);
+      - rewritten_protocol — СЫРОЙ markdown после `===ПРОТОКОЛ===`, обрезанный до
+        шапки `#протоколвстречи`. Нет маркера / нет шапки → None (caller
+        деградирует в черновик — РИСК1, не молчаливый провал);
+      - edits — счётчики правок (только из `_REWRITE_EDIT_KEYS`, клампятся в int).
+
+    Толерантно к мусору: битый DIAG-JSON → findings=[]/edits={}, но протокол
+    (если есть) всё равно отдаём; протокол без шапки → None.
+    """
+    findings: list[dict] = []
+    edits: dict = {}
+    protocol: Optional[str] = None
     if not raw or not raw.strip():
-        return []
+        return findings, protocol, edits
     text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-    # Вырезаем первый JSON-объект, если модель добавила прозу вокруг.
-    if not text.lstrip().startswith("{"):
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    # Разрез по маркеру протокола (последнее вхождение — на случай эха маркера
+    # внутри DIAG). Всё после него — сырой протокол; всё до — DIAG-блок.
+    idx = text.rfind(_REWRITE_PROTOCOL_MARKER)
+    diag_part = text if idx == -1 else text[:idx]
+    proto_part = "" if idx == -1 else text[idx + len(_REWRITE_PROTOCOL_MARKER):]
+
+    # --- DIAG-блок (маленький JSON) ---
+    d = diag_part
+    j = d.find(_REWRITE_DIAG_MARKER)
+    if j != -1:
+        d = d[j + len(_REWRITE_DIAG_MARKER):]
+    d = d.strip()
+    if d.startswith("```"):
+        d = re.sub(r"^```(?:json)?\s*\n?", "", d)
+        d = re.sub(r"\n?```\s*$", "", d)
+    if d and not d.lstrip().startswith("{"):
+        m = re.search(r"\{.*\}", d, flags=re.DOTALL)
         if m:
-            text = m.group(0)
+            d = m.group(0)
+    if d:
+        try:
+            data = json.loads(d)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            findings = _normalize_findings_list(data.get("findings"))
+            raw_edits = data.get("edits")
+            if isinstance(raw_edits, dict):
+                edits = {k: _safe_count(raw_edits.get(k)) for k in _REWRITE_EDIT_KEYS}
+
+    # --- ПРОТОКОЛ-блок (сырой markdown) ---
+    p = proto_part.strip()
+    if p.startswith("```"):
+        p = re.sub(r"^```(?:markdown|md)?\s*\n?", "", p)
+        p = re.sub(r"\n?```\s*$", "", p)
+    if p:
+        m = re.search(r"^#протоколвстречи\b", p, flags=re.MULTILINE)
+        if m:
+            protocol = p[m.start():].strip()
+    return findings, protocol, edits
+
+
+def _safe_count(v: object) -> int:
+    """Счётчик правок критика → безопасный int (клампим 0..9999; мусор → 0)."""
     try:
-        data = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("[review] не распарсил JSON ответа (len=%d)", len(raw))
-        return []
-    findings = data.get("findings") if isinstance(data, dict) else None
+        n = int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return n if 0 <= n <= 9999 else 0
+
+
+def _normalize_findings_list(findings: object) -> list[dict]:
+    """Нормализует сырой список findings (из JSON) в `{section, quote, note[, verdict, speaker_to]}`.
+
+    Общий разбор для флаг-прохода (`_parse_review_response`) и второго прохода
+    Ф7 (`_parse_rewrite_response`) — чтобы контракт diarization-полей (verdict
+    fix|flag + speaker_to, дефолт flag) жил в ОДНОМ месте. На мусор/не-список — [].
+    """
     if not isinstance(findings, list):
         return []
     out: list[dict] = []
@@ -4887,6 +5055,31 @@ def _parse_review_response(raw: str) -> list[dict]:
             item["speaker_to"] = speaker_to
         out.append(item)
     return out
+
+
+def _parse_review_response(raw: str) -> list[dict]:
+    """Парсит JSON-ответ ревью-прохода в список findings. Терпим к обёртке.
+
+    Возвращает список dict'ов `{section, quote, note}`. На мусор — [].
+    """
+    if not raw or not raw.strip():
+        return []
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    # Вырезаем первый JSON-объект, если модель добавила прозу вокруг.
+    if not text.lstrip().startswith("{"):
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if m:
+            text = m.group(0)
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("[review] не распарсил JSON ответа (len=%d)", len(raw))
+        return []
+    findings = data.get("findings") if isinstance(data, dict) else None
+    return _normalize_findings_list(findings)
 
 
 def _normalize_for_match(s: str) -> str:
@@ -5110,23 +5303,123 @@ def review_protocol(
     return findings
 
 
+class RewriteResult(NamedTuple):
+    """Результат второго прохода Ф7. `protocol is None` → деградация (РИСК1):
+    caller отдаёт черновик как финал. `degraded` — машинный маркер для метаданных
+    (`no` | `rewrite-timeout` | `no-cli` | `rewrite-error` | `rewrite-malformed`
+    | `disabled`)."""
+    findings: list[dict]
+    protocol: Optional[str]
+    edits: dict
+    degraded: str
+
+
+def review_and_rewrite_protocol(
+    protocol_text: str,
+    transcript_md: str,
+    *,
+    checks: tuple[str, ...] = ("values",),
+    meeting_sid: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> RewriteResult:
+    """Ф7 (G8): ВТОРОЙ проход «редактор-критик». ОДИН claude-вызов (Opus), который
+    и переписывает черновик по чек-листу (пропущенное / задачи без владельца /
+    смешение ролей / плоское / числа-инверсии), и — если включена секция
+    `diarization` — сообщает грубые ошибки деления по спикерам (Ф4) ТЕМ ЖЕ вызовом.
+
+    ГРАН1/НЕС1: это ВТОРОЙ из двух тяжёлых вызовов (генерация черновика — первый),
+    третьего Opus-вызова нет. РИСК1: таймаут/сбой/битый ответ → `protocol=None` +
+    маркер `degraded` (caller отдаёт черновик как финал), НЕ молчаливый провал и
+    НЕ потеря встречи. Best-effort, как `review_protocol`.
+
+    G10/опасная тройка: в промпт — только черновик + транскрипт (нужны для
+    вычитки); лог несёт длину/время/счётчики, НЕ текст транскрипта/реплик; полный
+    ответ модели не сохраняется (результат — сам улучшенный протокол).
+    """
+    if not _is_protocol_review_enabled() or not _is_protocol_selfreview_enabled():
+        return RewriteResult([], None, {}, "disabled")
+    if not protocol_text or not protocol_text.strip():
+        return RewriteResult([], None, {}, "")
+    if not transcript_md or not transcript_md.strip():
+        return RewriteResult([], None, {}, "")
+    if timeout is None:
+        timeout = _selfreview_timeout()
+    system_prompt = _build_rewrite_system_prompt(checks)
+    user_prompt = (
+        "ЧЕРНОВИК протокола (вычитать и улучшить):\n\n" + protocol_text
+        + "\n\n---\n\nТРАНСКРИПТ (источник истины):\n\n" + transcript_md
+    )
+    started = time.monotonic()
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=system_prompt,
+            timeout=timeout,
+            model=PROTOCOL_REWRITE_MODEL,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning(
+            "[selfreview] `claude` не в PATH — деградация в один проход meeting=%s",
+            meeting_sid or "?",
+        )
+        return RewriteResult([], None, {}, "no-cli")
+    except ClaudeCliTimeout:
+        # РИСК1: второй проход на Opus не уложился в таймаут → отдаём черновик как
+        # финал (НЕ молчаливый провал, НЕ потеря встречи). Лог — только метаданные.
+        logger.warning(
+            "[selfreview] degraded meeting=%s reason=timeout model=%s timeout=%ds",
+            meeting_sid or "?", PROTOCOL_REWRITE_MODEL, timeout,
+        )
+        return RewriteResult([], None, {}, "rewrite-timeout")
+    except ClaudeCliError as e:
+        logger.warning(
+            "[selfreview] degraded meeting=%s reason=error: %s",
+            meeting_sid or "?", str(e)[:200],
+        )
+        return RewriteResult([], None, {}, "rewrite-error")
+    findings, protocol, edits = _parse_rewrite_response(raw)
+    elapsed = time.monotonic() - started
+    if protocol is None:
+        # Ответ есть, но протокол не извлёкся (нет маркера/шапки) → деградация в
+        # черновик. findings/edits могли распарситься — отдаём их (best-effort).
+        logger.warning(
+            "[selfreview] degraded meeting=%s reason=malformed elapsed=%.1fs raw_len=%d",
+            meeting_sid or "?", elapsed, len(raw or ""),
+        )
+        return RewriteResult(findings, None, edits, "rewrite-malformed")
+    logger.info(
+        "[selfreview] meeting=%s elapsed=%.1fs out_len=%d findings=%d degraded=no",
+        meeting_sid or "?", elapsed, len(protocol), len(findings),
+    )
+    return RewriteResult(findings, protocol, edits, "no")
+
+
 def review_and_flag_protocol_file(
     protocol_path: Path,
     transcript_path: Path,
     *,
     checks: tuple[str, ...] = ("values",),
     meeting_sid: Optional[str] = None,
+    rewrite: bool = False,
 ) -> int:
-    """Высокоуровневая обёртка 5.2/Ф4: читает протокол+транскрипт, прогоняет
-    `review_protocol` (ОДИН claude-вызов), затем:
-      - Ф4 (D2): однозначные ошибки деления по спикерам — детерминированная
-        re-attribution реплик в ТРАНСКРИПТЕ (`apply_diarization_fixes`);
-      - 5.2/6.2/7.4 + Ф4 (D3): ⚠️-пометки (вкл. «спикер под вопросом» для
-        сомнительного деления) в ПРОТОКОЛ (`apply_review_flags`).
+    """Высокоуровневая обёртка 5.2/Ф4/Ф7: читает протокол+транскрипт, прогоняет
+    ревью-проход (ОДИН claude-вызов), затем правит файлы.
+
+    Два режима ОДНОГО вызова:
+      - `rewrite=False` (флаг-only, Ф5/Ф6/Ф4) — `review_protocol` находит
+        подозрительное → ⚠️-пометки; Ф4 (D2) однозначные ошибки деления →
+        re-attribution в ТРАНСКРИПТЕ. Поведение до Ф7 (модель Sonnet).
+      - `rewrite=True` (Ф7 второй проход, G8) — `review_and_rewrite_protocol`
+        ПЕРЕПИСЫВАЕТ черновик по чек-листу критика (Opus) + ТЕМ ЖЕ вызовом несёт
+        ревизию диаризации (Ф4). Финал чище черновика; владелец видит только его.
+        РИСК1: таймаут/сбой второго прохода → черновик отдаётся как финал
+        (деградация с маркером, не молчаливый провал). Боевые триггеры
+        (finalize/clarify) идут этим путём; `rewrite` под env-kill-switch
+        `ENABLE_PROTOCOL_SELFREVIEW`.
+
     Оба файла пишутся atomic, независимо и best-effort: сбой записи одного не
-    валит встречу и не мешает второму. Возвращает суммарное число изменений
-    (правки транскрипта + пометки протокола). D4: лог — ТОЛЬКО счётчики, без
-    текста реплик/имён.
+    валит встречу и не мешает второму. Возвращает суммарное число изменений.
+    D4/G10: лог — ТОЛЬКО счётчики/метаданные, без текста реплик/имён.
     """
     if not protocol_path.is_file() or not transcript_path.is_file():
         return 0
@@ -5136,6 +5429,17 @@ def review_and_flag_protocol_file(
     except OSError as e:
         logger.warning("[review] read failed: %s", e)
         return 0
+
+    # Ф7 (G8): второй проход «редактор-критик» — переписывает черновик ТЕМ ЖЕ
+    # единственным вызовом, что несёт ревизию диаризации (Ф4). 2 тяжёлых вызова
+    # суммарно (генерация + этот), НЕ третий. Флаг-only путь (ниже) сохранён для
+    # отката (kill-switch) и для регресс-тестов Ф4–Ф6.
+    if rewrite and _is_protocol_review_enabled() and _is_protocol_selfreview_enabled():
+        return _selfreview_rewrite_and_apply(
+            protocol_path, transcript_path, protocol_text, transcript_md,
+            checks=checks, meeting_sid=meeting_sid,
+        )
+
     findings = review_protocol(
         protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
     )
@@ -5172,6 +5476,79 @@ def review_and_flag_protocol_file(
             meeting_sid or "?", n_fixes, n_flags,
         )
     return n_flags + n_fixes
+
+
+def _selfreview_rewrite_and_apply(
+    protocol_path: Path,
+    transcript_path: Path,
+    protocol_text: str,
+    transcript_md: str,
+    *,
+    checks: tuple[str, ...],
+    meeting_sid: Optional[str],
+) -> int:
+    """Ф7 (G8): прогоняет второй проход (`review_and_rewrite_protocol`, ОДИН
+    вызов) и применяет результат:
+      - улучшенный протокол → на диск (или ЧЕРНОВИК остаётся, если деградация —
+        РИСК1: встреча не теряется, файл не трогаем зря);
+      - Ф4 (D2) diarization-fix → re-attribution реплик в ТРАНСКРИПТЕ;
+      - Ф4 (D3) diarization-flag → ⚠️ «спикер под вопросом» в (улучшенный)
+        протокол; реплики на местах.
+    В режиме rewrite content-находки (values/roles/memory) НЕ флажатся — критик
+    исправил их прямо в тексте (A5: владелец видит финал, не пометки). Лог — ТОЛЬКО
+    счётчики/метаданные (G10), без текста реплик/имён. Возвращает число изменений.
+    """
+    result = review_and_rewrite_protocol(
+        protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
+    )
+    findings = result.findings
+    rewrite_applied = result.protocol is not None
+    # База протокола: улучшенный (если есть) или черновик (деградация — РИСК1).
+    base_protocol = result.protocol if rewrite_applied else protocol_text
+    if rewrite_applied:
+        # Дисклеймер авторства (Ф4а) обязан выжить редактуру: модель просили его
+        # сохранить, но подстраховываемся идемпотентной вставкой (no-op, если есть).
+        base_protocol = protocol_to_tg.insert_protocol_disclaimer(base_protocol)
+
+    # Ф4 (D2): re-attribution однозначных реплик в ТРАНСКРИПТЕ (отдельный файл).
+    n_fixes = 0
+    new_transcript, nf = apply_diarization_fixes(transcript_md, findings)
+    if nf and new_transcript != transcript_md:
+        try:
+            _atomic_write_text(transcript_path, new_transcript)
+            n_fixes = nf
+        except OSError as e:
+            logger.warning("[selfreview] transcript fix write failed %s: %s", transcript_path, e)
+
+    # Ф4 (D3): только diarization-flag (сомнительное деление) → видимая пометка.
+    # diarization-fix уже в транскрипте; content-правки уже в теле (rewrite).
+    diar_flags = [
+        f for f in findings
+        if f.get("section") == "diarization" and f.get("verdict") != "fix"
+    ]
+    flagged = apply_review_flags(base_protocol, diar_flags)
+
+    # Пишем протокол, если он реально изменился относительно черновика на диске
+    # (улучшен и/или добавлены ⚠️-пометки). Деградация без пометок → не трогаем.
+    n_protocol_changes = 0
+    if flagged != protocol_text:
+        try:
+            _atomic_write_text(protocol_path, flagged)
+            n_protocol_changes = (1 if rewrite_applied else 0) + len(diar_flags)
+        except OSError as e:
+            logger.warning("[selfreview] protocol write failed %s: %s", protocol_path, e)
+
+    e = result.edits or {}
+    # G10: лог — только метаданные/счётчики, без текста реплик/имён.
+    logger.info(
+        "[selfreview] meeting=%s rewrite=%s degraded=%s diar-fixes=%d diar-flags=%d "
+        "added=%d owners=%d roles=%d sharpened=%d numbers=%d",
+        meeting_sid or "?", "applied" if rewrite_applied else "skipped", result.degraded,
+        n_fixes, len(diar_flags) if n_protocol_changes else 0,
+        e.get("added_agreements", 0), e.get("owners_assigned", 0),
+        e.get("roles_separated", 0), e.get("sharpened", 0), e.get("numbers_fixed", 0),
+    )
+    return n_fixes + n_protocol_changes
 
 
 # ===========================================================================
