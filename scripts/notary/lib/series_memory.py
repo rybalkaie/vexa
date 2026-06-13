@@ -1146,7 +1146,10 @@ def resolve_cross_memory(
                     continue
             except OSError:
                 pass
-            digs = list_series_digests(entry, exclude_date=current_date)
+            # БЕЗ exclude_date: текущая серия уже исключена целиком выше (по resolve),
+            # а у ЧУЖОЙ серии встреча в ту же календарную дату — валидный фон, не дубль
+            # текущей. Передача current_date сюда раньше молча роняла такие кросс-встречи.
+            digs = list_series_digests(entry)
         except OSError:
             continue
         if not digs:
