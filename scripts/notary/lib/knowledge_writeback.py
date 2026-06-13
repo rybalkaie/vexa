@@ -235,7 +235,10 @@ def enqueue(
         "status": "queued",
     }
     _append_outbox(company, record)
-    logger.info("[writeback] предложение в %s: %s «%s»", target, kind, val)
+    # B6/опасная тройка: значение insight — durable-ВЫВОД (целое предложение, текст
+    # кандидата), его в INFO-лог НЕ пишем; термин/роль — короткий каноник, допустимо.
+    _logval = f"<{len(val)} симв.>" if kind == KIND_INSIGHT else f"«{val}»"
+    logger.info("[writeback] предложение в %s: %s %s", target, kind, _logval)
     return EnqueueResult("company", company, val, destination.reason)
 
 
@@ -825,7 +828,12 @@ def run_flush(
                 if isinstance(role, dict):
                     have_roles.add((str(slug).strip().lower(),
                                     str(role.get("name") or "").strip().lower()))
-    have_insights = {nf for nf in (_norm_fact(ln) for ln in (insights_text0 or "").splitlines()) if nf}
+    # Детект «уже в main» для insight ОБЯЗАН совпадать с дедупом apply_entries_to_insights
+    # (там — подстрока нормализованного факта в нормализованном теле файла). Строки
+    # insights.md несут префикс «- [дата] (серия …) _[тег]_», поэтому точное членство
+    # ГОЛОГО факта в множестве строк не совпало бы НИКОГДА → уже-смерженный факт вечно
+    # числился бы pending и не дренировался из outbox. Сверяем как дедуп: подстрока в blob.
+    have_insights_norm = "\n".join(_norm_fact(ln) for ln in (insights_text0 or "").splitlines())
     merged_keys, pending_keys = set(), set()
     for r in active:
         kind, val = r.get("kind"), str(r.get("value") or "").strip().lower()
@@ -839,7 +847,7 @@ def run_flush(
         elif kind == KIND_INSIGHT:
             pl = r.get("payload") or {}
             nf = _norm_fact(pl.get("fact") or r.get("value"))
-            (merged_keys if (nf and nf in have_insights) else pending_keys).add((kind, val))
+            (merged_keys if (nf and nf in have_insights_norm) else pending_keys).add((kind, val))
 
     # 3) влить новое в YAML (glossary — textual append, сохраняя комментарии; org — dump).
     #    NB: apply_entries_to_glossary мутирует список terms на месте — длину «до» снимаем заранее.

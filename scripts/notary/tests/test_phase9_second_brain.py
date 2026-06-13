@@ -522,6 +522,28 @@ class TestRunFlushInsightLive(_IsolatedMixin):
         with self.assertRaises(AssertionError):
             self._show("main", wb.INSIGHTS_REL)  # файла в main нет → git show падает
 
+    def test_already_merged_insight_marked_not_repushed(self):
+        # У1/Н1 (цикл5): после мёржа PR командой факт уже в main → следующий flush
+        # ДОЛЖЕН распознать его как merged (дренировать из outbox), а НЕ держать вечно
+        # pending. Регрессия на рассинхрон детекта merge (полные строки vs голый факт).
+        wb.propose_insight("Durable факт уже в main", series="s1", company="anzhee",
+                           publication_allowed=True)
+        r1 = wb.run_flush("anzhee", clone_path=self.clone)
+        self.assertEqual(r1["status"], "pr-pushed")
+        # команда приняла PR: мёржим bot-ветку в main и пушим.
+        self._git(self.clone, "fetch", "-q", "origin")
+        self._git(self.clone, "checkout", "-q", "main")
+        self._git(self.clone, "merge", "-q", "--no-edit", "origin/notary/auto-knowledge")
+        self._git(self.clone, "push", "-q", "origin", "main")
+        # второй flush: факт уже в origin/main → merged, ничего нового не вливаем.
+        r2 = wb.run_flush("anzhee", clone_path=self.clone)
+        self.assertIn(r2["status"], ("already-merged", "nothing-to-commit"))
+        self.assertEqual(r2.get("n_insight", 0), 0)
+        # запись больше НЕ висит queued/pending — помечена merged, ушла из активных.
+        active = [r for r in wb._read_outbox("anzhee")
+                  if r.get("status") in (wb.STATUS_QUEUED, wb.STATUS_PENDING)]
+        self.assertEqual(active, [])
+
 
 class TestCLI(_IsolatedMixin):
     """CLI обёртка (воскресный крон/скил): --learn и dry-run отчёта без claude/tg."""

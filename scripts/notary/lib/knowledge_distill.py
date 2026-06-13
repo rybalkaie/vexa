@@ -34,9 +34,15 @@ import re
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
+
+try:
+    import fcntl  # POSIX advisory-локи; на Windows нет (наш деплой — Linux VPS / mac)
+except Exception:  # noqa: BLE001
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +153,34 @@ def _today_iso() -> str:
     return _now().strftime("%Y-%m-%d")
 
 
+@contextmanager
+def _exclusive_lock(path: Path):
+    """Best-effort эксклюзивная блокировка ФАЙЛА (advisory `flock`) на время read-
+    modify-write — сериализует параллельные finalize/clarify, пишущие в один файл
+    (иначе lost-update при перезаписи целиком). Лочим сам файл (без stray `.lock` в
+    синкаемом `me/`). Нет fcntl / не открылся → без блокировки (как раньше, не хуже)."""
+    if fcntl is None:
+        yield
+        return
+    fh = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a", encoding="utf-8")  # лок-хэндл; режим "a" контент НЕ усекает
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        if fh is not None:
+            fh.close()
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
 # ── B1: дистилляция кандидатов из готового протокола ───────────────────────────
 
 
@@ -216,7 +250,9 @@ def _parse_candidates(raw: str, *, cap: int) -> list:
     for item in data:
         if not isinstance(item, dict):
             continue
-        fact = str(item.get("fact") or "").strip()
+        # У3 (цикл5): схлопываем ВСЕ пробелы (вкл. внутренние \n/\t) — факт обязан быть
+        # ОДНОЙ строкой: формат insights.md «один факт = одна строка» + дедуп per-line.
+        fact = " ".join(str(item.get("fact") or "").split())
         if not fact or len(fact) < 8:
             continue
         kind = str(item.get("kind") or "").strip().lower()
@@ -313,32 +349,34 @@ def append_brain_queue(
     date = date or _today_iso()
     line = (f"- [ ] {date} | {_company_display(company)} | {target_hint} | {fact} | "
             f"({reason})")
+    existed = p.is_file()  # снимаем ДО лока: _exclusive_lock открывает файл в "a" (создаёт пустой)
     try:
-        if p.is_file():
-            text = p.read_text(encoding="utf-8")
-        else:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            text = ("# Очередь кандидатов в мозг компании (на еженедельное подтверждение)\n\n"
-                    "## Очередь\n\n## История (внесено / отклонено)\n")
-        if _norm_fact(fact) in _norm_fact(text):  # уже стоит в очереди/истории
-            return True
-        lines = text.splitlines()
-        # Вставляем в конец секции «## Очередь» (перед «## История» или EOF).
-        q_idx = next((i for i, ln in enumerate(lines) if ln.strip().lower().startswith("## очередь")), None)
-        if q_idx is None:
-            lines += ["", "## Очередь", line]
-        else:
-            end = len(lines)
-            for j in range(q_idx + 1, len(lines)):
-                if lines[j].lstrip().startswith("## "):
-                    end = j
-                    break
-            # отступаем назад через пустые строки, чтобы вставить вплотную к контенту
-            ins = end
-            while ins - 1 > q_idx and not lines[ins - 1].strip():
-                ins -= 1
-            lines.insert(ins, line)
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with _exclusive_lock(p):
+            if existed:
+                text = p.read_text(encoding="utf-8")
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                text = ("# Очередь кандидатов в мозг компании (на еженедельное подтверждение)\n\n"
+                        "## Очередь\n\n## История (внесено / отклонено)\n")
+            if _norm_fact(fact) in _norm_fact(text):  # уже стоит в очереди/истории
+                return True
+            lines = text.splitlines()
+            # Вставляем в конец секции «## Очередь» (перед «## История» или EOF).
+            q_idx = next((i for i, ln in enumerate(lines) if ln.strip().lower().startswith("## очередь")), None)
+            if q_idx is None:
+                lines += ["", "## Очередь", line]
+            else:
+                end = len(lines)
+                for j in range(q_idx + 1, len(lines)):
+                    if lines[j].lstrip().startswith("## "):
+                        end = j
+                        break
+                # отступаем назад через пустые строки, чтобы вставить вплотную к контенту
+                ins = end
+                while ins - 1 > q_idx and not lines[ins - 1].strip():
+                    ins -= 1
+                lines.insert(ins, line)
+            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return True
     except OSError as e:
         logger.warning("[distill] brain-queue append failed (%s)", e)
@@ -532,6 +570,10 @@ def distill_and_route(
                 summary["exists"] += 1
             elif res.layer == "private":  # company-missing→private деградация
                 summary["private"] += 1
+                # B5: деградация всё равно положила факт в приватную очередь — отражаем
+                # в недельном логе (иначе отчёт/дашборд недосчитают сохранённый факт).
+                record_week_log(route="private", company=None, fact=fact,
+                                insight_kind=ikind, meeting_sid=meeting_sid, date=src["date"])
             else:
                 summary["drop"] += 1
             continue
