@@ -588,12 +588,47 @@ def _resolve_participants(meta: dict) -> list[str]:
 # --- Длительность речи (правка #5 владельца + НЕС1 приоритет источников) -
 
 
-def speech_bounds_ms_from_raw_json(raw_json) -> Optional[tuple[int, int]]:
-    """Границы реальной речи по сырому ответу Speechmatics (json-v2).
+def _aai_speech_bounds_ms(raw_json: dict) -> Optional[tuple[int, int]]:
+    """Границы речи (мс) по ответу AssemblyAI (Ф1 umnyi-protokol-assemblyai).
 
-    Возвращает `(firstSpeechMs, lastSpeechMs)` — min(start_time) и max(end_time)
-    по элементам `results` с `type == "word"` (пунктуацию игнорируем), в
-    миллисекундах. `None` — если `raw_json` битый/пустой или нет ни одного слова.
+    У AAI нет Speechmatics-style `results`; есть `words` (пословно) и `utterances`
+    (по репликам), `start`/`end` уже в ЦЕЛЫХ миллисекундах (не ×1000). Предпочитаем
+    `words` (точнее границы), фолбэк — `utterances`. Защита та же, что у SM-пути:
+    нечисловые тайминги пропускаем, `end < start` нормализуем к `start`. None —
+    если ни одного пригодного элемента (битый/чужой формат)."""
+    for key in ("words", "utterances"):
+        items = raw_json.get(key)
+        if not isinstance(items, list) or not items:
+            continue
+        first_ms: Optional[int] = None
+        last_ms: Optional[int] = None
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                st = int(round(float(it.get("start"))))
+                en = int(round(float(it.get("end"))))
+            except (TypeError, ValueError):
+                continue
+            if en < st:
+                en = st
+            if first_ms is None or st < first_ms:
+                first_ms = st
+            if last_ms is None or en > last_ms:
+                last_ms = en
+        if first_ms is not None and last_ms is not None:
+            return (first_ms, last_ms)
+    return None
+
+
+def speech_bounds_ms_from_raw_json(raw_json) -> Optional[tuple[int, int]]:
+    """Границы реальной речи по сырому ответу внешнего STT.
+
+    Speechmatics (json-v2): `(firstSpeechMs, lastSpeechMs)` = min(start_time) и
+    max(end_time) по элементам `results` с `type == "word"` (пунктуацию игнорируем),
+    в миллисекундах. AssemblyAI (нет `results`): делегируем `_aai_speech_bounds_ms`
+    (words[]/utterances[] уже в мс). `None` — если `raw_json` битый/пустой или нет
+    ни одного слова.
 
     Защита (РАЗМ1, риск «firstSpeechMs из results»): пропускаем нечисловые
     тайминги; `end_time < start_time` нормализуем к `start_time` (не доверяем
@@ -603,7 +638,8 @@ def speech_bounds_ms_from_raw_json(raw_json) -> Optional[tuple[int, int]]:
         return None
     results = raw_json.get("results")
     if not isinstance(results, list) or not results:
-        return None
+        # Нет Speechmatics-style results — пробуем форму AssemblyAI (words/utterances).
+        return _aai_speech_bounds_ms(raw_json)
 
     first_s: Optional[float] = None
     last_s: Optional[float] = None

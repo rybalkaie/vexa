@@ -29,8 +29,17 @@ Pipeline (определяется env STT_BACKEND, default `whisper_pyannote`):
            уходит в `_failed/<sid>.*` для retry-очереди, в Telegram идёт
            push. WAV из _tmp НЕ удаляется до успешной финализации.
 
+    STT_BACKEND=assemblyai (Ф1 umnyi-protokol-assemblyai; на бою — новый дефолт):
+        То же, что speechmatics, но через `assemblyai_client.transcribe_diarize_wav`
+        (upload → create → poll, universal-3-pro, ru, speaker_labels). Тот же
+        downstream (архив _transcripts/<date>.{json,txt}, clean-time, bench) — обе
+        внешние STT-ветки идут общим путём через `_is_external_stt(backend)`. При
+        AssemblyAIError/AssemblyAIRejectedError аудио+meta → `_failed/`, push;
+        retry_failed форсит Speechmatics → сбой AAI ретраится на fallback (AA4).
+        Speechmatics НЕ удаляется — остаётся fallback/legacy.
+
 Pipeline-инвариант: name_mapping (Claude Haiku) и render_protocol работают
-поверх AlignedTurn в обеих ветках без изменений.
+поверх AlignedTurn во всех ветках без изменений.
 
 Конфиденциальность («Опасная тройка» Ф3):
     - НЕ логируем содержимое транскрипта.
@@ -93,16 +102,40 @@ def _is_protocol_enabled() -> bool:
 
 
 def _stt_backend() -> str:
-    """Читает STT_BACKEND из env. Поддерживается `whisper_pyannote` (default) и `speechmatics`."""
+    """Читает STT_BACKEND из env. Поддерживается `whisper_pyannote` (default),
+    `speechmatics` и `assemblyai` (Ф1 плана umnyi-protokol-assemblyai). На бою
+    дефолт переходит на AAI; Speechmatics остаётся fallback (AA4), не удаляем."""
     raw = (os.environ.get("STT_BACKEND") or "").strip().lower()
     if not raw or raw == "whisper_pyannote":
         return "whisper_pyannote"
     if raw == "speechmatics":
         return "speechmatics"
+    if raw == "assemblyai":
+        return "assemblyai"
     raise SystemExit(
         f"STT_BACKEND={raw!r} — недопустимое значение. "
-        "Допустимо: 'whisper_pyannote' (default) или 'speechmatics'."
+        "Допустимо: 'whisper_pyannote' (default), 'speechmatics' или 'assemblyai'."
     )
+
+
+def _is_external_stt(backend: str) -> bool:
+    """Внешний облачный STT (один HTTP-job; есть raw_json/job_id/архив транскрипта).
+
+    speechmatics и assemblyai делят общий downstream-путь (архив `_transcripts`,
+    clean-time, bench-лог, recovery по id). whisper_pyannote — локальный, без них."""
+    return backend in ("speechmatics", "assemblyai")
+
+
+def _stt_id_meta_key(backend: str) -> str:
+    """Ключ в meta для id внешнего job'а (идемпотентность/recovery/CG2).
+
+    Разные ключи у движков, чтобы id одного не подхватился как id другого при
+    смене backend между прогонами одной встречи. whisper_pyannote → '' (нет id)."""
+    if backend == "speechmatics":
+        return "speechmatics_job_id"
+    if backend == "assemblyai":
+        return "assemblyai_transcript_id"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +299,83 @@ def _run_speechmatics(
 
 
 # ---------------------------------------------------------------------------
-# _failed/ — retry-очередь при сбое Speechmatics
+# Ветка AssemblyAI (новая, Ф1 плана umnyi-protokol-assemblyai)
+# ---------------------------------------------------------------------------
+
+def _persist_transcript_id_to_meta(meta_path: str, meta: dict, transcript_id: str) -> None:
+    """AAI-аналог `_persist_job_id_to_meta`: фиксируем `assemblyai_transcript_id`
+    в meta СРАЗУ после create, до поллинга. На рестарте main() прочитает id и
+    переиспользует существующий транскрипт без повторной оплаты (идемпотентность).
+    Мутируем и in-memory `meta`, чтобы дальнейший код в этом процессе видел id."""
+    meta["assemblyai_transcript_id"] = transcript_id
+    try:
+        _atomic_write_json(meta_path, meta)
+    except OSError as e:
+        logging.getLogger("finalize-meeting").warning(
+            "не смог зафиксировать assemblyai_transcript_id в %s: %s", meta_path, e
+        )
+
+
+def _run_assemblyai(
+    wav_path: str,
+    log: logging.Logger,
+    *,
+    existing_transcript_id: str | None = None,
+    on_transcript_created=None,
+):
+    """AssemblyAI-ветка: upload → create → poll вместо whisper+pyannote.
+
+    Контракт возврата идентичен `_run_speechmatics`: (turns, extra, aai_result).
+    `aai_result` — TranscriptionResult с raw_json/job_id/duration/lang (используется
+    выше для архива `_transcripts/<date>.{json,txt}` и clean-time, как у Speechmatics).
+
+    `existing_transcript_id` (идемпотентность) — id из прошлого прогона той же
+    встречи: если задан, переиспользуем без повторной оплаты. `on_transcript_created`
+    — callback(id), которым main() фиксирует id в meta СРАЗУ после create.
+
+    HF_TOKEN явно удаляется из env (как в Speechmatics-ветке): AAI его не использует,
+    нечего таскать в дочерние процессы — дисциплина.
+    """
+    from lib.assemblyai_client import transcribe_diarize_wav, to_aligned_turns
+    from lib.align import merge_consecutive_same_speaker  # noqa
+
+    os.environ.pop("HF_TOKEN", None)
+
+    log.info("Step 1/3 — AssemblyAI upload + transcribe + diarize (один job)")
+    aai_result = transcribe_diarize_wav(
+        wav_path,
+        existing_transcript_id=existing_transcript_id,
+        on_transcript_created=on_transcript_created,
+    )
+    log.info(
+        "AssemblyAI: %d utterances, %d спикеров, %.1f сек аудио, lang=%s, id=%s",
+        len(aai_result.utterances),
+        len({u.speaker for u in aai_result.utterances}),
+        aai_result.audio_duration_s,
+        aai_result.detected_language,
+        aai_result.job_id,
+    )
+
+    log.info("Step 2/3 — Adapter Utterance → AlignedTurn + merge_consecutive")
+    aligned = to_aligned_turns(aai_result.utterances)
+    # merge_consecutive_same_speaker идемпотентен: AAI уже отдаёт реплики turn-by-turn
+    # (utterances[]), поэтому на практике no-op. Не убираем — защита на нестандартных
+    # стыках (короткое перебивание + продолжение того же спикера), как в SM-ветке.
+    turns = merge_consecutive_same_speaker(aligned, max_gap_s=1.5)
+
+    extra = {
+        "detected_language": aai_result.detected_language,
+        "audio_duration_s": aai_result.audio_duration_s,
+        "assemblyai_transcript_id": aai_result.job_id,
+        "utterances_raw": len(aai_result.utterances),
+        "speakers_detected": len({u.speaker for u in aai_result.utterances}),
+        "stt_label": "assemblyai-universal-3-pro",
+    }
+    return turns, extra, aai_result
+
+
+# ---------------------------------------------------------------------------
+# _failed/ — retry-очередь при сбое внешнего STT (Speechmatics / AssemblyAI)
 # ---------------------------------------------------------------------------
 
 def _failed_dir() -> Path:
@@ -573,18 +682,19 @@ def main() -> int:
     # chunks[], ни в files.wav (тогда ниже отрабатывает rc=10/rc=3, как раньше).
     audio_path, audio_is_temp = resolve_wav_for_stt(meta, log=log)
     if audio_path is None:
-        # Recovery: WAV почищен, но в meta есть speechmatics_job_id прошлого
-        # прогона. Если job ещё жив (running/done) — CG2 переиспользует его
-        # транскрипт без повторного STT и без файла на диске (transcribe_diarize_wav
-        # в reuse-ветке WAV не открывает). Длительность/clean-time берутся из
-        # транскрипта + meta.recording, а не из WAV. Job истёк → audio_path так и
-        # останется None, ниже отработает обычная логика rc=3/rc=10.
-        _reuse_job_id = meta.get("speechmatics_job_id") if isinstance(meta, dict) else None
+        # Recovery: WAV почищен, но в meta есть id внешнего job'а прошлого прогона
+        # (speechmatics_job_id / assemblyai_transcript_id — по backend). Если job/
+        # транскрипт ещё жив — reuse переиспользует его без повторного STT и без
+        # файла на диске (transcribe_diarize_wav в reuse-ветке WAV не открывает).
+        # Длительность/clean-time берутся из транскрипта + meta.recording, а не из
+        # WAV. Id истёк → audio_path так и останется None, ниже отработает rc=3/rc=10.
+        _id_key = _stt_id_meta_key(backend)
+        _reuse_job_id = meta.get(_id_key) if (_id_key and isinstance(meta, dict)) else None
         if _reuse_job_id:
             log.info(
-                "WAV отсутствует, но есть speechmatics_job_id=%s — recovery-режим: "
-                "переиспользую существующий job без STT/WAV (files.wav=%s)",
-                _reuse_job_id, wav_path,
+                "WAV отсутствует, но есть %s=%s — recovery-режим: переиспользую "
+                "существующий job/transcript без STT/WAV (files.wav=%s)",
+                _id_key, _reuse_job_id, wav_path,
             )
             audio_path = str(wav_path)  # путь-декларация; в reuse-ветке не читается
             audio_is_temp = False
@@ -684,20 +794,32 @@ def main() -> int:
 
     # 2. STT + диаризация (зависит от backend). audio_path может быть временным
     # сконкатенированным/починенным WAV — чистим его в finally после STT.
-    sm_result = None  # заполняется только в speechmatics-ветке
-    # CG2/CG3 — дедуп платных job'ов Speechmatics.
-    #   existing: job из прошлого прогона этой встречи (meta переживает рестарт).
-    #   callback: фиксирует job_id в meta СРАЗУ после сабмита, до поллинга.
+    sm_result = None   # заполняется только в speechmatics-ветке
+    aai_result = None  # заполняется только в assemblyai-ветке
+    # Дедуп платных job'ов внешнего STT (id переживает рестарт встречи в meta).
+    #   existing: id из прошлого прогона этой встречи (meta переживает рестарт).
+    #   callback: фиксирует id в meta СРАЗУ после сабмита/create, до поллинга
+    #   (CG2/CG3 у Speechmatics; идемпотентность по transcript id у AssemblyAI).
     existing_job_id = meta.get("speechmatics_job_id") if isinstance(meta, dict) else None
+    existing_transcript_id = meta.get("assemblyai_transcript_id") if isinstance(meta, dict) else None
 
     def _on_job_submitted(job_id: str) -> None:
         _persist_job_id_to_meta(args.meta_json, meta, job_id)
+
+    def _on_transcript_created(transcript_id: str) -> None:
+        _persist_transcript_id_to_meta(args.meta_json, meta, transcript_id)
 
     try:
         if backend == "speechmatics":
             turns, extra, sm_result = _run_speechmatics(
                 audio_path, log, expected_speakers=expected_speaker_count,
                 existing_job_id=existing_job_id, on_job_submitted=_on_job_submitted,
+            )
+        elif backend == "assemblyai":
+            turns, extra, aai_result = _run_assemblyai(
+                audio_path, log,
+                existing_transcript_id=existing_transcript_id,
+                on_transcript_created=_on_transcript_created,
             )
         else:
             turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)
@@ -769,6 +891,64 @@ def main() -> int:
                         f"(файлы: _failed/{session_uid}.*)"
                     )
                 return 4
+        elif backend == "assemblyai":
+            from lib.assemblyai_client import (
+                AssemblyAIError,
+                AssemblyAIRejectedError,
+                AssemblyAIKillSwitchError,
+            )
+            if isinstance(e, AssemblyAIKillSwitchError):
+                # CG7-аналог: kill-switch взведён — НЕ платим за сабмит, кладём
+                # встречу в retry-очередь (не теряется), ждём ручного снятия (CG8).
+                # rc=5 — отдельный код: retry НЕ жжёт 24ч-бюджет (blocked_by_killswitch).
+                log.warning(
+                    "AssemblyAI kill-switch активен — встреча %s отложена в retry "
+                    "без сабмита (ждёт ручного снятия флага)", session_uid,
+                )
+                already_queued = (_failed_dir() / f"{session_uid}.retry-state.json").exists()
+                if not already_queued:
+                    _stash_into_failed(
+                        session_uid, audio_path, args.meta_json,
+                        rejected=False, err_repr="kill-switch active", killswitch=True,
+                    )
+                    series_label = meta.get("series") or session_uid
+                    date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
+                    _push_telegram(
+                        f"⏸ Расшифровка на паузе: сработал недельный лимит распознавания. "
+                        f"Встреча «{series_label}» ({date_label}) отложена и НЕ потеряна — "
+                        f"обработаю, как только снимешь стоп-флаг (подробности и счётчик "
+                        f"ждущих встреч — в дайджесте)."
+                    )
+                return 5
+            if isinstance(e, (AssemblyAIError, AssemblyAIRejectedError)):
+                rejected = isinstance(e, AssemblyAIRejectedError)
+                log.error("AssemblyAI %s: %s", "rejected" if rejected else "failed", e)
+                # Стэшим audio_path (склеенный/починенный) — на retry он станет
+                # files.wav; исходные chunk-файлы могут быть уже почищены. retry_failed
+                # форсит STT_BACKEND=speechmatics → сбой AAI ретраится на fallback (AA4).
+                _stash_into_failed(
+                    session_uid, audio_path, args.meta_json,
+                    rejected=rejected, err_repr=f"{type(e).__name__}: {e}",
+                )
+                series_label = meta.get("series") or session_uid
+                date_label = (meta.get("startTs") or datetime.now().isoformat())[:10]
+                if rejected:
+                    _push_telegram(
+                        f"⛔ Не удалось расшифровать встречу «{series_label}» ({date_label}): "
+                        f"сервис распознавания речи отклонил запрос и повторять не станет — "
+                        f"нужно разобраться вручную. Аудио сохранено, не потеряно. "
+                        f"Что пошло не так: {type(e).__name__}: {str(e)[:200]} "
+                        f"(файлы для разбора: _failed/{session_uid}.*)"
+                    )
+                else:
+                    _push_telegram(
+                        f"⚠️ Пока не получилось расшифровать встречу «{series_label}» ({date_label}): "
+                        f"сервис распознавания речи временно недоступен. Аудио сохранено — "
+                        f"автоматически попробую ещё раз примерно через сутки, от тебя ничего не нужно. "
+                        f"Что пошло не так: {type(e).__name__}: {str(e)[:200]} "
+                        f"(файлы: _failed/{session_uid}.*)"
+                    )
+                return 4
         log.exception("STT/диаризация упала: %s", e)
         return 4
     finally:
@@ -784,6 +964,12 @@ def main() -> int:
     # 2.1. Smoke-точка отказа для теста атомарности: симулируем сбой ПОСЛЕ STT.
     if getattr(args, "_test_fail_after_stt", False):
         raise RuntimeError("smoke: симуляция exception после STT (тест атомарности)")
+
+    # Унифицированный результат внешнего STT (Speechmatics ИЛИ AssemblyAI), None
+    # для whisper_pyannote. Downstream (архив `_transcripts`, clean-time, bench,
+    # result_json) работает на нём единообразно через `_is_external_stt(backend)` —
+    # ровно один из sm_result/aai_result непуст, когда backend внешний.
+    ext_result = sm_result if sm_result is not None else aai_result
 
     # 3. Маппинг имён: Ф4б якорь серии → S1 → Ф3 ростер-домен → S2 → LLM-добивка.
     # Ф3 (A4/B3): ростер ролей серии (домен реплики ↔ ответственный). Хардкод
@@ -830,12 +1016,18 @@ def main() -> int:
     transcripts_dir = series_dir / "_transcripts"
     transcripts_json_path = transcripts_dir / f"{date_part}.json"
     transcripts_txt_path = transcripts_dir / f"{date_part}.txt"
-    if backend == "speechmatics" and sm_result is not None:
+    if _is_external_stt(backend) and ext_result is not None:
         # Относительный путь от папки серии — рендер кладёт его в шапку .md.
         transcript_relpath = f"_transcripts/{date_part}.txt"
 
-    asr_label = "speechmatics-enhanced" if backend == "speechmatics" else args.asr_model
-    diar_label = "speechmatics-enhanced" if backend == "speechmatics" else "pyannote/speaker-diarization-3.1"
+    # Метки движков для шапки протокола (asr/диаризация).
+    _STT_LABELS = {
+        "speechmatics": ("speechmatics-enhanced", "speechmatics-enhanced"),
+        "assemblyai": ("assemblyai-universal-3-pro", "assemblyai-universal-3-pro"),
+    }
+    asr_label, diar_label = _STT_LABELS.get(
+        backend, (args.asr_model, "pyannote/speaker-diarization-3.1")
+    )
 
     markdown = render_protocol(
         template_path=args.template,
@@ -850,16 +1042,17 @@ def main() -> int:
     md_path = series_dir / md_name
     bundle = _AtomicBundle()
     try:
-        # 4a. JSON/TXT — только для speechmatics-ветки.
-        if backend == "speechmatics" and sm_result is not None:
+        # 4a. JSON/TXT — для любой внешней STT-ветки (speechmatics/assemblyai).
+        if _is_external_stt(backend) and ext_result is not None:
             archive_json = {
                 "session_uid": session_uid,
                 "series": meta.get("series"),
                 "date": date_part,
-                "speechmatics_job_id": sm_result.job_id,
-                "audio_duration_s": sm_result.audio_duration_s,
-                "detected_language": sm_result.detected_language,
-                "raw_json": sm_result.raw_json,
+                "stt_backend": backend,
+                _stt_id_meta_key(backend): ext_result.job_id,
+                "audio_duration_s": ext_result.audio_duration_s,
+                "detected_language": ext_result.detected_language,
+                "raw_json": ext_result.raw_json,
             }
             bundle.add(
                 transcripts_json_path,
@@ -867,7 +1060,7 @@ def main() -> int:
             )
             bundle.add(
                 transcripts_txt_path,
-                _format_transcript_txt(sm_result.utterances),
+                _format_transcript_txt(ext_result.utterances),
             )
         # 4b. .md — всегда.
         bundle.add(md_path, markdown)
@@ -885,11 +1078,11 @@ def main() -> int:
     # от первой до последней реплики. Пишем И в in-memory meta (caption-путь Ф2
     # читает через source 2 compute_duration_label), И обратно в meta.json
     # (REQ 2.2: после finalize meta.json содержит recording.firstSpeechMs/Last).
-    if backend == "speechmatics" and sm_result is not None:
+    if _is_external_stt(backend) and ext_result is not None:
         bounds = None
         try:
             from lib.protocol_to_tg import speech_bounds_ms_from_raw_json
-            bounds = speech_bounds_ms_from_raw_json(sm_result.raw_json)
+            bounds = speech_bounds_ms_from_raw_json(ext_result.raw_json)
         except Exception as e:  # noqa: BLE001
             log.warning("[clean-time] speech-bounds compute failed (non-fatal): %s", e)
         if bounds is not None:
@@ -986,8 +1179,8 @@ def main() -> int:
             task_meta["expectedParticipants"] = expected
             task_meta["participants"] = participants
             # audioDurationS для расчёта порога анти-галлюцинации.
-            if sm_result is not None:
-                task_meta["audioDurationS"] = sm_result.audio_duration_s
+            if ext_result is not None:
+                task_meta["audioDurationS"] = ext_result.audio_duration_s
             try:
                 tasks = extract_tasks(
                     protocol_md_text,
@@ -1264,16 +1457,16 @@ def main() -> int:
     # повторный trigger ПОСЛЕ доставки (дизайн Ф3/Ф4); в Ф5 он перенесён вверх,
     # чтобы имя попадало в первую доставку, а не только в поздний до-сыл.
 
-    if backend == "speechmatics":
+    if _is_external_stt(backend) and ext_result is not None:
         log.info("Transcripts archive → %s, %s", transcripts_json_path, transcripts_txt_path)
-        # Append в bench-speechmatics-prod.log — Ф4 семидневный мониторинг.
+        # Append в bench-<backend>-prod.log — семидневный мониторинг (как у SM, Ф4).
         # Формат: <iso_ts> <series> <date> wav=<sec> finalize=<sec> job=<id>
         try:
-            bench_path = "/srv/meeting-notary/logs/bench-speechmatics-prod.log"
+            bench_path = f"/srv/meeting-notary/logs/bench-{backend}-prod.log"
             series_label = meta.get("series") or session_uid
-            audio_sec = round(sm_result.audio_duration_s, 1) if sm_result else 0.0
+            audio_sec = round(ext_result.audio_duration_s, 1)
             finalize_sec = round(time.time() - t_start, 1)
-            job_id = sm_result.job_id if sm_result else "n/a"
+            job_id = ext_result.job_id
             iso_ts = datetime.utcnow().isoformat() + "Z"
             line = f"{iso_ts} {series_label} {date_part} wav={audio_sec} finalize={finalize_sec} job={job_id}\n"
             with open(bench_path, "a", encoding="utf-8") as bf:
@@ -1313,8 +1506,13 @@ def main() -> int:
                 pass
         series_label = meta.get("series") or session_uid
         n = (attempts_count or 0) + 1
+        _stt_friendly = {
+            "speechmatics": "Speechmatics",
+            "assemblyai": "AssemblyAI",
+            "whisper_pyannote": "Whisper",
+        }.get(backend, backend)
         _push_telegram(
-            f"✅ Встреча `{series_label} {date_part}` обработана после {n} попыток (Speechmatics)."
+            f"✅ Встреча `{series_label} {date_part}` обработана после {n} попыток ({_stt_friendly})."
         )
 
     # 6. Краткий результат.
@@ -1335,10 +1533,12 @@ def main() -> int:
         "tasks_extracted": tasks_extracted_meta,
         "delivery": delivery_result,
     }
-    if backend == "speechmatics":
+    if _is_external_stt(backend):
         result_json.update({
             "audio_duration_s": extra.get("audio_duration_s"),
-            "speechmatics_job_id": extra.get("speechmatics_job_id"),
+            # id внешнего job'а под backend-специфичным ключом (speechmatics_job_id
+            # / assemblyai_transcript_id) — чтобы аудит-trail совпадал с meta/архивом.
+            _stt_id_meta_key(backend): extra.get(_stt_id_meta_key(backend)),
             "utterances_raw": extra.get("utterances_raw"),
             "transcripts_archive_json": str(transcripts_json_path),
             "transcripts_archive_txt": str(transcripts_txt_path),
