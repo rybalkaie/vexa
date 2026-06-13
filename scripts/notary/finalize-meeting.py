@@ -1170,6 +1170,24 @@ def main() -> int:
                 "[protocol] generation failed (non-fatal) meeting=%s: %s",
                 session_uid, e,
             )
+            # Ф3 (РИСК1 «не молчаливый провал», цикл5/У2): таймаут Opus уже
+            # закрыт деградацией на фолбэк (протокол доставляется), но НЕ-таймаут
+            # отказ генерации (Opus недоступен на VPS / опечатка id / нет шапки)
+            # иначе уходил бы только в journal — владелец узнавал бы об отсутствии
+            # протокола по факту его неприхода. Активный push делает провал
+            # видимым и actionable. Приватность (опасная тройка/egress): в
+            # сообщение — только slug серии + дата + КЛАСС ошибки, без `str(e)`
+            # (тело может нести stderr-фрагмент) и без реплик/имён. Сам push
+            # best-effort (`_push_telegram` не валит finalize).
+            _series = str(meta.get("series") or "—")
+            _push_telegram(
+                "⚠️ Протокол встречи не сгенерировался (транскрипт сохранён).\n"
+                f"Серия: {_series}\n"
+                f"Дата: {date_part}\n"
+                f"Причина: {type(e).__name__}\n"
+                f"Перегенерировать: «протокол {_series} {date_part}» "
+                "или tools/regenerate-protocol.py"
+            )
     else:
         log.info("[protocol] disabled by ENABLE_PROTOCOL_GENERATION=0 — skip")
 

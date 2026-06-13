@@ -1518,7 +1518,10 @@ def generate_protocol(
                 f"claude --print (фолбэк {fallback}): {e2}"
             ) from e2
         model_used = fallback
-        degraded_reason = "opus-timeout"
+        # Модель-нейтральный маркер: primary мог быть переопределён через env
+        # (PROTOCOL_GEN_MODEL) — «opus» в значении лога ввёл бы в заблуждение.
+        # Сама модель, что таймаутнула, логируется рядом (primary=%s выше).
+        degraded_reason = "primary-timeout"
     except ClaudeCliError as e:
         logger.warning(
             "[protocol] failed meeting=%s error=%s retry=0",
