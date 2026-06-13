@@ -36,7 +36,11 @@ from lib import series_markup  # noqa: E402  (тот же объект, что �
 from lib import series_roster as sr  # noqa: E402
 
 SLUG = sr.ANZHEE_COORDINATION_SLUG
-_ALL_GENRES = ("директорат", "координация", "продукт", "1-на-1", "oneoff")
+# Один источник истины — реестр (цикл5/ход3, У4): параметрические тесты ниже
+# автоматически покроют любой будущий жанр, добавленный в registry.VALID_GENRES,
+# без правки этого списка. Совпадение VALID_GENRES↔GENRE_FOCUS стережёт
+# отдельный гард-тест (TestGenreMarkupWrapper.test_valid_genres_match_genre_focus).
+_ALL_GENRES = tuple(sorted(registry.VALID_GENRES))
 
 # Минимальный валидный протокол (должен начинаться с `#протоколвстречи`).
 _FAKE_PROTOCOL = (
@@ -166,6 +170,17 @@ class TestGenreMarkupWrapper(unittest.TestCase):
         # Битый реестр (watched не той формы) → мягкий дефолт, НЕ падение (graceful A4).
         self.assertEqual(series_markup.genre_for_series(SLUG, watched={"watched": "broken"}),
                          series_markup.DEFAULT_GENRE)
+
+    def test_valid_genres_match_genre_focus(self):
+        # Инвариант (цикл5/ход1, Н1): набор VALID_GENRES реестра обязан совпадать с
+        # ключами GENRE_FOCUS. Иначе валидный жанр серии резолвится, но
+        # format_genre_block отдаёт "" → блок жанра молча исчезает (регресс к до-Ф5
+        # для этой серии, без падения и без сигнала). Гард ловит расхождение при
+        # добавлении нового жанра только в один из двух наборов.
+        self.assertEqual(
+            set(registry.VALID_GENRES), set(series_markup.GENRE_FOCUS),
+            "VALID_GENRES и GENRE_FOCUS разошлись: жанр без фокуса даст пустой блок молча",
+        )
 
 
 # ---------------------------------------------------------------------------

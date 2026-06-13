@@ -134,6 +134,12 @@ GENRE_FOCUS: dict[str, str] = {
     ),
 }
 
+# Жанр (ключ/токен watched.yaml) → человекочитаемый ярлык для ПРОМПТА. Токены
+# латиницей («oneoff») удобны владельцу в YAML, но в русскоязычном промпте режут
+# глаз и расходятся с методичкой («разовая»). Маппим только не-русские ключи; для
+# остальных ярлык = сам ключ (цикл5/ход3, У3).
+_GENRE_DISPLAY: dict[str, str] = {"oneoff": "разовая"}
+
 
 def genre_for_series(series: Optional[str], *, watched: Optional[dict] = None) -> str:
     """Жанр серии: разметка `watched.yaml` ПЕРВИЧНА, иначе — мягкий дефолт.
@@ -170,7 +176,8 @@ def format_genre_block(genre: Optional[str]) -> str:
     focus = GENRE_FOCUS.get(key)
     if not focus:
         return ""
-    return f"Тип (повестка) этой встречи: {key}.\n{focus}"
+    label = _GENRE_DISPLAY.get(key, key)
+    return f"Тип (повестка) этой встречи: {label}.\n{focus}"
 
 
 def markup_for_series(
