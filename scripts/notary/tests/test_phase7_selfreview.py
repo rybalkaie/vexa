@@ -275,6 +275,22 @@ class TestReviewAndRewriteProtocol(unittest.TestCase):
         self.assertEqual(m.call_count, 0)
         self.assertEqual(res.degraded, "disabled")
 
+    def test_gutted_protocol_degrades_to_draft(self):
+        """🔴 РИСК1+: критик вернул шапку, но выхолостил тело (резко короче
+        черновика — обрезка/отказ/сбой) → не доверяем, деградация в черновик."""
+        gutted = lp._REWRITE_PROTOCOL_MARKER + "\n#протоколвстречи 13.06.2026\n\n(пусто)"
+        with mock.patch.object(lp, "call_claude_print", return_value=gutted):
+            res = lp.review_and_rewrite_protocol(DRAFT, TRANSCRIPT, meeting_sid="sid")
+        self.assertIsNone(res.protocol)
+        self.assertEqual(res.degraded, "rewrite-too-short")
+
+    def test_legit_rewrite_not_flagged_too_short(self):
+        """Контроль ложного срабатывания: IMPROVED (≈ длине черновика) проходит."""
+        with mock.patch.object(lp, "call_claude_print", return_value=_envelope(IMPROVED)):
+            res = lp.review_and_rewrite_protocol(DRAFT, TRANSCRIPT, meeting_sid="sid")
+        self.assertIsNotNone(res.protocol)
+        self.assertEqual(res.degraded, "no")
+
 
 # ==========================================================================
 # Достижимость из реального триггера (review_and_flag_protocol_file rewrite=True)
@@ -332,6 +348,15 @@ class TestSelfreviewWiring(unittest.TestCase):
         with mock.patch.object(lp, "call_claude_print", return_value=bad):
             n = self._run()
         self.assertEqual(self.protocol.read_text(encoding="utf-8"), DRAFT)
+
+    def test_gutted_keeps_draft_on_disk(self):
+        """🔴 РИСК1+: выхолощенный ответ (шапка есть, тело пустое) → на диске
+        остаётся ЧЕРНОВИК, а не огрызок; файл не тронут (n=0)."""
+        gutted = lp._REWRITE_PROTOCOL_MARKER + "\n#протоколвстречи 13.06.2026\n\nпусто"
+        with mock.patch.object(lp, "call_claude_print", return_value=gutted):
+            n = self._run()
+        self.assertEqual(self.protocol.read_text(encoding="utf-8"), DRAFT)
+        self.assertEqual(n, 0)
 
     def test_diarization_fix_to_transcript_flag_to_protocol(self):
         """Ф4 сохранён в режиме rewrite: fix→транскрипт, flag→улучшенный протокол."""

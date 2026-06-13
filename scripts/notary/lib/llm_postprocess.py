@@ -5307,7 +5307,7 @@ class RewriteResult(NamedTuple):
     """Результат второго прохода Ф7. `protocol is None` → деградация (РИСК1):
     caller отдаёт черновик как финал. `degraded` — машинный маркер для метаданных
     (`no` | `rewrite-timeout` | `no-cli` | `rewrite-error` | `rewrite-malformed`
-    | `disabled`)."""
+    | `rewrite-too-short` | `disabled`)."""
     findings: list[dict]
     protocol: Optional[str]
     edits: dict
@@ -5387,6 +5387,19 @@ def review_and_rewrite_protocol(
             meeting_sid or "?", elapsed, len(raw or ""),
         )
         return RewriteResult(findings, None, edits, "rewrite-malformed")
+    # РИСК1+: шапка есть, но критик «выхолостил» черновик — вернул резко более
+    # короткий текст (обрезка вывода / отказ с шапкой / сбой на длинной встрече).
+    # Доверять нельзя: легитимная вычитка не теряет половину (промпт прямо
+    # запрещает удалять верные пункты — «Не выхолащивай»), значит порог ловит
+    # только катастрофу, нормальные правки (≈ длине черновика или длиннее) не
+    # задевает. Отдаём ЧЕРНОВИК как финал (РИСК1, A5: владелец читает финал, не
+    # огрызок), а не молчаливо затираем известно-хороший черновик пустышкой.
+    if len(protocol) < 0.5 * len(protocol_text):
+        logger.warning(
+            "[selfreview] degraded meeting=%s reason=too-short out_len=%d draft_len=%d",
+            meeting_sid or "?", len(protocol), len(protocol_text),
+        )
+        return RewriteResult(findings, None, edits, "rewrite-too-short")
     logger.info(
         "[selfreview] meeting=%s elapsed=%.1fs out_len=%d findings=%d degraded=no",
         meeting_sid or "?", elapsed, len(protocol), len(findings),
