@@ -196,6 +196,37 @@ def filter_roster_to_present(
     return [e for e in roster if _name_in_names(str(e.get("name") or ""), present_names)]
 
 
+def format_roles_block(roster: list[RosterEntry]) -> str:
+    """Ф3 (G2): блок «роли участников» для ПРОМПТА ГЕНЕРАЦИИ протокола.
+
+    В отличие от `format_roster_hint` (подсказка авторства для маппинга спикеров,
+    с доменными keywords) — это компактный список «имя → зона ответственности».
+    Цель в синтезе протокола: модель привязывает задачи/решения к верным людям и
+    не смешивает роли. keywords сюда НЕ кладём — это лексика ASR-маппинга, в
+    синтезе протокола она шум. Пустой ростер → "" (блок не добавляется, поведение
+    генерации не меняется).
+
+    Без сырого текста реплик (опасная тройка) — только имена и ярлык зоны; сам
+    блок не логируется (G10), кладётся только в промпт генерации.
+    """
+    if not roster:
+        return ""
+    lines = [
+        "Роли участников этой серии (кто за какую зону отвечает). Привязывай "
+        "задачи и решения к верным людям по зоне ответственности — не смешивай "
+        "роли и не приписывай задачу не тому участнику:",
+    ]
+    for entry in roster:
+        name = entry.get("name", "").strip()
+        domain = entry.get("domain", "").strip()
+        if not name or not domain:
+            continue
+        lines.append(f"- {name} — {domain}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
 def format_roster_hint(roster: list[RosterEntry]) -> str:
     """Блок-подсказка для LLM-маппинга: зона ответственности → ответственный.
 

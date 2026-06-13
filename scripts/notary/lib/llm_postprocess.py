@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 from .claude_cli import (
     ClaudeCliError,
     ClaudeCliNotInstalled,
+    ClaudeCliTimeout,
     call_claude_print,
 )
 from . import clarify_state
@@ -1100,11 +1101,32 @@ def clarify_speakers_via_telegram(
 
 # ---------- Ф4: генератор протокола встречи ------------------------------
 
-# Модель для генерации протокола. Sonnet 4.6 — компромисс между качеством
-# (структура, формулировки) и латентностью (на 21-минутном sales-quality
-# ответ приходит за ~15-30 сек). Передаётся в `call_claude_print(model=...)`,
-# который прокидывает `--model claude-sonnet-4-6` в subprocess.
-PROTOCOL_GEN_MODEL = "claude-sonnet-4-6"
+# Ф3 (G1): модель генерации протокола — Opus 4.8. Sonnet 4.6 «плоско» собирал
+# связки «кто за что / что решили / что висит» и смешивал данные; Opus умнее на
+# синтезе (план `2026-06-13-umnyi-protokol-assemblyai.md`, REQ G1). Env
+# `PROTOCOL_GEN_MODEL` переопределяет — откат на Sonnet без передеплоя кода.
+# Передаётся в `call_claude_print(model=...)` → `--model <value>` в subprocess.
+# Opus медленнее Sonnet → см. таймаут/деградацию ниже (РИСК1).
+PROTOCOL_GEN_MODEL = (os.environ.get("PROTOCOL_GEN_MODEL") or "claude-opus-4-8").strip()
+
+# Ф3 (РИСК1): резервная модель генерации на случай ТАЙМАУТА основной (Opus) на
+# длинной встрече. Деградация = один проход на более быстрой модели вместо
+# молчаливой потери протокола (встреча не теряется, см. `generate_protocol`).
+# Пусто (`PROTOCOL_GEN_FALLBACK_MODEL=`) → фолбэка нет, таймаут пробрасывается как
+# `ProtocolGenerationError` (kill-switch деградации).
+PROTOCOL_GEN_FALLBACK_MODEL = (
+    os.environ.get("PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6") or ""
+).strip()
+
+# Ф3 (РИСК1): дефолтный таймаут генерации протокола. Был 180с — мало для Opus на
+# длинной встрече (молчаливый провал → протокола нет). Поднят до 600с; env
+# `PROTOCOL_GEN_TIMEOUT` переопределяет. Глобальный пол `CLAUDE_MIN_TIMEOUT`
+# (claude_cli) применяется ПОВЕРХ этого — на VPS он остаётся deploy-страховкой
+# для остальных claude-вызовов (см. пакет сдачи §5).
+try:
+    PROTOCOL_GEN_TIMEOUT = int(os.environ.get("PROTOCOL_GEN_TIMEOUT", "600") or "600")
+except ValueError:
+    PROTOCOL_GEN_TIMEOUT = 600
 
 # Имя файла метода на диске (общий для мака и VPS). На маке живёт в
 # `~/Projects/me/methods/`, на VPS — копируется через cron rsync (см.
@@ -1238,6 +1260,23 @@ def _format_protocol_user_prompt(
     merged = protocol_to_tg.resolve_present_participants(expected, panel, voiced)
     participants_str = ", ".join(merged) if merged else "—"
 
+    # Ф3 (G2): блок «роли участников» (имя → зона ответственности) из оргструктуры
+    # серии. company-scoped — `series_roster.get_roster` резолвит компанию внутри
+    # (тот же источник, что keyterms Ф2). Фильтруем к реально присутствующим (как
+    # roster-hint маппинга: не подсказываем роль отсутствующего). Блок-ДАННЫЕ ПЕРЕД
+    # транскриптом, рядом с метаданными участников — чтобы модель привязывала задачи
+    # к верным людям и не смешивала роли. Best-effort: сбой источника не роняет
+    # генерацию. Имена в блок попадают, но НЕ логируются (G10/опасная тройка).
+    roles_block = ""
+    try:
+        roster = series_roster.get_roster(meeting_meta.get("series"))
+        roster_present = series_roster.filter_roster_to_present(roster, merged)
+        rb = series_roster.format_roles_block(roster_present)
+        if rb.strip():
+            roles_block = "\n\n" + rb.strip()
+    except Exception:  # noqa: BLE001 — роли не должны ронять генерацию протокола
+        roles_block = ""
+
     transcript_filename = meeting_meta.get("transcript_filename") or f"{date}.md"
 
     meta_block = [
@@ -1297,6 +1336,7 @@ def _format_protocol_user_prompt(
 
     return (
         "\n".join(meta_block)
+        + roles_block
         + memory_block
         + learned_block
         + correction_block
@@ -1364,11 +1404,11 @@ def generate_protocol(
     meeting_meta: dict,
     *,
     method_text: Optional[str] = None,
-    timeout: int = 180,
+    timeout: Optional[int] = None,
     meeting_sid: Optional[str] = None,
     series_memory: Optional[str] = None,
 ) -> str:
-    """Генерирует .md-файл протокола встречи из транскрипта через Claude Sonnet 4.6.
+    """Генерирует .md-файл протокола встречи из транскрипта через Claude (Ф3: Opus 4.8).
 
     Параметры:
       transcript_md: содержимое финального транскрипта (с применёнными именами).
@@ -1378,8 +1418,9 @@ def generate_protocol(
         транскрипта; дефолт `<date>.md`).
       method_text: содержимое метод-файла. None → читаем с диска через
         `_load_method_text()` (это default-путь; явный текст нужен только тестам).
-      timeout: timeout subprocess `claude --print` (default 180s — генерация
-        протокола занимает 15–60s, запас на медленные ответы).
+      timeout: timeout subprocess `claude --print`. None → `PROTOCOL_GEN_TIMEOUT`
+        (Ф3: дефолт 600s — Opus на длинной встрече медленнее Sonnet; РИСК1).
+        Глобальный пол `CLAUDE_MIN_TIMEOUT` (claude_cli) применяется поверх.
       meeting_sid: для structured-лога.
 
     Возвращает: готовый markdown-текст протокола (от строки `#протоколвстречи`).
@@ -1392,6 +1433,8 @@ def generate_protocol(
     """
     if method_text is None:
         method_text = _load_method_text()
+    if timeout is None:
+        timeout = PROTOCOL_GEN_TIMEOUT
 
     # Ф6 (E6): компания встречи — разметка `watched.yaml` ПЕРВИЧНА (поле company),
     # оргструктурный поиск `*-context` — fallback переходного периода. Нет привязки
@@ -1422,18 +1465,60 @@ def generate_protocol(
         transcript_md, meeting_meta, series_memory=series_memory,
     )
 
+    # Ф3 (РИСК1): деградация вместо молчаливого провала. Если основная модель
+    # (Opus) не уложилась в таймаут на длинной встрече — один проход на резервной
+    # модели (`PROTOCOL_GEN_FALLBACK_MODEL`, по умолч. Sonnet), чтобы встреча НЕ
+    # потерялась. Видимая пометка — в structured-лог (`degraded=...`), без текста
+    # транскрипта/ролей (G10/опасная тройка). Не-таймаут-ошибки и отсутствие CLI
+    # ведут себя как до Ф3 (понятный отказ, не тихий None).
+    primary_model = PROTOCOL_GEN_MODEL
+    model_used = primary_model
+    degraded_reason = "no"
     started = time.monotonic()
     try:
         raw = call_claude_print(
             user_prompt,
             system=system_prompt,
             timeout=timeout,
-            model=PROTOCOL_GEN_MODEL,
+            model=primary_model,
         )
     except ClaudeCliNotInstalled as e:
         raise ProtocolGenerationError(
             "`claude` CLI не найден в PATH — генерация протокола невозможна"
         ) from e
+    except ClaudeCliTimeout as e:
+        fallback = PROTOCOL_GEN_FALLBACK_MODEL
+        if not fallback or fallback == primary_model:
+            # Фолбэк выключен/совпадает с основной → не тихий None, а понятный
+            # отказ (caller перегенерирует позже). Лог — только метаданные.
+            logger.warning(
+                "[protocol] timeout meeting=%s model=%s timeout=%ds (фолбэка нет)",
+                meeting_sid or "?", primary_model, timeout,
+            )
+            raise ProtocolGenerationError(
+                f"claude --print timeout (модель {primary_model}, {timeout}s): {e}"
+            ) from e
+        logger.warning(
+            "[protocol] degraded meeting=%s reason=timeout primary=%s fallback=%s timeout=%ds",
+            meeting_sid or "?", primary_model, fallback, timeout,
+        )
+        try:
+            raw = call_claude_print(
+                user_prompt,
+                system=system_prompt,
+                timeout=timeout,
+                model=fallback,
+            )
+        except ClaudeCliError as e2:
+            logger.warning(
+                "[protocol] fallback failed meeting=%s model=%s error=%s",
+                meeting_sid or "?", fallback, str(e2)[:200],
+            )
+            raise ProtocolGenerationError(
+                f"claude --print (фолбэк {fallback}): {e2}"
+            ) from e2
+        model_used = fallback
+        degraded_reason = "opus-timeout"
     except ClaudeCliError as e:
         logger.warning(
             "[protocol] failed meeting=%s error=%s retry=0",
@@ -1443,7 +1528,7 @@ def generate_protocol(
     elapsed = time.monotonic() - started
 
     text = raw.strip()
-    # Срезаем markdown-fence на случай если Sonnet всё-таки обернул ответ.
+    # Срезаем markdown-fence на случай если модель всё-таки обернула ответ.
     if text.startswith("```"):
         text = re.sub(r"^```(?:markdown|md)?\s*\n?", "", text)
         text = re.sub(r"\n?```\s*$", "", text)
@@ -1460,7 +1545,7 @@ def generate_protocol(
                 meeting_sid or "?",
             )
             raise ProtocolGenerationError(
-                "Sonnet вернул ответ без шапки протокола (`#протоколвстречи`)"
+                "модель вернула ответ без шапки протокола (`#протоколвстречи`)"
             )
 
     # FU-11 / Ф5: детерминированный пост-проход доменных терминов (остаточные
@@ -1475,9 +1560,9 @@ def generate_protocol(
     text = protocol_to_tg.insert_protocol_disclaimer(text)
 
     logger.info(
-        "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s",
+        "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s degraded=%s",
         meeting_sid or "?", elapsed, len(system_prompt) + len(user_prompt),
-        len(text), PROTOCOL_GEN_MODEL,
+        len(text), model_used, degraded_reason,
     )
     return text
 
