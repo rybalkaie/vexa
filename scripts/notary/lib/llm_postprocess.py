@@ -4519,6 +4519,21 @@ _REVIEW_MEMORY_SECTION = """### Секция "memory" — протокол не 
 НЕ помечай: имена участников и устоявшиеся термины/названия проектов — их подстановка из памяти серии это НОРМА, а не ошибка. Помечай только факты/числа/решения без опоры на текущую запись. Порог высокий: лучше пропустить сомнительное, чем зашуметь."""
 
 
+_REVIEW_DIARIZATION_SECTION = """### Секция "diarization" — грубые ошибки деления по спикерам
+
+В транскрипте каждая реплика помечена спикером (`**[время] Имя:**` или `**[время] Спикер N:**`). Диаризация иногда ошибается ГРУБО ровно в двух видах:
+- ВНУТРИ одного спикера идёт явный диалог ДВУХ людей (вопрос одного → ответ другого, оба под одной меткой — два человека слиплись в одного спикера);
+- ОТВЕТ приписан тому, кто задал вопрос (реплика-ответ стоит под спикером-спрашивавшим).
+
+Сообщай ТОЛЬКО такие грубые ошибки. Для КАЖДОЙ находки реши, насколько ты уверен, и поставь `verdict`:
+- `verdict="fix"` — ОДНОЗНАЧНО, поправить можно без сомнений: конкретная реплика по смыслу/обращению явно принадлежит ДРУГОМУ спикеру, чем помечено (например ответ «да, готово» стоит под тем же спикером, что задал вопрос «готово?»). Тогда добавь `speaker_to` — кому реплика принадлежит на самом деле (имя ровно как в транскрипте, или «Спикер N»; если это второй, ранее склеенный человек без своей метки — назови «Спикер N» со следующим свободным номером).
+- `verdict="flag"` — СОМНИТЕЛЬНО: есть подозрение, но не уверен. НЕ переставляй — только пометь на ручную сверку. `speaker_to` не нужен.
+
+`quote` = ДОСЛОВНАЯ подстрока ТЕКСТА реплики из транскрипта (без префикса `**[время] Имя:**`), достаточно длинная, чтобы реплика находилась ОДНОЗНАЧНО (если та же фраза встречается у нескольких реплик — возьми кусок длиннее или не сообщай). `note` = коротко (3-7 слов), напр. «ответ под спрашивавшим». `section` = "diarization".
+
+Порог ОЧЕНЬ высокий: на нормально размеченной встрече находок быть НЕ должно. Если сомневаешься, реальная ли это ошибка деления, — ставь `flag` или вообще не сообщай. НЕ трогай нормальную смену тем у одного человека, монолог, короткие поддакивания, уточнения своей же мысли. Лучше пропустить, чем переставить верную реплику."""
+
+
 def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
     """Собирает system-prompt ревью-прохода из включённых секций.
 
@@ -4531,25 +4546,43 @@ def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
         sections.append(_REVIEW_ROLES_SECTION)
     if "memory" in checks:  # Ф7 (7.4): дисциплина «прошлое = справка, не факт»
         sections.append(_REVIEW_MEMORY_SECTION)
+    if "diarization" in checks:  # Ф4: грубые ошибки деления по спикерам (fix/flag)
+        sections.append(_REVIEW_DIARIZATION_SECTION)
     sections_text = "\n\n".join(sections)
     allowed_sections = ", ".join(f'"{c}"' for c in checks) or '"values"'
     section_enum = "|".join(checks) or "values"
+    has_diar = "diarization" in checks
+    # Описание `quote` и поля fix-правки добавляем в контракт ТОЛЬКО когда секция
+    # diarization включена (иначе не путаем модель полями отсутствующей секции).
+    quote_desc = (
+        "<для values/memory — точная подстрока из протокола (буллет/фраза, где "
+        "проблема); для roles — имя спикера ровно как в протоколе"
+    )
+    if has_diar:
+        quote_desc += "; для diarization — точная подстрока ТЕКСТА реплики из транскрипта"
+    quote_desc += ">"
+    diar_fields = (
+        ', "verdict": "<только для diarization: fix|flag>", "speaker_to": '
+        '"<только для diarization+fix: кому реплика принадлежит>"'
+    ) if has_diar else ""
+    diar_tail = (
+        " Поля `verdict`/`speaker_to` нужны ТОЛЬКО для секции diarization "
+        "(для остальных секций их не добавляй)."
+    ) if has_diar else ""
     return (
         "Ты — придирчивый проверяющий протокола встречи. Тебе дан готовый "
         "протокол и исходный транскрипт. Твоя задача — НАЙТИ подозрительные "
         "места и вернуть их списком. Ты НИЧЕГО не правишь сам.\n\n"
         + sections_text
         + "\n\nОтвет — СТРОГО JSON-объект без markdown-обёртки:\n"
-        '{"findings": [{"section": "' + section_enum + '", "quote": "<для values/'
-        'memory — точная подстрока из протокола (буллет/фраза, где проблема); для '
-        'roles — имя спикера ровно как в протоколе>", "note": "<коротко (3-7 слов) что '
-        'проверить>"}]}\n'
+        '{"findings": [{"section": "' + section_enum + '", "quote": "' + quote_desc
+        + '", "note": "<коротко (3-7 слов) что проверить>"' + diar_fields + "}]}\n"
         f"Поле `section` — одно из: {allowed_sections} (по тому, какая секция "
         "выше дала находку).\n"
         "Если подозрительного нет — верни {\"findings\": []}. "
         "Для секции values `quote` должен быть ДОСЛОВНОЙ подстрокой протокола "
         "(можно неполная строка, но без перефраза) — по ней пометка встанет "
-        "на нужное место."
+        "на нужное место." + diar_tail
     )
 
 
@@ -4585,11 +4618,19 @@ def _parse_review_response(raw: str) -> list[dict]:
         note = (f.get("note") or "").strip()
         if not quote or not note:
             continue
-        out.append({
-            "section": (f.get("section") or "values").strip() or "values",
-            "quote": quote,
-            "note": note,
-        })
+        section = (f.get("section") or "values").strip() or "values"
+        item = {"section": section, "quote": quote, "note": note}
+        if section == "diarization":
+            # Ф4: diarization несёт verdict (fix|flag) и speaker_to (для fix).
+            # Дефолт — flag (консервативно: без явного fix не переставляем).
+            verdict = (f.get("verdict") or "").strip().lower()
+            speaker_to = (f.get("speaker_to") or "").strip()
+            if verdict != "fix" or not speaker_to:
+                verdict = "flag"
+                speaker_to = ""
+            item["verdict"] = verdict
+            item["speaker_to"] = speaker_to
+        out.append(item)
     return out
 
 
@@ -4608,10 +4649,13 @@ def _format_tail_finding(f: dict) -> str:
     """Строка хвостового блока «## ⚠️ Проверить» для одного finding.
 
     roles (6.2): спикер-уровневый флаг — `⚠️ <спикер>: <что смешано>`.
+    diarization (Ф4): сомнительное деление — `⚠️ спикер под вопросом: «<реплика>» — <note>`.
     values (5.2): не нашли строку для inline — `⚠️ <note> — «<quote>»`.
     """
     if f.get("section") == "roles":
         return f"{REVIEW_FLAG_MARKER} {f['quote']}: {f['note']}"
+    if f.get("section") == "diarization":
+        return f"{REVIEW_FLAG_MARKER} спикер под вопросом: «{f['quote']}» — {f['note']}"
     return f"{REVIEW_FLAG_MARKER} {f['note']} — «{f['quote']}»"
 
 
@@ -4638,8 +4682,18 @@ def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
     norm_lines = [_normalize_for_match(ln) for ln in lines]
     unmatched: list[dict] = []
     for f in findings:
+        sec = f.get("section")
+        # diarization (Ф4): fix-находки правятся в ТРАНСКРИПТЕ (apply_diarization_fixes),
+        # в протокол не идут — пропускаем. flag-находки (сомнительное деление) — видимая
+        # пометка «спикер под вопросом» в хвостовой блок протокола (D3: реплики на местах).
+        if sec == "diarization":
+            if f.get("verdict") == "fix":
+                continue
+            if f.get("quote") and f.get("note"):
+                unmatched.append(f)
+            continue
         # roles — всегда спикер-уровневый флаг в хвостовой блок (см. docstring).
-        if f.get("section") == "roles":
+        if sec == "roles":
             if f.get("quote") and f.get("note"):
                 unmatched.append(f)
             continue
@@ -4674,6 +4728,84 @@ def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
         if f"## {REVIEW_FLAG_MARKER} Проверить" not in out:
             out = out.rstrip() + "\n" + "\n".join(block).rstrip() + "\n"
     return out
+
+
+def _speaker_to_is_sane(speaker_to: str) -> bool:
+    """Кандидат-спикер для re-attribution безопасен: непустой, короткий, без
+    переноса/markdown-маркеров. Защита от того, что модель вернёт в `speaker_to`
+    целую фразу/мусор и мы впишем её как метку спикера."""
+    s = (speaker_to or "").strip()
+    if not s or len(s) > 40:
+        return False
+    if "\n" in s or "*" in s or ":" in s:
+        return False
+    return True
+
+
+def apply_diarization_fixes(
+    transcript_md: str, findings: list[dict]
+) -> tuple[str, int]:
+    """Ф4 (D2): консервативная re-attribution реплик в ТРАНСКРИПТЕ по находкам.
+
+    Берёт ТОЛЬКО diarization-находки с `verdict=="fix"` и валидным `speaker_to`.
+    Для каждой ищет РОВНО ОДНУ строку-реплику (`**[ts] X:**  текст`), текст
+    которой содержит `quote` (нечётко — по схлопнутым пробелам/регистру, без
+    markdown-эмфазы). Условия правки (иначе НЕ трогаем — лучше пропустить, чем
+    переставить верное):
+      - совпадение РОВНО одно (0 или ≥2 — неоднозначно → пропуск);
+      - текущая метка строки ≠ `speaker_to` (иначе уже та — идемпотентность).
+    Найдено и условия выполнены → переписываем метку РОВНО этой строки на
+    `speaker_to` (остальные строки того же спикера НЕ трогаем — это
+    реплика-уровневая правка, не глобальный remap).
+
+    Чистая функция (без IO/claude) — основной объект unit-тестов D2. Идемпотентна
+    (повторный проход видит метку = speaker_to → no-op). Возвращает
+    `(новый_текст, n_правок)`; при 0 правок — исходный текст без изменений.
+    """
+    if not transcript_md or not findings:
+        return transcript_md, 0
+    fixes = [
+        f for f in findings
+        if f.get("section") == "diarization"
+        and f.get("verdict") == "fix"
+        and (f.get("quote") or "").strip()
+        and _speaker_to_is_sane(f.get("speaker_to", ""))
+    ]
+    if not fixes:
+        return transcript_md, 0
+    lines = transcript_md.split("\n")
+    # Предрасчёт по строкам-репликам: (индекс, нормализованный текст после метки).
+    replicas: list[tuple[int, str]] = []
+    for i, ln in enumerate(lines):
+        m = _TRANSCRIPT_SPEAKER_RE.search(ln)
+        if not m:
+            continue
+        replicas.append((i, _normalize_for_match(ln[m.end():])))
+    fixed_lines: set[int] = set()
+    n_fixed = 0
+    for f in fixes:
+        quote_norm = _normalize_for_match(f["quote"])
+        if not quote_norm:
+            continue
+        matches = [i for (i, txt) in replicas if quote_norm in txt]
+        if len(matches) != 1:
+            continue  # 0 — не нашли; ≥2 — неоднозначно. Консервативно пропускаем.
+        idx = matches[0]
+        if idx in fixed_lines:
+            continue  # одну строку правим один раз
+        m = _TRANSCRIPT_SPEAKER_RE.search(lines[idx])
+        if not m:
+            continue
+        speaker_to = f["speaker_to"].strip()
+        if _normalize_for_match(m.group(2)) == _normalize_for_match(speaker_to):
+            continue  # метка уже та — идемпотентность
+        start, end = m.start(2), m.end(2)
+        lines[idx] = lines[idx][:start] + speaker_to + lines[idx][end:]
+        fixed_lines.add(idx)
+        n_fixed += 1
+    if not n_fixed:
+        return transcript_md, 0
+    return "\n".join(lines), n_fixed
 
 
 def review_protocol(
@@ -4730,11 +4862,16 @@ def review_and_flag_protocol_file(
     checks: tuple[str, ...] = ("values",),
     meeting_sid: Optional[str] = None,
 ) -> int:
-    """Высокоуровневая обёртка 5.2: читает протокол+транскрипт, прогоняет
-    `review_protocol`, вписывает ⚠️ через `apply_review_flags`, atomic-write.
-
-    Возвращает число вставленных пометок (0 — нечего/сбой). Best-effort:
-    любой сбой → 0, файл не трогаем.
+    """Высокоуровневая обёртка 5.2/Ф4: читает протокол+транскрипт, прогоняет
+    `review_protocol` (ОДИН claude-вызов), затем:
+      - Ф4 (D2): однозначные ошибки деления по спикерам — детерминированная
+        re-attribution реплик в ТРАНСКРИПТЕ (`apply_diarization_fixes`);
+      - 5.2/6.2/7.4 + Ф4 (D3): ⚠️-пометки (вкл. «спикер под вопросом» для
+        сомнительного деления) в ПРОТОКОЛ (`apply_review_flags`).
+    Оба файла пишутся atomic, независимо и best-effort: сбой записи одного не
+    валит встречу и не мешает второму. Возвращает суммарное число изменений
+    (правки транскрипта + пометки протокола). D4: лог — ТОЛЬКО счётчики, без
+    текста реплик/имён.
     """
     if not protocol_path.is_file() or not transcript_path.is_file():
         return 0
@@ -4749,15 +4886,37 @@ def review_and_flag_protocol_file(
     )
     if not findings:
         return 0
+
+    # Ф4 (D2): re-attribution однозначных реплик в транскрипте (отдельный файл).
+    new_transcript, n_fixes = apply_diarization_fixes(transcript_md, findings)
+    if n_fixes and new_transcript != transcript_md:
+        try:
+            _atomic_write_text(transcript_path, new_transcript)
+        except OSError as e:
+            logger.warning("[review] transcript fix write failed %s: %s", transcript_path, e)
+            n_fixes = 0  # не записалось — не засчитываем
+
+    # Пометки в протокол (values/roles/memory + diarization-flag). diarization-fix
+    # сюда не идут — apply_review_flags их пропускает (они уже в транскрипте).
+    n_flags = 0
     new_text = apply_review_flags(protocol_text, findings)
-    if new_text == protocol_text:
-        return 0
-    try:
-        _atomic_write_text(protocol_path, new_text)
-    except OSError as e:
-        logger.warning("[review] write failed %s: %s", protocol_path, e)
-        return 0
-    return len(findings)
+    if new_text != protocol_text:
+        try:
+            _atomic_write_text(protocol_path, new_text)
+            n_flags = sum(
+                1 for f in findings
+                if not (f.get("section") == "diarization" and f.get("verdict") == "fix")
+            )
+        except OSError as e:
+            logger.warning("[review] write failed %s: %s", protocol_path, e)
+            n_flags = 0
+
+    if n_fixes or n_flags:
+        logger.info(
+            "[review] meeting=%s diarization-fixes=%d protocol-flags=%d",
+            meeting_sid or "?", n_fixes, n_flags,
+        )
+    return n_flags + n_fixes
 
 
 # ===========================================================================

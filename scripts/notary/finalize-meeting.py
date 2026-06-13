@@ -1328,12 +1328,15 @@ def main() -> int:
     # Ф7 (7.4): добавлена "memory" — ТЕМ ЖЕ одним вызовом (НЕ 3-й проход). Секция
     # ловит факты протокола без опоры на текущий транскрипт (утечку прошлого из
     # справки памяти серии). Сверяет протокол↔транскрипт, доп. данные не нужны.
+    # Ф4 (D2/D3): добавлена "diarization" — ТЕМ ЖЕ одним вызовом. Однозначные ошибки
+    # деления по спикерам правятся в транскрипте (re-attribution), сомнительные —
+    # помечаются «⚠️ спикер под вопросом» в протоколе (реплики на местах).
     if _is_protocol_enabled() and protocol_path.is_file():
         try:
             n_flags = review_and_flag_protocol_file(
                 protocol_path=protocol_path,
                 transcript_path=md_path,
-                checks=("values", "roles", "memory"),
+                checks=("values", "roles", "memory", "diarization"),
                 meeting_sid=session_uid,
             )
             if n_flags:
