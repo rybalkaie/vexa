@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 # Виды знания, которыми оперирует ратчет (совпадают с `knowledge_router`).
 KIND_TERM = "term"
 KIND_ROSTER_ROLE = "roster-role"
+# Ф9 (B4): durable-факт уровня второго мозга (стратегия/позиционирование/экономика/
+# проверенный вывод/веха). Ратчет/keep-private работают по нему так же, как по
+# терминам/ролям — логика kind-агностична, добавлена лишь именованная константа.
+KIND_INSIGHT = "insight"
 
 # Спец-значение company в пер-kind правиле: «любая компания» (владелец не уточнил).
 COMPANY_ANY = "*"
@@ -67,10 +71,16 @@ def _empty_state() -> dict:
             "Ф7 D4: ратчет private→company. promote_kinds: впредь знание этого рода "
             "для этой компании роутится в *-context. promote_keys: конкретный факт. "
             "Повышает владелец командой «переноси в контекст»; автоматика сама не "
-            "повышает (fail-closed). Секреты сюда не попадают (D5)."
+            "повышает (fail-closed). Секреты сюда не попадают (D5). Ф9 B4: "
+            "keep_private_* — зеркало вниз (company→private): владелец объяснил «это "
+            "приватное» → впредь такое НЕ публикуем (только увеличивает приватность)."
         ),
         "promote_kinds": {},   # "<kind>" -> {"company": <name|*>, "at": iso}
         "promote_keys": {},    # "<kind>:<normkey>" -> {"company": <name|*>, "at": iso}
+        # Ф9 (B4): запомненное владельцем «держать приватным». Перебивает повышение
+        # (fail-closed: приватность всегда выигрывает). Та же форма ключей.
+        "keep_private_kinds": {},
+        "keep_private_keys": {},
         "log": [],             # append-only история команд владельца
     }
 
@@ -88,7 +98,8 @@ def load_state() -> dict:
         if not isinstance(data, dict):
             raise ValueError("ratchet state не объект")
         base = _empty_state()
-        for k in ("promote_kinds", "promote_keys"):
+        for k in ("promote_kinds", "promote_keys",
+                  "keep_private_kinds", "keep_private_keys"):
             if not isinstance(data.get(k), dict):
                 data[k] = base[k]
         if not isinstance(data.get("log"), list):
@@ -194,6 +205,66 @@ def remember_promotion(
     return {"kind": k, "scope": scope, "company": comp, "key": (_norm(key) if key else None)}
 
 
+# ── Ф9 (B4): зеркало вниз — «держать приватным» (company→private) ─────────────
+# Дефолт безопасности (D3) уже приватный, но публикационный гейт/ратчет могут
+# отправить факт в COMPANY. Если владелец объяснил «это приватное» — запоминаем,
+# и ВПРЕДЬ такое знание принудительно остаётся приватным, ПЕРЕБИВАЯ повышение.
+# Это только УВЕЛИЧИВАЕТ приватность (fail-closed остаётся fail-closed).
+
+
+def should_keep_private(kind: str, *, company: Optional[str] = None, key: Optional[str] = None) -> bool:
+    """Запомнил ли владелец, что такое знание держать приватным (B4)?
+
+    Совпадение по конкретному ключу (пер-key) ИЛИ по роду (пер-kind), при
+    совместимости компании — симметрично `should_promote`. Нет правила → False.
+    """
+    k = _norm(kind)
+    if not k:
+        return False
+    data = load_state()
+    if key:
+        rule = data.get("keep_private_keys", {}).get(f"{k}:{_norm(key)}")
+        if isinstance(rule, dict) and _company_match(rule.get("company"), company):
+            return True
+    rule = data.get("keep_private_kinds", {}).get(k)
+    if isinstance(rule, dict) and _company_match(rule.get("company"), company):
+        return True
+    return False
+
+
+def remember_keep_private(
+    kind: str, *, company: Optional[str] = None, key: Optional[str] = None,
+    scope: str = "kind",
+) -> Optional[dict]:
+    """Запомнить «держать приватным»: впредь знание рода `kind` (scope=kind) или
+    конкретный факт `key` (scope=key) для компании `company` остаётся приватным.
+
+    Зеркало `remember_promotion`. company=None → `*` (любая). Идемпотентно.
+    """
+    k = _norm(kind)
+    if not k:
+        return None
+    comp = _norm(company) or COMPANY_ANY
+    rule = {"company": comp, "at": _now_iso()}
+
+    def _mut(data: dict) -> None:
+        if scope == "key" and key:
+            data["keep_private_keys"][f"{k}:{_norm(key)}"] = rule
+        else:
+            data["keep_private_kinds"][k] = rule
+        data["log"].append({"op": "keep-private", "kind": k, "scope": scope,
+                            "company": comp, "key": (_norm(key) if key else None),
+                            "at": rule["at"]})
+
+    with _lock():
+        data = load_state()
+        _mut(data)
+        _write_atomic(state_path(), data)
+    logger.info("[ratchet] запомнено «держать приватным» (company→private): kind=%s scope=%s company=%s",
+                k, scope, comp)
+    return {"kind": k, "scope": scope, "company": comp, "key": (_norm(key) if key else None)}
+
+
 # ── Разбор команды владельца «переноси в контекст …» ─────────────────────────
 # Триггер действия + цель «контекст/общий мозг/командное/общая база».
 _PROMOTE_TRIGGER_RE = re.compile(
@@ -218,6 +289,15 @@ _COMPANY_HINTS = (
     ("mpfirst", re.compile(r"\b(?:mpfirst|мпервый|м-?первый|m1|первый)\b", re.IGNORECASE)),
 )
 
+# Ф9: отрицание прямо перед триггером повышения («не переноси в контекст») — это НЕ
+# команда повышения, а наоборот (часто = держать приватным). Fail-closed: при
+# отрицании повышение НЕ срабатывает (ошибочное повышение необратимо для команды).
+_PROMOTE_NEGATION_RE = re.compile(
+    r"\b(?:не|нет|никогда|ни\s+в\s+коем)\s+(?:перенос\w*|перенеси|переведи|фиксируй|"
+    r"сохраняй|клади|добавляй|запоминай|храни)\b",
+    re.IGNORECASE,
+)
+
 
 def parse_promote_command(text: object) -> Optional[dict]:
     """Это команда «переноси в контекст …»? → {company: Optional[str], scope}.
@@ -230,6 +310,9 @@ def parse_promote_command(text: object) -> Optional[dict]:
     if not isinstance(text, str) or not text.strip():
         return None
     s = text.strip()
+    # Fail-closed: отрицание перед триггером («не переноси в контекст») → не повышаем.
+    if _PROMOTE_NEGATION_RE.search(s):
+        return None
     has_target = bool(_PROMOTE_TARGET_RE.search(s))
     is_command = (has_target and bool(_PROMOTE_TRIGGER_RE.search(s))) or bool(_PROMOTE_SHORT_RE.search(s))
     if not is_command:
@@ -262,4 +345,47 @@ def note_promote_command(
         return remember_promotion(kind, company=comp, key=key, scope=scope)
     except Exception as e:  # noqa: BLE001
         logger.warning("[ratchet] запись повышения не удалась (non-fatal): %s", e)
+        return None
+
+
+# Ф9 (B4): команда «это приватное / держи в личном / не в контекст».
+_KEEP_PRIVATE_RE = re.compile(
+    r"(?:\bэто\s+)?(?:приватн\w+|личн\w+|не\s+(?:для|в)\s+команд\w+|"
+    r"не\s+(?:в|для)\s+контекст\w*|не\s+публику\w+|оставь\s+(?:в\s+)?(?:личн\w+|приватн\w+)|"
+    r"держи\s+(?:в\s+)?(?:личн\w+|приватн\w+|при\s+себе)|только\s+(?:для\s+)?меня)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_keep_private_command(text: object) -> Optional[dict]:
+    """Это объяснение «держать приватным»? → {company, scope}. Зеркало
+    `parse_promote_command`. None, если текст не про приватность."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    s = text.strip()
+    if not _KEEP_PRIVATE_RE.search(s):
+        return None
+    company: Optional[str] = None
+    for name, rx in _COMPANY_HINTS:
+        if rx.search(s):
+            company = name
+            break
+    scope = "key" if re.search(r"\b(?:только\s+это|именно\s+эт\w+|разов\w+|один\s+раз)\b", s, re.IGNORECASE) else "kind"
+    return {"company": company, "scope": scope}
+
+
+def note_keep_private_command(
+    text: object, *, kind: str, key: Optional[str] = None, company: Optional[str] = None,
+) -> Optional[dict]:
+    """Если `text` — объяснение приватности, запомнить keep-private для факта.
+    Зеркало `note_promote_command`. Best-effort: ошибку наружу не пускаем."""
+    parsed = parse_keep_private_command(text)
+    if parsed is None:
+        return None
+    comp = parsed.get("company") or company
+    scope = parsed.get("scope") or "kind"
+    try:
+        return remember_keep_private(kind, company=comp, key=key, scope=scope)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[ratchet] запись keep-private не удалась (non-fatal): %s", e)
         return None

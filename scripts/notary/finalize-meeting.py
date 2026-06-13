@@ -1429,6 +1429,36 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             log.warning("[series-memory] digest save failed (non-fatal): %s", e)
 
+    # 4.0.2e. Ф9 (B1–B6): дистилляция durable-знания из ГОТОВОГО протокола в мозг.
+    # Идёт ПОСЛЕ self-review (Ф7) и публикационного гейта — по ФИНАЛЬНОМУ протоколу
+    # (не по сырому транскрипту). Маршрут ТОЛЬКО через knowledge_router; COMPANY
+    # проходит G11+гейт ДО записи; чувствительное/спорное → воскресная очередь, НЕ
+    # молча в *-context. В headless flush gated токеном → COMPANY лишь копится в
+    # outbox (PR делает провижининг владельца). Best-effort: сбой → finalize не
+    # валится (протокол на диске и доставляется ниже). Достижимо из ОБОИХ триггеров
+    # (finalize + clarify) — память review-checks-two-call-sites.
+    if _is_protocol_enabled() and protocol_path.is_file():
+        try:
+            from lib import knowledge_distill  # noqa: PLC0415
+            _voiced_distill = [n for n in (cluster_to_name or {}).values()
+                               if isinstance(n, str) and n.strip()]
+            _present_distill = publication_gate.present_participants_for_gate(
+                expected, participants, _voiced_distill)
+            _distill_res = knowledge_distill.distill_and_route(
+                protocol_path.read_text(encoding="utf-8"),
+                series=meta.get("series"),
+                present_participants=_present_distill,
+                date=date_part,
+                meeting_sid=session_uid,
+            )
+            # B6: только счётчики (без текста факта/реплик).
+            log.info("[distill] meeting=%s status=%s cand=%d company=%d private=%d sunday=%d",
+                     session_uid, _distill_res.get("status"), _distill_res.get("candidates", 0),
+                     _distill_res.get("company", 0), _distill_res.get("private", 0),
+                     _distill_res.get("sunday", 0))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[distill] failed (non-fatal): %s", e)
+
     # 4.0.3. Ф6: доставка протокола в Telegram-группу.
     # Идемпотентность через `meta.delivered` в meta.json. Если привязки
     # series→chat_id в watched.yaml нет — `deliver_protocol` сам спросит

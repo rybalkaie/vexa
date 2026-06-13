@@ -45,12 +45,27 @@ logger = logging.getLogger(__name__)
 
 KIND_TERM = "term"
 KIND_ROLE = "roster-role"
+# Ф9 (B1/B2): durable-факт уровня второго мозга (стратегия/позиционирование/
+# экономика/проверенный вывод/веха). Едет в `*-context` той же веткой+PR, что
+# термины/роли, но в ОТДЕЛЬНЫЙ markdown-файл `insights.md` (читаемый командой; не
+# YAML-словарь). Команда на ревью PR переносит в `baza-znaniy/` по своему усмотрению.
+KIND_INSIGHT = "insight"
 
 # Стабильное имя bot-ветки (контракт §3.3) — пересоздаётся от свежего origin/main.
 WRITEBACK_BRANCH = "notary/auto-knowledge"
 # Поддерево, которое бот ПРАВИТ (и только его) — контракт §1.1/§3.3.
 GLOSSARY_REL = "knowledge/notary/glossary.yaml"
 ORG_REL = "knowledge/notary/org-structure.yaml"
+INSIGHTS_REL = "knowledge/notary/insights.md"  # Ф9: durable-факты встреч (markdown)
+
+# Шапка `insights.md` при первом создании (бот владеет файлом целиком).
+_INSIGHTS_HEADER = (
+    "# Авто-знание нотариуса: durable-факты встреч\n\n"
+    "<!-- Бот-нотариус (Ф9) предлагает сюда durable-факты уровня второго мозга\n"
+    "(стратегия/позиционирование/экономика/проверенный вывод/веха). Ревью и перенос\n"
+    "в baza-znaniy — за командой через PR. Чувствительное сюда НЕ попадает (фильтр\n"
+    "G11 + публикационный гейт). Сырьё (транскрипт/реплики) сюда НЕ течёт. -->\n"
+)
 
 
 # ── Пути хранилища ────────────────────────────────────────────────────────────
@@ -207,7 +222,8 @@ def enqueue(
         return EnqueueResult("exists", company, val, "already-queued")
     if kind == KIND_TERM and key in _glossary_existing_canon(company):
         return EnqueueResult("exists", company, val, "already-in-glossary")
-    target = f"{context_knowledge.repo_for_company(company) or company}/{GLOSSARY_REL if kind == KIND_TERM else ORG_REL}"
+    _rel = {KIND_TERM: GLOSSARY_REL, KIND_ROLE: ORG_REL, KIND_INSIGHT: INSIGHTS_REL}.get(kind, ORG_REL)
+    target = f"{context_knowledge.repo_for_company(company) or company}/{_rel}"
     record = {
         "kind": kind,
         "company": company,
@@ -298,6 +314,50 @@ def propose_role(
                    source=dict(source or {}, series=series))
 
 
+def propose_insight(
+    fact: str,
+    *,
+    series: Optional[str],
+    company: Optional[str] = None,
+    insight_kind: Optional[str] = None,
+    confidence: Optional[str] = None,
+    publication_allowed: bool = False,
+    present_participants: Optional[list] = None,
+    watched: Optional[dict] = None,
+    source: Optional[dict] = None,
+) -> EnqueueResult:
+    """Ф9 (B1/B2): предложить durable-ФАКТ уровня второго мозга. Адресат — роутер.
+
+    Тонкая обёртка вокруг `route_for_meeting`/`classify_destination` + `enqueue`,
+    симметричная `propose_term`/`propose_role`, но для нового вида знания (insight).
+    НЕ заводит параллельную трубу — тот же router/outbox/PR-механизм.
+
+    🔴 Маршрут COMPANY обязан ДОПОЛНИТЕЛЬНО пройти фильтр чувствительного (G11) у
+    вызывателя (`knowledge_distill.distill_and_route`) ДО записи; здесь — только
+    адресация слоя. Прямой вызов с company+publication_allowed=True предполагает,
+    что G11 уже пройден (используется в тестах/после фильтра).
+    """
+    fact = (fact or "").strip()
+    if not fact:
+        return EnqueueResult("drop", None, "", "empty")
+    if company is not None:
+        dest = knowledge_router.classify_destination(
+            fact, kind=KIND_INSIGHT, company=company, publication_allowed=publication_allowed,
+        )
+    else:
+        dest = knowledge_router.route_for_meeting(
+            fact, kind=KIND_INSIGHT, series=series,
+            present_participants=present_participants, watched=watched,
+        )
+    payload = {"fact": fact, "scope": dest.company or (str(company).strip().lower() if company else None) or None}
+    if insight_kind:
+        payload["insight_kind"] = str(insight_kind)[:40]
+    if confidence:
+        payload["confidence"] = str(confidence)[:10]
+    return enqueue(dest, kind=KIND_INSIGHT, value=fact, payload=payload,
+                   source=dict(source or {}, series=series))
+
+
 # ── Чистый мёрж предложений в YAML-структуру знания (тестируется на dict) ──────
 
 
@@ -377,6 +437,55 @@ def apply_entries_to_org(org_doc: Optional[dict], entries: list[dict]) -> tuple[
     return doc, added
 
 
+def _norm_fact(s: object) -> str:
+    """Нормализация факта для дедупа: схлопнуть пробелы, lower, отбросить хвостовую
+    пунктуацию. Не идеальная семантика, но ловит точные/почти-точные повторы."""
+    t = " ".join(str(s or "").split()).strip().lower()
+    return t.rstrip(".!?;: ")
+
+
+def apply_entries_to_insights(insights_text: Optional[str], entries: list[dict]) -> tuple[str, int]:
+    """Ф9: влить insight-предложения в markdown `insights.md`. Возвращает (text, added).
+
+    Чистая функция над ТЕКСТОМ (не YAML — файл человекочитаемый, бот владеет им
+    целиком). Дедуп по нормализованному факту против уже лежащих строк. Креды
+    отсекаются (D5). Сырьё сюда не попадает — только сжатый факт. Новые строки
+    дописываются в конец (минимальный diff для ревью).
+    """
+    text = insights_text if (insights_text and insights_text.strip()) else _INSIGHTS_HEADER
+    # Существующие факты — нормализованный пул для дедупа (всё тело файла, lower).
+    have_norm = "\n".join(_norm_fact(ln) for ln in text.splitlines())
+    new_lines: list[str] = []
+    added = 0
+    for e in entries:
+        if e.get("kind") != KIND_INSIGHT:
+            continue
+        pl = e.get("payload") or {}
+        fact = str(pl.get("fact") or e.get("value") or "").strip()
+        if not fact or not cred_filter.is_safe_to_store(fact):
+            continue
+        nf = _norm_fact(fact)
+        if not nf or nf in have_norm:
+            continue
+        src = e.get("source") or {}
+        series = src.get("series") or pl.get("slug") or pl.get("series") or "—"
+        date = src.get("date") or "—"
+        kind_tag = pl.get("insight_kind")
+        tag = f" _[{kind_tag}]_" if kind_tag else ""
+        new_lines.append(f"- [{date}] (серия `{series}`){tag} {fact}")
+        have_norm += "\n" + nf
+        added += 1
+    if not new_lines:
+        return text, 0
+    if not text.endswith("\n"):
+        text += "\n"
+    # Пустая строка-разделитель перед первым добавлением в свежий файл/блок.
+    if not text.endswith("\n\n"):
+        text += "\n"
+    text += "\n".join(new_lines) + "\n"
+    return text, added
+
+
 # ── Чистый ПЛАН PR (инварианты Ф4 §3.3 зашиты и тестируются) ──────────────────
 
 
@@ -428,20 +537,38 @@ def plan_pr(company: str, entries: list[dict], *, repo: Optional[str] = None,
         )
     n_term = sum(1 for e in entries if e.get("kind") == KIND_TERM)
     n_role = sum(1 for e in entries if e.get("kind") == KIND_ROLE)
-    title = f"[notary] авто-знание: +{n_term} терм., +{n_role} ролей"
-    # Тело PR — производные термины/роли, НЕ сырьё (опасная тройка).
-    body_lines = ["Авто-предложение бота-нотариуса (D1/D2). Ревью и мёрж — за командой.", ""]
+    n_insight = sum(1 for e in entries if e.get("kind") == KIND_INSIGHT)
+    title = f"[notary] авто-знание: +{n_term} терм., +{n_role} ролей, +{n_insight} фактов"
+    # Тело PR — производные термины/роли/факты, НЕ сырьё (опасная тройка). Факты —
+    # сжатые durable-выводы (Ф9), прошедшие G11+гейт ДО постановки в COMPANY-outbox.
+    body_lines = ["Авто-предложение бота-нотариуса (D1/D2/Ф9). Ревью и мёрж — за командой.", ""]
     for e in entries:
         if e.get("kind") == KIND_TERM:
             body_lines.append(f"- термин: `{e.get('value')}`")
         elif e.get("kind") == KIND_ROLE:
             body_lines.append(f"- роль: `{e.get('value')}` (серия {(e.get('source') or {}).get('series') or '—'})")
+        elif e.get("kind") == KIND_INSIGHT:
+            pl = e.get("payload") or {}
+            body_lines.append(f"- факт: {pl.get('fact') or e.get('value')} (серия {(e.get('source') or {}).get('series') or '—'})")
     body = "\n".join(body_lines)
     commit_message = title
+    # Conditional `git add` — стейджим ТОЛЬКО файлы под актуальные виды записей.
+    # Иначе `git add <несуществующий insights.md>` упал бы на репо без файла и
+    # отменил бы всю постановку (git add атомарен по pathspec). Все пути — внутри
+    # поддерева бота knowledge/notary/* (контракт §3.3). Term/role-путь неизменен.
+    add_paths = []
+    if n_term:
+        add_paths.append(GLOSSARY_REL)
+    if n_role:
+        add_paths.append(ORG_REL)
+    if n_insight:
+        add_paths.append(INSIGHTS_REL)
+    if not add_paths:  # подстраховка (entries без распознанного kind) — штатные YAML
+        add_paths = [GLOSSARY_REL, ORG_REL]
     commands = [
         ["git", "fetch", "origin"],
         ["git", "checkout", "-B", WRITEBACK_BRANCH, "origin/main"],
-        ["git", "add", GLOSSARY_REL, ORG_REL],
+        ["git", "add", *add_paths],
         ["git", "commit", "-m", commit_message],
         ["git", "push", "--force-with-lease", "origin", WRITEBACK_BRANCH],
     ]
@@ -550,6 +677,21 @@ def _safe_yaml_write(path: Path, doc: dict) -> None:
         yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, default_flow_style=False),
         encoding="utf-8",
     )
+
+
+def _safe_text_read(path: Path) -> Optional[str]:
+    """Прочитать markdown-файл `insights.md` (или None, если нет/нечитаем)."""
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _safe_text_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def _rewrite_outbox(company: str, records: list[dict]) -> None:
@@ -673,6 +815,7 @@ def run_flush(
     # 2) что уже в main (→ merged), что новое (→ в ветку)
     g_doc0 = _safe_yaml_read(cp / GLOSSARY_REL)
     o_doc0 = _safe_yaml_read(cp / ORG_REL)
+    insights_text0 = _safe_text_read(cp / INSIGHTS_REL)  # Ф9: markdown, может отсутствовать
     have_terms = {str(t.get("canonical") or "").strip().lower()
                   for t in ((g_doc0 or {}).get("terms") or []) if isinstance(t, dict)}
     have_roles = set()
@@ -682,6 +825,7 @@ def run_flush(
                 if isinstance(role, dict):
                     have_roles.add((str(slug).strip().lower(),
                                     str(role.get("name") or "").strip().lower()))
+    have_insights = {nf for nf in (_norm_fact(ln) for ln in (insights_text0 or "").splitlines()) if nf}
     merged_keys, pending_keys = set(), set()
     for r in active:
         kind, val = r.get("kind"), str(r.get("value") or "").strip().lower()
@@ -692,15 +836,20 @@ def run_flush(
             slug = str(pl.get("slug") or "").strip().lower()
             name = str((pl.get("role") or {}).get("name") or "").strip().lower()
             (merged_keys if (slug, name) in have_roles else pending_keys).add((kind, val))
+        elif kind == KIND_INSIGHT:
+            pl = r.get("payload") or {}
+            nf = _norm_fact(pl.get("fact") or r.get("value"))
+            (merged_keys if (nf and nf in have_insights) else pending_keys).add((kind, val))
 
     # 3) влить новое в YAML (glossary — textual append, сохраняя комментарии; org — dump).
     #    NB: apply_entries_to_glossary мутирует список terms на месте — длину «до» снимаем заранее.
     n_orig_terms = len((g_doc0 or {}).get("terms") or [])
     g_doc, n_term = apply_entries_to_glossary(g_doc0, active)
     o_doc, n_role = apply_entries_to_org(o_doc0, active)
+    insights_text, n_insight = apply_entries_to_insights(insights_text0, active)  # Ф9
     if merged_keys:
         _set_status(company, merged_keys, STATUS_MERGED)
-    if n_term == 0 and n_role == 0:
+    if n_term == 0 and n_role == 0 and n_insight == 0:
         return {"status": "already-merged", "company": company,
                 "merged": len(merged_keys), "entries": len(active)}
     if n_term:
@@ -709,6 +858,8 @@ def run_flush(
             yaml_writer(cp / GLOSSARY_REL, g_doc)
     if n_role:
         yaml_writer(cp / ORG_REL, o_doc)
+    if n_insight:
+        _safe_text_write(cp / INSIGHTS_REL, insights_text)  # Ф9: markdown-файл бота
 
     # 4) add → commit → push (plan-команды 2..4)
     run(plan.commands[2])  # git add knowledge/notary/*
@@ -727,7 +878,7 @@ def run_flush(
     return {"status": "pr-pushed", "company": company, "branch": plan.branch,
             "compare_url": plan.compare_url, "pushed": len(pending_keys),
             "merged": len(merged_keys), "n_term": n_term, "n_role": n_role,
-            "pr_results": pr_results}
+            "n_insight": n_insight, "pr_results": pr_results}
 
 
 def run_flush_all(*, companies: Optional[list] = None, **kw) -> dict:
@@ -768,8 +919,10 @@ def outbox_digest() -> dict:
         out[company] = {
             "terms": [r.get("value") for r in queued if r.get("kind") == KIND_TERM],
             "roles": [r.get("value") for r in queued if r.get("kind") == KIND_ROLE],
+            "insights": [r.get("value") for r in queued if r.get("kind") == KIND_INSIGHT],
             "pending_terms": [r.get("value") for r in pending if r.get("kind") == KIND_TERM],
             "pending_roles": [r.get("value") for r in pending if r.get("kind") == KIND_ROLE],
+            "pending_insights": [r.get("value") for r in pending if r.get("kind") == KIND_INSIGHT],
             "pr_url": pr_url,
             "target_repo": context_knowledge.repo_for_company(company) or company,
         }
@@ -799,7 +952,8 @@ def main(argv: Optional[list] = None) -> int:
     summary = run_flush_all(companies=companies)
     # Печатаем только статусы/счётчики (не значения) — лог-гигиена опасной тройки.
     safe = {c: {k: v for k, v in (r or {}).items()
-                if k in ("status", "pushed", "merged", "n_term", "n_role", "branch", "compare_url")}
+                if k in ("status", "pushed", "merged", "n_term", "n_role", "n_insight",
+                         "branch", "compare_url")}
             for c, r in summary.items()}
     print(json.dumps(safe, ensure_ascii=False, indent=2))
     return 0

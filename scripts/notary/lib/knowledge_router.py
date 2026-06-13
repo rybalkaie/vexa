@@ -95,7 +95,17 @@ def classify_destination(
 
     comp = (str(company).strip().lower() if company else "")
 
-    # 2) D4 — запомненный ратчет владельца (private→company). Нужна известная компания.
+    # 2) Ф9 B4 — владелец объяснил «это приватное» (keep-private). ПЕРЕБИВАЕТ
+    #    повышение и гейт: приватность всегда выигрывает (fail-closed). Проверяем
+    #    раньше повышения, чтобы конкретный «держи приватным» бил общий «впредь
+    #    такие — в контекст». company=None → ищем правило с company=`*`.
+    try:
+        if ratchet.should_keep_private(kind, company=(comp or None), key=value):
+            return _private("owner-keep-private")
+    except Exception as e:  # noqa: BLE001 — ратчет вторичен, сбой не должен ронять
+        logger.warning("[router] keep-private check failed (non-fatal): %s", e)
+
+    # 3) D4 — запомненный ратчет владельца (private→company). Нужна известная компания.
     if comp:
         try:
             if ratchet.should_promote(kind, company=comp, key=value):
@@ -103,11 +113,11 @@ def classify_destination(
         except Exception as e:  # noqa: BLE001 — ратчет вторичен, сбой не должен ронять
             logger.warning("[router] ratchet check failed (non-fatal): %s", e)
 
-    # 3) E1 — публикационный гейт Ф6 явно разрешил публикацию знания этой встречи.
+    # 4) E1 — публикационный гейт Ф6 явно разрешил публикацию знания этой встречи.
     if comp and publication_allowed:
         return _company(comp, "publication-allowed")
 
-    # 4) D3 — дефолт при сомнении: приватно (me/). Сюда падает всё неоднозначное.
+    # 5) D3 — дефолт при сомнении: приватно (me/). Сюда падает всё неоднозначное.
     if not comp:
         return _private("default-private-no-company")
     return _private("default-private")

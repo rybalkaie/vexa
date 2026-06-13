@@ -305,6 +305,33 @@ def _apply_resolution(
                     state.get("meeting_id"), e,
                 )
 
+        # Ф9 (B1–B6): дистилляция durable-знания из ПЕРЕсобранного протокола в мозг.
+        # Паритет с finalize call-site (footgun two-call-sites): поздний clarify
+        # тоже питает второй мозг по финальному (вычитанному) протоколу. Маршрут
+        # только через router; COMPANY проходит G11+гейт ДО записи; чувствительное/
+        # спорное → воскресная очередь. Best-effort: сбой не валит clarify.
+        if protocol_regenerated and protocol_path.is_file():
+            try:
+                from . import knowledge_distill  # noqa: PLC0415
+                from . import publication_gate  # noqa: PLC0415
+                _present_distill = publication_gate.present_participants_for_gate(
+                    state.get("name_pool") or [], meta_block.get("participants") or [], [])
+                _dres = knowledge_distill.distill_and_route(
+                    protocol_path.read_text(encoding="utf-8"),
+                    series=meta_block.get("series"),
+                    present_participants=_present_distill,
+                    date=meta_block.get("date") or None,
+                    meeting_sid=state.get("meeting_id"),
+                )
+                logger.info(
+                    "[distill] meeting=%s status=%s cand=%d company=%d private=%d sunday=%d",
+                    state.get("meeting_id"), _dres.get("status"), _dres.get("candidates", 0),
+                    _dres.get("company", 0), _dres.get("private", 0), _dres.get("sunday", 0),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[distill] failed (non-fatal) meeting=%s: %s",
+                               state.get("meeting_id"), e)
+
         # Ф5 (5.5/5.6): до-сыл обновлённой версии. meta.json лежит рядом с
         # транскриптом. redeliver сам решает: если ещё не доставляли →
         # not-delivered-yet (первичная доставка подхватит); если контент не
