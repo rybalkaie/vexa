@@ -48,8 +48,9 @@ callback фиксирует id ДО поллинга — переживает к
 
 Приватность (S6, «Опасная тройка»): `ASSEMBLYAI_API_KEY` НЕ логируется и НЕ
 кладётся в текст ошибок. Тело ошибки провайдера обрезается `[:80]` (РИСК2: может
-содержать эхо `keyterms` с именами участников — keyterms заводит Ф2, обрезаем уже
-сейчас, на будущее). Текст транскрипта НЕ логируется — только метаданные
+содержать эхо `keyterms` с именами участников — keyterms заведены в Ф2 (S4),
+обрезка их не светит). Само тело create-запроса (с `keyterms_prompt`) НЕ
+логируется. Текст транскрипта НЕ логируется — только метаданные
 (длительность, число спикеров/слов/реплик, время).
 
 Smoke CLI:
@@ -222,17 +223,39 @@ def _upload_audio(client: httpx.Client, headers: dict, wav_path: Path) -> str:
     return _call_with_retry(_do, action="upload")
 
 
-def _create_transcript(client: httpx.Client, headers: dict, audio_url: str) -> str:
+def _create_transcript(
+    client: httpx.Client,
+    headers: dict,
+    audio_url: str,
+    *,
+    keyterms_prompt: list[str] | None = None,
+) -> str:
     """Шаг 2. POST /v2/transcript — создать задание с конфигом → id.
 
     Конфиг Ф1: universal-3-pro, ru, speaker_labels. speakers_expected НЕ ставим
-    (AA2 — авто-определение). keyterms_prompt появится в Ф2 (S4) — здесь нет."""
+    (AA2 — авто-определение).
+
+    `keyterms_prompt` (Ф2, S4) — доменный словарь серии (имена участников + бренды
+    + термины ниши), уже нормализованный и обрезанный под лимиты AAI вызывателем
+    (`keyterms.build_keyterms_prompt`: ≤1000 терминов, ≤6 слов/фраза). Пусто/None →
+    поле в тело НЕ кладётся (поведение Ф1 неизменно). РИСК2: список содержит ИМЕНА
+    участников — тело задания НЕ логируется (тут и нигде), в текст ошибок не попадает.
+
+    Взаимоисключение `keyterms_prompt` ↔ `prompt` (S4): API запрещает оба сразу.
+    Мы `prompt` не используем (форматный контроль — на Claude, Ф3), поэтому в теле
+    его и нет; keyterms кладём всегда, когда он непуст. Гард-инвариант ниже: если в
+    `body` когда-нибудь окажется непустой `prompt`, keyterms НЕ добавляется (выбор:
+    keyterms молча уступает `prompt`), чтобы запрос остался валидным."""
     body = {
         "audio_url": audio_url,
         "speech_models": [SPEECH_MODEL],
         "language_code": LANGUAGE_CODE,
         "speaker_labels": True,
     }
+    # S4: keyterms и prompt взаимоисключающи. `prompt` мы не задаём — гард на случай
+    # будущей правки конфига, чтобы не отправить невалидную пару (keyterms уступает).
+    if keyterms_prompt and not body.get("prompt"):
+        body["keyterms_prompt"] = list(keyterms_prompt)
 
     def _do():
         r = client.post(
@@ -379,12 +402,18 @@ def transcribe_diarize_wav(
     *,
     existing_transcript_id: str | None = None,
     on_transcript_created=None,
+    keyterms_prompt: list[str] | None = None,
     sleep=time.sleep,
 ) -> TranscriptionResult:
     """Прогнать WAV через AssemblyAI и вернуть TranscriptionResult.
 
     Шаги: (kill-switch) → upload → create → poll → parse. На 5xx/timeout — 1 retry
     через 30 сек на каждом шаге; на status=error → AssemblyAIRejectedError.
+
+    `keyterms_prompt` (Ф2, S4) — доменный словарь серии для биаса распознавания,
+    уже под лимитами AAI. Используется ТОЛЬКО при новом сабмите (в create); при
+    reuse существующего транскрипта create не делается, словарь игнорируется. Пусто/
+    None → поле не передаётся (Ф1-поведение). РИСК2: список с именами НЕ логируется.
 
     Идемпотентность (S5, «по transcript id»):
       `existing_transcript_id` — id из прошлого прогона той же встречи. Если задан —
@@ -430,7 +459,9 @@ def transcribe_diarize_wav(
                         f"новый сабмит запрещён ({killswitch_path()})"
                     )
                 upload_url = _upload_audio(client, headers, p)
-                transcript_id = _create_transcript(client, headers, upload_url)
+                transcript_id = _create_transcript(
+                    client, headers, upload_url, keyterms_prompt=keyterms_prompt
+                )
                 logger.info("AssemblyAI transcript created: %s", transcript_id)
                 # Отдать id наверх ДО поллинга (переживает краш/рестарт).
                 if on_transcript_created is not None:

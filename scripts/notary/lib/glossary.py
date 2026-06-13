@@ -68,6 +68,37 @@ PROJECT_GLOSSARY_PROMPT_BLOCK = """Глоссарий проекта (домен
 Не добавляй термины, которых в транскрипте нет. Глоссарий — про написание уже сказанного, а не повод дописать."""
 
 
+# --- Ф2 (umnyi-protokol-assemblyai, S4): бренд-термины для keyterms_prompt AAI --
+#
+# Канонические имена собственные (бренды/продукты/контрагенты/юрлица/термины ниши),
+# которые ASR систематически перевирает. Подаются в `keyterms_prompt` задания
+# AssemblyAI как ПОДСКАЗКА входному распознаванию (биас к верному написанию), в
+# отличие от `apply_glossary_corrections` (пост-проход по уже сгенерированному
+# тексту). В keyterms кладём ТОЛЬКО канонические формы — НЕ ASR-искажения
+# (`aliases`): искажение в keyterms биасило бы движок к ошибке.
+#
+# Это ВСТРОЕННЫЙ FALLBACK (как `PROJECT_GLOSSARY_PROMPT_BLOCK`): когда YAML-знание
+# компании активно, `glossary_keyterms` строит список из его `canonical` (company-
+# scoped); пока клон `*-context` не забутстраплен (control/Ф8) — отдаём этот
+# список, чтобы бренды распознавались уже на первой боевой встрече. Все термины
+# извлечены из `PROJECT_GLOSSARY_PROMPT_BLOCK` выше (переиспользование, не
+# изобретение); каждый ≤6 слов (жёсткий лимит AAI на фразу).
+BUILTIN_KEYTERMS: list[str] = [
+    # Компании и бренды
+    "Anzhee", "МПервый", "ENVYTON", "ALTRONIX", "ENVONIX", "Сценалогия",
+    "Dealer 360", "YME", "OZON",
+    # Продукты (разные товары — не сливать)
+    "Space Projector", "Dream Story", "Браво", "Bravo",
+    # Контрагенты и люди
+    "Zifriend", "Bolong", "KEKTAR", "Ангелина",
+    # Юрлица в закупках
+    "КС-ТРЕЙД", "Альтроникс",
+    # Аббревиатуры и термины ниши
+    "РСЯ", "ЭДО", "СТМ", "КТК", "ковенанта", "палетное хранение",
+    "Битрикс24", "VPS",
+]
+
+
 # --- Cross-cutting базис (Ф8, У1/У2): не-терминные правила, переживающие YAML --
 #
 # При активации YAML-знания `glossary_prompt_block` строит блок ИЗ YAML-записей
@@ -214,6 +245,25 @@ def glossary_prompt_block(company: Optional[str] = None) -> str:
         parts.append(CROSS_CUTTING_GUIDANCE_BLOCK)
         return "\n\n".join(p for p in parts if p)
     return PROJECT_GLOSSARY_PROMPT_BLOCK
+
+
+def glossary_keyterms(company: Optional[str] = None) -> list[str]:
+    """Канонические доменные термины компании для `keyterms_prompt` AAI (Ф2, S4).
+
+    Источник — тот же `load_glossary(company)`, что кормит промпт-блок и regex-
+    замены (РИСК2 — единый источник истины). Берём ТОЛЬКО `canonical` (верное
+    написание), НЕ `aliases` (ASR-искажения — в keyterms они биасили бы движок к
+    ошибке). Есть YAML-знание компании → канонические из него (company-scoped:
+    Bolong[mpfirst] не утечёт в Anzhee); нет (company=None / клон не забутстраплен /
+    нет pyyaml) → встроенный `BUILTIN_KEYTERMS` (поведение как с `glossary_prompt_block`).
+
+    Возвращает сырые строки БЕЗ применения лимитов AAI (≤1000/≤6 слов) — нормализацию,
+    дедуп и обрезку делает `keyterms.build_keyterms_prompt` уже над объединённым
+    словарём серии (роли + глоссарий + ручные термины)."""
+    entries = context_knowledge.load_glossary(company)
+    if entries:
+        return [str(e.get("canonical")).strip() for e in entries if str(e.get("canonical") or "").strip()]
+    return list(BUILTIN_KEYTERMS)
 
 
 def protocol_replacements(company: Optional[str] = None) -> list[tuple[re.Pattern, str]]:

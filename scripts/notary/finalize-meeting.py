@@ -322,6 +322,7 @@ def _run_assemblyai(
     *,
     existing_transcript_id: str | None = None,
     on_transcript_created=None,
+    series_slug: str | None = None,
 ):
     """AssemblyAI-ветка: upload → create → poll вместо whisper+pyannote.
 
@@ -333,19 +334,32 @@ def _run_assemblyai(
     встречи: если задан, переиспользуем без повторной оплаты. `on_transcript_created`
     — callback(id), которым main() фиксирует id в meta СРАЗУ после create.
 
+    `series_slug` (Ф2, S4) — slug серии встречи: по нему собираем доменный словарь
+    (имена участников + бренды + термины ниши) и передаём в `keyterms_prompt`
+    задания AAI (биас распознавания к верным написаниям). Нет slug / сбор упал →
+    словарь пуст, поле не передаётся (поведение Ф1). РИСК2: список содержит имена —
+    логируем только ЧИСЛО терминов, не сам список.
+
     HF_TOKEN явно удаляется из env (как в Speechmatics-ветке): AAI его не использует,
     нечего таскать в дочерние процессы — дисциплина.
     """
     from lib.assemblyai_client import transcribe_diarize_wav, to_aligned_turns
     from lib.align import merge_consecutive_same_speaker  # noqa
+    from lib import keyterms  # Ф2: сбор доменного словаря серии
 
     os.environ.pop("HF_TOKEN", None)
+
+    # S4: доменный словарь серии → keyterms_prompt. best-effort; сам список НЕ
+    # логируем (РИСК2 — имена участников), только метаданные (число терминов).
+    keyterms_prompt = keyterms.collect_keyterms_prompt(series_slug)
+    log.info("AssemblyAI keyterms: %d терминов словаря серии", len(keyterms_prompt))
 
     log.info("Step 1/3 — AssemblyAI upload + transcribe + diarize (один job)")
     aai_result = transcribe_diarize_wav(
         wav_path,
         existing_transcript_id=existing_transcript_id,
         on_transcript_created=on_transcript_created,
+        keyterms_prompt=keyterms_prompt,
     )
     log.info(
         "AssemblyAI: %d utterances, %d спикеров, %.1f сек аудио, lang=%s, id=%s",
@@ -820,6 +834,7 @@ def main() -> int:
                 audio_path, log,
                 existing_transcript_id=existing_transcript_id,
                 on_transcript_created=_on_transcript_created,
+                series_slug=(meta.get("series") if isinstance(meta, dict) else None),
             )
         else:
             turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)

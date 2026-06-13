@@ -221,7 +221,8 @@ class TestTranscribeOrchestration(_OrchBase):
         polls = {"n": 0}
 
         aai._upload_audio = lambda c, h, p: events.append("upload") or "https://up/abc"
-        aai._create_transcript = lambda c, h, url: events.append("create") or "tid-1"
+        # double отражает сигнатуру _create_transcript после Ф2 (опц. keyterms_prompt).
+        aai._create_transcript = lambda c, h, url, **_k: events.append("create") or "tid-1"
 
         def fake_get(c, h, tid):
             events.append("poll")
@@ -249,7 +250,7 @@ class TestTranscribeOrchestration(_OrchBase):
     def test_callback_runs_before_polling(self):
         order = []
         aai._upload_audio = lambda c, h, p: "https://up"
-        aai._create_transcript = lambda c, h, url: "tid-x"
+        aai._create_transcript = lambda c, h, url, **_k: "tid-x"
 
         def fake_get(c, h, tid):
             order.append("poll")
@@ -293,7 +294,7 @@ class TestIdempotency(_OrchBase):
 class TestFailureNonSilent(_OrchBase):
     def test_status_error_raises_rejected(self):
         aai._upload_audio = lambda c, h, p: "https://up"
-        aai._create_transcript = lambda c, h, url: "tid-err"
+        aai._create_transcript = lambda c, h, url, **_k: "tid-err"
         aai._get_transcript = lambda c, h, tid: {
             "status": "error", "error": "audio file is corrupt"
         }
@@ -411,7 +412,7 @@ class TestPrivacy(_OrchBase):
         root.setLevel(logging.DEBUG)
         try:
             aai._upload_audio = lambda c, h, p: "https://up"
-            aai._create_transcript = lambda c, h, url: "tid-priv"
+            aai._create_transcript = lambda c, h, url, **_k: "tid-priv"
             aai._get_transcript = lambda c, h, tid: _completed_raw(
                 text_a=secret_text, text_b="вторая секретная")
             aai.transcribe_diarize_wav(self._wav, sleep=lambda _s: None)
