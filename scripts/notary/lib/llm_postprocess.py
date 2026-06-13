@@ -63,6 +63,7 @@ from . import clarify_state
 from . import glossary
 from . import protocol_to_tg
 from . import series_markup
+from . import series_memory
 from . import series_roster
 from . import protocol_to_pdf
 from . import telegram_api
@@ -1661,6 +1662,238 @@ def regenerate_protocol_for_meeting(
     )
     _atomic_write_text(protocol_path, protocol_text)
     return protocol_path
+
+
+# ---------- Ф6 (umnyi-protokol-assemblyai): кросс-встречный фон + фильтр G11 ----------
+# Оркестрация широкого кросс-встречного фона для промпта генерации. Чистая логика
+# пула/ранжирования/лимита живёт в `series_memory` (stdlib-only); сюда вынесены два
+# куска, которым нужен claude/реестр: (1) G11-классификатор чувствительного
+# (`classify_sensitive_memory`) и (2) обёртка-оркестратор (`build_cross_memory_block`),
+# которую зовут finalize И clarify_worker (как блок памяти серии — два call-site).
+#
+# «Опасная тройка» в полный рост (РИСК4, решение владельца 2026-05-26): производные
+# ПДн из РАЗНЫХ встреч → LLM-обработка → egress в Anthropic. Дисциплина реализации:
+#   • в промпт классификатора идут ТОЛЬКО выжимки (темы/пункты), НЕ сырой транскрипт;
+#   • текст кандидатов/фона/ответа LLM НЕ логируется — только счётчики;
+#   • ответ классификатора НЕ сохраняется (только результат «чувствительно/нет»);
+#   • при сомнении/сбое — исключаем (консервативно, A3): ложно-скрыть < протечь.
+
+_CROSS_SENSITIVE_SYSTEM_PROMPT = (
+    "Ты — фильтр приватности. Тебе дают пронумерованные выжимки прошлых встреч, "
+    "которые планируется показать как ФОН при составлении протокола ДРУГОЙ встречи "
+    "(возможно, другой команды/компании). Помечай номера выжимок, которые НЕЛЬЗЯ "
+    "показывать как фон, потому что они содержат ЧУВСТВИТЕЛЬНОЕ:\n"
+    "- кадровые решения, увольнения, найм или оценка конкретных людей;\n"
+    "- необсуждённые личные мысли, планы или сомнения владельца;\n"
+    "- зарплаты, личные финансы, личные конфликты с именами;\n"
+    "- юридические/спорные темы, явно приватные разговоры.\n"
+    "При ЛЮБОМ сомнении — помечай как чувствительное (лучше лишний раз скрыть).\n"
+    "Ответь СТРОГО валидным JSON-объектом без markdown: {\"sensitive\": [номера]}. "
+    "Если чувствительного нет — {\"sensitive\": []}."
+)
+
+
+def _cross_classifier_model() -> str:
+    """Модель G11-классификатора `CROSS_MEMORY_CLASSIFIER_MODEL` (дефолт Haiku).
+
+    Классификация бинарная и дешёвая — Haiku достаточно; держит классификатор вне
+    бюджета Opus (Ф7: 2 Opus-вызова; это ТРЕТИЙ LLM-вызов, но Haiku — см. handoff §5).
+    """
+    return (os.environ.get("CROSS_MEMORY_CLASSIFIER_MODEL") or "").strip() or "claude-haiku-4-5-20251001"
+
+
+def _cross_classifier_timeout() -> int:
+    """Таймаут G11-классификатора `CROSS_MEMORY_CLASSIFIER_TIMEOUT` (сек, дефолт 60).
+
+    Своя защита от таймаута на ЭТОМ call-site (РИСК1: защита Ф3 локальна в
+    `generate_protocol`). Таймаут → консервативно «всё чувствительно» (см. ниже).
+    """
+    try:
+        v = int(os.environ.get("CROSS_MEMORY_CLASSIFIER_TIMEOUT", "60") or "60")
+    except ValueError:
+        v = 60
+    return v if v > 0 else 60
+
+
+def _parse_sensitive_response(raw: str, n: int) -> list:
+    """Парсит ответ классификатора → list[bool] длины n (True=чувствительно).
+
+    Ждём JSON-объект `{"sensitive":[1,3,...]}` (номера 1..n) ИЛИ голый JSON-массив
+    номеров. Номера вне [1,n] игнорируем. Невалидный JSON → ValueError (вызыватель
+    трактует консервативно — всё исключить).
+    """
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    nums = None
+    start_obj = s.find("{")
+    if start_obj >= 0:
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(s[start_obj:])
+            if isinstance(obj, dict):
+                nums = obj.get("sensitive")
+        except json.JSONDecodeError:
+            nums = None
+    if nums is None:
+        start_arr = s.find("[")
+        if start_arr < 0:
+            raise ValueError("classifier: ни объекта, ни массива")
+        try:
+            nums, _end = json.JSONDecoder().raw_decode(s[start_arr:])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"classifier: невалидный JSON: {e}") from e
+    if not isinstance(nums, list):
+        raise ValueError("classifier: 'sensitive' не список")
+    flagged: set = set()
+    for x in nums:
+        try:
+            idx = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= idx <= n:
+            flagged.add(idx)
+    return [(i in flagged) for i in range(1, n + 1)]
+
+
+def classify_sensitive_memory(
+    candidates: list,
+    *,
+    timeout: Optional[int] = None,
+    model: Optional[str] = None,
+    meeting_sid: Optional[str] = None,
+) -> list:
+    """Ф6 (G11): LLM-классификатор чувствительного в кандидатах кросс-фона.
+
+    `candidates` — список выжимок (dict со `series`/`date`/`themes`/`key_points`); БЕЗ
+    сырого транскрипта (выжимки уже сжаты в протоколе → в память). Возвращает list[bool]
+    той же длины: True = выжимка ЧУВСТВИТЕЛЬНА → в кросс-фон НЕ идёт.
+
+    ОДИН батч-вызов Claude (Haiku) на ВСЕ кандидаты — не N вызовов (бюджет/опасная
+    тройка). Своя защита на ЭТОМ call-site: таймаут / ошибка CLI / битый парс /
+    несоответствие длины → КОНСЕРВАТИВНО все True (исключить всё). Ложно-исключить
+    безопаснее, чем протечь (A3, «при сомнении — исключить»).
+
+    Приватность (G10/опасная тройка): НЕ логируем текст выжимок/ответа — только
+    счётчики (n / sensitive / elapsed / model). Ответ LLM НЕ сохраняем.
+    """
+    n = len(candidates or [])
+    if n == 0:
+        return []
+    all_sensitive = [True] * n
+    if timeout is None:
+        timeout = _cross_classifier_timeout()
+    if model is None:
+        model = _cross_classifier_model()
+    lines = []
+    for i, dig in enumerate(candidates, start=1):
+        themes = "; ".join(dig.get("themes") or []) if isinstance(dig, dict) else ""
+        points = " | ".join(dig.get("key_points") or []) if isinstance(dig, dict) else ""
+        body = " ".join(p for p in (themes, points) if p) or "(пусто)"
+        lines.append(f"{i}. {body}")
+    user_prompt = (
+        "Выжимки-кандидаты для использования как ФОН в протоколе ДРУГОЙ встречи:\n\n"
+        + "\n".join(lines)
+        + "\n\nВерни номера выжимок, содержащих ЧУВСТВИТЕЛЬНОЕ."
+    )
+    started = time.monotonic()
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=_CROSS_SENSITIVE_SYSTEM_PROMPT,
+            timeout=timeout,
+            model=model,
+        )
+    except ClaudeCliError as e:
+        logger.warning(
+            "[cross-memory] classifier failed meeting=%s n=%d error=%s → exclude-all",
+            meeting_sid or "?", n, type(e).__name__,
+        )
+        return all_sensitive
+    try:
+        flags = _parse_sensitive_response(raw, n)
+    except ValueError:
+        logger.warning(
+            "[cross-memory] classifier parse failed meeting=%s n=%d → exclude-all",
+            meeting_sid or "?", n,
+        )
+        return all_sensitive
+    elapsed = time.monotonic() - started
+    logger.info(
+        "[cross-memory] classified meeting=%s n=%d sensitive=%d elapsed=%.1fs model=%s",
+        meeting_sid or "?", n, sum(1 for f in flags if f), elapsed, model,
+    )
+    return flags
+
+
+def build_cross_memory_block(
+    root: Path,
+    series_dir: Path,
+    meeting_meta: dict,
+    *,
+    current_participants: Optional[list] = None,
+    same_series_digests: Optional[list] = None,
+    watched: Optional[dict] = None,
+    meeting_sid: Optional[str] = None,
+) -> str:
+    """Ф6 (G6/G7/G11): собрать блок кросс-встречного фона для промпта генерации.
+
+    Единая точка для finalize И clarify (как блок памяти серии): грузит реестр ОДИН
+    раз → резолвит компанию текущей серии → строит тематический профиль из выжимок
+    ТОЙ ЖЕ серии → зовёт `series_memory.resolve_cross_memory` (широкий пул;
+    ранжирование участники+тема+свежесть; мягкий приоритет компании; ручной маркер
+    `visibility=private`; лимит N) с инъекцией G11-классификатора → форматирует блок
+    (потолок M символов). Best-effort: выключенный killswitch / нет slug серии / любой
+    сбой → "" (кросс-фон опционален, генерацию не роняет).
+
+    Приватность: текст фона/кандидатов НЕ логируем — только счётчики.
+    """
+    if not series_memory.is_cross_enabled():
+        return ""
+    series = meeting_meta.get("series")
+    if not series_memory.has_series_slug(series):
+        return ""
+    try:
+        w = series_markup._load_watched_safe(watched)
+        current_company = series_markup.company_for_series(series, watched=w)
+
+        def _markup(slug):
+            return series_markup.markup_for_series(slug, watched=w)
+
+        def _classifier(cands):
+            return classify_sensitive_memory(cands, meeting_sid=meeting_sid)
+
+        topic = series_memory.build_topic_profile(same_series_digests or [])
+        exclude = {
+            (d.get("series"), d.get("date"))
+            for d in (same_series_digests or [])
+            if isinstance(d, dict)
+        }
+        selected = series_memory.resolve_cross_memory(
+            Path(root),
+            current_series_dir=Path(series_dir),
+            current_company=current_company,
+            current_participants=current_participants or [],
+            current_topic_tokens=topic,
+            current_date=meeting_meta.get("date") or None,
+            markup_resolver=_markup,
+            sensitive_classifier=_classifier,
+            exclude_keys=exclude,
+        )
+        block = series_memory.format_cross_memory_block(
+            selected, max_chars=series_memory.cross_memory_max_chars()
+        )
+        logger.info(
+            "[cross-memory] block meeting=%s series=%s selected=%d block_len=%d",
+            meeting_sid or "?", series, len(selected), len(block),
+        )
+        return block
+    except Exception as e:  # noqa: BLE001 — кросс-фон опционален, генерацию не роняем
+        logger.warning(
+            "[cross-memory] build failed meeting=%s (non-fatal): %s",
+            meeting_sid or "?", type(e).__name__,
+        )
+        return ""
 
 
 # ---------- Ф5: извлечение задач + маршрутизация ------------------------

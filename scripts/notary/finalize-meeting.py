@@ -66,6 +66,7 @@ sys.path.insert(0, str(THIS_DIR))
 from lib.name_mapping import map_all, apply_mapping  # noqa: E402
 from lib.llm_postprocess import (  # noqa: E402
     ProtocolGenerationError,
+    build_cross_memory_block,
     clarify_speakers_via_telegram,
     deliver_protocol,
     extract_tasks,
@@ -786,10 +787,24 @@ def main() -> int:
                     expected_enriched.append(nm)
             series_memory_block = series_memory.format_memory_block(series_memory_digests)
             series_speaker_anchor = series_memory.resolve_speaker_anchor(series_memory_digests)
+            # Ф6 (G6/G7/G11): ШИРОКИЙ кросс-встречный фон из ДРУГИХ серий (приоритет
+            # своей компании, кросс-компания при релевантности — A7, не стена).
+            # Главный guard — фильтр чувствительного G11 (LLM) + ручной маркер серии
+            # `visibility=private`. Кладём В ТОТ ЖЕ memory-блок ПЕРЕД транскриптом,
+            # отдельной секцией «ФОН». Best-effort внутри build_cross_memory_block → "".
+            cross_block = build_cross_memory_block(
+                Path(args.output_dir), series_dir, meta,
+                current_participants=participants_union,
+                same_series_digests=series_memory_digests,
+                meeting_sid=session_uid,
+            )
+            series_memory_block = "\n\n".join(
+                p for p in (series_memory_block.strip(), cross_block.strip()) if p
+            )
             log.info(
-                "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d",
+                "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
                 session_uid, meta.get("series") or "?", len(series_memory_digests),
-                len(expected_enriched) - len(_expected_base),
+                len(expected_enriched) - len(_expected_base), len(cross_block),
             )
     except Exception as e:  # noqa: BLE001
         log.warning("[series-memory] resolve failed (non-fatal): %s", e)

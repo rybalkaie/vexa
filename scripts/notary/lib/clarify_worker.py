@@ -211,6 +211,19 @@ def _apply_resolution(
                     current_date=meta_block.get("date") or None,
                 )
                 series_memory_block = series_memory.format_memory_block(_smem)
+                # Ф6 (G6/G7/G11): кросс-встречный фон в РЕВИЗИЮ тоже (как и память
+                # серии) — чтобы пере-генерация держала тот же фон, что первичная.
+                # transcript лежит в `<root>/<series>/<date>.md` → parent = серия,
+                # parent.parent = root. Best-effort внутри build_cross_memory_block → "".
+                cross_block = llm_postprocess.build_cross_memory_block(
+                    transcript_path.parent.parent, transcript_path.parent, meta_block,
+                    current_participants=state.get("name_pool") or [],
+                    same_series_digests=_smem,
+                    meeting_sid=state.get("meeting_id"),
+                )
+                series_memory_block = "\n\n".join(
+                    p for p in (series_memory_block.strip(), cross_block.strip()) if p
+                )
         except Exception:  # noqa: BLE001
             series_memory_block = ""
         try:

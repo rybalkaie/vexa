@@ -913,3 +913,336 @@ def backfill_root(
             digests_written += n
     logger.info("[series-memory] backfill_root: series=%d digests=%d", series_touched, digests_written)
     return {"series": series_touched, "digests": digests_written}
+
+
+# ===========================================================================
+# Ф6 (umnyi-protokol-assemblyai) — КРОСС-встречная память уровня компании
+# ===========================================================================
+# Отличие от резолва ТОЙ ЖЕ серии (`resolve_memory`): кросс-память собирает ШИРОКИЙ
+# фон из ДРУГИХ серий и кладёт в промпт генерации отдельным блоком «ФОН». Приоритет
+# своей компании — МЯГКИЙ (A7: жёсткой стены между компаниями нет; кросс-компания
+# участвует при релевантности — напр. совместные поставки/процессы). Главный guard
+# приватности — фильтр чувствительного G11 (LLM-классификатор, инъекция
+# `sensitive_classifier`), плюс ручной маркер серии `visibility=private`
+# («приватное — не использовать как фон»). «Опасная тройка» (РИСК4): сюда сходятся
+# производные ПДн из РАЗНЫХ встреч + LLM-обработка + egress — поэтому: в промпт идёт
+# ТОЛЬКО отобранное и лимитированное (РАЗМ1), текст фона/кандидатов НЕ логируется,
+# при сомнении классификатора — исключаем (консервативно).
+#
+# Этот модуль остаётся stdlib-only: и резолвер компании/видимости, и LLM-классификатор
+# ИНЪЕКТИРУЮТСЯ колбэками (как `participant_filter` в `build_digest`) — claude/реестр
+# живут у вызывателя (`llm_postprocess.build_cross_memory_block`).
+
+# Веса ранкера. Участники — сильнейший сигнал «та же орбита людей», тема — «тот же
+# предмет», свежесть — лёгкий бонус недавнему. Сумма нормировки не требует: score
+# нужен для сортировки и отсечки по MIN_SCORE.
+_CROSS_W_PARTICIPANTS = 0.5
+_CROSS_W_TOPIC = 0.4
+_CROSS_W_FRESHNESS = 0.1
+# Кросс-компания — МЯГКИЙ приоритет (НЕ стена, A7): её score множится на фактор < 1,
+# поэтому для попадания в фон ей нужна более высокая «сырая» релевантность. Применяем
+# ТОЛЬКО когда обе компании известны и различны (иначе нейтрально 1.0 — fallback по
+# slug, см. УПУ1: без разметки company-приоритет деградирует мягко).
+_CROSS_COMPANY_FACTOR = 0.6
+# Минимальный финальный score для попадания в фон. Кандидат без пересечения по людям
+# И по теме (relevance==0) отсекается раньше — свежесть сама по себе фоном не делает.
+_CROSS_MIN_SCORE = 0.12
+# Окно свежести (дни): встреча сегодня → 1.0, старше окна → 0.0 (линейно).
+_CROSS_FRESHNESS_WINDOW_DAYS = 180
+# Потолок кандидатов, уходящих в классификатор — cost-guard на LLM-вызов G11 (один
+# батч-вызов на ≤ этого числа топ-релевантных кандидатов, не на весь архив).
+_CROSS_POOL_CAP = 8
+
+# Дефолты лимита блока (РАЗМ1). N — сколько выжимок, M — потолок символов.
+DEFAULT_CROSS_MAX_DIGESTS = 3
+DEFAULT_CROSS_MAX_CHARS = 1800
+# Сколько тем/пунктов одной выжимки показывать в блоке ФОНА. Фон — это ХИНТ
+# (общие проекты/термины), не полная запись: ограничиваем вклад одной выжимки,
+# чтобы богатая прошлая встреча не съедала весь бюджет M в одиночку.
+_CROSS_BLOCK_THEMES_PER_DIGEST = 8
+_CROSS_BLOCK_POINTS_PER_DIGEST = 5
+
+# Стоп-слова (рус/eng) — выкидываем из тематических токенов, иначе предлоги/союзы
+# дают ложное пересечение тем между любыми встречами.
+_TOPIC_STOPWORDS = frozenset({
+    "и", "в", "во", "на", "по", "для", "от", "до", "из", "за", "о", "об", "с", "со",
+    "к", "у", "что", "как", "это", "этот", "эта", "эти", "тот", "та", "те", "не",
+    "ни", "да", "но", "или", "the", "a", "an", "of", "to", "in", "on", "for", "and", "or",
+})
+_TOPIC_TOKEN_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
+_MIN_TOPIC_TOKEN_LEN = 3
+
+
+def is_cross_enabled() -> bool:
+    """Ф6: kill-switch `ENABLE_CROSS_MEMORY` (дефолт ON; `0/false/no` → OFF).
+
+    Отдельный от `ENABLE_SERIES_MEMORY`: кросс-фон (другие серии) можно выключить в
+    проде, оставив резолв памяти ТОЙ ЖЕ серии (diarization/постоянный состав) живым.
+    """
+    raw = (os.environ.get("ENABLE_CROSS_MEMORY") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def cross_memory_max_digests() -> int:
+    """Ф6 (G7/РАЗМ1): лимит числа выжимок кросс-фона `CROSS_MEMORY_MAX_DIGESTS` (3).
+
+    Невалидное/<=0 → дефолт. Потолок 10 — кросс-фон справочный, не должен раздувать
+    промпт (длинная история — это РАЗМ1, отсекаем).
+    """
+    raw = (os.environ.get("CROSS_MEMORY_MAX_DIGESTS") or "").strip()
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CROSS_MAX_DIGESTS
+    if val <= 0:
+        return DEFAULT_CROSS_MAX_DIGESTS
+    return min(val, 10)
+
+
+def cross_memory_max_chars() -> int:
+    """Ф6 (G7/РАЗМ1): потолок символов блока кросс-фона `CROSS_MEMORY_MAX_CHARS` (1800).
+
+    Невалидное/<=0 → дефолт. Пол 200 (меньше — блок бессмысленен), потолок 8000
+    (защита промпта).
+    """
+    raw = (os.environ.get("CROSS_MEMORY_MAX_CHARS") or "").strip()
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CROSS_MAX_CHARS
+    if val <= 0:
+        return DEFAULT_CROSS_MAX_CHARS
+    # Пол 700 (а не меньше): заголовок-дисциплина блока ~430 символов — при M ниже
+    # этого блок всегда схлопывался бы в "" (одна выжимка не влезает к заголовку).
+    return min(max(val, 700), 8000)
+
+
+def _topic_tokens(texts) -> set:
+    """Множество тематических токенов из строк (темы/ключевые пункты).
+
+    Lowercase, выкидываем стоп-слова и токены короче `_MIN_TOPIC_TOKEN_LEN`. Только
+    для ранжирования (пересечение тем) — НЕ хранится, НЕ логируется.
+    """
+    out: set = set()
+    for t in texts or []:
+        if not isinstance(t, str):
+            continue
+        for m in _TOPIC_TOKEN_RE.findall(t.lower()):
+            if len(m) >= _MIN_TOPIC_TOKEN_LEN and m not in _TOPIC_STOPWORDS:
+                out.add(m)
+    return out
+
+
+def build_topic_profile(digests) -> set:
+    """Ф6: тематический профиль текущей серии — токены тем/пунктов её выжимок.
+
+    Опора оси «тема» при ранжировании кросс-фона: «эта серия про X» → кросс-серия,
+    тоже про X, релевантнее. Пустой список (новая серия без истории) → пустой профиль
+    → ось темы = 0 (ранжирование мягко падает на участников+свежесть).
+    """
+    texts: list = []
+    for dig in digests or []:
+        if not isinstance(dig, dict):
+            continue
+        texts.extend(dig.get("themes") or [])
+        texts.extend(dig.get("key_points") or [])
+    return _topic_tokens(texts)
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def _freshness(date_str: Optional[str], today: Optional[str]) -> float:
+    """Свежесть выжимки в [0,1]: сегодня → 1.0, старше окна → 0.0 (линейно).
+
+    Битая/пустая дата → 0.0 (без бонуса свежести, не фатально).
+    """
+    if not date_str or not today:
+        return 0.0
+    try:
+        from datetime import date as _date
+        y, m, d = (int(x) for x in str(date_str).split("-"))
+        ty, tm, td = (int(x) for x in str(today).split("-"))
+        age = (_date(ty, tm, td) - _date(y, m, d)).days
+    except (ValueError, TypeError):
+        return 0.0
+    if age <= 0:
+        return 1.0
+    if age >= _CROSS_FRESHNESS_WINDOW_DAYS:
+        return 0.0
+    return 1.0 - age / _CROSS_FRESHNESS_WINDOW_DAYS
+
+
+def resolve_cross_memory(
+    root: Path,
+    *,
+    current_series_dir: Path,
+    current_company: Optional[str] = None,
+    current_participants: Optional[list] = None,
+    current_topic_tokens: Optional[set] = None,
+    current_date: Optional[str] = None,
+    markup_resolver: Optional[Callable[[str], tuple]] = None,
+    sensitive_classifier: Optional[Callable[[list], list]] = None,
+    exclude_keys: Optional[set] = None,
+    max_digests: Optional[int] = None,
+    today: Optional[str] = None,
+) -> list:
+    """Ф6 (G6/G7/G11): ШИРОКИЙ кросс-встречный фон из ДРУГИХ серий.
+
+    Пул = выжимки ВСЕХ серий под `root`, КРОМЕ текущей (`current_series_dir`).
+    Ранжирование по трём осям (G7): Jaccard-по-участникам (не-владельцы) + Jaccard
+    тематических токенов (тема) + свежесть. Компания — МЯГКИЙ приоритет (A7), не стена:
+    кросс-компания штрафуется множителем, не отбрасывается. Ручной маркер серии
+    `visibility=='private'` (через `markup_resolver`) → серия в пул НЕ берётся вовсе
+    («приватное — не использовать как фон»). Топ-`_CROSS_POOL_CAP` кандидатов идут в
+    `sensitive_classifier` (G11) ОДНИМ батчем; помеченные чувствительными — выкинуты.
+    Возвращает ≤`max_digests` ОТОБРАННЫХ выжимок (по убыванию релевантности).
+
+    Инъекции (stdlib-only): `markup_resolver(slug) -> (company, visibility)` и
+    `sensitive_classifier(candidates) -> list[bool]` (True=чувствительно). Без
+    классификатора (None) → [] КОНСЕРВАТИВНО: G11 — главный guard, без него фон не
+    отдаём. `exclude_keys` — set из `(series, date)`, уже показанных в блоке памяти
+    ТОЙ ЖЕ серии (fallback-матч по составу), чтобы не дублировать их в фоне.
+
+    Приватность (опасная тройка): текст кандидатов/фона тут НЕ логируется — только
+    счётчики у вызывателя. Best-effort внутри пер-серийного скана; общий best-effort
+    держит `build_cross_memory_block`.
+    """
+    r = Path(root)
+    if not r.is_dir():
+        return []
+    if max_digests is None:
+        max_digests = cross_memory_max_digests()
+    if today is None:
+        from datetime import date as _date  # локальный импорт: модуль stdlib-only
+        today = _date.today().isoformat()
+    cur_participants = current_participants or []
+    cur_topic = current_topic_tokens or set()
+    excl = exclude_keys or set()
+    try:
+        cur_resolved = current_series_dir.resolve()
+    except OSError:
+        cur_resolved = current_series_dir
+
+    scored: list = []  # (score, digest)
+    try:
+        entries = list(r.iterdir())
+    except OSError as e:
+        # Корень нечитаем (напр. неожиданно высокий путь) — тихо без фона, не падаем.
+        logger.warning("[cross-memory] scan failed (non-fatal): %s", type(e).__name__)
+        return []
+    for entry in entries:
+        # Весь файловый доступ по входу — под OSError-гардом: неreadable серия
+        # (напр. чужая папка при неожиданно высоком корне) пропускается, не валит скан.
+        try:
+            if not entry.is_dir() or entry.name.startswith("_") or entry.name.startswith("."):
+                continue
+            try:
+                if entry.resolve() == cur_resolved:
+                    continue
+            except OSError:
+                pass
+            digs = list_series_digests(entry, exclude_date=current_date)
+        except OSError:
+            continue
+        if not digs:
+            continue
+        slug = (digs[0].get("series") or entry.name) if isinstance(digs[0], dict) else entry.name
+        company = None
+        visibility = None
+        if markup_resolver is not None:
+            try:
+                company, visibility = markup_resolver(slug)
+            except Exception:  # noqa: BLE001 — резолв разметки best-effort
+                company, visibility = None, None
+        # Ручной маркер «приватное — не использовать как фон»: серия целиком вне пула.
+        if isinstance(visibility, str) and visibility.strip().lower() == "private":
+            continue
+        # Кросс-компания — мягкий штраф (A7), и только когда ОБЕ компании известны.
+        if current_company and company and company != current_company:
+            company_factor = _CROSS_COMPANY_FACTOR
+        else:
+            company_factor = 1.0
+        for dig in digs:
+            if not isinstance(dig, dict):
+                continue
+            if (dig.get("series"), dig.get("date")) in excl:
+                continue
+            p_overlap = _participant_overlap(cur_participants, dig.get("participants") or [])
+            t_overlap = _jaccard(cur_topic, _topic_tokens((dig.get("themes") or []) + (dig.get("key_points") or [])))
+            if p_overlap <= 0.0 and t_overlap <= 0.0:
+                continue  # нет пересечения ни по людям, ни по теме → не фон
+            fresh = _freshness(dig.get("date"), today)
+            score = (
+                _CROSS_W_PARTICIPANTS * p_overlap
+                + _CROSS_W_TOPIC * t_overlap
+                + _CROSS_W_FRESHNESS * fresh
+            ) * company_factor
+            if score < _CROSS_MIN_SCORE:
+                continue
+            scored.append((score, dig))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: x[0], reverse=True)
+    candidates = [dig for _, dig in scored[:_CROSS_POOL_CAP]]
+    # G11 — главный guard. Без классификатора фон НЕ отдаём (консервативно).
+    if sensitive_classifier is None:
+        return []
+    try:
+        verdicts = sensitive_classifier(candidates)
+    except Exception:  # noqa: BLE001 — сбой классификатора → консервативно всё скрыть
+        return []
+    if not isinstance(verdicts, list) or len(verdicts) != len(candidates):
+        return []  # несоответствие длины = доверять нельзя → исключить всё
+    safe = [dig for dig, bad in zip(candidates, verdicts) if not bad]
+    return safe[:max_digests] if max_digests > 0 else safe
+
+
+# Блок-ДАННЫЕ кросс-фона. Дисциплина ЖЁСТЧЕ, чем у памяти той же серии: факты ДРУГИХ
+# встреч к текущей могут не иметь отношения вовсе — перенос любого из них = ошибка.
+_CROSS_MEMORY_BLOCK_HEADER = (
+    "ФОН — связанные встречи из ДРУГИХ серий (это НЕ источник фактов для протокола!).\n"
+    "Ниже короткие выжимки релевантных встреч (возможно, других команд/направлений),\n"
+    "приведены ТОЛЬКО как фон: распознать общие проекты/термины/контекст. СТРОГО "
+    "ЗАПРЕЩЕНО переносить в протокол ЛЮБЫЕ темы, решения, задачи, числа или имена из "
+    "этого фона — к ТЕКУЩЕЙ встрече они могут не относиться. Все факты протокола — "
+    "только из ТЕКУЩЕГО транскрипта ниже."
+)
+
+
+def format_cross_memory_block(digests: list, *, max_chars: Optional[int] = None) -> str:
+    """Ф6 (G7/РАЗМ1): блок кросс-фона с дисциплиной «фон, не факт» и потолком символов.
+
+    Состав выжимки в блоке — серия + дата + темы + ключевые пункты. Участников ДРУГИХ
+    встреч НЕ выводим (лишний egress ПДн без пользы для генерации; имена постоянного
+    состава — забота памяти ТОЙ ЖЕ серии). Пустой список → "". Превышение `max_chars`
+    → выкидываем ХВОСТОВЫЕ (наименее релевантные) выжимки целиком и пересобираем; не
+    влезает даже одна → "" (лучше без фона, чем рваный).
+    """
+    if not digests:
+        return ""
+    if max_chars is None:
+        max_chars = cross_memory_max_chars()
+    selected = list(digests)
+    while selected:
+        lines = [_CROSS_MEMORY_BLOCK_HEADER, ""]
+        for dig in selected:
+            date = dig.get("date") or "—"
+            series = dig.get("series") or "другая серия"
+            lines.append(f"— Серия «{series}», встреча {date}:")
+            themes = (dig.get("themes") or [])[:_CROSS_BLOCK_THEMES_PER_DIGEST]
+            if themes:
+                lines.append(f"  Темы: {'; '.join(themes)}")
+            for kp in (dig.get("key_points") or [])[:_CROSS_BLOCK_POINTS_PER_DIGEST]:
+                lines.append(f"  • {kp}")
+            lines.append("")
+        lines.append("(конец фона — ниже текущая встреча, факты только из неё)")
+        block = "\n".join(lines).rstrip() + "\n"
+        if len(block) <= max_chars:
+            return block
+        selected = selected[:-1]  # хвост (наименее релевантный) не влез — выкидываем
+    return ""
