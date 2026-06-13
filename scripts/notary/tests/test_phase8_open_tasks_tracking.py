@@ -168,6 +168,23 @@ class TestExtractOpenTasks(unittest.TestCase):
         tasks = sm.extract_open_tasks(proto)
         self.assertTrue(any("всё ли по складу закрыто" in t for t in tasks))
 
+    def test_status_suffix_trailing_punctuation_tolerated(self):
+        # Дрейф (У1): модель дописала хвостовую пунктуацию/эмодзи к статусу.
+        # Суффикс всё равно срезается (carryover не копит статусы), а закрытая
+        # с «✅.» — отбрасывается. Дефис-разделитель по-прежнему обязателен.
+        proto = _PROTO_M2.replace(
+            "- Илья Рыбалка: Согласовать бюджет с финансами — висит",
+            "- Илья Рыбалка: Согласовать бюджет с финансами — висит.",
+        ).replace(
+            "- Татьяна Филиппова: Прислать медиаплан по WB — до пятницы — закрыта",
+            "- Татьяна Филиппова: Прислать медиаплан по WB — до пятницы — закрыта ✅.",
+        )
+        tasks = sm.extract_open_tasks(proto)
+        joined = " | ".join(tasks)
+        self.assertNotIn("медиаплан", joined)   # закрыта с «✅.» — отброшена
+        self.assertNotIn("висит", joined)       # суффикс с точкой срезан
+        self.assertTrue(any(t.endswith("Согласовать бюджет с финансами") for t in tasks))
+
     def test_dedup(self):
         proto = _PROTO_M1 + "\n## 🔻 С прошлых встреч\n\n- Илья Рыбалка: Согласовать бюджет с финансами — висит\n"
         tasks = sm.extract_open_tasks(proto)
@@ -286,6 +303,12 @@ class TestFormatAndBuildBlock(unittest.TestCase):
         self.assertIn("закрыта", block)
         self.assertIn("висит", block)
 
+    def test_header_instructs_preserve_owner_prefix(self):
+        # У2: промпт явно велит сохранять префикс исполнителя — иначе на round-trip
+        # через carryover теряется «кто следующий шаг» (половина ценности G9).
+        block = sm.format_open_tasks_block(["Татьяна: прислать Y"])
+        self.assertIn("префикс исполнителя", block)
+
     def test_build_block_killswitch_off(self):
         digests = [{"date": "2026-06-08", "open_tasks": ["висит X"]}]
         with mock.patch.dict(os.environ, {"ENABLE_OPEN_TASKS_TRACKING": "0"}):
@@ -311,7 +334,8 @@ class TestFormatAndBuildBlock(unittest.TestCase):
         with mock.patch.dict(os.environ, {"OPEN_TASKS_MAX": "0"}):
             self.assertEqual(sm.open_tasks_max(), sm.DEFAULT_OPEN_TASKS_MAX)
         with mock.patch.dict(os.environ, {"OPEN_TASKS_MAX": "999"}):
-            self.assertEqual(sm.open_tasks_max(), 50)
+            # потолок подачи = storage cap (просить больше, чем хранится, нельзя)
+            self.assertEqual(sm.open_tasks_max(), sm._MAX_OPEN_TASKS)
         with mock.patch.dict(os.environ, {"ENABLE_OPEN_TASKS_TRACKING": "no"}):
             self.assertFalse(sm.is_open_tasks_enabled())
 
@@ -395,6 +419,29 @@ class TestEndToEndSynthetic(unittest.TestCase):
             # блок доходит до промпта генерации
             prompt = lp._format_protocol_user_prompt("транскрипт", _META, open_tasks=block)
             self.assertIn("медиаплан", prompt)
+
+    def test_current_meeting_excluded_no_self_loop(self):
+        """Регресс (У3): резолв памяти серии исключает выжимку ТЕКУЩЕЙ встречи →
+        её СОБСТВЕННЫЕ открытые задачи НЕ возвращаются как «с прошлых встреч».
+        Иначе clarify-реген (выжимка текущей встречи уже сохранена первичным
+        finalize) зациклил бы новые задачи встречи в раздел переноса."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            series_dir = root / "koordinaciya"
+            series_dir.mkdir()
+            # Прошлая встреча — висящий хвост-якорь.
+            prev = sm.build_digest(_PROTO_M1, {"series": "koordinaciya", "date": "2026-06-01"})
+            sm.save_digest(series_dir, "2026-06-01", prev)
+            # ТЕКУЩАЯ встреча уже сохранена (как после первичного finalize) со СВОЕЙ задачей.
+            cur_proto = _PROTO_M1.replace(
+                "Согласовать бюджет с финансами", "ЗАДАЧА-ТЕКУЩЕЙ-ВСТРЕЧИ")
+            cur = sm.build_digest(cur_proto, {"series": "koordinaciya", "date": "2026-06-08"})
+            sm.save_digest(series_dir, "2026-06-08", cur)
+            # Резолв ДЛЯ текущей встречи (clarify-путь передаёт current_date).
+            digests = sm.resolve_memory(series_dir, root, current_date="2026-06-08")
+            block = sm.build_open_tasks_block(digests, meeting_sid="loop-guard")
+            self.assertNotIn("ЗАДАЧА-ТЕКУЩЕЙ-ВСТРЕЧИ", block)  # свои задачи не зациклены
+            self.assertIn("медиаплан", block)                  # хвост прошлой встречи на месте
 
 
 # ==========================================================================
