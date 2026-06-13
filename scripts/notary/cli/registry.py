@@ -153,6 +153,14 @@ WATCHED_HEADER = """# Реестр отслеживаемых встреч дл�
 #               трактует серию как private (fail-closed): знание НЕ уходит в
 #               *-context (E3). 1-на-1 — всегда private. Сырьё (транскрипт/
 #               протокол) этим полям НЕ подчиняется — оно всегда в me/встречи.
+#
+# Ф5 (G4): опциональный жанр/повестка серии — задаёт ФОКУС протокола:
+#   genre: директорат | координация | продукт | 1-на-1 | oneoff
+#               директорат — решения/риски/цифры; координация — кто-что-когда;
+#               продукт — решения/гипотезы; 1-на-1 — личные договорённости;
+#               oneoff — разовая самодостаточная встреча. Проставляй ключевым
+#               сериям вручную; ОТСУТСТВИЕ genre → бот берёт мягкий дефолт
+#               (координация), НЕ форсируя.
 """
 
 
@@ -247,6 +255,16 @@ VALID_TYPES = {"google-calendar", "manual", "one-off"}
 VALID_COMPANIES = {"anzhee", "mpfirst"}
 VALID_VISIBILITY = {"company", "private"}
 
+# Ф5 (G4): жанр/повестка серии — задаёт ФОКУС протокола генерации (директорат →
+# решения/риски/цифры; координация → кто-что-когда; продукт → решения/гипотезы;
+# 1-на-1 → личные договорённости; oneoff → разовая самодостаточная встреча).
+# Опционально, пер-record (резолв на уровень series, как company). Владелец
+# проставляет ключевым сериям вручную (A4); неразмеченным вызыватель
+# (`lib/series_markup.genre_for_series`) даёт мягкий дефолт, НЕ форсируя. Значения
+# нормализуются casefold-lower; невалидное в watched.yaml пропускается как
+# отсутствие (резолв устойчив к ручному мусору).
+VALID_GENRES = {"директорат", "координация", "продукт", "1-на-1", "oneoff"}
+
 
 def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[str]:
     errors: list[str] = []
@@ -292,6 +310,11 @@ def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[
     if visibility is not None:
         if not isinstance(visibility, str) or visibility.strip().lower() not in VALID_VISIBILITY:
             errors.append(f"visibility={visibility!r}: допустимо {sorted(VALID_VISIBILITY)} или отсутствие")
+    # Ф5 (G4): genre — опционален, валидируем значение если задано.
+    genre = rec.get("genre")
+    if genre is not None:
+        if not isinstance(genre, str) or genre.strip().casefold() not in VALID_GENRES:
+            errors.append(f"genre={genre!r}: допустимо {sorted(VALID_GENRES)} или отсутствие")
     return errors
 
 
@@ -433,6 +456,25 @@ def get_visibility_for_series(series: str, watched: dict[str, Any]) -> str | Non
         v = w.get("visibility")
         if isinstance(v, str) and v.strip().lower() in VALID_VISIBILITY:
             return v.strip().lower()
+    return None
+
+
+def get_genre_for_series(series: str, watched: dict[str, Any]) -> str | None:
+    """Ф5 (G4): первая непустая `genre` среди записей серии (нормализована casefold).
+
+    Зеркало `get_company_for_series` — пер-record поле, резолвится на уровень
+    series. Невалидное/неизвестное значение пропускается (как будто не задано) —
+    резолв устойчив к ручному мусору в watched.yaml. Нет разметки → None
+    (вызыватель `lib/series_markup.genre_for_series` подставит мягкий дефолт).
+    """
+    if not series:
+        return None
+    for w in watched.get("watched", []):
+        if w.get("series") != series:
+            continue
+        g = w.get("genre")
+        if isinstance(g, str) and g.strip().casefold() in VALID_GENRES:
+            return g.strip().casefold()
     return None
 
 

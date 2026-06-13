@@ -1277,6 +1277,22 @@ def _format_protocol_user_prompt(
     except Exception:  # noqa: BLE001 — роли не должны ронять генерацию протокола
         roles_block = ""
 
+    # Ф5 (G4): блок жанра/повестки серии — короткая инструкция фокуса протокола
+    # (директорат → решения/риски/цифры; координация → кто-что-когда; и т.д.).
+    # Company-scoped паттерн рядом с ролями: жанр резолвится из разметки watched.yaml
+    # (`series_markup.genre_for_series`); неразмеченная серия → мягкий дефолт
+    # (координация), НЕ форсируем (A4). Идёт в ТОТ ЖЕ единственный вызов генерации
+    # (Вызов 1, ГРАН1/НЕС1 — без отдельного Opus-вызова под жанр). Best-effort: сбой
+    # источника не роняет генерацию. Инструкция жанра не персональна → лог не трогаем (G10).
+    genre_block = ""
+    try:
+        genre = series_markup.genre_for_series(meeting_meta.get("series"))
+        gb = series_markup.format_genre_block(genre)
+        if gb.strip():
+            genre_block = "\n\n" + gb.strip()
+    except Exception:  # noqa: BLE001 — жанр не должен ронять генерацию протокола
+        genre_block = ""
+
     transcript_filename = meeting_meta.get("transcript_filename") or f"{date}.md"
 
     meta_block = [
@@ -1337,6 +1353,7 @@ def _format_protocol_user_prompt(
     return (
         "\n".join(meta_block)
         + roles_block
+        + genre_block
         + memory_block
         + learned_block
         + correction_block
