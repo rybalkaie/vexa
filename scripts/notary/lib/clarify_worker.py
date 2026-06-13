@@ -264,7 +264,7 @@ def _apply_resolution(
                 n_flags = llm_postprocess.review_and_flag_protocol_file(
                     protocol_path=protocol_path,
                     transcript_path=transcript_path,
-                    checks=("values", "roles", "memory"),  # Ф7: тем же одним вызовом
+                    checks=("values", "roles", "memory", "diarization"),  # Ф7+Ф4: те же checks, что в finalize, ОДНИМ вызовом
                     meeting_sid=state.get("meeting_id"),
                 )
                 if n_flags:

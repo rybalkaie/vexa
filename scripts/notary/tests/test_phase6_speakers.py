@@ -316,9 +316,10 @@ class TestReviewSurvivesRevision(unittest.TestCase):
             self.assertEqual(status, "sent")
             self.assertTrue(rev.called)
             # Объединённый проход на ревизии — те же checks, что в finalize.
-            # Ф7 расширил набор: + "memory" (дисциплина «прошлое = справка»), тем
-            # же одним вызовом (НЕ отдельный проход).
-            self.assertEqual(rev.call_args.kwargs.get("checks"), ("values", "roles", "memory"))
+            # Ф7 расширил набор: + "memory" (дисциплина «прошлое = справка»); Ф4: +
+            # "diarization" (поздний реген не должен терять ⚠️ «спикер под вопросом»).
+            # Всё тем же ОДНИМ вызовом (НЕ отдельный проход).
+            self.assertEqual(rev.call_args.kwargs.get("checks"), ("values", "roles", "memory", "diarization"))
             # Порядок: регенерация → ревью (вернуло ⚠️) → до-сыл.
             simplified = [c if isinstance(c, str) else c[0] for c in order]
             self.assertEqual(simplified, ["regen", "review", "redeliver"])
