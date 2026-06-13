@@ -769,6 +769,9 @@ def main() -> int:
     series_dir, date_part, _md_name_early = _output_dir_for_meta(args, meta)
     series_memory_digests: list[dict] = []
     series_memory_block = ""
+    # Ф8 (G9): хвост незакрытых задач серии → раздел «🔻 С прошлых встреч» в протоколе.
+    # Готовый блок-инструкция, едет в ТОТ ЖЕ Вызов 1 генерации (НЕ отдельный вызов).
+    open_tasks_block = ""
     # Ф4б (REQ 1.2): закреплённое человеком сопоставление спикер→имя из памяти серии
     # (правка авторства реплаем на прошлой встрече). Подаётся якорем в map_all ДО
     # догадки Ф4а. {} если нет/старые файлы без ключа (ленивое поле, УПУ3).
@@ -800,6 +803,12 @@ def main() -> int:
             )
             series_memory_block = "\n\n".join(
                 p for p in (series_memory_block.strip(), cross_block.strip()) if p
+            )
+            # Ф8 (G9): хвост открытых задач серии из тех же выжимок (latest несёт
+            # кумулятивное состояние). Под своим kill-switch внутри. Отдельным от
+            # series_memory каналом — у него обратная дисциплина (перенести + статус).
+            open_tasks_block = series_memory.build_open_tasks_block(
+                series_memory_digests, meeting_sid=session_uid,
             )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
@@ -1174,6 +1183,7 @@ def main() -> int:
                 meeting_meta=protocol_meta,
                 meeting_sid=session_uid,
                 series_memory=series_memory_block,  # Ф7 (7.3/7.4): справка серии
+                open_tasks=open_tasks_block,  # Ф8 (G9): хвост открытых задач серии
             )
             log.info("Protocol generated → %s", protocol_path)
         except ProtocolGenerationError as e:

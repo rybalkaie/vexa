@@ -203,6 +203,9 @@ def _apply_resolution(
         # в `<root>/<series>/<date>.md` → parent = серия, parent.parent = root.
         # Best-effort: сбой → без справки (ревизия не страдает).
         series_memory_block = ""
+        # Ф8 (G9): хвост незакрытых задач серии → раздел «🔻 С прошлых встреч».
+        # Паритет с finalize: поздний clarify тоже подаёт трекинг в ТОТ ЖЕ Вызов 1.
+        open_tasks_block = ""
         try:
             if series_memory.is_enabled() and series_memory.has_series_slug(meta_block.get("series")):
                 _smem = series_memory.resolve_memory(
@@ -224,8 +227,14 @@ def _apply_resolution(
                 series_memory_block = "\n\n".join(
                     p for p in (series_memory_block.strip(), cross_block.strip()) if p
                 )
+                # Ф8 (G9): хвост открытых задач серии из тех же выжимок (kill-switch
+                # внутри). Паритет с finalize call-site (footgun two-call-sites).
+                open_tasks_block = series_memory.build_open_tasks_block(
+                    _smem, meeting_sid=state.get("meeting_id"),
+                )
         except Exception:  # noqa: BLE001
             series_memory_block = ""
+            open_tasks_block = ""
         try:
             regen_meta = {
                 "series": meta_block.get("series") or "",
@@ -247,6 +256,7 @@ def _apply_resolution(
                 meeting_meta=regen_meta,
                 meeting_sid=state.get("meeting_id"),
                 series_memory=series_memory_block,  # Ф7
+                open_tasks=open_tasks_block,  # Ф8 (G9): хвост открытых задач серии
             )
             protocol_regenerated = True
             logger.info(

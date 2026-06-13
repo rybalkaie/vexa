@@ -1226,8 +1226,10 @@ def _format_protocol_user_prompt(
     meeting_meta: dict,
     *,
     series_memory: Optional[str] = None,
+    open_tasks: Optional[str] = None,
 ) -> str:
-    """Собирает user-prompt: метаданные + (Ф7) справка памяти серии + транскрипт.
+    """Собирает user-prompt: метаданные + (Ф7) справка памяти серии + (Ф8) хвост
+    открытых задач серии + транскрипт.
 
     Метаданные специально дублируют шапку транскрипта (Sonnet не должен полагаться
     на её парсинг — там может не быть `Длительность`, если STT-pipeline её не положил).
@@ -1235,6 +1237,13 @@ def _format_protocol_user_prompt(
     `series_memory` (Ф7 7.3/7.4) — готовый справочный блок выжимок прошлых встреч
     серии (из `series_memory.format_memory_block`). Идёт ПЕРЕД транскриптом с явной
     дисциплиной «справка, не факт». None/"" → блок не добавляется.
+
+    `open_tasks` (Ф8, G9) — готовый блок-инструкция с незакрытыми задачами серии
+    (из `series_memory.build_open_tasks_block`): модель добавит раздел «🔻 С прошлых
+    встреч» и проставит статус (закрыта/висит) по ТЕКУЩЕМУ транскрипту. Идёт ПОСЛЕ
+    блока памяти серии (его дисциплина «не переноси факты прошлого» имеет явное
+    исключение для этого хвоста). Едет в ТОТ ЖЕ единственный Вызов 1 (ГРАН1/НЕС1 —
+    отдельного Opus-вызова под трекинг нет). None/"" → раздела не будет.
     """
     series = meeting_meta.get("series") or "—"
     date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
@@ -1334,6 +1343,14 @@ def _format_protocol_user_prompt(
     if isinstance(series_memory, str) and series_memory.strip():
         memory_block = "\n\n" + series_memory.strip()
 
+    # Ф8 (G9): хвост незакрытых задач серии. Отдельный блок ПОСЛЕ памяти серии —
+    # дисциплина обратная справке (память: «не переноси факты прошлого»; здесь:
+    # «перенеси эти задачи и проставь статус», что блок и оговаривает как явное
+    # исключение). Best-effort готовая строка из `build_open_tasks_block`.
+    open_tasks_block = ""
+    if isinstance(open_tasks, str) and open_tasks.strip():
+        open_tasks_block = "\n\n" + open_tasks.strip()
+
     # Ф6 (FB10): выученные из правок участников терм-замены ЭТОЙ серии. Тот же
     # канал, что `series_memory` — справочный блок-ДАННЫЕ ПЕРЕД транскриптом (не
     # команда модели, не факт). Источник — append-only лог на серию; активные
@@ -1357,6 +1374,7 @@ def _format_protocol_user_prompt(
         + genre_block
         + memory_block
         + learned_block
+        + open_tasks_block
         + correction_block
         + feedback_block
         + "\n\nТранскрипт:\n\n"
@@ -1425,6 +1443,7 @@ def generate_protocol(
     timeout: Optional[int] = None,
     meeting_sid: Optional[str] = None,
     series_memory: Optional[str] = None,
+    open_tasks: Optional[str] = None,
 ) -> str:
     """Генерирует .md-файл протокола встречи из транскрипта через Claude (Ф3: Opus 4.8).
 
@@ -1480,7 +1499,7 @@ def generate_protocol(
     except Exception:  # noqa: BLE001
         pass
     user_prompt = _format_protocol_user_prompt(
-        transcript_md, meeting_meta, series_memory=series_memory,
+        transcript_md, meeting_meta, series_memory=series_memory, open_tasks=open_tasks,
     )
 
     # Ф3 (РИСК1): деградация вместо молчаливого провала. Если основная модель
@@ -1621,6 +1640,7 @@ def regenerate_protocol_for_meeting(
     method_text: Optional[str] = None,
     meeting_sid: Optional[str] = None,
     series_memory: Optional[str] = None,
+    open_tasks: Optional[str] = None,
 ) -> Path:
     """Высокоуровневая обёртка: читает transcript → генерирует → atomic write.
 
@@ -1659,6 +1679,7 @@ def regenerate_protocol_for_meeting(
         method_text=method_text,
         meeting_sid=meeting_sid,
         series_memory=series_memory,
+        open_tasks=open_tasks,
     )
     _atomic_write_text(protocol_path, protocol_text)
     return protocol_path

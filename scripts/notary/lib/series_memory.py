@@ -72,10 +72,36 @@ _BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|▪️|▫️|🔸|🟠|🔹|◾
 _REVIEW_FLAG_RE = re.compile(r"\s*⚠️.*$")
 _HAS_DIGIT_RE = re.compile(r"\d")
 
+# Ф8 (трекинг открытых задач). Потолок числа открытых задач, оседающих в выжимке
+# серии (storage cap, РАЗМ/приватность): не даём хвосту незакрытых разрастаться без
+# предела. Подача в промпт капится отдельно env-лимитом `open_tasks_max()` (≤ этого).
+_MAX_OPEN_TASKS = 25
+DEFAULT_OPEN_TASKS_MAX = 15
+# Подзаголовок исполнителя внутри блока «Задачи»: `**Имя Фамилия**` (методичка §4).
+_OWNER_SUBHEADING_RE = re.compile(r"^\s*\*\*(.+?)\*\*\s*$")
+# Статус перенесённой задачи в блоке «🔻 С прошлых встреч»: модель пишет
+# `- <задача> — <статус>` (см. `format_open_tasks_block`). «— закрыта» (с опц. ✅) в
+# хвосте → задачу дальше НЕ несём. Дефис ОБЯЗАТЕЛЕН (а не просто слово «закрыт» в
+# конце): иначе висящая задача с формулировкой вида «…проверить, всё ли закрыто»
+# ложно схлопнулась бы в «закрыта». Консерватизм правила вопроса 8: ложно-закрыть
+# хуже, чем лишний раз показать висящей — поэтому требуем явный разделитель статуса.
+_OPEN_TASK_CLOSED_RE = re.compile(
+    r"[—–-]\s*(?:✅\s*)?закрыт\w*\s*(?:✅)?\s*$", re.IGNORECASE
+)
+# Суффикс статуса «— висит» / «— висит, статус?» (с опц. 🔻) — срезаем при переносе,
+# чтобы текст задачи не копил статусы из встречи в встречу.
+_OPEN_TASK_STATUS_SUFFIX_RE = re.compile(
+    r"\s*[—–-]\s*(?:🔻\s*)?висит(?:,?\s*статус\??)?\s*$", re.IGNORECASE
+)
+
 # Служебные заголовки протокола — НЕ темы встречи.
 _DECISION_HEADING_KEYS = ("решен", "что внедряем", "договорил")
 _TASK_HEADING_KEYS = ("задач",)
 _SERVICE_HEADING_KEYS = ("провер", "что изменилось", "🔁", "приложен")
+# Ф8: блок трекинга открытых задач серии «🔻 С прошлых встреч». Своя секция, НЕ
+# тема и НЕ блок задач текущей встречи: её содержимое — перенесённые задачи со
+# статусом (закрыта/висит), их разбирает `extract_open_tasks`, а не темы/key_points.
+_CARRYOVER_HEADING_KEYS = ("с прошлых встреч", "🔻")
 
 # Владелец присутствует на каждой встрече — при матчинге серии по составу
 # участников его исключаем (иначе любая встреча «похожа» на любую). Можно
@@ -139,6 +165,34 @@ def retention_days() -> int:
     return max(val, 0)
 
 
+def is_open_tasks_enabled() -> bool:
+    """Ф8: kill-switch `ENABLE_OPEN_TASKS_TRACKING` (дефолт ON; `0/false/no` → OFF).
+
+    Отдельный от `ENABLE_SERIES_MEMORY`: при сбое в проде можно выключить ТОЛЬКО
+    подачу хвоста открытых задач в промпт (раздел «🔻 С прошлых встреч»), не трогая
+    резолв памяти серии (диаризация/постоянный состав/справка). Выключение гасит
+    лишь построение блока на call-site; сами выжимки `open_tasks` хранить продолжаем.
+    """
+    raw = (os.environ.get("ENABLE_OPEN_TASKS_TRACKING") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def open_tasks_max() -> int:
+    """Ф8: лимит числа открытых задач, подаваемых в промпт `OPEN_TASKS_MAX` (15).
+
+    Невалидное/<=0 → дефолт. Потолок 50 — защита промпта генерации от раздутого
+    хвоста (РАЗМ/приватность: в промпт идёт только нужное число задач).
+    """
+    raw = (os.environ.get("OPEN_TASKS_MAX") or "").strip()
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_OPEN_TASKS_MAX
+    if val <= 0:
+        return DEFAULT_OPEN_TASKS_MAX
+    return min(val, 50)
+
+
 def _owner_tokens() -> tuple[str, ...]:
     raw = (os.environ.get("SERIES_MEMORY_OWNER_NAMES") or "").strip()
     if not raw:
@@ -167,8 +221,12 @@ def _is_bullet(line: str) -> bool:
 
 
 def _classify_heading(title: str) -> str:
-    """Классифицирует заголовок: theme | decisions | tasks | service."""
+    """Классифицирует заголовок: carryover | theme | decisions | tasks | service."""
     low = title.lower()
+    # Ф8: «🔻 С прошлых встреч» — самый специфичный, проверяем первым (иначе при
+    # будущем переименовании секции мог бы случайно уйти в theme и засорить выжимку).
+    if any(k in low for k in _CARRYOVER_HEADING_KEYS):
+        return "carryover"
     if any(k in low for k in _SERVICE_HEADING_KEYS):
         return "service"
     if any(k in low for k in _DECISION_HEADING_KEYS):
@@ -249,6 +307,93 @@ def extract_protocol_sections(protocol_text: str) -> tuple[list[str], list[str]]
         if p not in key_points:
             key_points.append(p)
     return themes[:_MAX_THEMES], key_points
+
+
+def _clean_task_text(line: str) -> str:
+    """Текст задачи без ведущих маркеров (-, 🟠, 🔻, ▪️…), эмфазы, ⚠️ и лишних
+    пробелов, с обрезкой. Маркеры срезаем В ЦИКЛЕ: строка задачи бывает «- 🟠 …»
+    (дефис + функциональный эмодзи), один проход `^`-якорного regex снял бы только
+    дефис.
+    """
+    s = line
+    prev = None
+    while prev != s:
+        prev = s
+        s = _BULLET_PREFIX_RE.sub("", s).lstrip()
+    s = _REVIEW_FLAG_RE.sub("", s)
+    s = re.sub(r"[*_`]{1,2}", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > _MAX_POINT_LEN:
+        s = s[: _MAX_POINT_LEN - 1].rstrip() + "…"
+    return s
+
+
+def _task_key(text: str) -> str:
+    """Ключ дедупликации задачи: lower, без эмфазы, схлопнутые пробелы."""
+    s = re.sub(r"[*_`]{1,2}", "", text or "")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def extract_open_tasks(protocol_text: str) -> list[str]:
+    """Ф8: открытые (незакрытые) задачи серии ИЗ ГОТОВОГО протокола.
+
+    Два источника в протоколе:
+      • блок «Задачи» (section==tasks, методичка §4): задачи, назначенные на ЭТОЙ
+        встрече — НОВЫЕ открытые. Сгруппированы под подзаголовком `**Имя**` —
+        исполнителя кладём префиксом «Имя: …» (нужен для «за кем следующий шаг»).
+      • блок «🔻 С прошлых встреч» (section==carryover, Ф8): ПЕРЕНЕСЁННЫЕ задачи со
+        статусом. Помеченные «закрыта» — ОТБРАСЫВАЕМ (закрыты на этой встрече);
+        «висит»/«висит, статус?» — несём дальше, срезая суффикс статуса. Консерватизм
+        (правило вопроса 8): дальше несём всё, что не помечено явно закрытым.
+
+    Возвращает дедуплицированный список «перенесённые-висящие → новые», capped
+    `_MAX_OPEN_TASKS`. Порядок (висящие раньше новых) держит «хвост» серии при капе.
+    Чистая функция (без IO, без claude) — основной объект unit-тестов Ф8. НЕ кладёт
+    сырые реплики (РИСК4): только формулировки задач из уже сжатого протокола.
+    """
+    carried: list[str] = []
+    fresh: list[str] = []
+    section = None  # carryover|tasks|theme|decisions|service|None
+    current_owner: Optional[str] = None
+    for raw_line in (protocol_text or "").splitlines():
+        hm = _HEADING_RE.match(raw_line)
+        if hm:
+            title = _THEME_NUM_PREFIX_RE.sub("", hm.group(1).strip()).strip()
+            title = re.sub(r"[*_`]{1,2}", "", title).strip()
+            section = _classify_heading(title)
+            current_owner = None
+            continue
+        if section == "tasks":
+            om = _OWNER_SUBHEADING_RE.match(raw_line)
+            if om:
+                current_owner = re.sub(r"\s+", " ", om.group(1)).strip()
+                continue
+            if _is_bullet(raw_line):
+                txt = _clean_task_text(raw_line)
+                if not txt:
+                    continue
+                if current_owner and current_owner.lower() not in txt.lower():
+                    txt = f"{current_owner}: {txt}"
+                fresh.append(txt)
+        elif section == "carryover":
+            if not _is_bullet(raw_line):
+                continue
+            txt = _clean_task_text(raw_line)
+            if not txt:
+                continue
+            if _OPEN_TASK_CLOSED_RE.search(txt):
+                continue  # закрыта на этой встрече — дальше серия её не несёт
+            txt = _OPEN_TASK_STATUS_SUFFIX_RE.sub("", txt).strip()
+            if txt:
+                carried.append(txt)
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in carried + fresh:
+        k = _task_key(t)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out[:_MAX_OPEN_TASKS]
 
 
 def _norm_speaker_mapping(speaker_mapping: Optional[dict]) -> dict[str, str]:
@@ -334,6 +479,15 @@ def build_digest(
         "themes": themes,
         "key_points": key_points,
     }
+    # Ф8 (G9): открытые задачи серии (новые + перенесённые-висящие) — лазивый ключ,
+    # кладём ТОЛЬКО если непусто (как speaker_mapping/publication; старые выжимки без
+    # ключа → resolve_open_tasks вернёт [], миграции/бэкфилл не нужны). Эта выжимка
+    # несёт КУМУЛЯТИВНОЕ состояние хвоста: на следующей встрече серии resolve_open_tasks
+    # берёт его из самой свежей выжимки и подаёт в промпт генерации (Вызов 1). РИСК4:
+    # только формулировки задач из уже сжатого протокола, не сырые реплики.
+    open_tasks = extract_open_tasks(protocol_text or "")
+    if open_tasks:
+        digest["open_tasks"] = open_tasks
     sm = _norm_speaker_mapping(speaker_mapping)
     if sm:
         digest["speaker_mapping"] = sm
@@ -387,11 +541,12 @@ def save_digest(series_dir: Path, date: str, digest: dict) -> Optional[Path]:
         logger.warning("[series-memory] save failed series=%s date=%s: %s",
                        digest.get("series") if isinstance(digest, dict) else "?", date, e)
         return None
-    logger.info("[series-memory] saved digest series=%s date=%s participants=%d themes=%d points=%d",
+    logger.info("[series-memory] saved digest series=%s date=%s participants=%d themes=%d points=%d open_tasks=%d",
                 digest.get("series") or "?", date,
                 len(digest.get("participants") or []),
                 len(digest.get("themes") or []),
-                len(digest.get("key_points") or []))
+                len(digest.get("key_points") or []),
+                len(digest.get("open_tasks") or []))
     return path
 
 
@@ -818,6 +973,103 @@ def format_memory_block(digests: list[dict]) -> str:
         lines.append("")
     lines.append("(конец справки — ниже текущая встреча, факты только из неё)")
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Ф8 — трекинг открытых задач серии во времени (G9)
+# ---------------------------------------------------------------------------
+def resolve_open_tasks(digests: list[dict]) -> list[str]:
+    """Ф8: открытые задачи серии для подачи в промпт генерации (Вызов 1).
+
+    Берём `open_tasks` из САМОЙ СВЕЖЕЙ выжимки (`digests` по дате ВОЗРАСТАНИЮ → [-1]).
+    Каждая выжимка несёт КУМУЛЯТИВНОЕ состояние хвоста: новые задачи той встречи +
+    перенесённые-висящие (закрытые на той встрече уже отброшены в `build_digest`).
+    Поэтому достаточно последней — она уже учитывает все предыдущие состояния;
+    старые выжимки не подмешиваем, иначе воскресили бы давно закрытые задачи.
+    Нет выжимок / нет ключа (история до Ф8) / пусто → [] (блок не строится). Capped
+    `open_tasks_max()`.
+    """
+    if not digests:
+        return []
+    latest = digests[-1]
+    if not isinstance(latest, dict):
+        return []
+    raw = latest.get("open_tasks") or []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        s = t.strip()
+        k = _task_key(s)
+        if s and k and k not in seen:
+            seen.add(k)
+            out.append(s)
+    cap = open_tasks_max()
+    return out[:cap] if cap > 0 else out
+
+
+_OPEN_TASKS_BLOCK_HEADER = (
+    "ОТКРЫТЫЕ ЗАДАЧИ С ПРОШЛЫХ ВСТРЕЧ ЭТОЙ СЕРИИ — трекинг во времени.\n"
+    "Ниже задачи/договорённости, которые на ПРОШЛЫХ встречах серии остались "
+    "НЕзакрытыми. В протоколе текущей встречи добавь В САМОМ КОНЦЕ (после блока "
+    "«Задачи») отдельный раздел с заголовком ровно:\n"
+    "## 🔻 С прошлых встреч\n"
+    "и для КАЖДОЙ задачи из списка ниже выведи ОДНУ строку строго в формате:\n"
+    "- <текст задачи дословно как в списке> — <статус>\n"
+    "Статус определяй ТОЛЬКО по ТЕКУЩЕМУ транскрипту этой встречи:\n"
+    "- задача обсуждалась и решена/выполнена на этой встрече → «закрыта»;\n"
+    "- задача в текущем транскрипте не всплыла → «висит»;\n"
+    "- упоминание есть, но неясно, закрыта ли она → «висит, статус?» "
+    "(НЕ угадывай «закрыта» — лучше показать висящей лишний раз).\n"
+    "ВАЖНО: это ЕДИНСТВЕННОЕ исключение из правила «факты только из текущей записи» — "
+    "сами задачи взяты из прошлых встреч серии, ты лишь проставляешь им статус по "
+    "текущей. НЕ добавляй в этот раздел новые задачи текущей встречи (они идут в "
+    "обычный блок «Задачи»). НЕ выдумывай задач, которых нет в списке ниже."
+)
+
+
+def format_open_tasks_block(open_tasks: list[str]) -> str:
+    """Ф8: блок-инструкция «открытые задачи серии» для промпта генерации.
+
+    Пустой список → "" (блок не добавляется → раздела «🔻 С прошлых встреч» в
+    протоколе не будет). Дисциплина: это НЕ справка-«не-факт» (как память серии),
+    а явная инструкция перенести перечисленные задачи со статусом — потому идёт
+    отдельным блоком ПОСЛЕ блока памяти серии (см. `_format_protocol_user_prompt`).
+    """
+    if not open_tasks:
+        return ""
+    lines = [_OPEN_TASKS_BLOCK_HEADER, "", "Незакрытые задачи серии:"]
+    for t in open_tasks:
+        lines.append(f"- {t}")
+    lines.append("(конец списка — статус каждой определяй по текущему транскрипту)")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_open_tasks_block(digests: list[dict], *, meeting_sid: Optional[str] = None) -> str:
+    """Ф8 (G9): единая точка сборки блока открытых задач для ОБОИХ триггеров
+    (finalize И clarify) — как `build_cross_memory_block` для кросс-фона.
+
+    Под kill-switch `is_open_tasks_enabled()`. Best-effort: выключено / нет хвоста /
+    любой сбой → "" (трекинг опционален, генерацию не роняет). Приватность (опасная
+    тройка): текст задач НЕ логируем — только счётчик (число висящих) и длину блока.
+    """
+    if not is_open_tasks_enabled():
+        return ""
+    try:
+        tasks = resolve_open_tasks(digests)
+        block = format_open_tasks_block(tasks)
+        logger.info(
+            "[open-tasks] block meeting=%s carried=%d block_len=%d",
+            meeting_sid or "?", len(tasks), len(block),
+        )
+        return block
+    except Exception as e:  # noqa: BLE001 — трекинг опционален, генерацию не роняем
+        logger.warning(
+            "[open-tasks] build failed meeting=%s (non-fatal): %s",
+            meeting_sid or "?", type(e).__name__,
+        )
+        return ""
 
 
 # ---------------------------------------------------------------------------
