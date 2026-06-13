@@ -124,7 +124,16 @@ def manual_keyterms_for_series(series_slug: Optional[str]) -> list[str]:
     Содержимое НЕ логируется (термины ниши, дисциплина приватности)."""
     if not series_slug or not str(series_slug).strip():
         return []
-    path = keyterms_dir() / f"{str(series_slug).strip()}.txt"
+    slug = str(series_slug).strip()
+    # Path-traversal guard: slug уходит в ИМЯ файла. Реальные slug'и системные
+    # (`series-<...>-<hex>`). Любой разделитель пути / `..` / NUL отвергаем
+    # (best-effort → [], как прочие сбои источника): иначе slug увёл бы чтение за
+    # каталог keyterms, а абсолютный путь (ведущий `/`) — куда угодно (pathlib
+    # `dir / "/abs"` сбрасывает на абсолютный).
+    if any(c in slug for c in ("/", "\\", "\x00")) or ".." in slug:
+        logger.info("[keyterms] slug серии не filename-safe, ручной файл пропущен")
+        return []
+    path = keyterms_dir() / f"{slug}.txt"
     try:
         if not path.is_file():
             return []
@@ -212,7 +221,7 @@ def collect_keyterms_prompt(
     терминов логирует вызыватель."""
     try:
         raw = gather_series_terms(series_slug, company=company, extra_terms=extra_terms)
+        return build_keyterms_prompt(raw)
     except Exception as e:  # noqa: BLE001 — никогда не роняем расшифровку из-за словаря
         logger.warning("[keyterms] сбор словаря серии упал (degradation): %s", e)
         return []
-    return build_keyterms_prompt(raw)

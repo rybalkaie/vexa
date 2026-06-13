@@ -173,6 +173,20 @@ class TestManualKeyterms(unittest.TestCase):
         self.assertEqual(kt.manual_keyterms_for_series(""), [])
         self.assertEqual(kt.manual_keyterms_for_series(None), [])
 
+    def test_path_traversal_slug_rejected(self):
+        # Файл-приманка ВНЕ каталога keyterms — traversal-slug не должен его прочитать.
+        parent = Path(self._tmp).parent
+        (parent / "evil.txt").write_text("СЕКРЕТ\n", encoding="utf-8")
+        try:
+            self.assertEqual(kt.manual_keyterms_for_series("../evil"), [])  # parent traversal
+            self.assertEqual(kt.manual_keyterms_for_series("a/b"), [])       # разделитель пути
+            self.assertEqual(kt.manual_keyterms_for_series("/etc/passwd"), [])  # абсолютный путь
+            # Легитимный системный slug в том же каталоге по-прежнему читается (нет регресса).
+            self._write("series-ok-1a2b", "Anzhee\n")
+            self.assertEqual(kt.manual_keyterms_for_series("series-ok-1a2b"), ["Anzhee"])
+        finally:
+            (parent / "evil.txt").unlink(missing_ok=True)
+
 
 # ─────────────────────── S4: glossary_keyterms (канон + fallback) ───────────────────────
 
