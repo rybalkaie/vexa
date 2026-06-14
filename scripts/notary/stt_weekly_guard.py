@@ -49,14 +49,20 @@ DEFAULT_FAILED_DIR = "/srv/meeting-notary/_failed"
 WINDOW_DAYS = 7
 _WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
-# РИСК3: какие STT-движки покрывает недельный счёт. fetch_jobs_speechmatics тянет
-# ТОЛЬКО Speechmatics jobs API, поэтому суммируется лишь он. Любой ДРУГОЙ внешний
-# (платный) движок — например AssemblyAI (боевой дефолт с Ф1 umnyi-protokol-
-# assemblyai) — сторож НЕ видит, и kill-switch по его расходу не взведётся. Пока
-# учёт такого движка не добавлен, об этом предупреждаем НЕ молча (см. run_guard).
-# whisper_pyannote — локальный/бесплатный, в счёте не нуждается.
+# РИСК3: какие STT-движки покрывает недельный счёт.
+#   - assemblyai — боевой движок; считается через СВОЙ локальный леджер трат
+#     (fetch_jobs_assemblyai), НЕ через list-API аккаунта: аккаунт AAI общий с другими
+#     проектами, API смешал бы чужой объём → ложный kill-switch. Леджер пишет только
+#     нотариусные сабмиты (assemblyai_client.record_spend).
+#   - speechmatics — УБРАН из счёта (решение владельца 2026-06-14): его аккаунт оказался
+#     общим (за 7 дн 339 коротких job'ов, медиана ~73 сек — звонки, не встречи нотариуса),
+#     и нотариус на него больше не ходит. Speechmatics-ветка ОСТАВЛЕНА switchable
+#     (STT_BACKEND=speechmatics) на будущее; если когда-то переключат — движок окажется в
+#     _EXTERNAL, но не в _TALLIED, и run_guard НЕ молча предупредит, что счёт его не кроет.
+#   - whisper_pyannote — локальный/бесплатный, в счёте не нуждается.
+# Порог недельного лимита — на нотариусные часы AssemblyAI.
 _EXTERNAL_STT_BACKENDS = ("speechmatics", "assemblyai")
-_TALLIED_STT_BACKENDS = ("speechmatics",)
+_TALLIED_STT_BACKENDS = ("assemblyai",)
 
 
 class WeeklySummary(NamedTuple):
@@ -203,6 +209,77 @@ def fetch_jobs_speechmatics(
     return out
 
 
+def fetch_jobs_assemblyai(
+    now: dt.datetime, *, window_days: int = WINDOW_DAYS
+) -> list[dict]:
+    """РИСК3: нотариусные траты AssemblyAI из ЛОКАЛЬНОГО леджера (не list-API аккаунта
+    — он общий с другими проектами, смешал бы чужой объём → ложный kill-switch).
+
+    Леджер пишет `assemblyai_client.record_spend` по строке JSONL на новый сабмит:
+    {"ts", "transcript_id", "duration_s"}. Возвращаем в формате compute_weekly_summary
+    ({created_at, duration}); окно фильтрует она сама. Битые строки/отсутствие файла —
+    пропускаем (не роняем сторож из-за мусора или «ещё ни одной встречи на AAI»).
+    `window_days` в сигнатуре для единообразия с fetch_jobs_speechmatics (фильтр — в
+    compute_weekly_summary)."""
+    from lib.assemblyai_client import spend_ledger_path  # noqa: PLC0415
+
+    p = spend_ledger_path()
+    out: list[dict] = []
+    try:
+        if not p.exists():
+            return out
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                out.append({
+                    "created_at": rec.get("ts"),
+                    "duration": rec.get("duration_s"),
+                    "id": rec.get("transcript_id"),
+                })
+    except OSError as e:
+        logger.warning("AAI spend-ledger: не смог прочитать %s: %s", p, e)
+    return out
+
+
+def fetch_jobs_all(now: dt.datetime, *, window_days: int = WINDOW_DAYS) -> list[dict]:
+    """Объединяет траты всех УЧИТЫВАЕМЫХ движков (_TALLIED_STT_BACKENDS): Speechmatics
+    (jobs API) + AssemblyAI (локальный леджер). Порог — на СУММУ внешнего STT.
+
+    Устойчивость: каждый источник тянем независимо. Сбой одного логируем и считаем по
+    остальным (не ослепнуть из-за блипа одного API; для сторожа недосчёт ОДНОГО движка
+    лучше полной слепоты). Если упали ВСЕ — пробрасываем (main запушит «не отработал»,
+    fail-loud для сторожа денег)."""
+    fetchers = {
+        "speechmatics": lambda: fetch_jobs_speechmatics(now, window_days=window_days),
+        "assemblyai": lambda: fetch_jobs_assemblyai(now, window_days=window_days),
+    }
+    active = [n for n in _TALLIED_STT_BACKENDS if n in fetchers]
+    out: list[dict] = []
+    failed: list[str] = []
+    for name in active:
+        try:
+            out.extend(fetchers[name]())
+        except Exception as e:  # noqa: BLE001
+            failed.append(name)
+            logger.warning(
+                "STT weekly: источник трат '%s' упал (%s: %s) — считаю по остальным, "
+                "недельная сумма может быть НЕПОЛНОЙ", name, type(e).__name__, str(e)[:80],
+            )
+    if active and len(failed) == len(active):
+        raise RuntimeError(
+            f"все источники трат STT недоступны ({', '.join(failed)}) — недельный счёт не собран"
+        )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # CG6/CG7/CG8 — kill-switch (флаг-файл)
 # --------------------------------------------------------------------------- #
@@ -273,7 +350,7 @@ def _fmt_by_day(by_day: dict) -> str:
 
 def _fmt_warn(summary: WeeklySummary, warn_h: float, block_h: float) -> str:
     return (
-        f"📊 Speechmatics: за 7 дней {summary.total_hours:.1f} ч "
+        f"📊 AssemblyAI: за 7 дней {summary.total_hours:.1f} ч "
         f"(порог предупреждения {warn_h:g} ч, стоп на {block_h:g} ч).\n"
         f"По дням:\n{_fmt_by_day(summary.by_day)}\n"
         f"Пока только слежу — расшифровку не останавливаю."
@@ -282,7 +359,7 @@ def _fmt_warn(summary: WeeklySummary, warn_h: float, block_h: float) -> str:
 
 def _fmt_block(summary: WeeklySummary, block_h: float, killswitch_path: Path) -> str:
     return (
-        f"🛑 Speechmatics: за 7 дней {summary.total_hours:.1f} ч — достигнут стоп-порог "
+        f"🛑 AssemblyAI: за 7 дней {summary.total_hours:.1f} ч — достигнут стоп-порог "
         f"{block_h:g} ч. Расшифровка ОСТАНОВЛЕНА (kill-switch взведён). Новые встречи "
         f"копятся в очереди и НЕ теряются.\n"
         f"По дням:\n{_fmt_by_day(summary.by_day)}\n"
@@ -429,7 +506,7 @@ def main() -> int:
             warn_h=args.warn_h,
             block_h=args.block_h,
             killswitch_path=Path(args.killswitch_path),
-            jobs_fetcher=fetch_jobs_speechmatics,
+            jobs_fetcher=fetch_jobs_all,
             pusher=pusher,
             dry_run=args.dry_run,
         )
@@ -442,7 +519,7 @@ def main() -> int:
         if not args.dry_run:
             try:
                 _default_pusher(
-                    f"⚠️ Недельный монитор трат Speechmatics не отработал: "
+                    f"⚠️ Недельный монитор трат STT не отработал: "
                     f"{type(e).__name__}: {str(e)[:120]}. Слежение за лимитом сейчас не идёт.",
                     dedupe_key=f"stt-weekly-guard-error:{now.date().isoformat()}",
                 )

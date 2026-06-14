@@ -98,6 +98,7 @@ collector = _load("collector_cg1", "collector.py")
 retry_failed = _load("retry_failed_cg", "retry_failed.py")
 swg = _load("stt_weekly_guard_cg", "stt_weekly_guard.py")
 sc = _load("speechmatics_client_cg", "lib/speechmatics_client.py")
+aai = _load("assemblyai_client_cg", "lib/assemblyai_client.py")
 
 try:
     finalize = _load("finalize_meeting_cg", "finalize-meeting.py")
@@ -532,6 +533,149 @@ class TestWeeklyGuard(unittest.TestCase):
         (self.failed / "d.retry-state.json").write_text("{bad json")
         self.assertEqual(swg.count_waiting_meetings(self.failed), 2)
         self.assertEqual(swg.count_waiting_meetings(self.tmp / "nope"), 0)
+
+
+# ───────────────── РИСК3: учёт трат AssemblyAI (локальный леджер) ─────────────────
+
+class TestAssemblyAISpendLedger(unittest.TestCase):
+    """RECORD: новый сабмит пишет трату в локальный леджер; reuse — нет.
+    READ: сторож читает леджер и суммирует только нотариусные часы AAI (не аккаунт)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ledger = self.tmp / "aai-spend.jsonl"
+        self._prev = os.environ.get("AAI_SPEND_LEDGER_PATH")
+        os.environ["AAI_SPEND_LEDGER_PATH"] = str(self.ledger)
+        self.now = dt.datetime(2026, 6, 14, 12, 0, 0)
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("AAI_SPEND_LEDGER_PATH", None)
+        else:
+            os.environ["AAI_SPEND_LEDGER_PATH"] = self._prev
+
+    def test_record_spend_writes_jsonl_line(self):
+        aai.record_spend("T1", 1800.0, now=self.now)
+        aai.record_spend("T2", 3600.0, now=self.now)
+        lines = self.ledger.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        rec = json.loads(lines[0])
+        self.assertEqual(rec["transcript_id"], "T1")
+        self.assertEqual(rec["duration_s"], 1800.0)
+        self.assertTrue(rec["ts"].endswith("Z"))
+
+    def test_record_spend_best_effort_never_raises(self):
+        os.environ["AAI_SPEND_LEDGER_PATH"] = "/proc/nonexistent/x/aai.jsonl"
+        try:
+            aai.record_spend("T", 10.0, now=self.now)  # не должно бросить
+        finally:
+            os.environ["AAI_SPEND_LEDGER_PATH"] = str(self.ledger)
+        self.assertFalse(self.ledger.exists())  # запись не прошла, но и не упала
+
+    def test_fetch_reads_ledger(self):
+        aai.record_spend("T1", 1800.0, now=self.now)
+        aai.record_spend("T2", 900.0, now=self.now)
+        jobs = swg.fetch_jobs_assemblyai(self.now)
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual({j["duration"] for j in jobs}, {1800.0, 900.0})
+        self.assertTrue(all("created_at" in j for j in jobs))
+
+    def test_fetch_missing_file_empty(self):
+        self.assertEqual(swg.fetch_jobs_assemblyai(self.now), [])
+
+    def test_fetch_skips_bad_lines(self):
+        self.ledger.write_text(
+            '{"ts":"2026-06-14T10:00:00Z","transcript_id":"ok","duration_s":600}\n'
+            "{bad json\n"
+            "\n"
+            "12345\n",  # валидный JSON, но не dict
+            encoding="utf-8",
+        )
+        jobs = swg.fetch_jobs_assemblyai(self.now)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["id"], "ok")
+
+    def test_summary_hours_and_window(self):
+        aai.record_spend("in", 3600.0, now=self.now)           # 1 ч в окне
+        aai.record_spend("old", 7200.0, now=self.now - dt.timedelta(days=10))  # вне окна
+        summ = swg.compute_weekly_summary(swg.fetch_jobs_assemblyai(self.now), self.now)
+        self.assertAlmostEqual(summ.total_hours, 1.0, places=3)
+        self.assertEqual(summ.job_count, 1)
+
+
+class TestFetchJobsAllCombines(unittest.TestCase):
+    """fetch_jobs_all суммирует оба движка и устойчив к сбою одного источника."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ledger = self.tmp / "aai-spend.jsonl"
+        self._prev = os.environ.get("AAI_SPEND_LEDGER_PATH")
+        os.environ["AAI_SPEND_LEDGER_PATH"] = str(self.ledger)
+        self.now = dt.datetime(2026, 6, 14, 12, 0, 0)
+        self.ledger.write_text(
+            '{"ts":"2026-06-14T10:00:00Z","transcript_id":"a","duration_s":600}\n',
+            encoding="utf-8",
+        )
+        self._sm = swg.fetch_jobs_speechmatics
+        self._ai = swg.fetch_jobs_assemblyai
+
+    def tearDown(self):
+        swg.fetch_jobs_speechmatics = self._sm
+        swg.fetch_jobs_assemblyai = self._ai
+        if self._prev is None:
+            os.environ.pop("AAI_SPEND_LEDGER_PATH", None)
+        else:
+            os.environ["AAI_SPEND_LEDGER_PATH"] = self._prev
+
+    def test_only_assemblyai_tallied_speechmatics_not_queried(self):
+        # Speechmatics убран из _TALLIED (аккаунт общий) → fetch_jobs_all его НЕ
+        # запрашивает, считает только нотариусный AAI-леджер.
+        called = {"sm": False}
+
+        def sm_spy(now, **k):
+            called["sm"] = True
+            return [{"created_at": "2026-06-14T09:00:00Z", "duration": 1200, "id": "s1"}]
+
+        swg.fetch_jobs_speechmatics = sm_spy
+        jobs = swg.fetch_jobs_all(self.now)
+        self.assertEqual({j.get("id") for j in jobs}, {"a"})
+        self.assertFalse(called["sm"], "speechmatics вне _TALLIED — не должен запрашиваться")
+
+    def test_raises_when_tallied_source_fails(self):
+        # Единственный учитываемый источник (AAI) упал → fail-loud (main запушит).
+        def boom(now, **k):
+            raise RuntimeError("ledger read blew up")
+        swg.fetch_jobs_assemblyai = boom
+        with self.assertRaises(RuntimeError):
+            swg.fetch_jobs_all(self.now)
+
+
+class TestUntalliedWarningGoneForAAI(unittest.TestCase):
+    """assemblyai теперь учитывается → run_guard НЕ шлёт предупреждение «не покрыт»."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._prev = os.environ.get("STT_BACKEND")
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("STT_BACKEND", None)
+        else:
+            os.environ["STT_BACKEND"] = self._prev
+
+    def test_assemblyai_backend_no_untallied_warning(self):
+        os.environ["STT_BACKEND"] = "assemblyai"
+        pushes = []
+        res = swg.run_guard(
+            now=dt.datetime(2026, 6, 14, 12, 0, 0),
+            failed_dir=self.tmp,
+            warn_h=10.0, block_h=15.0,
+            killswitch_path=self.tmp / "ks.flag",
+            jobs_fetcher=lambda now: [],
+            pusher=lambda msg, *, dedupe_key=None: pushes.append(msg),
+        )
+        self.assertNotIn("untallied-backend-warning", res["actions"])
+        self.assertFalse(any("РИСК3" in m for m in pushes))
 
 
 if __name__ == "__main__":

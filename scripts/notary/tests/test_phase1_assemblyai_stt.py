@@ -554,9 +554,10 @@ class TestFinalizeBranch(unittest.TestCase):
 # ─────── РИСК3: сторож недельных трат и боевой движок (ход3 цикла) ───────
 
 class TestWeeklyGuardCoversActiveBackend(unittest.TestCase):
-    """Сторож трат тянет только Speechmatics jobs. Если боевой STT_BACKEND —
-    assemblyai (дефолт example с Ф1), он НЕ молча предупреждает, что расход
-    активного движка не учитывается и kill-switch по нему не взведётся (РИСК3)."""
+    """РИСК3 закрыт (umnyi-protokol-assemblyai cost-guard follow-up): сторож теперь
+    учитывает И speechmatics (jobs API), И assemblyai (локальный леджер). Поэтому при
+    боевом STT_BACKEND=assemblyai предупреждения «движок не покрыт» БОЛЬШЕ НЕТ —
+    оно осталось бы только для НОВОГО внешнего движка вне `_TALLIED_STT_BACKENDS`."""
 
     def _run(self, backend):
         import stt_weekly_guard as g  # top-level модуль notary (sys.path уже включает _NOTARY)
@@ -588,15 +589,21 @@ class TestWeeklyGuardCoversActiveBackend(unittest.TestCase):
                 os.environ["STT_BACKEND"] = saved
         return res, pushes
 
-    def test_assemblyai_active_triggers_warning(self):
+    def test_assemblyai_active_no_warning_now_tallied(self):
+        # РИСК3 закрыт: assemblyai теперь в _TALLIED_STT_BACKENDS (учитывается через
+        # локальный леджер) → предупреждение «движок не покрыт» НЕ шлётся.
         res, pushes = self._run("assemblyai")
-        self.assertIn("untallied-backend-warning", res["actions"])
-        self.assertTrue(any("assemblyai" in m for m, _ in pushes),
-                        "предупреждение должно называть активный движок")
-
-    def test_speechmatics_active_no_warning(self):
-        res, pushes = self._run("speechmatics")
         self.assertNotIn("untallied-backend-warning", res["actions"])
+        self.assertFalse(any("РИСК3" in m for m, _ in pushes),
+                         "после закрытия РИСК3 предупреждение о непокрытом движке не шлём")
+
+    def test_speechmatics_active_warns_now_untallied(self):
+        # Speechmatics убран из _TALLIED (решение владельца 2026-06-14, аккаунт общий).
+        # Если когда-то переключат STT_BACKEND обратно на speechmatics — сторож НЕ молча
+        # предупредит, что его расход не покрыт счётом (движок switchable, но не трекается).
+        res, pushes = self._run("speechmatics")
+        self.assertIn("untallied-backend-warning", res["actions"])
+        self.assertTrue(any("speechmatics" in m for m, _ in pushes))
 
     def test_whisper_active_no_warning(self):
         res, pushes = self._run("whisper_pyannote")

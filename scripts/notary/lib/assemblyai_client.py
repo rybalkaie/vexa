@@ -60,6 +60,8 @@ Smoke CLI:
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import logging
 import os
 import sys
@@ -154,6 +156,49 @@ def killswitch_armed() -> bool:
         # Недоступность FS трактуем как «не взведён» — не блокируем расшифровку
         # из-за инфраструктурного сбоя проверки (ложный блок хуже ложного пропуска).
         return False
+
+
+# --- РИСК3: локальный леджер трат AAI (источник для недельного сторожа) --------
+# Аккаунт AssemblyAI ОБЩИЙ с другими проектами (ключ переиспользуется), поэтому
+# считать недельный расход нотариуса через list-API аккаунта НЕЛЬЗЯ — он смешает
+# чужие транскрипты, и недельный kill-switch может ложно сработать (заблокировать
+# нотариус из-за чужого объёма). Вместо этого пишем СВОЙ леджер: одна строка JSONL
+# на каждый НОВЫЙ (платный) сабмит. `stt_weekly_guard` читает только его — считает
+# исключительно нотариусные часы. Reuse существующего id НЕ пишем (деньги потрачены
+# на первом сабмите — повторный учёт был бы завышением).
+DEFAULT_SPEND_LEDGER_PATH = "/srv/meeting-notary/state/aai-spend.jsonl"
+
+
+def spend_ledger_path() -> Path:
+    """Путь леджера трат AAI (env AAI_SPEND_LEDGER_PATH, иначе дефолт VPS)."""
+    return Path(os.environ.get("AAI_SPEND_LEDGER_PATH") or DEFAULT_SPEND_LEDGER_PATH)
+
+
+def record_spend(transcript_id: str, audio_duration_s: float, *, now: dt.datetime | None = None) -> None:
+    """Best-effort: дописать трату в леджер. НИКОГДА не фатально для финализации.
+
+    Строка JSONL: {"ts": <iso-utc>, "transcript_id": ..., "duration_s": <сек>}.
+    Сбой записи (нет каталога/прав/диск) только логируем — расшифровка уже сделана,
+    ронять её из-за учёта нельзя (ложный провал финализации хуже недосчёта трат).
+    Зовётся ТОЛЬКО на новом сабмите (не на reuse) — иначе двойной учёт."""
+    try:
+        stamp = (now or dt.datetime.utcnow()).replace(microsecond=0).isoformat() + "Z"
+        try:
+            dur = float(audio_duration_s)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if dur < 0:
+            dur = 0.0
+        p = spend_ledger_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {"ts": stamp, "transcript_id": str(transcript_id or ""), "duration_s": round(dur, 1)},
+            ensure_ascii=False,
+        )
+        with p.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("AAI spend-ledger: не смог записать трату (не фатально): %s", e)
 
 
 def _get_api_key() -> str:
@@ -486,6 +531,10 @@ def transcribe_diarize_wav(
 
     utterances = parse_utterances(raw)
     audio_duration_s = _extract_audio_duration_s(raw, utterances)
+    if not existing_transcript_id:
+        # Новый платный сабмит — фиксируем трату в леджер для недельного сторожа
+        # (РИСК3). Reuse сюда не попадает (деньги уже учтены на первом сабмите).
+        record_spend(transcript_id, audio_duration_s)
     detected_language = _extract_detected_language(raw)
     words = raw.get("words")
     n_words = len(words) if isinstance(words, list) else 0
