@@ -1503,6 +1503,149 @@ def _normalize_protocol_duration(
     return new_text
 
 
+# ===========================================================================
+# Ф3 (R13): детерминированный пост-проход «спокойной генерации»
+# ===========================================================================
+#
+# Проблема (РИСК1/A5): `claude --print` не даёт флага сэмплинга — temp≈0
+# недостижим, поэтому ДВЕ генерации одного транскрипта плывут. Вход-хинт
+# (panel ∪ voiced) уже стабилен — нестабилен именно ВЫХОД LLM: порядок имён в
+# шапке `**Участники:**` и физический порядок секций `## ` (служебные блоки то
+# выше тематических, то ниже; тематические — в разном порядке при одинаковой
+# нумерации). Нормализуем именно выход, ПОСЛЕ генерации, чистой функцией без IO
+# (объект unit-тестов R13). Температуру/сэмплинг НЕ трогаем — это отвергнутый
+# подход (дайджест/A5).
+#
+# Что делает (и ТОЛЬКО это — прозу не переписываем, её плавание неустранимо
+# пост-проходом; честно отражено в тестах):
+#   1) Шапка `**Участники:**` — стабильная сортировка имён (casefold) + дедуп.
+#   2) Порядок секций `## ` — канонический по методичке: тематические (по
+#      номеру, с ренумерацией 1)2)3…) → Решения → Задачи → 🔻 С прошлых встреч →
+#      ⚠️ Проверить / 🔁 Что изменилось / Приложения. Нераспознанные `## ` —
+#      сохраняют исходный относительный порядок между тематическими и служебными
+#      (что не понимаем — не двигаем относительно друг друга).
+# Всё ДО первой `## ` (шапка + дисклеймер авторства Ф4а) сохраняется дословно.
+# Идемпотентна: stabilize(stabilize(x)) == stabilize(x).
+
+_PARTICIPANTS_LINE_RE = re.compile(r"^(\s*\*{0,2}\s*Участники:\*{0,2}\s*)(.*)$")
+_THEMATIC_NUM_RE = re.compile(r"^##\s+(\d{1,2})\s*[).]\s*(.*)$")
+
+
+def _classify_protocol_section(heading_line: str) -> tuple[int, int]:
+    """Классификатор секции `## ` для пост-прохода Ф3.
+
+    Возвращает `(rank, thematic_number)`:
+      rank 0 — тематическая (`## N) …`), `thematic_number` = её номер;
+      rank 1 — нераспознанная `## …` (порядок сохраняем как был);
+      rank 2 — Решения / что внедряем / договорились;
+      rank 3 — Задачи;
+      rank 4 — 🔻 С прошлых встреч;
+      rank 5 — ⚠️ Проверить / 🔁 Что изменилось / Приложения.
+    Ключи согласованы со служебными заголовками `series_memory` (там тот же
+    разбор протокола на темы/служебку).
+    """
+    m = _THEMATIC_NUM_RE.match(heading_line)
+    if m:
+        try:
+            return 0, int(m.group(1))
+        except ValueError:
+            return 0, 0
+    low = heading_line.lstrip("#").strip().lower()
+    if any(k in low for k in ("решен", "что внедряем", "договорил")):
+        return 2, 0
+    if "задач" in low:
+        return 3, 0
+    if "с прошлых встреч" in low or low.startswith("🔻"):
+        return 4, 0
+    if any(k in low for k in ("провер", "что изменилось", "🔁", "приложен")):
+        return 5, 0
+    return 1, 0
+
+
+def _sort_participants_in_lines(lines: list[str]) -> list[str]:
+    """Стабильная сортировка имён в строке `**Участники:**` (первое вхождение).
+
+    По методичке участники — ровно один раз, в шапке. Дедуп регистронезависимый
+    (сохраняем первый встреченный вариант написания), сортировка по casefold —
+    детерминизм важнее идеального локального алфавита (требование R13 — стабильность).
+    """
+    out = list(lines)
+    for i, ln in enumerate(out):
+        m = _PARTICIPANTS_LINE_RE.match(ln)
+        if not m:
+            continue
+        prefix, value = m.group(1), m.group(2)
+        names = [n.strip() for n in value.split(",") if n.strip()]
+        if not names:
+            return out
+        seen: dict[str, str] = {}
+        for n in names:
+            key = n.casefold()
+            if key not in seen:
+                seen[key] = n
+        uniq = sorted(seen.values(), key=lambda s: (s.casefold(), s))
+        out[i] = prefix + ", ".join(uniq)
+        break
+    return out
+
+
+def stabilize_protocol_text(text: str) -> str:
+    """Детерминированный пост-проход «спокойной генерации» (Ф3/R13). Чистая,
+    идемпотентная функция без IO. См. блок-комментарий выше."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    sec_starts = [i for i, ln in enumerate(lines) if ln.startswith("## ")]
+    if not sec_starts:
+        # Нет секций — нормализуем только шапку участников.
+        return "\n".join(_sort_participants_in_lines(lines))
+
+    header = _sort_participants_in_lines(lines[: sec_starts[0]])
+
+    # Режем тело на блоки-секции (заголовок + всё до следующего `## `).
+    blocks: list[list[str]] = []
+    for k, start in enumerate(sec_starts):
+        end = sec_starts[k + 1] if k + 1 < len(sec_starts) else len(lines)
+        blocks.append(lines[start:end])
+
+    decorated = []
+    for origin_idx, blk in enumerate(blocks):
+        rank, num = _classify_protocol_section(blk[0])
+        # Вторичный ключ: для тематических — их номер, для прочих — исходный
+        # индекс (стабильность внутри ранга).
+        secondary = num if rank == 0 else origin_idx
+        decorated.append((rank, secondary, origin_idx, blk))
+    decorated.sort(key=lambda d: (d[0], d[1], d[2]))
+
+    # Нормализуем хвостовые пустые строки каждого блока и склеиваем секции ровно
+    # одной пустой строкой — иначе межсекционные отступы зависели бы от того, какой
+    # блок был последним во ВХОДЕ (глобальный `.strip()` генерации срезает хвост
+    # лишь у последней секции), и две перестановки расходились бы по пробелам.
+    section_texts: list[str] = []
+    theme_n = 0
+    for rank, _sec, _orig, blk in decorated:
+        blk = list(blk)
+        if rank == 0:
+            theme_n += 1
+            mm = _THEMATIC_NUM_RE.match(blk[0])
+            if mm:
+                blk[0] = f"## {theme_n}) {mm.group(2)}".rstrip()
+        while blk and blk[-1].strip() == "":
+            blk.pop()
+        section_texts.append("\n".join(blk))
+    body = "\n\n".join(section_texts)
+
+    # Шапка — дословно (строка участников отсортирована на месте, число строк не
+    # меняется → префикс до первой `## ` побайтово совпадает с входом).
+    if header:
+        result = "\n".join(header) + "\n" + body
+    else:
+        result = body
+    if not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
 def generate_protocol(
     transcript_md: str,
     meeting_meta: dict,
@@ -1666,6 +1809,11 @@ def generate_protocol(
     # TG-текст инжектит свой вариант). Идемпотентно — повторная генерация не
     # плодит дубль. Ставится ДО первой секции → не уходит в series_memory-дайджест.
     text = protocol_to_tg.insert_protocol_disclaimer(text)
+    # Ф3 (R13): детерминированный пост-проход «спокойной генерации» — стабильный
+    # порядок участников в шапке + канонический порядок секций. ПОСЛЕ дисклеймера
+    # (он живёт ДО первой `## `, пост-проход его не двигает). Делает два одинаковых
+    # входа → одинаковый протокол по составу/порядку (не через temp≈0 — РИСК1/A5).
+    text = stabilize_protocol_text(text)
 
     logger.info(
         "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s degraded=%s",
@@ -5812,7 +5960,12 @@ REVISION_SUMMARY_PROMPT = """Ты помогаешь сформулироват�
 - <одно изменение одной строкой>
 - <ещё одно, если есть>
 
-Чаще всего меняется имя спикера (был «Спикер N» → стало имя) — так и пиши. Не дублируй протокол целиком, не выдумывай ничего сверх diff. Только готовый русский текст без markdown-обёртки и без префиксов."""
+Чаще всего меняется имя спикера (был «Спикер N» → стало имя) — так и пиши. Не дублируй протокол целиком, не выдумывай ничего сверх diff. Только готовый русский текст без markdown-обёртки и без префиксов.
+
+ВАЖНО (честность changelog):
+- Перестановка участников или секций в другом порядке — это НЕ изменение. Не упоминай её.
+- Про состав участников пиши СТРОГО по явной строке «Состав участников» во входе (added/removed), а НЕ по строкам diff. Если added и removed пусты — НЕ пиши «заменили/добавили/убрали человека»: набор людей тот же.
+- Если по сути в содержании ничего не поменялось — напиши одну строку, что правок по содержанию нет (новая версия ниже)."""
 
 
 def _protocol_content_hash(text: str) -> str:
@@ -5823,6 +5976,27 @@ def _protocol_content_hash(text: str) -> str:
     """
     norm = "\n".join(ln.rstrip() for ln in (text or "").split("\n")).strip()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _participants_from_protocol(text: str) -> list[str]:
+    """Список имён из строки `**Участники:**` протокола (первое вхождение)."""
+    for ln in (text or "").split("\n"):
+        m = _PARTICIPANTS_LINE_RE.match(ln)
+        if m:
+            return [n.strip() for n in m.group(2).split(",") if n.strip()]
+    return []
+
+
+def _participant_delta(old_text: str, new_text: str) -> tuple[list[str], list[str]]:
+    """(added, removed) участников ПО МНОЖЕСТВУ (casefold-сравнение). R14: чтобы
+    перестановка имён не выдавалась за добавление/замену человека."""
+    old = _participants_from_protocol(old_text)
+    new = _participants_from_protocol(new_text)
+    old_l = {n.casefold() for n in old}
+    new_l = {n.casefold() for n in new}
+    added = [n for n in new if n.casefold() not in old_l]
+    removed = [n for n in old if n.casefold() not in new_l]
+    return added, removed
 
 
 def _compose_revision_summary(
@@ -5840,15 +6014,37 @@ def _compose_revision_summary(
     fallback = f"🔁 Обновил протокол «{series}» {date} — уточнил детали, новая версия ниже."
     if not old_text or not new_text:
         return fallback
+    # R14/Ф3: убираем «плавание» (перестановка участников/секций) из diff —
+    # стабилизируем обе версии. Тогда чистая перестановка даёт пустой diff и не
+    # выдаётся за замену человека; реальная правка остаётся в diff как есть.
+    old_s = stabilize_protocol_text(old_text)
+    new_s = stabilize_protocol_text(new_text)
     diff_lines = list(difflib.unified_diff(
-        old_text.splitlines(), new_text.splitlines(),
+        old_s.splitlines(), new_s.splitlines(),
         fromfile="было", tofile="стало", lineterm="", n=2,
     ))
     if not diff_lines:
         return fallback
     if len(diff_lines) > 200:
         diff_lines = diff_lines[:200] + ["... (diff обрезан)"]
-    user_prompt = f"Series: {series}\nDate: {date}\n\nDiff (unified):\n" + "\n".join(diff_lines)
+    # R14: явная дельта участников ПО МНОЖЕСТВУ (не по строкам diff) — чтобы модель
+    # не выдала перестановку за «добавили/убрали человека».
+    added, removed = _participant_delta(old_s, new_s)
+    if added or removed:
+        parts = []
+        if added:
+            parts.append("добавлены: " + ", ".join(added))
+        if removed:
+            parts.append("убраны: " + ", ".join(removed))
+        delta_note = "Состав участников (по множеству имён) — " + "; ".join(parts) + "."
+    else:
+        delta_note = (
+            "Состав участников НЕ менялся (возможна лишь перестановка — это НЕ изменение)."
+        )
+    user_prompt = (
+        f"Series: {series}\nDate: {date}\n\n{delta_note}\n\nDiff (unified):\n"
+        + "\n".join(diff_lines)
+    )
     try:
         raw = call_claude_print(
             user_prompt, system=REVISION_SUMMARY_PROMPT,
@@ -5911,7 +6107,13 @@ def redeliver_revised_protocol(
         return {"status": "error", "error": "empty new protocol"}
 
     new_hash = _protocol_content_hash(new_protocol_text)
-    if old_protocol_text and _protocol_content_hash(old_protocol_text) == new_hash:
+    # R14/Ф3: «изменилось ли» — по СТАБИЛИЗИРОВАННОМУ тексту, чтобы перестановка
+    # участников/секций (или до-Ф3 нестабильная старая версия на диске) не считалась
+    # изменением и не порождала ложный до-сыл с «🔁 что изменилось».
+    if old_protocol_text and (
+        _protocol_content_hash(stabilize_protocol_text(old_protocol_text))
+        == _protocol_content_hash(stabilize_protocol_text(new_protocol_text))
+    ):
         return {"status": "no-change"}
 
     meta = _read_meta_json(meta_json_path) if meta_json_path else None
