@@ -304,5 +304,35 @@ class TestRedeliverNoChangeOnReorder(unittest.TestCase):
         self.assertEqual(sent, [])  # в чат ничего не ушло
 
 
+# ===========================================================================
+# Ф3-сопровождение (цикл5): классификатор секций пост-прохода НЕ должен
+# разойтись с разбором заголовков в series_memory. Оба модуля независимо хранят
+# ключи служебных секций (решения/задачи/перенос/служебка); добавят ключ в один,
+# забудут в другой → пост-проход поставит секцию НЕ туда, где её ждёт память
+# серии. Тест ловит дрейф (класс бага auto-memory `review-checks-two-call-sites`).
+# ===========================================================================
+class TestClassifierAlignedWithSeriesMemory(unittest.TestCase):
+    def test_section_keys_match_series_memory(self):
+        from lib import series_memory as sm
+
+        # Каждый служебный ключ series_memory обязан классифицироваться
+        # пост-проходом в соответствующий неттематический ранг.
+        cases = [
+            (sm._DECISION_HEADING_KEYS, 2),
+            (sm._TASK_HEADING_KEYS, 3),
+            (sm._CARRYOVER_HEADING_KEYS, 4),
+            (sm._SERVICE_HEADING_KEYS, 5),
+        ]
+        for keys, expected_rank in cases:
+            for k in keys:
+                rank, _ = lp._classify_protocol_section(f"## {k}")
+                self.assertEqual(
+                    rank, expected_rank,
+                    f"ключ {k!r} из series_memory → ранг {rank} в пост-проходе, "
+                    f"ожидался {expected_rank}: ключи служебных секций разошлись "
+                    f"между _classify_protocol_section и series_memory._classify_heading",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
