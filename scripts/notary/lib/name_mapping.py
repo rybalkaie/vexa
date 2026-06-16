@@ -765,7 +765,7 @@ def map_all(
         )
         if delta:
             cluster_to_name.update(delta)
-            uncertain_clusters.update({c: f"тёзка по имени — вероятный по роли, уверенность низкая" for c in delta})
+            uncertain_clusters.update({c: "тёзка по имени — вероятный по роли, уверенность низкая" for c in delta})
             sources_used.append("namesake_disambig")
 
     unresolved = [c for c in clusters if c not in cluster_to_name]
