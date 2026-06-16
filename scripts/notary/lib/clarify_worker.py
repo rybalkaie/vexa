@@ -293,6 +293,12 @@ def _apply_resolution(
                     checks=("values", "roles", "memory", "diarization"),  # Ф7+Ф4: те же checks, что в finalize, ОДНИМ вызовом
                     meeting_sid=state.get("meeting_id"),
                     rewrite=True,
+                    # R3: паритет с finalize — после перегенерации заново ставим ⚠️
+                    # «авторство под вопросом» для тёзка-подстановок (иначе доразметка
+                    # теряла бы пометку). Имена сохранены в state при первой clarify.
+                    extra_findings=llm_postprocess.build_authorship_uncertainty_findings(
+                        state.get("authorship_uncertain") or []
+                    ),
                 )
                 if n_flags:
                     logger.info(

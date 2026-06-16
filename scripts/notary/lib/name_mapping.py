@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .align import AlignedTurn
@@ -30,6 +30,12 @@ class MappingResult:
     cluster_to_name: dict[str, str]  # SPEAKER_00 → «Илья»; пустой если ничего не уверены
     sources_used: list[str]          # подмножество из ["telemost_list", "regex_pymorphy3"]
     unresolved_clusters: list[str]   # кластеры, которым не нашли имя
+    # R3 (тёзки): кластеры, авто-резолвленные ДИЗАМБИГУАЦИЕЙ тёзок (вероятный по
+    # роли подставлен, но уверенность низкая). cluster → короткая нота. finalize
+    # ставит по ним ⚠️ «авторство под вопросом, поправьте» (system-applied, оба
+    # call-site) и занижает speaker_confidence, чтобы clarify-страховка не считала
+    # кластер «решённым» (РИСК4). Новое поле с дефолтом — обратная совместимость.
+    uncertain_clusters: dict[str, str] = field(default_factory=dict)
 
 
 # ---------- Источник 1: Telemost participants ----------
@@ -397,6 +403,145 @@ def map_from_roster_domain(
     return result
 
 
+# ---------- R3: дизамбигуация тёзок (вероятный по роли + пометка ⚠️) ----------
+
+
+def _first_word_lower(name: str) -> str:
+    parts = (name or "").strip().split()
+    return (parts[0] if parts else (name or "")).strip().lower()
+
+
+def _namesake_groups(participants: list[str]) -> dict[str, list[str]]:
+    """{первое-слово: [полные тёзка-имена]} для групп ≥2 РАЗНЫХ полных имён с общим
+    первым словом («Михаил Саргин» + «Михаил Еремеев»). Голые однословные имена
+    (без фамилии) тёзку не различают — в группу не входят."""
+    by_first: dict[str, list[str]] = {}
+    for p in participants or []:
+        full = (p or "").strip()
+        if not full or len(full.split()) < 2:
+            continue
+        fw = _first_word_lower(full)
+        bucket = by_first.setdefault(fw, [])
+        if full not in bucket:
+            bucket.append(full)
+    return {fw: names for fw, names in by_first.items() if len(names) >= 2}
+
+
+def disambiguate_namesakes(
+    turns: list[AlignedTurn],
+    participants: list[str],
+    already_mapped: dict[str, str],
+    *,
+    roster: Optional[list[dict]] = None,
+    present: Optional[list[str]] = None,
+    inactive: Optional[set[str]] = None,
+) -> dict[str, str]:
+    """R3: для тёзок (имя совпадает, фамилия разная) подставляет ВЕРОЯТНОГО ПО РОЛИ
+    кандидата на свободный кластер, но результат НЕУВЕРЕННЫЙ (⚠️ ставит finalize +
+    занижает confidence — РИСК4: не считать кластер «решённым молча»).
+
+    Срабатывает КОНСЕРВАТИВНО — только когда:
+      • в составе есть группа тёзок (≥2 полных имени с общим первым словом);
+      • среди свободных имён группы ровно один кандидат «вероятен по роли»: он
+        присутствует (`present`, тёзко-безопасно) И активен (не в `inactive`,
+        строгое совпадение по канону/алиасу) И его зона ростера даёт по репликам
+        кластера СТРОГО больший доменный сигнал (≥1 ключевое слово), чем у любого
+        другого тёзки группы. Сигнал ≥1, но НИЖЕ строгого порога `map_from_roster_domain`
+        (тот уже отработал и забрал уверенные кластеры) — оттого и неуверенность;
+      • кластер сам строго НЕ окликнул это имя (защита от инверсии);
+      • назначение one-to-one.
+
+    Нет группы тёзок / нет различающего по роли кандидата / нулевой сигнал → `{}`
+    (оставляем clarify/LLM: лучше «Спикер N» + переспрос, чем уверенно неверный тёзка).
+    Имя в маппинге — КАНОНИЧНОЕ из ростера. `already_mapped` исключает занятых
+    (правка-факт/ростер/якорь/S1/S2 идут раньше).
+    """
+    if not roster or not turns:
+        return {}
+    groups = _namesake_groups(participants)
+    if not groups:
+        return {}
+    inactive = {str(x).strip().lower() for x in (inactive or set()) if str(x).strip()}
+
+    free_clusters = sorted(
+        {t.speaker for t in turns if t.speaker and t.speaker not in already_mapped}
+    )
+    if not free_clusters:
+        return {}
+    used_names = set(already_mapped.values())
+
+    # Каноничные записи ростера по точному имени (case-insensitive) — для keywords.
+    roster_by_name: dict[str, list[str]] = {}
+    for entry in roster:
+        nm = str(entry.get("name") or "").strip()
+        kws = [str(k).lower() for k in (entry.get("keywords") or []) if str(k).strip()]
+        if nm and kws:
+            roster_by_name[nm.lower()] = kws
+
+    # Eligible-кандидаты внутри каждой группы: присутствует + активен + есть зона.
+    eligible: dict[str, list[str]] = {}  # first-word → [canonical names]
+    for fw, names in groups.items():
+        elig: list[str] = []
+        for full in names:
+            if full in used_names:
+                continue
+            if full.strip().lower() in inactive:
+                continue
+            if not _roster_name_in_pool(full, present):  # тёзко-безопасное присутствие
+                continue
+            if full.lower() not in roster_by_name:        # нет зоны → «по роли» нечем мерить
+                continue
+            elig.append(full)
+        if elig:
+            eligible[fw] = elig
+    if not eligible:
+        return {}
+
+    texts = _cluster_texts(turns, set(free_clusters))
+
+    # strict-vocative ТЕКУЩЕЙ встречи — защита от инверсии (по первому слову имени).
+    elig_names = [n for names in eligible.values() for n in names]
+    name_forms = {n: _expand_name_forms(_first_word_lower(n)) for n in elig_names}
+    _, _, strict_anti_votes = _scan_speech_votes(turns, name_forms)
+
+    # Кандидатные пары (score, cluster, name): по каждому свободному кластеру — лучший
+    # тёзка группы, если он СТРОГО доминирует над другими членами группы (вероятный
+    # по роли) и сигнал ≥1.
+    pairs: list[tuple[float, str, str]] = []
+    for cluster in free_clusters:
+        text = texts.get(cluster, "")
+        if not text:
+            continue
+        for fw, names in eligible.items():
+            scored = sorted(
+                ((sum(1 for kw in set(roster_by_name[n.lower()]) if kw in text), n) for n in names),
+                key=lambda x: x[0], reverse=True,
+            )
+            best_count, best_name = scored[0]
+            if best_count < 1:
+                continue  # нет доменного сигнала к группе — не угадываем
+            if len(scored) > 1 and scored[1][0] >= best_count:
+                continue  # внутри группы ничья → не «вероятный по роли»
+            if strict_anti_votes.get((cluster, best_name), 0.0) > 0:
+                continue  # кластер сам окликнул это имя → он НЕ оно
+            pairs.append((float(best_count), cluster, best_name))
+
+    # Greedy one-to-one по силе сигнала.
+    pairs.sort(key=lambda x: x[0], reverse=True)
+    result: dict[str, str] = {}
+    taken_clusters: set[str] = set()
+    taken_names: set[str] = set()
+    for _score, cluster, name in pairs:
+        if cluster in taken_clusters or name in taken_names:
+            continue
+        result[cluster] = name
+        taken_clusters.add(cluster)
+        taken_names.add(name)
+    if result:
+        logger.info("R3 namesake-disambig: %d тёзка-кластер(ов) подставлено (НЕуверенно)", len(result))
+    return result
+
+
 def _resolve_two_speakers(
     strict_anti_votes: dict[tuple[str, str], float],
     clusters: list[str],
@@ -440,6 +585,7 @@ def _apply_series_anchor(
     clusters: list[str],
     participants: list[str],
     anchor: dict[str, str],
+    already_mapped: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     """Ф4б: применяет закреплённое человеком сопоставление спикер→имя из памяти серии.
 
@@ -448,6 +594,10 @@ def _apply_series_anchor(
     применяем ТОЛЬКО валидные и НЕпротиворечивые записи (защита от инверсии,
     которую Ф4а закрыла; метки S1/S2 нестабильны между джобами — см. РИСК-диаризация):
       • cluster существует в текущей встрече И имя в составе участников;
+      • cluster и имя НЕ заняты более приоритетным источником (`already_mapped` —
+        правка-факт/ростер-домен, R19): порядок приоритетов делает якорь НИЖЕ
+        достоверного company-факта/ростера, поэтому «ядовитый» якорь (закрепивший
+        ошибку прошлой встречи) НЕ перебивает ростерного ответственного (R2);
       • НИ ОДНА запись не противоречит строгому vocative ТЕКУЩЕЙ записи. Если в
         текущей встрече cluster C сам окликнул имя N («N, …») — он точно НЕ N; значит
         якорь C→N неверен. А так как метки S1/S2 между джобами нестабильны, ЛЮБОЕ
@@ -462,12 +612,17 @@ def _apply_series_anchor(
     """
     if not anchor:
         return {}
+    already_mapped = already_mapped or {}
+    taken_clusters = set(already_mapped)
+    taken_names = set(already_mapped.values())
     cluster_set = set(clusters)
     name_set = set(participants)
     cands = {
         str(c): str(n)
         for c, n in anchor.items()
         if str(c) in cluster_set and str(n) in name_set
+        # R19: занятое более приоритетным источником (правка-факт/ростер) якорь не трогает.
+        and str(c) not in taken_clusters and str(n) not in taken_names
     }
     if not cands:
         return {}
@@ -504,55 +659,70 @@ def map_all(
     anchor: Optional[dict[str, str]] = None,
     roster: Optional[list[dict]] = None,
     present: Optional[list[str]] = None,
+    edit_facts: Optional[dict[str, str]] = None,
+    inactive: Optional[set[str]] = None,
 ) -> MappingResult:
-    """Прогоняет детерминированные источники по очереди: якорь → S1 → ростер → S2.
+    """Прогоняет детерминированные источники по ТОТАЛЬНОМУ порядку приоритета (R19):
 
-    `anchor` (Ф4б, REQ 1.2) — закреплённое человеком сопоставление спикер→имя из
-    памяти серии. Применяется ПЕРВЫМ (бьёт догадку Ф4а), но лишь валидные и
-    непротиворечивые записи (см. `_apply_series_anchor`).
+        правка-факт > ростер-домен > якорь > S1(telemost) > S2(regex) > [LLM-добивка].
+
+    Это финализованный порядок (R19): достоверный company-факт о роли/каноне имени
+    (правка-факт и ростер-домен) перебивает устаревший якорь серии и Telemost-угадайку.
+    РАНЬШЕ якорь шёл ПЕРВЫМ и проносил ошибку имени вперёд (корень бага ISS-11 —
+    «Михаил Еремеев» вместо «Михаил Саргин»); теперь ростер-домен забирает сервис-
+    кластер ДО якоря, а якорь принимает `already_mapped` и не перебивает занятое (R2).
+
+    `edit_facts` (R19/Ф2-заготовка) — карта `{cluster: каноничное имя}` из принятой
+    человеком правки (высший приоритет). Применяется ПЕРВОЙ как прямой overlay, если
+    передана; в Ф1 опциональна и обычно `None` (Ф2 наполнит захватом правок). НЕ
+    меняет существующие вызовы (дефолт None → поведение без правок).
 
     `roster` (Ф3, A4/B3) — ростер ролей серии (домен→ответственный+keywords из
-    `series_roster.get_roster`). Доменный маппинг идёт ПОСЛЕ якоря+S1, но ПЕРЕД
-    vocative-greedy S2: он высокоточно закрывает «перепутал людей» (A4), а S2
-    добивает кластеры, по которым домен неоднозначен. `roster=None` → шаг
-    пропускается (поведение как до Ф3). Догадка Ф4а
-    (`map_from_speech_regex`/`_resolve_two_speakers`) — фолбэк для незакреплённых.
+    `series_roster.get_roster`). Идёт СРАЗУ за правкой-фактом и ВЫШЕ якоря: высокоточно
+    закрывает «перепутал людей» (A4) и нейтрализует ядовитый якорь (R2). `roster=None`
+    → шаг пропускается (поведение как до Ф3).
 
-    `present` (Ф3, A5) — РЕАЛЬНО присутствовавшие (панель Телемоста). Доменный
-    маппинг проверяет кандидата-ответственного на присутствие именно по `present`,
-    а НЕ по `participants` (тот = panel ∪ expected и тянет отпускников из
-    watched.yaml: иначе домен отсутствующего владельца, озвученный замещающим, лёг
-    бы на кластер замещающего под именем отсутствующего). `present=None` →
-    присутствие проверяется по `participants` (обратная совместимость/прямой вызов).
+    `anchor` (Ф4б, REQ 1.2) — закреплённое человеком сопоставление спикер→имя из
+    памяти серии. Теперь НИЖЕ ростера: применяет лишь записи, чьи cluster/имя НЕ
+    заняты правкой/ростером (`already_mapped`), и лишь валидные/непротиворечивые
+    (см. `_apply_series_anchor`).
 
-    LLM-добивка (бывший Source 3 / Claude Haiku) вынесена в
-    `lib/llm_postprocess.py::map_speaker_names` и вызывается отдельно из
-    `finalize-meeting.py` для unresolved'ов после якоря+S1+ростера+S2.
+    `present` (Ф3, A5) — РЕАЛЬНО присутствовавшие (панель/голоса). Доменный маппинг и
+    дизамбигуация тёзок проверяют присутствие по `present`, не по `participants` (тот
+    = panel ∪ expected, тянет отпускников из watched.yaml). `present=None` → по
+    `participants` (обратная совместимость/прямой вызов).
+
+    `inactive` (R3/R4) — множество имён людей со статусом inactive в справочнике
+    компании (`context_knowledge.inactive_person_names`). Используется дизамбигуацией
+    тёзок: неактивного тёзку (Еремеев) не подставляем. `None` → нет ограничения.
+
+    Дизамбигуация тёзок (R3) идёт ПОСЛЕ S2, по ещё-свободным кластерам: подставляет
+    вероятного по роли + помечает кластер НЕуверенным (`uncertain_clusters`) — finalize
+    ставит ⚠️ и занижает confidence (РИСК4). LLM-добивка вынесена в
+    `lib/llm_postprocess.py::map_speaker_names` и зовётся отдельно из finalize.
     """
     clusters = sorted({t.speaker for t in turns if t.speaker})
     cluster_to_name: dict[str, str] = {}
     sources_used: list[str] = []
+    uncertain_clusters: dict[str, str] = {}
 
     if not clusters:
         return MappingResult(cluster_to_name={}, sources_used=[], unresolved_clusters=[])
 
-    # 0) Ф4б: якорь авторства из памяти серии (бьёт догадку, но валидируется).
-    if anchor:
-        delta = _apply_series_anchor(turns, clusters, participants, anchor)
+    cluster_set = set(clusters)
+
+    # 0) R19/Ф2: правка-факт — высший приоритет, прямой overlay (если передан).
+    if edit_facts:
+        delta = {
+            str(c): str(n)
+            for c, n in edit_facts.items()
+            if str(c) in cluster_set and str(n).strip()
+        }
         if delta:
             cluster_to_name.update(delta)
-            sources_used.append("series_anchor")
+            sources_used.append("edit_facts")
 
-    # 1) Telemost list (по свободным от якоря кластерам/именам).
-    free_clusters = [c for c in clusters if c not in cluster_to_name]
-    free_names = [p for p in participants if p not in cluster_to_name.values()]
-    delta = map_from_telemost_list(free_clusters, free_names)
-    if delta:
-        cluster_to_name.update(delta)
-        sources_used.append("telemost_list")
-
-    # 1.5) Ф3: доменный маппинг по ростеру ролей (высокоточно, A4/B3).
-    # A5-гейт присутствия — по `present` (реальная панель), не по union с expected.
+    # 1) Ростер-домен (A4/B3) — ВЫШЕ якоря (R19/R2). A5-гейт присутствия по `present`.
     if roster:
         delta = map_from_roster_domain(
             turns, roster, cluster_to_name,
@@ -562,17 +732,48 @@ def map_all(
             cluster_to_name.update(delta)
             sources_used.append("roster_domain")
 
-    # 2) Regex + pymorphy3 (already_mapped исключает закреплённое якорем/S1/ростером).
+    # 2) Ф4б: якорь авторства из памяти серии — НИЖЕ ростера, не перебивает занятое.
+    if anchor:
+        delta = _apply_series_anchor(
+            turns, clusters, participants, anchor, already_mapped=cluster_to_name
+        )
+        if delta:
+            cluster_to_name.update(delta)
+            sources_used.append("series_anchor")
+
+    # 3) Telemost list (по свободным от правки/ростера/якоря кластерам/именам).
+    free_clusters = [c for c in clusters if c not in cluster_to_name]
+    free_names = [p for p in participants if p not in cluster_to_name.values()]
+    delta = map_from_telemost_list(free_clusters, free_names)
+    if delta:
+        cluster_to_name.update(delta)
+        sources_used.append("telemost_list")
+
+    # 4) Regex + pymorphy3 (already_mapped исключает закреплённое выше).
     delta = map_from_speech_regex(turns, participants, cluster_to_name)
     if delta:
         cluster_to_name.update(delta)
         sources_used.append("regex_pymorphy3")
+
+    # 5) R3: дизамбигуация тёзок по ещё-свободным кластерам (НЕуверенно → ⚠️).
+    if roster:
+        delta = disambiguate_namesakes(
+            turns, participants, cluster_to_name,
+            roster=roster,
+            present=present if present is not None else participants,
+            inactive=inactive,
+        )
+        if delta:
+            cluster_to_name.update(delta)
+            uncertain_clusters.update({c: f"тёзка по имени — вероятный по роли, уверенность низкая" for c in delta})
+            sources_used.append("namesake_disambig")
 
     unresolved = [c for c in clusters if c not in cluster_to_name]
     return MappingResult(
         cluster_to_name=cluster_to_name,
         sources_used=sources_used,
         unresolved_clusters=unresolved,
+        uncertain_clusters=uncertain_clusters,
     )
 
 

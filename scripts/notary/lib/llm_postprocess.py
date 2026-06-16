@@ -217,6 +217,51 @@ def _parse_llm_response(
     return result
 
 
+def _build_llm_name_pool(
+    expected_participants: list[str],
+    panel_participants: list[str],
+    already_mapped: dict[str, str],
+    *,
+    inactive_names: Optional[set[str]] = None,
+    absent_names: Optional[set[str]] = None,
+) -> tuple[list[str], int]:
+    """R4/A5: строит `name_pool` LLM-добивки = (expected ∪ panel) минус занятые
+    минус заведомо-отсутствующие. Чистая функция (без IO) — объект unit-тестов R4.
+
+    Решение владельца A6: присутствие гейтится ПО ГОЛОСУ, панель НЕ жёсткий фильтр.
+    Поэтому пул — ОБЪЕДИНЕНИЕ expected и panel (телефонный участник со своим голосом,
+    но без тайла, сохраняется), из него ВЫЧИТАЮТСЯ:
+      • уже занятые имена (`already_mapped.values()`);
+      • неактивные справочника (`inactive_names`) + негативный ростер текущей
+        встречи (`absent_names`, Ф2-заготовка) — СТРОГИМ точным матчем (case-
+        insensitive), НЕ тёзко-первословным: иначе bare «Михаил» отсёкся бы как
+        неактивный «Михаил Еремеев» и затёр присутствующего «Михаил Саргин».
+
+    Порядок (expected, затем panel) и дедуп сохранены 1-в-1 с прежним телом.
+    Возвращает `(name_pool, dropped_excluded)`.
+    """
+    already_mapped = already_mapped or {}
+    excluded_lower = {str(x).strip().lower() for x in (inactive_names or set()) if str(x).strip()}
+    excluded_lower |= {str(x).strip().lower() for x in (absent_names or set()) if str(x).strip()}
+    used = set(already_mapped.values())
+    name_pool: list[str] = []
+    seen: set[str] = set()
+    dropped_excluded = 0
+    for name in list(expected_participants) + list(panel_participants):
+        if not name or not isinstance(name, str):
+            continue
+        if name in used:
+            continue
+        if name in seen:
+            continue
+        if name.strip().lower() in excluded_lower:
+            dropped_excluded += 1
+            continue
+        seen.add(name)
+        name_pool.append(name)
+    return name_pool, dropped_excluded
+
+
 def map_speaker_names(
     turns: list[AlignedTurn],
     expected_participants: list[str],
@@ -225,6 +270,8 @@ def map_speaker_names(
     already_mapped: Optional[dict[str, str]] = None,
     meeting_sid: Optional[str] = None,
     roster: Optional[list[dict]] = None,
+    inactive_names: Optional[set[str]] = None,
+    absent_names: Optional[set[str]] = None,
 ) -> dict[str, tuple[str, float]]:
     """Маппит cluster label (SPEAKER_NN) на имя из участников через Claude.
 
@@ -238,6 +285,22 @@ def map_speaker_names(
       roster — Ф3 (B3): ростер ролей серии (`series_roster.get_roster`). Подаётся
                 в промпт доменной проверкой (домен реплики ↔ роль автора). None →
                 блок не добавляется.
+      inactive_names — R4/A5: имена (lowercase, канон+алиасы) людей со статусом
+                inactive в справочнике компании (`context_knowledge.inactive_person_names`).
+                Исключаются из `name_pool` СТРОГИМ точным матчем (не тёзко-первословным,
+                иначе bare «Михаил» отсёкся бы как неактивный Еремеев). Так стухший
+                ожидаемый (Еремеев) НЕ предлагается LLM в авторы. None → нет фильтра.
+      absent_names — Ф2-заготовка (негативный ростер ТЕКУЩЕЙ встречи): кто помечен
+                отсутствующим именно на этой встрече. Так же строго исключается из
+                пула. В Ф1 обычно None; Ф2 наполнит. Сигнатуру не ломает.
+
+    R4 (решение владельца A6): присутствие гейтится ПО ГОЛОСУ, а не по панели —
+    панель НЕ жёсткий фильтр. Поэтому `name_pool` остаётся ОБЪЕДИНЕНИЕМ
+    expected ∪ panel (участник со своим голосом, но без тайла в панели — телефонный
+    / один экран на двоих — сохраняется), из него лишь ВЫЧИТАЮТСЯ заведомо-отсутствующие
+    (inactive справочника + negative-roster). Кластер без своего голоса просто не
+    попадает в unresolved → имя на него не ляжет (гейт по голосу обеспечен составом
+    кластеров, не урезанием пула).
 
     Возвращает dict[cluster, (name, confidence)] ТОЛЬКО для cluster'ов,
     по которым LLM дал ответ с непустым name. Прочие cluster'ы остаются
@@ -259,17 +322,15 @@ def map_speaker_names(
     unresolved_clusters = sorted(
         {t.speaker for t in turns if t.speaker and t.speaker not in already_mapped}
     )
-    name_pool: list[str] = []
-    seen: set[str] = set()
-    for name in list(expected_participants) + list(panel_participants):
-        if not name or not isinstance(name, str):
-            continue
-        if name in already_mapped.values():
-            continue
-        if name in seen:
-            continue
-        seen.add(name)
-        name_pool.append(name)
+    name_pool, dropped_excluded = _build_llm_name_pool(
+        expected_participants, panel_participants, already_mapped,
+        inactive_names=inactive_names, absent_names=absent_names,
+    )
+    if dropped_excluded:
+        logger.info(
+            "[llm-map] meeting=%s name_pool: исключено %d заведомо-отсутствующих (inactive/absent)",
+            meeting_sid or "?", dropped_excluded,
+        )
 
     if not unresolved_clusters or not name_pool:
         logger.info(
@@ -830,6 +891,7 @@ def clarify_speakers_via_telegram(
     panel_participants: list[str],
     meta: dict,
     transcript_path: Path,
+    authorship_uncertain_names: Optional[list[str]] = None,
 ) -> Optional[Path]:
     """Если есть unresolved или low-confidence cluster'ы — шлёт Илье уведомление с inline keyboard.
 
@@ -1082,6 +1144,12 @@ def clarify_speakers_via_telegram(
         },
         "cluster_keys_ordered": cluster_keys_ordered,
         "name_pool": name_pool,
+        # R3: имена тёзка-подстановок (НЕуверенные). Поздний clarify_worker после
+        # перегенерации протокола заново ставит по ним ⚠️ «авторство под вопросом»
+        # (паритет с finalize call-site — иначе доразметка теряла бы пометку).
+        "authorship_uncertain": [
+            str(n).strip() for n in (authorship_uncertain_names or []) if str(n).strip()
+        ],
         "chat_id": chat_id,
         "message_id": message_id,
         "sent_at": sent_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -4748,6 +4816,33 @@ PROTOCOL_REVIEW_MODEL = "claude-sonnet-4-6"
 # (повторный проход не плодит дубли ⚠️).
 REVIEW_FLAG_MARKER = "⚠️"
 
+# R3 (тёзки): текст системной ⚠️-пометки авторства. Ставится ДЕТЕРМИНИРОВАННО (не
+# LLM-находка) для кластеров, авто-резолвленных дизамбигуацией тёзок (вероятный по
+# роли подставлен, уверенность низкая). Входит в content-hash (это смысловая
+# пометка), ставится из ОБОИХ call-site (finalize + clarify_worker) через
+# `review_and_flag_protocol_file(extra_findings=...)`. РИСК4: не «решено молча».
+AUTHORSHIP_FLAG_NOTE = "авторство под вопросом, поправьте"
+
+
+def build_authorship_uncertainty_findings(names: list[str]) -> list[dict]:
+    """R3: из имён НЕуверенно-подставленных тёзок → system-applied ⚠️-находки.
+
+    `names` — каноничные имена, которые дизамбигуация тёзок подставила без полной
+    уверенности (вероятный по роли). Каждое → finding `section="authorship"`,
+    `quote=<имя>`, `note=AUTHORSHIP_FLAG_NOTE`. `apply_review_flags` кладёт их в
+    хвостовой блок «## ⚠️ Проверить» (имя встречается во многих строках — inline-
+    привязка к одной бессмысленна, как у roles). Чистая функция (без IO/claude).
+    Дедуп по имени; пустые отброшены."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for n in names or []:
+        nm = (n or "").strip()
+        if not nm or nm in seen:
+            continue
+        seen.add(nm)
+        out.append({"section": "authorship", "quote": nm, "note": AUTHORSHIP_FLAG_NOTE})
+    return out
+
 
 class ProtocolReviewError(RuntimeError):
     """Сбой ревью-прохода (CLI/claude/parse)."""
@@ -5125,6 +5220,9 @@ def _format_tail_finding(f: dict) -> str:
         return f"{REVIEW_FLAG_MARKER} {f['quote']}: {f['note']}"
     if f.get("section") == "diarization":
         return f"{REVIEW_FLAG_MARKER} спикер под вопросом: «{f['quote']}» — {f['note']}"
+    if f.get("section") == "authorship":
+        # R3: тёзка-подстановка — «⚠️ авторство под вопросом, поправьте: <имя>».
+        return f"{REVIEW_FLAG_MARKER} {f['note']}: {f['quote']}"
     return f"{REVIEW_FLAG_MARKER} {f['note']} — «{f['quote']}»"
 
 
@@ -5163,6 +5261,12 @@ def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
             continue
         # roles — всегда спикер-уровневый флаг в хвостовой блок (см. docstring).
         if sec == "roles":
+            if f.get("quote") and f.get("note"):
+                unmatched.append(f)
+            continue
+        # authorship (R3) — тёзка-подстановка: имя встречается во многих строках,
+        # inline-привязка бессмысленна → всегда в хвостовой блок (как roles).
+        if sec == "authorship":
             if f.get("quote") and f.get("note"):
                 unmatched.append(f)
             continue
@@ -5435,6 +5539,7 @@ def review_and_flag_protocol_file(
     checks: tuple[str, ...] = ("values",),
     meeting_sid: Optional[str] = None,
     rewrite: bool = False,
+    extra_findings: Optional[list[dict]] = None,
 ) -> int:
     """Высокоуровневая обёртка 5.2/Ф4/Ф7: читает протокол+транскрипт, прогоняет
     ревью-проход (ОДИН claude-вызов), затем правит файлы.
@@ -5451,6 +5556,12 @@ def review_and_flag_protocol_file(
         (finalize/clarify) идут этим путём; `rewrite` под env-kill-switch
         `ENABLE_PROTOCOL_SELFREVIEW`.
 
+    `extra_findings` (R3) — system-applied ⚠️-находки, НЕ из LLM (напр. дизамбигуация
+    тёзок: «авторство под вопросом, поправьте»). Применяются ТЕМ ЖЕ
+    `apply_review_flags` (один хвостовой блок, идемпотентно) в ОБОИХ режимах. Так
+    пометка ставится из ОБОИХ call-site (finalize + clarify_worker), переживает
+    перегенерацию протокола (clarify) и входит в content-hash. Пусто → как раньше.
+
     Оба файла пишутся atomic, независимо и best-effort: сбой записи одного не
     валит встречу и не мешает второму. Возвращает суммарное число изменений.
     D4/G10: лог — ТОЛЬКО счётчики/метаданные, без текста реплик/имён.
@@ -5464,6 +5575,8 @@ def review_and_flag_protocol_file(
         logger.warning("[review] read failed: %s", e)
         return 0
 
+    extra = [f for f in (extra_findings or []) if f.get("quote") and f.get("note")]
+
     # Ф7 (G8): второй проход «редактор-критик» — переписывает черновик ТЕМ ЖЕ
     # единственным вызовом, что несёт ревизию диаризации (Ф4). 2 тяжёлых вызова
     # суммарно (генерация + этот), НЕ третий. Флаг-only путь (ниже) сохранён для
@@ -5471,13 +5584,13 @@ def review_and_flag_protocol_file(
     if rewrite and _is_protocol_review_enabled() and _is_protocol_selfreview_enabled():
         return _selfreview_rewrite_and_apply(
             protocol_path, transcript_path, protocol_text, transcript_md,
-            checks=checks, meeting_sid=meeting_sid,
+            checks=checks, meeting_sid=meeting_sid, extra_findings=extra,
         )
 
     findings = review_protocol(
         protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
     )
-    if not findings:
+    if not findings and not extra:
         return 0
 
     # Ф4 (D2): re-attribution однозначных реплик в транскрипте (отдельный файл).
@@ -5489,15 +5602,17 @@ def review_and_flag_protocol_file(
             logger.warning("[review] transcript fix write failed %s: %s", transcript_path, e)
             n_fixes = 0  # не записалось — не засчитываем
 
-    # Пометки в протокол (values/roles/memory + diarization-flag). diarization-fix
-    # сюда не идут — apply_review_flags их пропускает (они уже в транскрипте).
+    # Пометки в протокол (values/roles/memory + diarization-flag + R3 authorship).
+    # diarization-fix сюда не идут — apply_review_flags их пропускает (они в транскрипте).
+    # extra (R3) — system-applied ⚠️ авторства тёзок, ТЕМ ЖЕ хвостовым блоком.
     n_flags = 0
-    new_text = apply_review_flags(protocol_text, findings)
+    all_flag_findings = findings + extra
+    new_text = apply_review_flags(protocol_text, all_flag_findings)
     if new_text != protocol_text:
         try:
             _atomic_write_text(protocol_path, new_text)
             n_flags = sum(
-                1 for f in findings
+                1 for f in all_flag_findings
                 if not (f.get("section") == "diarization" and f.get("verdict") == "fix")
             )
         except OSError as e:
@@ -5520,6 +5635,7 @@ def _selfreview_rewrite_and_apply(
     *,
     checks: tuple[str, ...],
     meeting_sid: Optional[str],
+    extra_findings: Optional[list[dict]] = None,
 ) -> int:
     """Ф7 (G8): прогоняет второй проход (`review_and_rewrite_protocol`, ОДИН
     вызов) и применяет результат:
@@ -5556,11 +5672,15 @@ def _selfreview_rewrite_and_apply(
 
     # Ф4 (D3): только diarization-flag (сомнительное деление) → видимая пометка.
     # diarization-fix уже в транскрипте; content-правки уже в теле (rewrite).
+    # R3: extra (authorship тёзок) ставятся ТЕМ ЖЕ хвостовым блоком, переживая
+    # перегенерацию (паритет с finalize: пометка не теряется на позднем clarify).
     diar_flags = [
         f for f in findings
         if f.get("section") == "diarization" and f.get("verdict") != "fix"
     ]
-    flagged = apply_review_flags(base_protocol, diar_flags)
+    extra = [f for f in (extra_findings or []) if f.get("quote") and f.get("note")]
+    flag_findings = diar_flags + extra
+    flagged = apply_review_flags(base_protocol, flag_findings)
 
     # Пишем протокол, если он реально изменился относительно черновика на диске
     # (улучшен и/или добавлены ⚠️-пометки). Деградация без пометок → не трогаем.
@@ -5568,7 +5688,7 @@ def _selfreview_rewrite_and_apply(
     if flagged != protocol_text:
         try:
             _atomic_write_text(protocol_path, flagged)
-            n_protocol_changes = (1 if rewrite_applied else 0) + len(diar_flags)
+            n_protocol_changes = (1 if rewrite_applied else 0) + len(flag_findings)
         except OSError as e:
             logger.warning("[selfreview] protocol write failed %s: %s", protocol_path, e)
 

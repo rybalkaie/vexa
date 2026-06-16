@@ -66,6 +66,7 @@ sys.path.insert(0, str(THIS_DIR))
 from lib.name_mapping import map_all, apply_mapping  # noqa: E402
 from lib.llm_postprocess import (  # noqa: E402
     ProtocolGenerationError,
+    build_authorship_uncertainty_findings,
     build_cross_memory_block,
     clarify_speakers_via_telegram,
     deliver_protocol,
@@ -83,6 +84,7 @@ from lib.delivery_grace import wait_for_clarify_grace  # noqa: E402
 from lib.protocol_to_tg import filter_participant_names  # noqa: E402  # Ф1 A2.1
 from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
+from lib import context_knowledge  # noqa: E402  # R18: справочник людей компании
 from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
 from lib import series_roster  # noqa: E402  # Ф3: ростер ролей серии (домен→роль)
 from lib import publication_gate  # noqa: E402  # Ф6: гейтинг публикации знания (E1–E5)
@@ -1015,17 +1017,31 @@ def main() -> int:
     # Anzhee-координации; ЗАВ1/Ф5 переключит источник на `*-context`. Незнакомая
     # серия → [] (доменного маппинга нет, поведение как до Ф3).
     series_roster_entries = series_roster.get_roster(meta.get("series"))
-    log.info("Step 4/5 — Name mapping (anchor + S1 + roster-domain + S2 deterministic, then LLM)")
+    # R18/R4: справочник людей компании серии — неактивные имена не подставляем
+    # автором (LLM-добивка) и не путаем тёзку (дизамбигуация). Graceful: нет
+    # company/YAML → пусто (поведение как до R18).
+    _company = context_knowledge.company_for_series(meta.get("series"))
+    inactive_names = context_knowledge.inactive_person_names(_company)
+    log.info("Step 4/5 — Name mapping (R19: edit>roster>anchor>S1>S2 deterministic, then LLM)")
     mapping_result = map_all(
         turns, participants_union,
         anchor=series_speaker_anchor, roster=series_roster_entries,
         present=participants,  # Ф3 A5: присутствие для доменного маппинга — по
         # реальной панели Телемоста, не по union (expected-отпускник из
         # watched.yaml не делает отсутствующего владельца кандидатом).
+        inactive=inactive_names,  # R3: неактивного тёзку не подставляем.
     )
     cluster_to_name: dict[str, str] = dict(mapping_result.cluster_to_name)
     sources_used: list[str] = list(mapping_result.sources_used)
     speaker_confidence: dict[str, float] = {}
+    # R3/РИСК4: кластеры, авто-резолвленные дизамбигуацией тёзок, — НЕуверенные.
+    # Занижаем confidence (не «решено молча») и собираем имена под ⚠️-пометку.
+    uncertain_names: list[str] = []
+    for _uc in mapping_result.uncertain_clusters:
+        nm = cluster_to_name.get(_uc)
+        if nm:
+            speaker_confidence[_uc] = 0.4  # < CLARIFY_THRESHOLD (0.7)
+            uncertain_names.append(nm)
     if mapping_result.unresolved_clusters:
         llm_decided = map_speaker_names(
             turns,
@@ -1034,6 +1050,7 @@ def main() -> int:
             already_mapped=cluster_to_name,
             meeting_sid=session_uid,
             roster=series_roster_entries,
+            inactive_names=inactive_names,  # R4/A5: стухший ожидаемый не в авторы.
         )
         if llm_decided:
             for cluster, (name, conf) in llm_decided.items():
@@ -1334,6 +1351,9 @@ def main() -> int:
             panel_participants=participants,
             meta=clarify_meta,
             transcript_path=md_path,
+            # R3: имена тёзка-подстановок — чтобы поздний clarify_worker после
+            # перегенерации заново поставил ⚠️ «авторство под вопросом» (паритет).
+            authorship_uncertain_names=uncertain_names,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("clarify_speakers_via_telegram failed (non-fatal): %s", e)
@@ -1369,6 +1389,9 @@ def main() -> int:
                 checks=("values", "roles", "memory", "diarization"),
                 meeting_sid=session_uid,
                 rewrite=True,
+                # R3: ⚠️ «авторство под вопросом, поправьте» для тёзка-подстановок
+                # (system-applied, входит в content-hash). Паритет в clarify_worker.
+                extra_findings=build_authorship_uncertainty_findings(uncertain_names),
             )
             if n_flags:
                 log.info("[review] meeting=%s self-review изменил %d пункт(ов)", session_uid, n_flags)

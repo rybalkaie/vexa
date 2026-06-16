@@ -253,19 +253,22 @@ class TestAnchorStillWorks(unittest.TestCase):
     ROSTER = sr.get_roster(SLUG)
 
     def test_anchor_applied_alongside_roster(self):
-        # Якорь закрепляет SPEAKER_04→Ольга (без vocative-противоречия), домен
-        # докидывает остальных. Якорь не теряется при наличии ростера.
+        # R19: ростер-домен ВЫШЕ якоря. Якорь докрепляет кластер, который ростер НЕ
+        # достаёт (владелец говорит общими словами — домена нет), и не теряется при
+        # наличии ростера. (Раньше якорь шёл первым и забирал даже доменный кластер;
+        # теперь доменный кластер берёт ростер, якорь — остаток. Имена те же.)
         turns = [
-            _turn("SPEAKER_00", SUPPLY_TXT),
-            _turn("SPEAKER_04", FINANCE_TXT),
+            _turn("SPEAKER_00", SUPPLY_TXT),    # домен поставок → Мария (ростер)
+            _turn("SPEAKER_05", GENERIC_TXT),   # без домена → ростер не маппит
         ]
-        pool = [MARIA, SONA, SARGIN, DARIA, OLGA]
+        pool = [MARIA, SONA, SARGIN, DARIA, OLGA, ILYA]
         res = nm.map_all(
-            turns, pool, anchor={"SPEAKER_04": OLGA}, roster=self.ROSTER
+            turns, pool, anchor={"SPEAKER_05": ILYA}, roster=self.ROSTER
         )
-        self.assertEqual(res.cluster_to_name["SPEAKER_04"], OLGA)
-        self.assertEqual(res.cluster_to_name["SPEAKER_00"], MARIA)
+        self.assertEqual(res.cluster_to_name["SPEAKER_00"], MARIA)   # ростер
+        self.assertEqual(res.cluster_to_name["SPEAKER_05"], ILYA)    # якорь (ростер не достал)
         self.assertIn("series_anchor", res.sources_used)
+        self.assertIn("roster_domain", res.sources_used)
 
     def test_roster_none_unchanged(self):
         # roster=None → доменного источника нет (как до Ф3).

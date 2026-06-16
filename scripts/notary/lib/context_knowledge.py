@@ -85,6 +85,25 @@ class GlossaryEntry(TypedDict, total=False):
     protocol_regex: bool
 
 
+# Справочник людей компании (R18, план 2026-06-16): статусы участия + канон имени
+# + алиасы. Company-level (как rosters), читается из ТОГО ЖЕ org-structure.yaml в
+# верхнеуровневой секции `people:`. Нужен, чтобы:
+#   • не подставлять автором того, кто больше не ходит на встречи (status=inactive
+#     → выпадает из name_pool LLM-добивки и из ожидаемых; A5/R4/R5);
+#   • знать каноничное написание имени (будущий замок исправлений Ф2 — R6/R10).
+PERSON_STATUS_ACTIVE = "active"
+PERSON_STATUS_INACTIVE = "inactive"
+
+
+class PersonEntry(TypedDict, total=False):
+    """Одна запись `people:` (R18). `status`/`aliases` опциональны: запись без
+    status трактуется как активный участник (бэкомпат со старыми файлами)."""
+
+    name: str
+    status: str
+    aliases: list[str]
+
+
 # --- Резолв путей -------------------------------------------------------------
 
 
@@ -348,6 +367,91 @@ def load_org_structure(company: Optional[str]) -> dict[str, list[dict]]:
         roles = spec.get("roles") if isinstance(spec, dict) else None
         out[slug.strip()] = _roles_to_entries(roles)
     return out
+
+
+# --- Справочник людей компании (R18, план 2026-06-16) -------------------------
+
+
+def parse_people(data: object) -> list[PersonEntry]:
+    """`people:` YAML-объект → список `PersonEntry` (чистая, без IO).
+
+    Схема (R18): `people:` — список записей `{name, status?, aliases?}`.
+      • `name` обязателен и непуст (иначе запись отбрасывается);
+      • `status` нормализуется в lowercase; всё, что не `inactive`, считается
+        `active` — бэкомпат: СТАРАЯ запись без `status` = активный участник, и
+        неизвестное значение не «выключает» человека по ошибке;
+      • `aliases` — список непустых строк (нет/не список → `[]`).
+
+    Принимает как весь dict org-structure.yaml (берёт ключ `people`), так и уже
+    извлечённый список — удобно тестам инъекцией без YAML (как
+    `filter_glossary_by_company`).
+    """
+    if isinstance(data, dict):
+        raw = data.get("people")
+    else:
+        raw = data
+    if not isinstance(raw, list):
+        return []
+    out: list[PersonEntry] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        status_raw = str(item.get("status") or "").strip().lower()
+        status = PERSON_STATUS_INACTIVE if status_raw == PERSON_STATUS_INACTIVE else PERSON_STATUS_ACTIVE
+        aliases_raw = item.get("aliases")
+        aliases = (
+            [str(a).strip() for a in aliases_raw if str(a).strip()]
+            if isinstance(aliases_raw, list)
+            else []
+        )
+        out.append({"name": name, "status": status, "aliases": aliases})
+    return out
+
+
+def load_people(company: Optional[str]) -> list[PersonEntry]:
+    """Справочник людей компании из `people:` org-structure.yaml. Graceful: нет
+    клона/файла/yaml/секции → `[]` (как `load_org_structure`)."""
+    kdir = knowledge_dir(company)
+    if not kdir:
+        return []
+    data = _read_yaml(kdir / ORG_STRUCTURE_FILE)
+    if not data:
+        return []
+    return parse_people(data)
+
+
+def inactive_person_names(company: Optional[str]) -> set[str]:
+    """Множество ИМЁН (канон + алиасы) людей со статусом `inactive` у компании.
+
+    Для сужения `name_pool` LLM-добивки и чистки ожидаемых (R4/R5): такой человек
+    больше не ходит на встречи, автором его не подставляем. Алиасы включены, чтобы
+    короткое/искажённое написание неактивного тоже отсеялось. Сравнение СТРОГОЕ
+    (точное, case-insensitive) — НЕ тёзко-первословное: иначе bare «Михаил» отсёкся
+    бы как неактивный Еремеев и затёр присутствующего активного Саргина."""
+    out: set[str] = set()
+    for p in load_people(company):
+        if p.get("status") != PERSON_STATUS_INACTIVE:
+            continue
+        name = str(p.get("name") or "").strip()
+        if name:
+            out.add(name.lower())
+        for a in p.get("aliases") or []:
+            al = str(a).strip()
+            if al:
+                out.add(al.lower())
+    return out
+
+
+def is_name_inactive(name: Optional[str], company: Optional[str]) -> bool:
+    """Имя принадлежит неактивному человеку компании (строгое точное совпадение по
+    канону/алиасу). Пустое имя / неизвестная компания → False (инертно)."""
+    n = (str(name).strip().lower() if name else "")
+    if not n:
+        return False
+    return n in inactive_person_names(company)
 
 
 def company_for_series(series_slug: Optional[str]) -> Optional[str]:
