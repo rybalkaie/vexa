@@ -714,11 +714,41 @@ def reissue_one(
     except OSError as e:
         return {"status": "error", "error": f"read protocol: {e}"}
 
+    # Ф4 (R15/R16): ТОЧЕЧНАЯ ПЕРЕСБОРКА. Чистая правка авторства/имени (есть
+    # детерминированный remap, нет контентных правок) → НЕ регенерируем протокол
+    # из транскрипта (это плодило «плавание» всего текста), а подменяем имя в
+    # СТАРОМ протоколе точечно: масштаб (одна реплика / все места человека) — по
+    # тексту обратной связи. Инварианты (якорь/⚠️/структура) и объём диффа
+    # проверяются внутри targeted_name_reissue; не прошло → None → честный фолбэк
+    # на регенерацию ниже (без регресса). Транскрипт всё равно remap-ится и
+    # коммитится на sent (R12: будущие регенерации стартуют с исправленным
+    # авторством) — точечная правка чинит ТЕКУЩУЮ выдачу, не отменяя R12.
+    # Опасная тройка: targeted-модуль чисто текстовый, без LLM/сети/лога реплик.
+    targeted_new_text: Optional[str] = None
+    if remap and not content_edits:
+        try:
+            from . import targeted_protocol_edit as _tpe  # noqa: PLC0415
+            _edit_texts = [
+                (e.get("text") if isinstance(e, dict) else "") or "" for e in edits
+            ]
+            _tres = _tpe.targeted_name_reissue(old_text, remap, _edit_texts)
+            if _tres is not None:
+                targeted_new_text, _tmeta = _tres
+                logger.info(
+                    "[reissue] Ф4 точечная правка scope=%s changes=%d meeting=%s",
+                    _tmeta.get("scope"), _tmeta.get("n_changes"),
+                    state.get("feedback_id"),
+                )
+        except Exception as e:  # noqa: BLE001 — точечный путь не критичен → фолбэк регенерация
+            logger.info("[reissue] точечная правка пропущена (фолбэк регенерация): %s", e)
+            targeted_new_text = None
+
     # Вход генерации — путь (контракт generate_fn). При remap пишем remapped-текст
     # во временный sibling и генерим из него; реальный транскрипт не трогаем до sent.
+    # Ф4: при успешной точечной правке регенерации НЕ будет → tmp-вход не нужен.
     gen_input_path = transcript_path
     remap_tmp: Optional[Path] = None
-    if transcript_changed:
+    if transcript_changed and targeted_new_text is None:
         try:
             fd, tmp_s = tempfile.mkstemp(
                 prefix=f".{transcript_path.name}.remap.", suffix=".tmp",
@@ -741,12 +771,17 @@ def reissue_one(
             return {"status": "error", "error": f"remap tmp: {e}"}
 
     try:
-        # Перегенерация: remapped транскрипт + контентные правки-как-данные (FB6/FB7).
-        meeting_meta = _meeting_meta_for_regen(state, meta, transcript_path, instruction_block)
-        try:
-            new_text = generate_fn(gen_input_path, meeting_meta, state.get("feedback_id"))
-        except Exception as e:  # noqa: BLE001  (claude/CLI/любой сбой регена → revert)
-            return {"status": "error", "error": f"regen: {e}"}
+        if targeted_new_text is not None:
+            # Ф4 (R15): точечная правка уже дала новый протокол (имя подменено в
+            # старом, остальной текст побайтно стабилен) — регенерацию пропускаем.
+            new_text = targeted_new_text
+        else:
+            # Перегенерация: remapped транскрипт + контентные правки-как-данные (FB6/FB7).
+            meeting_meta = _meeting_meta_for_regen(state, meta, transcript_path, instruction_block)
+            try:
+                new_text = generate_fn(gen_input_path, meeting_meta, state.get("feedback_id"))
+            except Exception as e:  # noqa: BLE001  (claude/CLI/любой сбой регена → revert)
+                return {"status": "error", "error": f"regen: {e}"}
         if not new_text or not new_text.strip():
             return {"status": "error", "error": "empty regenerated protocol"}
         if new_text.strip() == old_text.strip():
