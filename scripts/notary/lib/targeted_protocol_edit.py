@@ -46,10 +46,13 @@ PROTOCOL_ANCHOR = "#протоколвстречи"
 REVIEW_FLAG_MARKER = "⚠️"
 DISCLAIMER_SENTINEL = "Авторство реплик"
 
-# Строка участников протокола (тот же шаблон, что `_PARTICIPANTS_LINE_RE` в
-# llm_postprocess) — narrow её НЕ трогает (человек остаётся участником, неверно
-# приписана лишь одна реплика).
-_PARTICIPANTS_LINE_RE = re.compile(r"^\s*\*\*Участники:\*\*", re.UNICODE)
+# Строка участников протокола. Толерантна к обрамлению (`**Участники:**`,
+# `*Участники:*`, `Участники:`) — как распознаёт источник `_PARTICIPANTS_LINE_RE`
+# в llm_postprocess (`^(\s*\*{0,2}\s*Участники:\*{0,2}\s*)(.*)$`): narrow НЕ должен
+# под-распознать её и сменить имя УЧАСТНИКА вместо реплики (раньше зеркало было
+# строже источника). Сверяется с источником `ParticipantsLineDriftTest` (защита от
+# дрейфа формата при merge upstream — раздел README про обязательную проверку).
+_PARTICIPANTS_LINE_RE = re.compile(r"^\s*\*{0,2}\s*Участники:", re.UNICODE)
 
 # --- Сигналы масштаба правки (R15). По тексту обратной связи. ------------------
 # narrow — правка точечная, про одну реплику/место; broad — про человека целиком.
@@ -304,6 +307,44 @@ def diff_is_bounded(
     return True, ""
 
 
+# Лейбл-слова (не distinctive личное имя) — их остаток НЕ считаем «неполной заменой».
+_NON_DISTINCTIVE_TOKENS = frozenset({"спикер", "speaker", "участник", "участники"})
+
+
+def _broad_replacement_incomplete(new_text: str, oneway: dict) -> bool:
+    """Эвристика: broad оставил склонённую форму старого имени → замена НЕПОЛНА.
+
+    broad подменяет ПОЛНОЕ имя в номинативе, но склонённые формы в прозе («поручили
+    Михаилу Еремееву», «с Еремеевым») не матчатся word-boundary'ом полного имени —
+    иначе доставился бы протокол со СМЕСЬЮ старого и нового имени (ровно жалоба
+    «не до конца исправил»). Морфология — вне scope Ф4 (§5 плана): здесь НЕ склоняем,
+    а ДЕТЕКТИМ неполноту. Если distinctive-токен СТАРОГО имени (≥4 букв, алфавитный,
+    не лейбл-слово, не общий с новым именем — напр. фамилия «Еремеев») уцелел
+    подстрокой (ловит «Еремееву»/«Еремееве») → True → caller честно регенерирует
+    (LLM применит правку со склонениями).
+
+    Направление безопасно: ложное срабатывание (тёзка-фамилия у другого человека)
+    даёт лишь ЛИШНЮЮ регенерацию — корректный (хоть и «плывущий») протокол, до-Ф4
+    поведение — но НИКОГДА неверный текст. Не полная морфология (first-name-склонение
+    при общей фамилии не ловит) — узкий безопасный сетап под главный инцидент-класс
+    (смена фамилии). Полное решение — деклинатор, §5 бэклога.
+    """
+    low = (new_text or "").casefold()
+    for old_name, new_name in (oneway or {}).items():
+        new_toks = {t.casefold() for t in (new_name or "").split()}
+        for tok in (old_name or "").split():
+            tl = tok.casefold()
+            if (
+                len(tl) >= 4
+                and tok[0].isalpha()
+                and tl not in new_toks
+                and tl not in _NON_DISTINCTIVE_TOKENS
+                and tl in low
+            ):
+                return True
+    return False
+
+
 def targeted_name_reissue(
     old_protocol: str, remap: dict, edit_texts: list[str],
 ) -> Optional[tuple[str, dict]]:
@@ -322,19 +363,36 @@ def targeted_name_reissue(
     человека»). СВОП (A↔B, взаимная путаница спикеров) оставляем проверенному пути
     Ф4б (remap транскрипта + регенерация): своп в синтезированном протоколе тоньше
     прямой подмены имени, а его ретрай-безопасность/без-tmp-течь там уже покрыты.
-    Чистый своп → None → caller честно регенерирует (без регресса Ф4б).
+    ЛЮБОЙ своп в наборе (в т.ч. в СМЕСИ с односторонними) → None: иначе частичное
+    применение «только односторонней части» молча потеряло бы своп из ДОСТАВЛЯЕМОГО
+    протокола (он ушёл бы лишь в транскрипт), хотя владелец просил и его. caller
+    честно регенерирует — там своп И переименование применяются вместе (без регресса Ф4б).
     """
     if not old_protocol or not remap:
         return None
-    oneway = {
-        k: v for k, v in remap.items()
-        if k and v and k != v and remap.get(v) != k
-    }
+    # Своп где-либо в наборе → точечный путь НЕ применим целиком. Частичное
+    # применение только односторонней части пропустило бы регенерацию (см. caller),
+    # и запрошенный своп не попал бы в доставленный протокол. Любой своп → None.
+    has_swap = any(
+        k and v and k != v and remap.get(v) == k for k, v in remap.items()
+    )
+    if has_swap:
+        return None
+    oneway = {k: v for k, v in remap.items() if k and v and k != v}
     if not oneway:
         return None
     scope = classify_edit_scope(edit_texts)
     new_text = apply_targeted_name_edit(old_protocol, oneway, scope)
     if new_text is None:
+        return None
+
+    # Ф4 (ход3): broad обязан убрать СТАРОЕ имя целиком. Уцелевшая склонённая форма
+    # (морфология — вне scope, §5) → доставили бы СМЕСЬ имён → честный фолбэк на
+    # регенерацию (без неверного текста; в худшем — лишняя регенерация).
+    if scope == "broad" and _broad_replacement_incomplete(new_text, oneway):
+        logger.info(
+            "[targeted-edit] broad-замена неполна (склонённая форма?) → фолбэк регенерация"
+        )
         return None
 
     inv_ok, reason = invariants_preserved(

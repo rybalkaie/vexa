@@ -287,20 +287,19 @@ class FallbackTest(unittest.TestCase):
                 old, {"Илья Рыбалка": "Михаил Еремеев",
                       "Михаил Еремеев": "Илья Рыбалка"}, ["перепутал местами"]))
 
-    def test_mixed_oneway_and_swap_keeps_oneway(self):
-        # Смешанный remap: своп-пара отсеивается, одностороннее переименование берётся.
+    def test_mixed_oneway_and_swap_falls_back_to_regen(self):
+        # Смешанный remap (своп-пара + одностороннее переименование) → None.
+        # Цикл5/Ф4 ход1: частичное применение только односторонней части (Еремеев→
+        # Саргин) пропустило бы регенерацию, и запрошенный своп Илья↔Ольга НЕ попал
+        # бы в доставленный протокол (ушёл бы лишь в транскрипт). Весь перевыпуск
+        # честно идёт на регенерацию, где своп И переименование применяются вместе.
         old = _protocol()
         res = tpe.targeted_name_reissue(
             old,
             {"Илья Рыбалка": "Ольга Сонина", "Ольга Сонина": "Илья Рыбалка",
              "Михаил Еремеев": "Михаил Саргин"},
             ["вообще перепутал"])
-        self.assertIsNotNone(res)
-        new, _ = res
-        # Своп-пара (Илья↔Ольга) НЕ тронута, односторонняя Еремеев→Саргин применена.
-        self.assertNotIn("Михаил Еремеев", new)
-        self.assertIn("Илья Рыбалка", new)
-        self.assertIn("Ольга Сонина", new)
+        self.assertIsNone(res)
 
 
 class SwapSafetyTest(unittest.TestCase):
@@ -381,6 +380,64 @@ class DiffBoundTest(unittest.TestCase):
         self.assertNotIn("другая строка", reason)
 
 
+class IncompleteBroadFallbackTest(unittest.TestCase):
+    """Ф4 ход3 (Н2): broad оставил склонённую форму старого имени → фолбэк (None).
+
+    Без фолбэка доставился бы протокол со СМЕСЬЮ старого и нового имени (старое
+    видно в склонении) — ровно жалоба владельца «не до конца исправил».
+    """
+
+    def test_broad_with_declension_residue_falls_back(self):
+        # «Михаилу Еремееву» (дат.) не матчится номинативом «Михаил Еремеев» →
+        # остаток фамилии «Еремеев» уцелел подстрокой → честный фолбэк на регенерацию.
+        old = (
+            "#протоколвстречи 01.01.2026\n\n"
+            "**Участники:** Михаил Еремеев\n\n"
+            "> ℹ️ _Авторство реплик восстановлено автоматически._\n\n"
+            "---\n\n## Тема\n\n"
+            "▪️ Михаил Еремеев вёл встречу.\n\n"
+            "▪️ Задачу поручили Михаилу Еремееву до пятницы.\n"
+        )
+        self.assertIsNone(
+            tpe.targeted_name_reissue(old, {OLD: NEW}, ["вообще перепутал"]))
+
+    def test_broad_clean_nominative_applies(self):
+        # Контроль (главный инцидент-кейс): чистый номинатив → targeted применяется.
+        old = (
+            "#протоколвстречи 01.01.2026\n\n"
+            "**Участники:** Михаил Еремеев\n\n"
+            "> ℹ️ _Авторство реплик восстановлено автоматически._\n\n"
+            "---\n\n## Тема\n\n"
+            "▪️ Михаил Еремеев вёл встречу.\n"
+        )
+        res = tpe.targeted_name_reissue(old, {OLD: NEW}, ["вообще перепутал"])
+        self.assertIsNotNone(res)
+        new, _ = res
+        self.assertNotIn(OLD, new)
+
+    def test_narrow_not_blocked_by_residue(self):
+        # narrow меняет ОДНУ реплику — остаток имени в других строках ОЖИДАЕМ;
+        # гвард неполноты на narrow НЕ распространяется (иначе narrow вообще не работал бы).
+        old = (
+            "#протоколвстречи 01.01.2026\n\n"
+            "**Участники:** Михаил Еремеев\n\n"
+            "> ℹ️ _Авторство реплик восстановлено автоматически._\n\n"
+            "---\n\n## Тема\n\n"
+            "▪️ Михаил Еремеев вёл встречу.\n\n"
+            "▪️ Поручили Михаилу Еремееву.\n"
+        )
+        res = tpe.targeted_name_reissue(old, {OLD: NEW}, ["эту реплику не тому"])
+        self.assertIsNotNone(res)
+
+    def test_shared_first_name_not_false_positive(self):
+        # Общий с новым именем токен (first-name «Михаил») НЕ триггерит неполноту —
+        # иначе главный кейс Еремеев→Саргин (общий «Михаил») всегда падал бы в фолбэк.
+        self.assertFalse(
+            tpe._broad_replacement_incomplete(
+                "**Участники:** Михаил Саргин\n▪️ Михаил Саргин вёл встречу.",
+                {OLD: NEW}))
+
+
 class ConstantsDriftTest(unittest.TestCase):
     """Локальные зеркала инвариантов совпадают с источником (защита от дрейфа)."""
 
@@ -399,6 +456,28 @@ class ConstantsDriftTest(unittest.TestCase):
         # Якорь именованной константы не имеет — сверяем, что он фигурирует в
         # валидации generate_protocol (если переименуют — тест упадёт).
         self.assertIn(tpe.PROTOCOL_ANCHOR, inspect.getsource(lp.generate_protocol))
+
+    def test_participants_line_not_under_recognized(self):
+        # У3 (цикл5/Ф4 ход3): зеркало строки участников НЕ должно под-распознавать
+        # то, что распознаёт источник `_PARTICIPANTS_LINE_RE` в llm_postprocess
+        # (иначе narrow сменит имя УЧАСТНИКА вместо реплики). Любую строку участников,
+        # которую матчит источник, обязан матчить и targeted-детектор. Защита от
+        # дрейфа формата шапки при merge upstream.
+        from notary.lib import llm_postprocess as lp
+        for line in (
+            "**Участники:** Илья Рыбалка, Пётр Сидоров",
+            "*Участники:* Илья",
+            "Участники: Илья",
+            "  **Участники:**  Илья",
+        ):
+            self.assertIsNotNone(lp._PARTICIPANTS_LINE_RE.match(line),
+                                 f"источник перестал матчить: {line!r}")
+            self.assertIsNotNone(
+                tpe._PARTICIPANTS_LINE_RE.match(line),
+                f"targeted под-распознал строку участников: {line!r}")
+        # И НЕ матчит обычную контентную строку (иначе narrow её бы пропускал).
+        self.assertIsNone(
+            tpe._PARTICIPANTS_LINE_RE.match("▪️ Илья Рыбалка ведёт переговоры."))
 
 
 # ---------------------------------------------------------------------------
