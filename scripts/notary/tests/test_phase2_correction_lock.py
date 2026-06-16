@@ -127,6 +127,17 @@ class TestCaptureR8(unittest.TestCase):
     def test_unknown_formulation_silent(self):
         self.assertEqual(cf.parse_correction_facts("спасибо, отлично сделано", known_names=NAMES), [])
 
+    def test_empty_pool_no_surface_form_facts(self):
+        # У2 (цикл5 ход3): ПУСТОЙ пул = «состав встречи неизвестен» → строго None,
+        # НЕ surface-form. Иначе кривой/пустой meta записал бы мусорный durable-факт
+        # («не понял, а переспросил» → name-канон), портящий имена на ВСЕХ будущих
+        # встречах компании (ровно класс ISS-11). Должно быть пусто.
+        self.assertEqual(cf.parse_correction_facts("не понял, а переспросил", known_names=[]), [])
+        self.assertEqual(cf.parse_correction_facts("Иванов отвечает за сервис", known_names=[]), [])
+        # Пул НЕ задан (None) → loose surface-form сохраняется (не-durable вызовы).
+        loose = cf.parse_correction_facts("Иванов отвечает за сервис", known_names=None)
+        self.assertIn({"kind": "role", "name": "Иванов", "domain": "сервис"}, loose)
+
 
 # ==========================================================================
 # R7 — кумулятивность + R10 — last-write-wins

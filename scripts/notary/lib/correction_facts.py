@@ -31,14 +31,16 @@ mkstemp+fsync+rename, graceful чтение). Last-write-wins резолвитс
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,26 @@ def load_correction_facts(company: Optional[str], *, root: Optional[Path] = None
     return [f for f in data if isinstance(f, dict)]
 
 
+@contextmanager
+def _flock(path: Path) -> Iterator[None]:
+    """Эксклюзивный блокирующий flock на sidecar `<file>.lock` — сериализует
+    read-modify-write append-журнала между ПЕРЕКРЫВАЮЩИМИСЯ sweep'ами reissue
+    (по образцу `feedback_learning._flock`). Без него одновременный append двух
+    процессов в `<company>-corrections.json` теряет факт (lost update) — нарушение
+    R7 «история правок не теряется». POSIX (fcntl) — VPS Linux + мак dev."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lf = open(lock_path, "w")
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+
 def _atomic_write_facts(company: str, facts: list[dict], *, root: Optional[Path] = None) -> Path:
     """Атомарная перезапись overlay (mkstemp + fsync + os.rename) — как feedback_state."""
     p = path_for(company, root=root)
@@ -147,10 +169,17 @@ def _append_fact(company: str, fact: dict, *, root: Optional[Path] = None) -> bo
     slug = _safe_company(company)
     if not slug:
         return False
-    facts = load_correction_facts(company, root=root)
-    facts.append(fact)
+    p = path_for(slug, root=root)
+    if p is None:  # pragma: no cover — defensive: slug валиден, путь резолвится
+        return False
     try:
-        _atomic_write_facts(slug, facts, root=root)
+        # read-modify-write под flock: иначе два перекрывающихся sweep'а reissue
+        # одной компании затрут append друг друга (lost update). Сериализуем весь
+        # цикл чтение→дозапись→атомарная перезапись на sidecar-локе файла компании.
+        with _flock(p):
+            facts = load_correction_facts(slug, root=root)
+            facts.append(fact)
+            _atomic_write_facts(slug, facts, root=root)
     except OSError as e:
         logger.warning("[corrections] write company=%s failed: %s", slug, e)
         return False
@@ -540,11 +569,13 @@ def parse_correction_facts(
     out: list[dict] = []
 
     def _name(tok: str) -> Optional[str]:
-        if known_names:
-            r = resolve_known_name(tok, known_names)
-            if r:
-                return r
-            return None  # есть пул, но не резолвится → не durable-имя (тёзка-безопасно)
+        # Пул ЗАДАН (`known_names is not None`, в т.ч. ПУСТОЙ) → резолвим строго против
+        # него, не угадываем. Пустой пул = «состав встречи неизвестен» → None: не
+        # пишем surface-form в durable company-факт (ISS-11: неверное имя НЕ проносим
+        # вперёд; кривой/пустой meta давал бы мусорный факт на все будущие встречи).
+        # Пул НЕ задан (None) → surface-form (loose, для не-durable вызовов без состава).
+        if known_names is not None:
+            return resolve_known_name(tok, known_names)
         t = str(tok or "").strip()
         return t or None
 
