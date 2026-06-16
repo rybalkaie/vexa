@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from . import context_knowledge
+from . import correction_facts
 from . import feedback_state
 from . import feedback_worker
 from . import paths
@@ -670,6 +672,28 @@ def reissue_one(
         edits, current_speakers, _author_name_pool(meta)
     )
     content_edits = [e for i, e in enumerate(edits) if i not in authorship_idx]
+
+    # Ф2 (R6/R7/R10/R11): DURABLE company-замок. Та же правка владельца, что чинит
+    # ЭТУ встречу (remap текста выше), записывается фактом КОМПАНИИ — роль («B
+    # отвечает за X») и канон имени («не A, а B»). Локально сразу (overlay читает
+    # будущий finalize любой серии этой компании), team-share — развязанно через PR
+    # (knowledge_writeback). Своп («перепутал A и B») НЕ durable (per-meeting). Best-
+    # effort: не должно ронять перевыпуск. Опасная тройка: текст правок не логируем.
+    try:
+        _company = context_knowledge.company_for_series(series)
+        if _company:
+            _name_pool = _author_name_pool(meta)
+            from . import series_roster as _sr  # lazy: не тянуть в listener без нужды
+            _roster = _sr.get_roster(series)
+            for _e in edits:
+                _txt = (_e.get("text") if isinstance(_e, dict) else "") or ""
+                if _txt.strip():
+                    correction_facts.record_facts_from_text(
+                        _company, _txt, known_names=_name_pool,
+                        series=series, date=date, roster=_roster,
+                    )
+    except Exception as e:  # noqa: BLE001 — durable-замок не критичен для перевыпуска
+        logger.info("[reissue] durable correction-lock skipped: %s", e)
 
     # FB7: контентные правки → данные (санитизация + anti-injection-рамка) ДО промпта.
     instruction_block = build_edit_instruction(content_edits)

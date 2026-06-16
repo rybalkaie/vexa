@@ -85,6 +85,7 @@ from lib.protocol_to_tg import filter_participant_names  # noqa: E402  # Ф1 A2.
 from lib.render import render_protocol  # noqa: E402
 from lib.wav_concat import resolve_wav_for_stt  # noqa: E402
 from lib import context_knowledge  # noqa: E402  # R18: справочник людей компании
+from lib import correction_facts  # noqa: E402  # Ф2: company-замок исправлений (R6-R12)
 from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
 from lib import series_roster  # noqa: E402  # Ф3: ростер ролей серии (домен→роль)
 from lib import publication_gate  # noqa: E402  # Ф6: гейтинг публикации знания (E1–E5)
@@ -622,6 +623,29 @@ def _delivery_marker_meta_path(meta_json_arg: str) -> Path:
     return Path(meta_json_arg)
 
 
+def _resolve_absent_for_meeting(meta: dict, pool: list[str]) -> set[str]:
+    """Ф2 (R9): негативный слой «кого не было» ТЕКУЩЕЙ встречи → множество каноничных
+    имён (по составу `pool`).
+
+    Источник — `meta.absentNames` (список имён, ставит листенер из правки владельца
+    «X не было»; может быть в склонённой форме). Резолвим каждое к каноничному имени
+    состава через `correction_facts.resolve_known_name` (склонения без pymorphy3);
+    нерезолвящееся берём surface-form. Только ЭТА встреча — НЕ персистится вперёд
+    (решение владельца R9/A3), поэтому читаем из meta встречи, не из company-overlay.
+    Нет поля / не список → пустое множество (поведение как до Ф2)."""
+    raw = meta.get("absentNames") if isinstance(meta, dict) else None
+    if not isinstance(raw, list):
+        return set()
+    out: set[str] = set()
+    for item in raw:
+        tok = str(item or "").strip()
+        if not tok:
+            continue
+        canon = correction_facts.resolve_known_name(tok, pool) or tok
+        out.add(canon)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1022,13 +1046,31 @@ def main() -> int:
     # company/YAML → пусто (поведение как до R18).
     _company = context_knowledge.company_for_series(meta.get("series"))
     inactive_names = context_knowledge.inactive_person_names(_company)
+    # Ф2 (R6/R10): durable company-факты исправлений ПОВЕРХ ростера серии. Выученная
+    # правка «сервис→Саргин» перекрывает устаревший YAML-ростер и держится на ВСЕХ
+    # будущих встречах ЭТОЙ компании (любой серии) — реприменяется на КАЖДОЙ
+    # регенерации, т.к. читается здесь. last-write-wins резолвится на чтении.
+    # Graceful: нет company / нет overlay → ростер как есть (поведение как до Ф2).
+    series_roster_entries = correction_facts.merge_roster(series_roster_entries, _company)
+    # Ф2 (R8): отвергнутые правкой имена («не Еремеев, а Саргин» → Еремеев) — в тот же
+    # negative-фильтр, что inactive: LLM-добивка/дизамбигуация их больше не предлагают.
+    inactive_names = set(inactive_names) | correction_facts.excluded_names(_company)
+    # Ф2 (R9): негативный слой ТЕКУЩЕЙ встречи — «кого не было». Только эта встреча,
+    # вперёд НЕ запоминается (решение владельца R9/A3): источник — meta.absentNames
+    # (ставит листенер из правки «X не было»), резолв склонений по составу. Механизм
+    # ОТДЕЛЁН от R4-сужения пула (НЕС1): тут не сужаем пул людей компании, а исключаем
+    # конкретно отсутствовавших на ЭТОЙ встрече.
+    absent_names = _resolve_absent_for_meeting(meta, participants_union)
+    present_effective = [p for p in participants if p not in absent_names]
+    expected_effective = [n for n in expected_enriched if n not in absent_names]
     log.info("Step 4/5 — Name mapping (R19: edit>roster>anchor>S1>S2 deterministic, then LLM)")
     mapping_result = map_all(
-        turns, participants_union,
+        turns, [p for p in participants_union if p not in absent_names],
         anchor=series_speaker_anchor, roster=series_roster_entries,
-        present=participants,  # Ф3 A5: присутствие для доменного маппинга — по
+        present=present_effective,  # Ф3 A5: присутствие для доменного маппинга — по
         # реальной панели Телемоста, не по union (expected-отпускник из
-        # watched.yaml не делает отсутствующего владельца кандидатом).
+        # watched.yaml не делает отсутствующего владельца кандидатом). Ф2 R9:
+        # минус помеченные «не было» на этой встрече.
         inactive=inactive_names,  # R3: неактивного тёзку не подставляем.
     )
     cluster_to_name: dict[str, str] = dict(mapping_result.cluster_to_name)
@@ -1045,18 +1087,25 @@ def main() -> int:
     if mapping_result.unresolved_clusters:
         llm_decided = map_speaker_names(
             turns,
-            expected_participants=expected_enriched,
-            panel_participants=participants,
+            expected_participants=expected_effective,
+            panel_participants=present_effective,
             already_mapped=cluster_to_name,
             meeting_sid=session_uid,
             roster=series_roster_entries,
             inactive_names=inactive_names,  # R4/A5: стухший ожидаемый не в авторы.
+            absent_names=absent_names,  # Ф2 R9: помеченные «не было» — не в пул.
         )
         if llm_decided:
             for cluster, (name, conf) in llm_decided.items():
                 cluster_to_name[cluster] = name
                 speaker_confidence[cluster] = conf
             sources_used.append("llm-postprocess")
+    # Ф2 (R12/R6): company name-канон ПОВЕРХ итогового маппинга — выученное «Еремеев→
+    # Саргин» переименует любой источник (детерминированный или LLM), поэтому правка
+    # имени держится между перевыпусками и на будущих встречах. Строгий точный матч
+    # (тёзка-безопасно). Нет фактов → no-op.
+    if _company:
+        cluster_to_name = correction_facts.apply_name_canon(cluster_to_name, _company)
     turns = apply_mapping(turns, cluster_to_name)
     unresolved_after = [c for c in mapping_result.unresolved_clusters if c not in cluster_to_name]
     log.info("Mapping done — sources=%s, mapped=%d, unresolved=%d",
