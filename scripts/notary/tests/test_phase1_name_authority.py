@@ -13,7 +13,10 @@
           вопросом, поправьте» (system-applied, content-hash, оба call-site).
   - R4  — name_pool LLM-добивки сужен (минус неактивные/негативный ростер), но по
           ГОЛОСУ: панель не жёсткий фильтр (телефонный участник сохраняется).
-  - R5  — стухший ожидаемый (Еремеев) помечен inactive в справочнике → выпадает.
+  - R5  — капабилити inactive: реально УШЕДШИЙ из компании человек (синтетический
+          «Пётр Уволенный») помечен inactive в справочнике → выпадает из пула/не
+          подставляется. NB: «Михаил Еремеев» НЕ inactive — это искажённая фамилия
+          присутствующего Михаила Саргина (см. R2-якорь); разовое отсутствие → R9.
 
 Дисциплина «опасной тройки»: фикстуры синтетические (доменная лексика, не ПДн).
 
@@ -57,7 +60,15 @@ SONA = "Сона Енгибарян"       # коммерция
 SARGIN = "Михаил Саргин"      # сервис (активный)
 DARIA = "Дарья Набережная"    # резервы
 OLGA = "Ольга Новикова"       # финансы
-EREMEEV = "Михаил Еремеев"    # тёзка Саргина, СТУХШИЙ ожидаемый (inactive)
+EREMEEV = "Михаил Еремеев"    # НЕ отдельный человек: искажённая фамилия present-Михаила
+                              # (Саргина). Используется только в R2 как «ядовитый якорь».
+DEPARTED = "Пётр Уволенный"   # синтетический УШЕДШИЙ из компании — носитель капабилити inactive
+# Синтетический тёзка Саргина по первому слову («Михаил»). Используется в R3 как
+# второй Михаил в пуле — без утверждения, что это реальный человек Anzhee.
+MIKHAIL_NAMESAKE = "Михаил Тёзкин"
+# Синтетический УШЕДШИЙ Михаил-тёзка — носитель капабилити «inactive выпадает из
+# группы тёзок, активный подставляется». Не Еремеев (тот не отдельный человек).
+MIKHAIL_DEPARTED = "Михаил Уволенный"
 ILYA = "Илья Рыбалка"         # владелец — не в ростере
 
 
@@ -92,7 +103,9 @@ class TestPeopleDirectoryParser(unittest.TestCase):
     DATA = {
         "people": [
             {"name": "Михаил Саргин", "status": "active", "aliases": ["Михаил С."]},
-            {"name": "Михаил Еремеев", "status": "inactive", "aliases": ["Еремеев"]},
+            # Капабилити inactive на синтетическом УШЕДШЕМ из компании человеке
+            # (не на Еремееве — тот не отдельный человек, а искажённая фамилия Саргина).
+            {"name": "Пётр Уволенный", "status": "inactive", "aliases": ["Уволенный"]},
             {"name": "Илья Рыбалка", "aliases": ["Илья"]},   # без status → active
             {"name": "  ", "status": "active"},               # пустое имя → отброшено
             "не-словарь",                                      # мусор → отброшен
@@ -104,7 +117,7 @@ class TestPeopleDirectoryParser(unittest.TestCase):
         by_name = {p["name"]: p for p in people}
         self.assertEqual(len(people), 3)
         self.assertEqual(by_name["Михаил Саргин"]["status"], ck.PERSON_STATUS_ACTIVE)
-        self.assertEqual(by_name["Михаил Еремеев"]["status"], ck.PERSON_STATUS_INACTIVE)
+        self.assertEqual(by_name["Пётр Уволенный"]["status"], ck.PERSON_STATUS_INACTIVE)
         self.assertEqual(by_name["Михаил Саргин"]["aliases"], ["Михаил С."])
 
     def test_backcompat_no_status_is_active(self):
@@ -130,17 +143,18 @@ class TestPeopleDirectoryParser(unittest.TestCase):
 
     def test_inactive_names_set_via_monkeypatch(self):
         # inactive_person_names собирает канон + алиасы неактивных (lowercase).
+        # Капабилити проверяется на синтетическом УШЕДШЕМ человеке (Пётр Уволенный).
         orig = ck.load_people
         ck.load_people = lambda company: ck.parse_people(self.DATA)
         try:
             inact = ck.inactive_person_names("anzhee")
-            self.assertIn("михаил еремеев", inact)
-            self.assertIn("еремеев", inact)              # алиас тоже
+            self.assertIn("пётр уволенный", inact)
+            self.assertIn("уволенный", inact)            # алиас тоже
             self.assertNotIn("михаил саргин", inact)     # активный — не в наборе
-            self.assertTrue(ck.is_name_inactive("Михаил Еремеев", "anzhee"))
+            self.assertTrue(ck.is_name_inactive("Пётр Уволенный", "anzhee"))
             self.assertFalse(ck.is_name_inactive("Михаил Саргин", "anzhee"))
-            # bare «Михаил» НЕ inactive (строгий матч, не тёзко-первословный).
-            self.assertFalse(ck.is_name_inactive("Михаил", "anzhee"))
+            # bare «Пётр» НЕ inactive (строгий матч полного имени, не первословный).
+            self.assertFalse(ck.is_name_inactive("Пётр", "anzhee"))
         finally:
             ck.load_people = orig
 
@@ -168,14 +182,17 @@ class TestPeopleDirectoryYaml(unittest.TestCase):
         by_name = {p["name"]: p for p in people}
         self.assertIn(SARGIN, by_name)
         self.assertEqual(by_name[SARGIN]["status"], ck.PERSON_STATUS_ACTIVE)
-        # R5: стухший ожидаемый Еремеев помечен inactive в реестре серии.
-        self.assertEqual(by_name[EREMEEV]["status"], ck.PERSON_STATUS_INACTIVE)
         # Бэкомпат: запись без status (Илья) = активный.
         self.assertEqual(by_name[ILYA]["status"], ck.PERSON_STATUS_ACTIVE)
+        # «Михаил Еремеев» в справочнике НЕТ: это искажённая фамилия present-Михаила
+        # (Саргина), а не отдельный ушедший человек. Никто не помечен inactive по ошибке.
+        self.assertNotIn(EREMEEV, by_name)
 
-    def test_eremeev_in_inactive_set(self):
+    def test_no_one_falsely_inactive(self):
+        # В боевой фикстуре никто не помечен inactive (нет реально ушедших). В частности
+        # Еремеев не утверждается как неактивный человек.
         inact = ck.inactive_person_names("anzhee")
-        self.assertIn(EREMEEV.lower(), inact)
+        self.assertNotIn(EREMEEV.lower(), inact)
         self.assertNotIn(SARGIN.lower(), inact)
 
     def test_mpfirst_people_stub_empty(self):
@@ -248,20 +265,22 @@ class TestPriorityOrderR19(unittest.TestCase):
 # ==========================================================================
 class TestNamesakeDisambiguationR3(unittest.TestCase):
     def test_inactive_namesake_excluded_active_substituted(self):
-        # Два «Михаил» в пуле, кластер со слабым сервис-сигналом (без строго
-        # разделяющего домена), Еремеев inactive → подставлен активный Саргин.
+        # Капабилити: два «Михаил» в пуле, кластер со слабым сервис-сигналом (без строго
+        # разделяющего домена), синтетический УШЕДШИЙ Михаил inactive → подставлен
+        # активный Саргин. (Демонстрирует механизм inactive на реально-ушедшем тёзке.)
         turns = [_t("SPEAKER_07", WEAK_SERVICE_TXT)]
-        pool = [SARGIN, EREMEEV, OLGA]
+        pool = [SARGIN, MIKHAIL_DEPARTED, OLGA]
         d = nm.disambiguate_namesakes(
-            turns, pool, {}, roster=ROSTER, present=pool, inactive={"михаил еремеев"},
+            turns, pool, {}, roster=ROSTER, present=pool,
+            inactive={MIKHAIL_DEPARTED.lower()},
         )
         self.assertEqual(d, {"SPEAKER_07": SARGIN})
 
     def test_role_discriminates_between_active_namesakes(self):
-        # Оба Михаила активны, но роль сервиса есть только у Саргина (Еремеева в
+        # Оба Михаила активны, но роль сервиса есть только у Саргина (второго тёзки в
         # ростере нет) → «вероятный по роли» = Саргин.
         turns = [_t("SPEAKER_07", WEAK_SERVICE_TXT)]
-        pool = [SARGIN, EREMEEV, OLGA]
+        pool = [SARGIN, MIKHAIL_NAMESAKE, OLGA]
         d = nm.disambiguate_namesakes(
             turns, pool, {}, roster=ROSTER, present=pool, inactive=set(),
         )
@@ -271,8 +290,8 @@ class TestNamesakeDisambiguationR3(unittest.TestCase):
         # Нет доменного сигнала к группе тёзок → не угадываем (отдаём clarify/LLM).
         turns = [_t("SPEAKER_09", GENERIC_TXT)]
         d = nm.disambiguate_namesakes(
-            turns, [SARGIN, EREMEEV], {}, roster=ROSTER, present=[SARGIN, EREMEEV],
-            inactive=set(),
+            turns, [SARGIN, MIKHAIL_NAMESAKE], {}, roster=ROSTER,
+            present=[SARGIN, MIKHAIL_NAMESAKE], inactive=set(),
         )
         self.assertEqual(d, {})
 
@@ -287,8 +306,9 @@ class TestNamesakeDisambiguationR3(unittest.TestCase):
     def test_map_all_marks_uncertain(self):
         # Через map_all: тёзка-подстановка попадает в uncertain_clusters (для ⚠️).
         turns = [_t("SPEAKER_07", WEAK_SERVICE_TXT)]
-        pool = [SARGIN, EREMEEV, OLGA]
-        res = nm.map_all(turns, pool, roster=ROSTER, present=pool, inactive={"михаил еремеев"})
+        pool = [SARGIN, MIKHAIL_DEPARTED, OLGA]
+        res = nm.map_all(turns, pool, roster=ROSTER, present=pool,
+                         inactive={MIKHAIL_DEPARTED.lower()})
         self.assertEqual(res.cluster_to_name["SPEAKER_07"], SARGIN)
         self.assertIn("SPEAKER_07", res.uncertain_clusters)
         self.assertIn("namesake_disambig", res.sources_used)
@@ -296,9 +316,10 @@ class TestNamesakeDisambiguationR3(unittest.TestCase):
     def test_strict_vocative_blocks_namesake(self):
         # Кластер сам строго окликнул «Михаил, …» → он НЕ Михаил, не подставляем.
         turns = [_t("SPEAKER_07", "Михаил, " + WEAK_SERVICE_TXT)]
-        pool = [SARGIN, EREMEEV, OLGA]
+        pool = [SARGIN, MIKHAIL_DEPARTED, OLGA]
         d = nm.disambiguate_namesakes(
-            turns, pool, {}, roster=ROSTER, present=pool, inactive={"михаил еремеев"},
+            turns, pool, {}, roster=ROSTER, present=pool,
+            inactive={MIKHAIL_DEPARTED.lower()},
         )
         self.assertNotIn("SPEAKER_07", d)
 
@@ -351,12 +372,14 @@ class TestAuthorshipFlagR3(unittest.TestCase):
 # ==========================================================================
 class TestNamePoolNarrowingR4(unittest.TestCase):
     def test_inactive_dropped_active_namesake_kept(self):
+        # Капабилити на синтетическом УШЕДШЕМ Михаиле-тёзке: неактивный выпадает,
+        # активный тёзка (Саргин) сохраняется.
         pool, dropped = lp._build_llm_name_pool(
-            [SARGIN, EREMEEV, OLGA], [], {},
-            inactive_names={EREMEEV.lower()},
+            [SARGIN, MIKHAIL_DEPARTED, OLGA], [], {},
+            inactive_names={MIKHAIL_DEPARTED.lower()},
         )
-        self.assertIn(SARGIN, pool)        # активный тёзка сохранён
-        self.assertNotIn(EREMEEV, pool)    # неактивный выпал (R4/R5)
+        self.assertIn(SARGIN, pool)            # активный тёзка сохранён
+        self.assertNotIn(MIKHAIL_DEPARTED, pool)  # неактивный выпал (R4/R5)
         self.assertEqual(dropped, 1)
 
     def test_panel_only_voiced_attendee_kept(self):
@@ -369,10 +392,10 @@ class TestNamePoolNarrowingR4(unittest.TestCase):
         self.assertIn("Инна Белобородова", pool)
 
     def test_bare_namesake_not_dropped_as_inactive(self):
-        # Строгий матч: bare «Михаил» НЕ отсекается как неактивный «Михаил Еремеев»
+        # Строгий матч: bare «Михаил» НЕ отсекается как неактивный «Михаил Уволенный»
         # (иначе затёрли бы присутствующего Саргина, записанного коротко).
         pool, _ = lp._build_llm_name_pool(
-            ["Михаил"], [], {}, inactive_names={EREMEEV.lower()},
+            ["Михаил"], [], {}, inactive_names={MIKHAIL_DEPARTED.lower()},
         )
         self.assertIn("Михаил", pool)
 
