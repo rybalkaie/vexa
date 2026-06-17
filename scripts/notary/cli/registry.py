@@ -21,9 +21,31 @@ from typing import Any
 # несут pyyaml; чтение/запись YAML без него осознанно падает (ImportError) у
 # caller'ов, которые это уже ловят best-effort (series_markup, llm_postprocess).
 
-DEFAULT_REGISTRY_DIR = Path(os.path.expanduser(
-    os.environ.get("MEETING_NOTARY_REGISTRY_DIR") or "~/Projects/me/встречи"
-))
+def _resolve_registry_dir() -> Path:
+    """Каталог реестра встреч (rooms.yaml/watched.yaml).
+
+    Приоритет: env `MEETING_NOTARY_REGISTRY_DIR` → канон-путь VPS
+    `/srv/meeting-notary/registry` (ТОЛЬКО если существует) → домашний дефолт
+    `~/Projects/me/встречи` (мак).
+
+    VPS-фолбэк (фикс бага доставки 2026-06-15): дочерний процесс финализации/
+    доставки может потерять env (спавн без EnvironmentFile/source) → без env
+    домашний дефолт `~/Projects/me/встречи` на VPS НЕ существует → реестр читается
+    пустым → привязка серии к группе не находится → протокол молча уходит в личку
+    (`deliver_protocol` fallback `TELEGRAM_NOTARIUS_CHAT_ID`). Фолбэк на
+    существующий `/srv/meeting-notary/registry` делает резолв устойчивым к потере
+    env, НЕ ломая мак (там `/srv/...` нет → домашний дефолт; env по-прежнему
+    главнее всего — фикстуры тестов и явная конфигурация выигрывают)."""
+    env = os.environ.get("MEETING_NOTARY_REGISTRY_DIR")
+    if env and env.strip():
+        return Path(os.path.expanduser(env.strip()))
+    vps_canonical = Path("/srv/meeting-notary/registry")
+    if vps_canonical.is_dir():
+        return vps_canonical
+    return Path(os.path.expanduser("~/Projects/me/встречи"))
+
+
+DEFAULT_REGISTRY_DIR = _resolve_registry_dir()
 ROOMS_FILE = DEFAULT_REGISTRY_DIR / "rooms.yaml"
 WATCHED_FILE = DEFAULT_REGISTRY_DIR / "watched.yaml"
 PAUSE_FILE = DEFAULT_REGISTRY_DIR / ".pause-until"

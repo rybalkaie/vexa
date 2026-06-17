@@ -3826,10 +3826,22 @@ def _load_watched_for_series(
     и PyYAML); в проде None → грузим из реестра.
     """
     try:
-        from notary.cli.registry import (  # noqa: PLC0415
-            load_watched, get_telegram_chat_id_for_series, find_series_bindings,
-            normalize_series_key,
-        )
+        try:
+            from notary.cli.registry import (  # noqa: PLC0415
+                load_watched, get_telegram_chat_id_for_series, find_series_bindings,
+                normalize_series_key,
+            )
+        except ImportError:
+            # finalize-meeting кладёт в sys.path ТОЛЬКО свою папку (THIS_DIR=.../notary),
+            # где пакет `notary` не виден (нужен его родитель .../scripts) → `notary.cli`
+            # падает ModuleNotFoundError. Без этого fallback _load_watched_for_series
+            # молча возвращал None → протокол уходил в ЛИЧКУ вместо группы (баг доставки
+            # 2026-06-16). `cli.registry` резолвится из THIS_DIR; в окружении с
+            # PYTHONPATH=scripts (listener/тесты) первой веткой берётся notary.cli.
+            from cli.registry import (  # noqa: PLC0415
+                load_watched, get_telegram_chat_id_for_series, find_series_bindings,
+                normalize_series_key,
+            )
     except Exception as e:  # noqa: BLE001
         logger.warning("[delivery] cli.registry import failed: %s", e)
         return None
@@ -3878,10 +3890,18 @@ def _persist_telegram_chat_id(series: str, chat_id: int) -> bool:
     lock висел на watched.yaml до stale-cleanup fs.
     """
     try:
-        from notary.cli.registry import (  # noqa: PLC0415
-            load_watched, save_watched, set_telegram_chat_id_for_series,
-            release_watched_lock,
-        )
+        try:
+            from notary.cli.registry import (  # noqa: PLC0415
+                load_watched, save_watched, set_telegram_chat_id_for_series,
+                release_watched_lock,
+            )
+        except ImportError:
+            # см. _load_watched_for_series: тот же fallback notary.* → cli.* для
+            # окружения finalize (sys.path=THIS_DIR без родителя .../scripts).
+            from cli.registry import (  # noqa: PLC0415
+                load_watched, save_watched, set_telegram_chat_id_for_series,
+                release_watched_lock,
+            )
     except Exception as e:  # noqa: BLE001
         logger.warning("[delivery] cli.registry import failed (persist): %s", e)
         return False
