@@ -435,6 +435,41 @@ def _meeting_meta_for_redeliver(state: dict, meta: Optional[dict]) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Ф2 (R6): уведомление о фолбэке точечной правки на регенерацию
+# --------------------------------------------------------------------------
+# Текст — ДОСЛОВНО из критерия приёмки R6 (план 2026-06-19). Шлётся в чат встречи,
+# когда патч-путь (Ф2) не лёг и протокол пришлось пересобрать заново.
+PATCH_FALLBACK_NOTICE = (
+    "⚠️ Не смог поправить точечно — пересобрал протокол заново, проверь, пожалуйста"
+)
+
+
+def _default_notify_fallback(chat_id: Any, meeting_sid: Optional[str] = None) -> bool:
+    """R6: сообщает участнику в ЧАТ ВСТРЕЧИ, что правка не легла точечно и протокол
+    пересобран заново (регенерация уже доставлена тем же путём, что обычный протокол).
+
+    Шлём в тот же `chat_id`, куда доставлен протокол (`telegram_api.send_message`) —
+    участник, приславший правку, там же. Best-effort: нет токена/chat_id/сбой API →
+    False, перевыпуск не падает. Опасная тройка (R8): текст статичен, реплик не несёт;
+    telegram_api логирует только chat_id+len.
+    """
+    if not isinstance(chat_id, int):
+        logger.warning("[reissue] R6 уведомление о фолбэке: нет chat_id (meeting=%s)", meeting_sid or "?")
+        return False
+    bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    if not bot_token:
+        logger.warning("[reissue] R6 уведомление о фолбэке: нет bot token (meeting=%s)", meeting_sid or "?")
+        return False
+    try:
+        from . import telegram_api  # noqa: PLC0415
+        telegram_api.send_message(bot_token, chat_id, PATCH_FALLBACK_NOTICE)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[reissue] R6 уведомление о фолбэке не отправлено (meeting=%s): %s", meeting_sid or "?", e)
+        return False
+
+
+# --------------------------------------------------------------------------
 # Перевыпуск одной встречи
 # --------------------------------------------------------------------------
 
@@ -622,6 +657,8 @@ def reissue_one(
     generate_fn: Optional[Callable] = None,
     redeliver_fn: Optional[Callable] = None,
     save_version_fn: Optional[Callable] = None,
+    patch_fn: Optional[Callable] = None,
+    notify_fn: Optional[Callable] = None,
 ) -> dict:
     """Перевыпуск ОДНОЙ встречи из claimed-state (status=reissuing).
 
@@ -656,6 +693,9 @@ def reissue_one(
     generate_fn = generate_fn or _default_generate
     redeliver_fn = redeliver_fn or lp.redeliver_revised_protocol
     save_version_fn = save_version_fn or lp._save_protocol_version
+    # Ф2: notify_fn — реальный отправитель уведомления о фолбэке (R6); patch_fn —
+    # граница запроса патча у Claude (тесты инъектируют оба, в проде — дефолты).
+    notify_fn = notify_fn or _default_notify_fallback
 
     try:
         old_transcript_text = transcript_path.read_text(encoding="utf-8")
@@ -779,6 +819,60 @@ def reissue_one(
             logger.warning("[reissue] детерминированная замена УПАЛА с исключением (фолбэк регенерация): %s", e)
             targeted_new_text = None
 
+    # Ф2 (ISS-16, R3/R4/R5b/R9/R10): LLM ПАТЧ-ПУТЬ. Когда детерминированные ярусы
+    # (Ф4 name, Ф1 term) не дали результата (targeted_new_text всё ещё None), а есть
+    # ЧИСТО контентные правки без авторского remap — это разговорная/смысловая правка:
+    # контентная ИЛИ авторская со склонением, которую parse_authorship_remap не
+    # разобрал (тогда она осталась в content_edits, remap пуст). Просим Claude понять
+    # суть и вернуть СТРУКТУРНЫЙ ПАТЧ; код применяет его к СТАРОМУ протоколу (нетронутый
+    # текст байт-в-байт). Результат — в ТОТ ЖЕ слот targeted_new_text (R12). Битый/
+    # неуникальный якорь (R4) или нарушение масштаба (R5b) → None → уведомление (R6) +
+    # регенерация ниже. Смесь (remap+контент) и чистый своп оставляем регенерации (R7).
+    # Опасная тройка (R8): промпт = протокол+правки, сырой ответ не персистим, лог —
+    # только метаданные. Авторский патч помечаем → исключим из контент-обучения (R10).
+    patch_attempted = False
+    patch_applied = False
+    patch_is_authorship = False
+    if targeted_new_text is None and content_edits and not remap:
+        try:
+            from . import protocol_patch as _pp  # noqa: PLC0415
+            # Гейт проверяем ЗДЕСЬ (не только внутри targeted_patch_reissue): пока патч-
+            # путь тёмный (дефолт OFF, активирует Ф3), мы НЕ «пробовали патч» → tier=regen
+            # без уведомления о фолбэке (R6), поведение как до Ф2 (никакого ⚠️-спама).
+            if _pp.is_enabled():
+                patch_attempted = True
+                _ce_texts = [
+                    (e.get("text") if isinstance(e, dict) else "") or "" for e in content_edits
+                ]
+                _known = list(current_speakers) + _author_name_pool(meta)
+                _pres = _pp.targeted_patch_reissue(
+                    old_text, _ce_texts, known_names=_known,
+                    request_fn=patch_fn, meeting_sid=state.get("feedback_id"),
+                )
+            else:
+                _pres = None
+            if _pres is not None:
+                targeted_new_text, _pmeta = _pres
+                patch_applied = True
+                patch_is_authorship = bool(_pmeta.get("is_authorship"))
+                # Опасная тройка: tier + счётчики, без текста правок/реплик.
+                logger.info(
+                    "[reissue] tier=patch точечный патч ops=%s changes=%s authorship=%s meeting=%s",
+                    _pmeta.get("n_ops"), _pmeta.get("n_changes"), patch_is_authorship,
+                    state.get("feedback_id"),
+                )
+        except Exception as e:  # noqa: BLE001 — патч-путь не критичен → фолбэк регенерация
+            # warning (не info): исключение = СЛОМАЛСЯ патч-модуль (баг/дрейф), а не
+            # штатный None-фолбэк. str(e) текст реплик не несёт (опасная тройка R8).
+            logger.warning("[reissue] патч-путь УПАЛ с исключением (фолбэк регенерация): %s", e)
+            targeted_new_text = None
+
+    # Ф2 (телеметрия/РИСК4): финальный ярус доставленного перевыпуска. Детерминированный
+    # (Ф1/Ф4) и патч-путь дали targeted_new_text; иначе впереди регенерация → tier=regen.
+    tier = "regen"
+    if targeted_new_text is not None:
+        tier = "patch" if patch_applied else "deterministic"
+
     # Вход генерации — путь (контракт generate_fn). При remap пишем remapped-текст
     # во временный sibling и генерим из него; реальный транскрипт не трогаем до sent.
     # Ф4: при успешной точечной правке регенерации НЕ будет → tmp-вход не нужен.
@@ -881,12 +975,17 @@ def reissue_one(
             # term/meaning-лог их НЕ пускаем, иначе «не Илья, а Михаил» отравит
             # словарь написаний). Чисто-авторский перевыпуск (content_edits пуст) →
             # не плодим пустую learning-запись.
-            if content_edits:
-                append_learning_log(state, content_edits, root=root)
+            # Ф2 (R10/РИСК2): авторский ПАТЧ (изменена только атрибуция реплики) тоже
+            # исключаем из контент-обучения — иначе «не A, а B», применённое патч-путём,
+            # отравит словарь терминов/ролей. Контентный патч и регенерация учатся как
+            # раньше (success патча/регенерации не теряет легитимные термины).
+            learning_edits = [] if patch_is_authorship else content_edits
+            if learning_edits:
+                append_learning_log(state, learning_edits, root=root)
                 # Ленивый импорт (feedback_learning импортирует этот модуль — иначе цикл).
                 try:
                     from . import feedback_learning  # noqa: PLC0415
-                    feedback_learning.record_learning_from_edits(state, content_edits, root=root)
+                    feedback_learning.record_learning_from_edits(state, learning_edits, root=root)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] self-learning hook упал (non-fatal): %s", e)
                 # D6 (Ф7): маршрутизатор фидбэка по слоям — РОЛИ → оргструктура
@@ -897,9 +996,24 @@ def reissue_one(
                     from . import feedback_router  # noqa: PLC0415
                     # template_root НЕ передаём: версии формата пишутся в свой
                     # store-dir (config/), тот же, что читает generate_protocol.
-                    feedback_router.route_edits(state, content_edits)
+                    feedback_router.route_edits(state, learning_edits)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] feedback-router hook упал (non-fatal): %s", e)
+
+            # Ф2 (телеметрия РИСК4 + R6): фиксируем финальный ярус доставленного
+            # перевыпуска (success-rate патча за окно) и — если патч пробовали, но он
+            # не лёг (tier=regen) — уведомляем участника, что протокол пересобран заново.
+            # Опасная тройка (R8): телеметрия только метаданные; текст уведомления статичен.
+            try:
+                from . import patch_telemetry  # noqa: PLC0415
+                patch_telemetry.record_tier(tier, patch_attempted=patch_attempted, root=root)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[reissue] телеметрия ярусов не записана (non-fatal): %s", e)
+            if patch_attempted and tier == "regen":
+                try:
+                    notify_fn(res.get("chat_id"), state.get("feedback_id"))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[reissue] R6 уведомление о фолбэке упало (non-fatal): %s", e)
 
         return res
     finally:
