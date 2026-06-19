@@ -114,6 +114,41 @@ class ParseDirectiveTest(unittest.TestCase):
     def test_too_long_returns_none(self):
         self.assertIsNone(tpe._parse_one_directive("замени " + "а" * 250 + " на б"))
 
+    def test_multiple_na_separators_refused(self):
+        # Н1 (цикл5): >1 самостоятельного предлога «на» → точка деления X|Y
+        # неоднозначна → отказ (а не мис-парс X=«налоги», Y=«прибыль на НДС»).
+        self.assertIsNone(tpe._parse_one_directive("замени налоги на прибыль на НДС"))
+        self.assertIsNone(tpe._parse_one_directive("замени Иван на Петрович на встрече"))
+
+    def test_na_inside_word_not_counted(self):
+        # «на» внутри слова (Анна/начало) НЕ считается разделителем — кейс жив.
+        self.assertEqual(tpe._parse_one_directive("замени Анна на Мария"), ("Анна", "Мария"))
+
+    def test_trailing_prose_comma_refused(self):
+        # У1 (цикл5): клаузо-хвост через «, » → Y поглотил бы продолжение фразы → отказ.
+        self.assertIsNone(
+            tpe._parse_one_directive("замени фронтенд на frontend, и убери последний пункт"))
+
+    def test_trailing_prose_conjunction_refused(self):
+        # У1 (цикл5): хвост без запятой, но >4 слов в Y → не термин → отказ.
+        self.assertIsNone(
+            tpe._parse_one_directive("замени фронтенд на frontend и ещё там дата неправильная"))
+
+    def test_multiword_name_ok(self):
+        # Имя из нескольких слов (≤ потолка) — валидный терсный Y, остаётся живым.
+        self.assertEqual(
+            tpe._parse_one_directive("замени Еремеев на Михаил Сергеевич Саргин"),
+            ("Еремеев", "Михаил Сергеевич Саргин"))
+
+    def test_decimal_comma_not_overrejected(self):
+        # «1,5» (десятичная запятая без пробела) — не клаузо-хвост, кейс жив.
+        self.assertEqual(tpe._parse_one_directive("замени 1,5 на 1.5"), ("1,5", "1.5"))
+
+    def test_arrow_with_na_inside_ok(self):
+        # Стрелочная форма: «на» внутри X легитимен (разделитель — стрелка, не «на»).
+        self.assertEqual(tpe._parse_one_directive("план на год → бюджет"),
+                         ("план на год", "бюджет"))
+
 
 class ParseDirectivesListTest(unittest.TestCase):
     def test_single(self):
