@@ -412,3 +412,196 @@ def targeted_name_reissue(
         1 for o, n in zip(old_protocol.split("\n"), new_text.split("\n")) if o != n
     )
     return new_text, {"scope": scope, "n_changes": n_changes}
+
+
+# ===========================================================================
+# Ф1 (ISS-16, R1/R2/R5): детерминированная точечная ЗАМЕНА «замени X на Y».
+# ===========================================================================
+# Корень (см. план 2026-06-19): терсная механическая правка («замени фронтенд на
+# frontend») сегодня пере-собирает ВЕСЬ протокол через Claude — проза плывёт, хотя
+# просили одно слово. Ф1 — первый ДЕШЁВЫЙ ярус для таких правок: парсим терсную
+# директиву и подменяем X→Y по СУЩЕСТВУЮЩЕМУ протоколу теми же word-boundary/
+# инвариантами/bounded-diff, что и name-путь Ф4 (общая строка вместо имени).
+#
+# Опасная тройка (R8): путь ЧИСТО ТЕКСТОВЫЙ — без LLM, без сети, без лога текста
+# реплик (как весь модуль). Anti-injection-поверхность нулевая: правка приходит как
+# уже-распарсенный детерминированный remap строк, не как промпт.
+#
+# Над тем же слотом доставки `targeted_new_text` (R12) — встраивание в `reissue_one`.
+# Отказ при over-match/неоднозначности (R2) или нарушении СТРОГИХ инвариантов Ф4
+# (R5: число строк/секций РАВНО старому — замена слов длину не меняет) → None →
+# управление уходит дальше (позже Ф2-патч; до него — регенерация). Ложный отказ
+# дёшев (та же регенерация, что сегодня); ложное применение опасно — поэтому при
+# любой неоднозначности ОТКАЗЫВАЕМСЯ.
+
+# Терсная директива замены короткая; длинная — разговорная правка, на ней
+# детерминированный парсер вредит (мис-парс) → отдаём её дальше (Ф2/LLM целиком).
+_MAX_REPLACE_DIRECTIVE_LEN = 200
+# Потолок длины самих X/Y: одно слово / короткая фраза. Длиннее → не терсная замена.
+_MAX_REPLACE_TERM_LEN = 100
+
+# Глаголы терсной замены (+ очевидные словоформы). «поправь авторство…» НЕ
+# матчит — у неё нет структуры «… на Y» (она уходит в name-путь Ф4б / позже Ф2).
+_REPLACE_VERB = r"замен(?:и|и-ка|ите|ить)|помен(?:яй|яйте|ять)|исправ(?:ь|ьте|ить)"
+# Полная директива «(пожалуйста,) <глагол> <X> на <Y>» — вся правка целиком (^…$,
+# терсная). X нежадный до ПЕРВОГО « на » — разделителя; Y — остаток до конца.
+_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:пожалуйста[,\s]+)?(?:" + _REPLACE_VERB + r")\s+"
+    r"(?P<x>.+?)\s+на\s+(?P<y>.+?)\s*$",
+    re.IGNORECASE | re.UNICODE,
+)
+# Стрелочная форма «X → Y» / «X -> Y» (вся правка = только директива, ^…$).
+_ARROW_RE = re.compile(
+    r"^\s*(?P<x>.+?)\s*(?:→|⟶|->|=>)\s*(?P<y>.+?)\s*$", re.UNICODE,
+)
+# Пары обрамляющих кавычек, которые снимаем у X/Y.
+_QUOTE_PAIRS = {'"': '"', "'": "'", "«": "»", "„": "“", "“": "”", "‘": "’", "`": "`"}
+
+
+def _clean_term(s: str) -> str:
+    """Снять обрамляющие кавычки и хвостовую пунктуацию у X/Y терсной директивы."""
+    s = (s or "").strip()
+    changed = True
+    while changed and len(s) >= 2:
+        changed = False
+        if s[0] in _QUOTE_PAIRS and s[-1] == _QUOTE_PAIRS[s[0]]:
+            s = s[1:-1].strip()
+            changed = True
+    # Хвостовая пунктуация предложения у Y («…на frontend.») — шум, не часть слова.
+    return s.rstrip(".!?;:").strip()
+
+
+def _parse_one_directive(text: str) -> Optional[tuple]:
+    """Одна терсная директива «замени X на Y» / «X → Y» → (X, Y) или None.
+
+    Многострочную / длинную / без чистых непустых X≠Y → None (не терсная замена →
+    управление дальше). Регистр X/Y сохраняем как есть (подмена регистрозависима).
+    """
+    if not text or "\n" in text:
+        return None
+    t = text.strip()
+    if not t or len(t) > _MAX_REPLACE_DIRECTIVE_LEN:
+        return None
+    m = _DIRECTIVE_RE.match(t) or _ARROW_RE.match(t)
+    if m is None:
+        return None
+    x = _clean_term(m.group("x"))
+    y = _clean_term(m.group("y"))
+    if not x or not y or x == y:
+        return None
+    if len(x) > _MAX_REPLACE_TERM_LEN or len(y) > _MAX_REPLACE_TERM_LEN:
+        return None
+    return x, y
+
+
+def parse_replace_directives(edit_texts) -> Optional[dict]:
+    """Тексты правок → объединённый remap {X:Y} замены или None (→ управление дальше).
+
+    None, если ХОТЬ ОДНА правка не является чистой терсной директивой замены (тогда
+    детерминированный путь не применим целиком — иначе частичное применение молча
+    потеряло бы неразобранную правку) или директивы конфликтуют (один X → разные Y).
+    Пустой результат → None.
+    """
+    texts = [t for t in (edit_texts or []) if t and t.strip()]
+    if not texts:
+        return None
+    remap: dict = {}
+    for t in texts:
+        pair = _parse_one_directive(t)
+        if pair is None:
+            return None  # есть не-замена среди правок → весь путь не применим
+        x, y = pair
+        if x in remap and remap[x] != y:
+            return None  # конфликт: один X → разные Y
+        remap[x] = y
+    return remap or None
+
+
+def _replacement_is_ambiguous(old_protocol: str, x: str) -> bool:
+    """R2: X неоднозначен / over-match → детерминированная замена не применима.
+
+    Применимо ТОЛЬКО когда X встречается как самостоятельный токен (word-bounded,
+    как `_compile_name_alt`) хотя бы раз И при этом НЕ входит подстрокой в более
+    широкие слова (число подстрочных вхождений == числу word-bounded). Иначе:
+      • «сет» внутри «сетка»/«советует» (подстрока шире) → True;
+      • X вообще нет самостоятельным токеном (wb==0, напр. «сет» при «интернет/
+        совет») → True (нечего безопасно менять — НЕ трогаем «интернет»).
+    Регистрозависимо (как подмена). True → отказ → следующий ярус.
+    """
+    pat = _compile_name_alt([x])
+    if pat is None:
+        return True
+    wb = len(pat.findall(old_protocol))
+    if wb == 0:
+        return True  # самостоятельного токена X нет → нечего безопасно заменять
+    # `str.count` и `findall` оба невложенные слева-направо: для «только-самостоятельных»
+    # вхождений равны; X внутри более широких слов → подстрочных больше → неоднозначно.
+    return old_protocol.count(x) != wb
+
+
+def apply_targeted_term_edit(old_protocol: str, remap: dict) -> Optional[str]:
+    """broad-подмена терсных X→Y по СУЩЕСТВУЮЩЕМУ протоколу. None → не применимо.
+
+    Каждый X обязан пройти R2-гард (`_replacement_is_ambiguous`) — любой
+    неоднозначный → весь путь не применим (None). Все вхождения каждого X
+    (word-bounded, своп-безопасно одним проходом `_subst_all`) → Y. Результат ==
+    исходник → None.
+    """
+    if not old_protocol or not remap:
+        return None
+    present = {}
+    for k, v in remap.items():
+        if not k or not v or k == v:
+            continue
+        if _replacement_is_ambiguous(old_protocol, k):
+            return None  # неоднозначный/over-match X → честный отказ всего пути
+        present[k] = v
+    if not present:
+        return None
+    pattern = _compile_name_alt(present.keys())
+    if pattern is None:
+        return None
+    new_text, n = _subst_all(old_protocol, present, pattern)
+    if not n or new_text == old_protocol:
+        return None
+    return new_text
+
+
+def targeted_term_reissue(old_protocol: str, edit_texts) -> Optional[tuple]:
+    """Ф1-вход для `reissue_one`: терсная точечная ЗАМЕНА «замени X на Y» или None.
+
+    Парсит терсные директивы из текстов правок → broad-подмена по СТАРОМУ протоколу
+    → СТРОГИЕ инварианты Ф4 (`invariants_preserved`: якорь/⚠️/дисклеймер целы, число
+    секций И строк РАВНО старому — замена слов длину протокола не меняет, R5) →
+    bounded-diff (`diff_is_bounded`, scope='broad': изменились только X-строки,
+    каждая ровно подменой X→Y). Любой провал/неоднозначность → None (caller честно
+    идёт дальше: позже Ф2-патч, до него — регенерация).
+
+    Возвращает (новый_протокол, meta{n_changes, n_terms}) либо None. Без LLM/сети/
+    лога текста реплик (опасная тройка R8). meta — только счётчики, без содержимого.
+    """
+    if not old_protocol:
+        return None
+    remap = parse_replace_directives(edit_texts)
+    if not remap:
+        return None
+    new_text = apply_targeted_term_edit(old_protocol, remap)
+    if new_text is None:
+        return None
+
+    inv_ok, reason = invariants_preserved(
+        protocol_invariants(old_protocol), protocol_invariants(new_text)
+    )
+    if not inv_ok:
+        logger.info("[targeted-term] инвариант нарушен (%s) → следующий ярус", reason)
+        return None
+
+    bound_ok, breason = diff_is_bounded(old_protocol, new_text, remap, "broad")
+    if not bound_ok:
+        logger.info("[targeted-term] дифф вне рамок (%s) → следующий ярус", breason)
+        return None
+
+    n_changes = sum(
+        1 for o, n in zip(old_protocol.split("\n"), new_text.split("\n")) if o != n
+    )
+    return new_text, {"n_changes": n_changes, "n_terms": len(remap)}

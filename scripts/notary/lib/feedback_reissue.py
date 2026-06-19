@@ -747,6 +747,38 @@ def reissue_one(
             logger.warning("[reissue] точечная правка УПАЛА с исключением (фолбэк регенерация): %s", e)
             targeted_new_text = None
 
+    # Ф1 (ISS-16, R1/R2/R5): ДЕТЕРМИНИРОВАННАЯ точечная ЗАМЕНА терсных правок «замени
+    # X на Y» / «X → Y» — БЕЗ LLM. Срабатывает, когда name-путь Ф4 не дал результата
+    # (targeted_new_text всё ещё None) и есть ЧИСТО контентные правки без авторского
+    # remap. Подменяем X→Y в СТАРОМ протоколе теми же word-boundary/инвариантами/
+    # bounded-diff, что и name-путь (строгий R5: длина протокола не меняется).
+    # Over-match/неоднозначность (R2) или нарушение инвариантов → None → управление
+    # дальше (позже Ф2-патч; до него — регенерация ниже). Результат — в ТОТ ЖЕ слот
+    # targeted_new_text (R12: redeliver-до-диска, архив версий — не параллельная ветка).
+    # remap есть → это правка авторства (возможно в смеси): её мы НЕ трогаем терсной
+    # заменой (нужен remap транскрипта) → отдаём регенерации как сегодня (R7 mixed).
+    # Опасная тройка (R8): targeted_term-путь чисто текстовый, без LLM/сети/лога реплик.
+    if targeted_new_text is None and content_edits and not remap:
+        try:
+            from . import targeted_protocol_edit as _tpe  # noqa: PLC0415
+            _ce_texts = [
+                (e.get("text") if isinstance(e, dict) else "") or "" for e in content_edits
+            ]
+            _tres = _tpe.targeted_term_reissue(old_text, _ce_texts)
+            if _tres is not None:
+                targeted_new_text, _tmeta = _tres
+                # Опасная тройка: логируем только tier + счётчики, без текста правок/реплик.
+                logger.info(
+                    "[reissue] tier=deterministic точечная замена terms=%d changes=%d meeting=%s",
+                    _tmeta.get("n_terms"), _tmeta.get("n_changes"),
+                    state.get("feedback_id"),
+                )
+        except Exception as e:  # noqa: BLE001 — детерминированный путь не критичен → фолбэк регенерация
+            # warning (не info): исключение = СЛОМАЛСЯ targeted_term-модуль (баг/дрейф),
+            # а не штатный None-фолбэк. str(e) от re/dict-операций текст реплик не несёт.
+            logger.warning("[reissue] детерминированная замена УПАЛА с исключением (фолбэк регенерация): %s", e)
+            targeted_new_text = None
+
     # Вход генерации — путь (контракт generate_fn). При remap пишем remapped-текст
     # во временный sibling и генерим из него; реальный транскрипт не трогаем до sent.
     # Ф4: при успешной точечной правке регенерации НЕ будет → tmp-вход не нужен.
