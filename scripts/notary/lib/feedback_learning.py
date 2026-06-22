@@ -158,6 +158,12 @@ _MAX_ACTIVE_RULES_PER_STORE = int(
 # (`meetings_listener._learning_digest_prefix`), не плодя второй литерал.
 DIGEST_PREFIX = "\U0001F9E0"  # 🧠
 
+# Ф4 (R16): первая строка сводного inline-подтверждения «✅ Применил правки …».
+# ЕДИНЫЙ источник истины: листенер опознаёт reply на подтверждение по этому
+# префиксу и роутит в тот же откат, что и reply на дайджест
+# (`meetings_listener._reissue_ack_prefix`), не плодя второй литерал.
+REISSUE_ACK_PREFIX = "✅ Применил правки. Заодно понял на будущее"  # ✅
+
 # Терм — короткий токен. Длиннее/многословнее = это уже фраза/содержание, не терм.
 _MAX_TERM_LEN = 40
 _MAX_TERM_WORDS = 2
@@ -638,6 +644,10 @@ def _fold(events: list[dict]) -> dict:
                 "rule": ev.get("rule"),
                 "active": True,
                 "author": ev.get("author"),
+                # Ф4 (R16): привязка правила к перевыпуску, в котором оно выучено —
+                # чтобы сводное inline-подтверждение озвучило ТОЛЬКО правила своего
+                # раунда (не зачерпнуть чужую встречу из общей очереди не-озвученных).
+                "source_feedback_id": ev.get("source_feedback_id"),
                 "at": ev.get("at"),
             }
             # Новый learn инвалидирует прежнюю озвучку: правило, откаченное и
@@ -1639,6 +1649,94 @@ def mark_announced(ids: list[str], *, root: Optional[Path] = None) -> None:
             continue
         _append_event_to_path(f, {"op": "announced", "ids": present,
                                   "at": feedback_state.now_iso()})
+
+
+# ---------------------------------------------------------------------------
+# Ф4 (R16): сводное inline-подтверждение выученного сразу в ответ на перевыпуск
+# ---------------------------------------------------------------------------
+def _human_scope(rule: dict) -> str:
+    """Уровень правила человеческим языком для подтверждения (РАЗМ1) — берётся из
+    ЗАПИСИ правила, НЕ хардкод: «везде» (global) / «для всей компании» (company,
+    групповая встреча) / «только эта серия» (series, личная 1:1)."""
+    scope = rule.get("scope")
+    if scope == SCOPE_GLOBAL:
+        return "везде"
+    if scope == SCOPE_COMPANY:
+        return "для всей компании"
+    return "только эта серия"
+
+
+def _ack_rule_phrase(rule: dict) -> str:
+    """Правило простым языком для подтверждения владельцу (формат Owner-preview):
+    написание «w» → пиши «r»; смысл «s» — m; различение «a» ≠ «b», не объединять;
+    указание «subj»: rule / rule. R6: только результат-правило, без контекста правки."""
+    kind = rule.get("kind") or "term"
+    if kind == "distinction":
+        note = rule.get("note") or ""
+        # Дефолтную многословную ноту схлопываем до Owner-preview «не объединять»;
+        # содержательную ноту LLM («разные разделы») показываем как есть.
+        if not note or note == _DISTINCTION_DEFAULT_NOTE:
+            note = "не объединять"
+        return f"«{rule.get('subject_a')}» ≠ «{rule.get('subject_b')}», {note}"
+    if kind == "meaning":
+        return f"«{rule.get('subject')}» — {rule.get('meaning')}"
+    if kind == "guidance":
+        subj = (rule.get("subject") or "").strip()
+        txt = (rule.get("rule") or "").strip()
+        if subj and txt:
+            return f"«{subj}»: {txt}"
+        return f"«{subj}»" if subj else txt
+    return f"«{rule.get('wrong')}» → пиши «{rule.get('right')}»"
+
+
+def learned_rules_for_source(
+    feedback_id: Any, *, root: Optional[Path] = None,
+) -> list[dict]:
+    """Ф4 (R16): активные, ещё НЕ озвученные правила, выученные в перевыпуске ЭТОЙ
+    встречи (`source_feedback_id == feedback_id`), по всем журналам (серии + company
+    + глобальный — РИСК1). Фильтр по `feedback_id` держит подтверждение в рамках
+    своего раунда (не зачерпнуть чужую встречу из общей очереди не-озвученных);
+    фильтр по `announced` — не повторять между раундами одной встречи. Источник
+    scope/субъектов — поля записи (имя файла санитизировано). Пусто без feedback_id."""
+    if not feedback_id:
+        return []
+    want = str(feedback_id)
+    out: list[dict] = []
+    for f in _iter_all_log_files(root=root):
+        fold = _fold(_read_events_from_file(f))
+        for r in fold["rules"].values():
+            if (r.get("active")
+                    and r.get("id") not in fold["announced"]
+                    and str(r.get("source_feedback_id") or "") == want):
+                out.append(r)
+    return out
+
+
+def format_reissue_ack(
+    feedback_id: Any, *, root: Optional[Path] = None,
+) -> tuple[str, list[str]]:
+    """Ф4 (R16): ОДНО сводное подтверждение выученного в этом перевыпуске.
+
+    Возвращает (text, ids). text="" если в раунде НЕ выучено durable-правил
+    (пустой/чисто-авторский перевыпуск → бот не пишет вовсе, ОЖИД1). ОДНО сообщение
+    на весь пакет правок (НЕ по сообщению на каждую — пакет даёт до 9). У каждой
+    строки — ФАКТИЧЕСКИЙ уровень из записи (РАЗМ1). ids — id озвученных правил;
+    caller передаёт их в `mark_announced` после успешной отправки — не дублировать
+    в вечернем дайджесте и в следующем раунде той же встречи (R16-дедуп). Чистый
+    билдер (без транспорта): отправку и гейт делает caller. R6: только результат-правило.
+    """
+    rules = learned_rules_for_source(feedback_id, root=root)
+    if not rules:
+        return "", []
+    lines = [f"{REISSUE_ACK_PREFIX} (применяю сразу — подтверди или откати):"]
+    ids: list[str] = []
+    for r in rules:
+        lines.append(f"  • {_ack_rule_phrase(r)} ({_human_scope(r)})")
+        ids.append(r.get("id"))
+    lines.append("")
+    lines.append("Что-то неверно — ответь «откати <термин>» (напр. «откати "
+                 + _rollback_hint_token(rules[0]) + "»).")
+    return "\n".join(lines), ids
 
 
 _ROLLBACK_TRIGGER_RE = re.compile(r"откат|отмен|забудь|не\s+выучив", re.IGNORECASE)

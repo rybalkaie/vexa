@@ -97,3 +97,33 @@ def push(
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logger.warning("tg-send failed: %s — %s", e, message[:80])
         return False
+
+
+def push_via_notarius(message: str, *, timeout: int = 30) -> bool:
+    """Шлёт сообщение владельцу ботом `notarius` — ТЕМ ЖЕ, что поллит
+    `meetings_listener` с роутом отката.
+
+    Критично для сообщений, на которые владелец отвечает «откати …» (дайджест
+    самообучения, Ф4-подтверждение перевыпуска): дефолтный бот `push` ушёл бы
+    ДРУГОМУ боту, листенер reply не увидит, и откат физически не сработает (тот же
+    инвариант, что у `feedback_learning_digest._send_via_notarius_bot`). Без дедупа
+    (подтверждение/дайджест — разовые, by design). Возвращает True при успехе.
+    R9 (опасная тройка): текст уходит наружу by design (это выученные правила);
+    в лог пишем лишь длину, не само сообщение."""
+    if not TG_SEND_BIN.exists():
+        logger.warning("tg-send не найден по пути %s — notarius push пропущен", TG_SEND_BIN)
+        return False
+    try:
+        proc = subprocess.run(
+            [str(TG_SEND_BIN), "--bot", "notarius", message],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:  # noqa: BLE001
+        logger.warning("notarius push упал: %s", e)
+        return False
+    if proc.returncode != 0:
+        logger.warning("notarius push rc=%d stderr=%s", proc.returncode,
+                       (proc.stderr or "").strip()[:300])
+        return False
+    logger.info("notarius push OK (%d chars)", len(message))
+    return True

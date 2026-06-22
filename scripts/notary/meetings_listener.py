@@ -1070,6 +1070,18 @@ def _learning_digest_prefix() -> str:
         return "\U0001F9E0"
 
 
+def _reissue_ack_prefix() -> str:
+    """Ф4 (R16): префикс сводного inline-подтверждения «✅ Применил правки …» —
+    из `feedback_learning.REISSUE_ACK_PREFIX` (один источник истины). Reply владельца
+    на это сообщение роутится в тот же откат, что и reply на дайджест. Fallback на
+    литерал, если модуль не импортируется."""
+    try:
+        from notary.lib.feedback_learning import REISSUE_ACK_PREFIX  # noqa: PLC0415
+        return REISSUE_ACK_PREFIX
+    except Exception:
+        return "✅ Применил правки. Заодно понял на будущее"
+
+
 def maybe_route_to_learning_rollback(token: str, chat_id: int, msg: dict[str, Any]) -> bool:
     """Ф3а (REQ 2.3): reply на дайджест самообучения «🧠 Ватсон выучил …» → откат.
 
@@ -1620,8 +1632,11 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
             )
             return
         # Ф3а: reply на дайджест самообучения «🧠 Ватсон выучил …» → откат/подтверждение.
-        # ДО проверки 📅, чтобы не утечь в apply_reply встреч (разные каналы).
-        if orig_text.startswith(_learning_digest_prefix()):
+        # Ф4 (R16): reply на сводное подтверждение перевыпуска «✅ Применил правки …»
+        # — ТОТ ЖЕ откат (владелец отвечает «откати …» прямо на подтверждение). ДО
+        # проверки 📅, чтобы не утечь в apply_reply встреч (разные каналы).
+        if (orig_text.startswith(_learning_digest_prefix())
+                or orig_text.startswith(_reissue_ack_prefix())):
             maybe_route_to_learning_rollback(token, cid, msg)
             return
         if not orig_text.startswith(TRIGGER_PREFIX):

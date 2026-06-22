@@ -469,6 +469,20 @@ def _default_notify_fallback(chat_id: Any, meeting_sid: Optional[str] = None) ->
         return False
 
 
+def _default_ack_sender(text: str) -> bool:
+    """Ф4 (R16): отправляет сводное подтверждение выученного ВЛАДЕЛЬЦУ нотариус-ботом.
+
+    Именно нотариус-ботом (`notify.push_via_notarius`) — ТЕМ ЖЕ, что поллит листенер
+    с роутом отката: иначе reply владельца «откати …» уйдёт дефолтному боту и откат не
+    сработает. Best-effort: нет tg-send/сбой → False, перевыпуск не падает."""
+    try:
+        from .notify import push_via_notarius  # noqa: PLC0415
+        return push_via_notarius(text)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[reissue] R16 подтверждение не отправлено (non-fatal): %s", e)
+        return False
+
+
 # --------------------------------------------------------------------------
 # Перевыпуск одной встречи
 # --------------------------------------------------------------------------
@@ -659,6 +673,7 @@ def reissue_one(
     save_version_fn: Optional[Callable] = None,
     patch_fn: Optional[Callable] = None,
     notify_fn: Optional[Callable] = None,
+    ack_send_fn: Optional[Callable] = None,
 ) -> dict:
     """Перевыпуск ОДНОЙ встречи из claimed-state (status=reissuing).
 
@@ -696,6 +711,9 @@ def reissue_one(
     # Ф2: notify_fn — реальный отправитель уведомления о фолбэке (R6); patch_fn —
     # граница запроса патча у Claude (тесты инъектируют оба, в проде — дефолты).
     notify_fn = notify_fn or _default_notify_fallback
+    # Ф4 (R16): отправитель сводного подтверждения выученного. Дефолт — нотариус-бот
+    # (тот же, что поллит листенер с роутом отката); тесты инъектируют capture-fn.
+    ack_send_fn = ack_send_fn or _default_ack_sender
 
     try:
         old_transcript_text = transcript_path.read_text(encoding="utf-8")
@@ -1077,12 +1095,32 @@ def reissue_one(
                 # не дублировать уже пойманное + не платить за лишние Haiku-вызовы).
                 # Ф1 только КЛАССИФИЦИРУЕТ (хранение новых типов — задел Ф2). Best-
                 # effort. Опасная тройка (R6): текст правок в лог/файлы не уходит.
+                classify_enabled = False
                 try:
                     from . import feedback_classify_llm  # noqa: PLC0415
+                    classify_enabled = feedback_classify_llm.is_enabled()
                     feedback_classify_llm.classify_remainder_edits(
                         state, learning_edits, meta=meta, root=root)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] LLM-классификатор остатка упал (non-fatal): %s", e)
+
+                # Ф4 (R16/ОЖИД1): ОДНО сводное подтверждение выученного — сразу в
+                # ответ на перевыпуск, ВЛАДЕЛЬЦУ нотариус-ботом (reply «откати …»
+                # вернётся в наш листенер). Гейтим мастер-флагом ISS-19
+                # (ENABLE_FEEDBACK_LLM_CLASSIFY, дефолт OFF, [[reissue-llm-tier-gate-
+                # default-off]]) — без него поведение перевыпуска прежнее, реальный
+                # tg-send в тестах не дёргается. У каждой строки фактический scope из
+                # записи (РАЗМ1). После отправки помечаем озвученными → не дублируем в
+                # вечернем дайджесте и в следующем раунде (R16-дедуп). Best-effort.
+                if classify_enabled:
+                    try:
+                        from . import feedback_learning  # noqa: PLC0415
+                        ack_text, ack_ids = feedback_learning.format_reissue_ack(
+                            state.get("feedback_id"), root=root)
+                        if ack_text and ack_send_fn(ack_text):
+                            feedback_learning.mark_announced(ack_ids, root=root)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[reissue] R16 inline-подтверждение упало (non-fatal): %s", e)
 
             # Ф2 (телеметрия РИСК4 + R6): фиксируем финальный ярус доставленного
             # перевыпуска (success-rate патча за окно) и — если патч пробовали, но он
