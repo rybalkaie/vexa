@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -188,12 +189,12 @@ def _norm_subjects(raw) -> list:
 
 
 def _norm_confidence(raw) -> float:
-    """confidence → float в [0,1]; не-число → 0.0 (осторожный дефолт, A4)."""
+    """confidence → float в [0,1]; не-число/NaN/±inf → 0.0 (осторожный дефолт, A4)."""
     try:
         c = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    if c != c:  # NaN
+    if not math.isfinite(c):  # NaN или ±inf — не валидная уверенность → осторожно 0.0
         return 0.0
     return max(0.0, min(1.0, c))
 

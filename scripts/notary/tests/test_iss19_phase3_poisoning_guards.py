@@ -122,6 +122,19 @@ class R8ConfidenceThresholdTest(_Base):
         # «вывод с ИП» (R15) на дефолте обязан проходить (его боевой confidence ~0.85).
         self.assertLessEqual(fl._DURABLE_MIN_CONFIDENCE, 0.85)
 
+    def test_infinite_confidence_rejected_by_threshold(self):
+        # Ход1-Н1: ±inf — не валидная уверенность, не должна обходить порог как «1.0»
+        # (json.raw_decode принимает литерал Infinity → float('inf')).
+        self.assertEqual(fl._as_confidence(float("inf")), 0.0)
+        self.assertEqual(fcl._norm_confidence(float("inf")), 0.0)
+        self.assertEqual(fcl._norm_confidence(float("-inf")), 0.0)
+        # Интеграция: durable с confidence=inf не пишется (как и любой ниже порога).
+        self._classify("seriesA", "вывод с ИП", GROUP,
+                       {"durable": True, "type": "meaning", "subjects": ["вывод"],
+                        "rule": "с ИП", "confidence": float("inf")})
+        self.assertEqual(fl.active_company_meaning_rules(COMPANY, root=self.root), [])
+        self.assertEqual(fl.active_meaning_rules("seriesA", root=self.root), [])
+
 
 # ===========================================================================
 # R7 — дисциплина уровня + cross-company global ТОЛЬКО по маркеру «везде»
@@ -168,6 +181,17 @@ class R7ScopeAndGlobalMarkerTest(_Base):
         glob = fl.active_global_spellings(root=self.root)
         self.assertEqual(len(glob), 1)
         self.assertEqual((glob[0]["wrong"], glob[0]["right"]), ("Зифренд", "Zifriend"))
+
+    def test_repeat_global_marked_term_writes_no_guidance(self):
+        # Ход1-Н2: повтор global-marked терма (пара уже в global) НЕ должен проваливаться
+        # в guidance и плодить мусорное правило поверх корректного глобального.
+        term = {"durable": True, "type": "term", "subjects": ["Зифренд", "Zifriend"],
+                "rule": "", "confidence": 0.9}
+        self._classify("seriesA", "везде так пишем бренд", GROUP, term)
+        self._classify("seriesA", "везде так пишем бренд", GROUP, term)   # повтор
+        self.assertEqual(len(fl.active_global_spellings(root=self.root)), 1)
+        self.assertEqual(fl.active_guidance_rules("seriesA", root=self.root), [])
+        self.assertEqual(fl.active_company_guidance_rules(COMPANY, root=self.root), [])
 
 
 # ===========================================================================
@@ -274,6 +298,18 @@ class R17CrossKindConflictTest(_Base):
         self._classify("seriesB", "Зифренд и Zifriend разные сущности", ONE_TO_ONE,
                        {"durable": True, "type": "distinction",
                         "subjects": ["Зифренд", "Zifriend"], "rule": "", "confidence": 0.9})
+        self.assertEqual(len(fl.active_term_rules("seriesA", root=self.root)), 1)
+
+    def test_series_term_supersedes_company_distinction(self):
+        # У2 (направление Н3): company-различение co-рендерится в промпте серии своей
+        # компании → новая series-замена тех же сущностей снимает его. Узкий вход
+        # (series-замена) гасит company-правило — покрываем направление series→company.
+        self._classify("seriesA", "Зифренд и Zifriend разные сущности", GROUP,
+                       {"durable": True, "type": "distinction",
+                        "subjects": ["Зифренд", "Zifriend"], "rule": "", "confidence": 0.9})
+        self.assertEqual(len(fl.active_company_distinction_rules(COMPANY, root=self.root)), 1)
+        self._learn("seriesA", "Зифренд → Zifriend")   # series-замена (коннектор-путь)
+        self.assertEqual(fl.active_company_distinction_rules(COMPANY, root=self.root), [])
         self.assertEqual(len(fl.active_term_rules("seriesA", root=self.root)), 1)
 
 

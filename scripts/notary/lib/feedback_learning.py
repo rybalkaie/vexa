@@ -94,6 +94,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -764,12 +765,12 @@ def _resolve_store(
 # Ф3 (ISS-19): защита от отравления — порог, дедуп/конфликт, лимиты, cross-kind
 # ---------------------------------------------------------------------------
 def _as_confidence(raw) -> float:
-    """confidence → float в [0,1]; не-число/NaN → 0.0 (осторожный дефолт A4, R8)."""
+    """confidence → float в [0,1]; не-число/NaN/±inf → 0.0 (осторожный дефолт A4, R8)."""
     try:
         c = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    if c != c:  # NaN
+    if not math.isfinite(c):  # NaN или ±inf — не валидная уверенность → осторожно 0.0
         return 0.0
     return max(0.0, min(1.0, c))
 
@@ -1188,6 +1189,10 @@ def record_classified_rule(
                                    source=source, root=root)
         if g:
             return g
+        # term-like пара уже активна в global (идемпотентный повтор) → НЕ дублируем её
+        # мусорным guidance; только НЕ-term-like маркер-терм падает в общий маршрут ниже.
+        if _pair_from(subjects[0], subjects[1]):
+            return None
     if scope == SCOPE_COMPANY and not company:
         company = _company_for_series_safe(series)
     # company неизвестна → дисциплину уровня держим консервативно: пишем в серию.
