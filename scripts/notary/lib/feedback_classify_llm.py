@@ -244,7 +244,11 @@ def parse_classification_response(raw: str) -> Optional[dict]:
 
 
 # ── Кандидат-уровень по типу встречи (Ф1 хинт; дисциплину уровня вводит Ф3) ──
-_BOT_NAME_RE = re.compile(r"бот|bot|протокол", re.IGNORECASE)
+# Имя бота-нотариуса — «Бот — протокол встречи» (CLAUDE.md проекта). Матчим
+# бот/bot как ЦЕЛЫЕ слова + фразу «протокол встречи», а НЕ подстроку: иначе
+# человек с этими буквами внутри имени («Ботвинник», «Abbott», «Протоколов»)
+# ошибочно выпал бы из счёта людей и сместил scope-хинт (Н1, ход1 ISS-19).
+_BOT_NAME_RE = re.compile(r"\bбот\b|\bbot\b|протокол встречи", re.IGNORECASE)
 
 
 def _count_humans(participants: Optional[list]) -> int:
