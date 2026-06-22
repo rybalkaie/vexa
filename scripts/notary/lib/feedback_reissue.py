@@ -1066,6 +1066,20 @@ def reissue_one(
                     feedback_router.route_edits(state, learning_edits)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] feedback-router hook упал (non-fatal): %s", e)
+                # Ф1 (ISS-19, R1/R2/R6/R13): LLM-классификатор «durable vs one-off»
+                # на ОСТАТКЕ регекспов — для смысловых правок, которые term/meaning-
+                # экстракторы не распознали (различение сущностей, разговорное
+                # объяснение смысла). Гейтится `ENABLE_FEEDBACK_LLM_CLASSIFY` (дефолт
+                # OFF — без флага claude не зовётся); зовётся ТОЛЬКО на остатке (РИСК4:
+                # не дублировать уже пойманное + не платить за лишние Haiku-вызовы).
+                # Ф1 только КЛАССИФИЦИРУЕТ (хранение новых типов — задел Ф2). Best-
+                # effort. Опасная тройка (R6): текст правок в лог/файлы не уходит.
+                try:
+                    from . import feedback_classify_llm  # noqa: PLC0415
+                    feedback_classify_llm.classify_remainder_edits(
+                        state, learning_edits, meta=meta, root=root)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[reissue] LLM-классификатор остатка упал (non-fatal): %s", e)
 
             # Ф2 (телеметрия РИСК4 + R6): фиксируем финальный ярус доставленного
             # перевыпуска (success-rate патча за окно) и — если патч пробовали, но он
