@@ -73,6 +73,19 @@ term-like токены и подаются в промпт как ДАННЫЕ-�
 поэтому смысл одной компании не протекает в протокол другой. В cross-company global
 (`spellings-global.jsonl`) по-прежнему едут ТОЛЬКО term-like написания; смысл/различение
 туда не пишутся (порог/изоляция cross-company global по маркеру «везде» — Ф3).
+
+Ф3 (ISS-19) — защита от отравления словаря ПОВЕРХ записи durable:
+  • R8 — порог уверенности `_DURABLE_MIN_CONFIDENCE` (env-override, осторожный дефолт,
+    калибруется реплеем Ф5): LLM-правило ниже порога не пишется (остаётся one-off).
+  • R7 — cross-company global (`spellings-global.jsonl`) только по явному маркеру «везде»
+    и ТОЛЬКО для term-like написаний; смысл/различение в global не уходят НИКОГДА (REQ 2.7),
+    маркер для них уровень не повышает. LLM-путь перехватывает маркер на своём ярусе.
+  • R9 — конфликт «последняя побеждает»: одна замена (`wrong`) → одно актуальное правило
+    в своём сторе (старое снимается supersede); межуровневый конфликт держит рендер.
+  • R17 — cross-kind: различение «X≠Y» и замена «X→Y» на одних сущностях взаимоисключающи,
+    новое отменяет старое противоположное (`_supersede_for_term`/`_supersede_for_distinction`
+    по co-рендерящимся сторам). Кейс-инициатор Dream Story/23МПКТК.
+  • Лимиты: `_MAX_ACTIVE_RULES_PER_STORE` — потолок активных durable-правил в сторе.
 """
 
 from __future__ import annotations
@@ -122,6 +135,22 @@ COMPANY_SCOPE_LABEL = "вся компания"
 
 # Дефолтная заметка различения (kind=distinction), если LLM не дал своей формулировки.
 _DISTINCTION_DEFAULT_NOTE = "разные сущности, не объединять"
+
+# Ф3 (ISS-19, R8): durable-порог уверенности LLM-классификатора. Правило с уверенностью
+# НИЖЕ порога НЕ пишется в durable — правка остаётся one-off (защита от отравления
+# словаря мусором). Дефолт ОСОЗНАННО ОСТОРОЖНЫЙ (A4: лучше пропустить полезное, чем
+# выучить мусор), но НЕ финальный: финальная калибровка — реплеем-оракулом в Ф5
+# (R15: тонкое «вывод с ИП» обязано пройти, «убери абзац» — нет). env-override без
+# передеплоя кода. Гейтит ТОЛЬКО LLM-путь; детерминированные регекс-правила (коннектор/
+# терм-пара) высокоточны и порогом не режутся (у них confidence нет).
+_DURABLE_MIN_CONFIDENCE = float(
+    os.environ.get("FEEDBACK_LLM_DURABLE_MIN_CONFIDENCE", "0.6") or "0.6")
+
+# Ф3 (ISS-19, лимиты/лавина): потолок числа АКТИВНЫХ durable-правил в одном сторе
+# (серия ИЛИ компания). Защита от лавины (отравление пачкой однотипных правок не
+# раздувает словарь без предела). Осознанно осторожный дефолт; env-override.
+_MAX_ACTIVE_RULES_PER_STORE = int(
+    os.environ.get("FEEDBACK_LEARNING_MAX_RULES_PER_STORE", "200") or "200")
 
 # Префикс первой строки дайджеста «🧠 Ватсон выучил …» — ЕДИНЫЙ источник истины.
 # Листенер опознаёт reply на дайджест по этому префиксу и роутит его в откат
@@ -731,6 +760,159 @@ def _resolve_store(
     return (None, None, None, None, None)
 
 
+# ---------------------------------------------------------------------------
+# Ф3 (ISS-19): защита от отравления — порог, дедуп/конфликт, лимиты, cross-kind
+# ---------------------------------------------------------------------------
+def _as_confidence(raw) -> float:
+    """confidence → float в [0,1]; не-число/NaN → 0.0 (осторожный дефолт A4, R8)."""
+    try:
+        c = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if c != c:  # NaN
+        return 0.0
+    return max(0.0, min(1.0, c))
+
+
+def _store_at_capacity(active_fn) -> bool:
+    """Стор переполнен активными durable-правилами (защита от лавины, R8/лимиты)?
+
+    Best-effort: сбой чтения стора → не блокируем запись (False). Cap общий на стор,
+    т.к. read-фильтр по компании/серии = выбор файла → одна серия/компания = один стор.
+    """
+    try:
+        return len(active_fn()) >= _MAX_ACTIVE_RULES_PER_STORE
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _entity_pair_key(a, b) -> frozenset:
+    """НЕУПОРЯДОЧЕННЫЙ ключ пары сущностей (casefold). Для cross-kind сравнения
+    term-пары (wrong,right) и различения (subject_a,subject_b) на одних сущностях."""
+    return frozenset([(a or "").casefold(), (b or "").casefold()])
+
+
+def _term_pair_key(rule: dict) -> frozenset:
+    return _entity_pair_key(rule.get("wrong"), rule.get("right"))
+
+
+def _distinction_key(rule: dict) -> frozenset:
+    return _entity_pair_key(rule.get("subject_a"), rule.get("subject_b"))
+
+
+def _co_render(scope: str, series: Optional[str], company: Optional[str], other: dict) -> bool:
+    """Co-рендерятся ли НОВОЕ правило (scope/series/company) и `other` в одном промпте?
+
+    Промпт серии X тянет: правила серии X + правила её компании + глобальные. Значит:
+      • любой global ↔ что угодно → да (global рендерится в каждой серии);
+      • company-C ↔ company-C → да; company-C ↔ series-X(∈C) → да (company видна в X);
+      • series-X ↔ series-X → да; series-X ↔ series-Y (X≠Y) → НЕТ (даже одной компании:
+        каждый промпт пер-серийный). Это держит cross-series изоляцию при supersede.
+    Компанию серии резолвим тем же `company_for_series`, что company-замок регенерации.
+    """
+    o_scope = other.get("scope") or "series"
+    if scope == SCOPE_GLOBAL or o_scope == SCOPE_GLOBAL:
+        return True
+    if scope == SCOPE_SERIES and o_scope == SCOPE_SERIES:
+        return bool(series and other.get("series")
+                    and str(series).casefold() == str(other.get("series")).casefold())
+    nc = company if scope == SCOPE_COMPANY else _company_for_series_safe(series)
+    oc = other.get("company") if o_scope == SCOPE_COMPANY else _company_for_series_safe(other.get("series"))
+    return bool(nc and oc and str(nc).casefold() == str(oc).casefold())
+
+
+def _same_store(scope: str, series: Optional[str], company: Optional[str], other: dict) -> bool:
+    """`other` лежит в ТОМ ЖЕ сторе (файле), что новое правило (scope+серия/компания).
+
+    Уже, чем `_co_render`: конфликт «последняя побеждает» (R9, одна и та же пара
+    wrong→{разные right}) резолвим ТОЛЬКО внутри одного стора; межуровневый конфликт
+    написаний (series>company>global) детерминированно решает рендер `_merge_levels`,
+    снимать чужой уровень здесь нельзя (он виден другим сериям)."""
+    o_scope = other.get("scope") or "series"
+    if scope != o_scope:
+        return False
+    if scope == SCOPE_GLOBAL:
+        return True
+    if scope == SCOPE_COMPANY:
+        return bool(company and other.get("company")
+                    and str(company).casefold() == str(other.get("company")).casefold())
+    return bool(series and other.get("series")
+                and str(series).casefold() == str(other.get("series")).casefold())
+
+
+def _retire(path: Path, rule: dict, reason: str) -> None:
+    """Деактивирует правило новым событием `rollback` В ЕГО ФАЙЛЕ (append-only, история
+    сохраняется). Supersede = тот же механизм, что ручной откат, но с системной причиной."""
+    _append_event_to_path(path, {
+        "op": "rollback",
+        "id": rule.get("id"),
+        "series": rule.get("series"),
+        "scope": rule.get("scope"),
+        "reason": reason,
+        "at": feedback_state.now_iso(),
+    })
+
+
+def _supersede_for_distinction(
+    a: str, b: str, *, scope: str, series: Optional[str], company: Optional[str],
+    root: Optional[Path],
+) -> list[str]:
+    """R17: новое РАЗЛИЧЕНИЕ «A ≠ B» отменяет ранее выученную ЗАМЕНУ A→B/B→A.
+
+    Ищем активные term-правила на той же НЕУПОРЯДОЧЕННОЙ паре во ВСЕХ журналах
+    (series+company+global), снимаем те, что co-рендерятся с новым различением (иначе
+    бот держал бы в промпте одновременно «пиши B вместо A» и «A и B — разные»). Это
+    ровно кейс Dream Story/23МПКТК. Best-effort. Возвращает id снятых правил."""
+    key = _entity_pair_key(a, b)
+    retired: list[str] = []
+    for f in _iter_all_log_files(root=root):
+        fold = _fold(_read_events_from_file(f))
+        for r in fold["rules"].values():
+            if not r.get("active") or (r.get("kind") or "term") != "term":
+                continue
+            if _term_pair_key(r) != key:
+                continue
+            if not _co_render(scope, series, company, r):
+                continue
+            _retire(f, r, "superseded:distinction")
+            retired.append(r.get("id"))
+    return retired
+
+
+def _supersede_for_term(
+    wrong: str, right: str, *, scope: str, series: Optional[str], company: Optional[str],
+    root: Optional[Path],
+) -> list[str]:
+    """R17 + R9 при записи term-замены «wrong→right»:
+
+      • R17 — снимаем активные РАЗЛИЧЕНИЯ на паре {wrong,right}, co-рендерящиеся с новой
+        заменой (новая замена «отменяет» прежнее различение тех же сущностей);
+      • R9  — снимаем активные term-правила с тем же `wrong`, но ДРУГИМ `right` в ТОМ ЖЕ
+        сторе (одна сущность → одно актуальное написание, последняя побеждает).
+    Best-effort. Возвращает id снятых правил."""
+    key = _entity_pair_key(wrong, right)
+    wl = (wrong or "").casefold()
+    rl = (right or "").casefold()
+    retired: list[str] = []
+    for f in _iter_all_log_files(root=root):
+        fold = _fold(_read_events_from_file(f))
+        for r in fold["rules"].values():
+            if not r.get("active"):
+                continue
+            o_kind = r.get("kind") or "term"
+            if o_kind == "distinction" and _distinction_key(r) == key:
+                if _co_render(scope, series, company, r):
+                    _retire(f, r, "superseded:term-vs-distinction")
+                    retired.append(r.get("id"))
+            elif o_kind == "term" \
+                    and (r.get("wrong") or "").casefold() == wl \
+                    and (r.get("right") or "").casefold() != rl:
+                if _same_store(scope, series, company, r):
+                    _retire(f, r, "superseded:term-latest")
+                    retired.append(r.get("id"))
+    return retired
+
+
 def record_global_spelling(
     wrong: str, right: str, *, author: Optional[str] = None,
     source: Optional[dict] = None, root: Optional[Path] = None,
@@ -752,6 +934,13 @@ def record_global_spelling(
                for r in active_global_spellings(root=root)}
     if (pair["wrong"].casefold(), pair["right"].casefold()) in already:
         return None
+    # Ф3 (R17/R9): глобальная замena отменяет противоположное различение на той же
+    # паре (везде) и устаревшее глоб-написание того же `wrong` (последнее побеждает).
+    try:
+        _supersede_for_term(pair["wrong"], pair["right"], scope=SCOPE_GLOBAL,
+                            series=None, company=None, root=root)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[fb-learn] supersede (global term) не удался (non-fatal): %s", e)
     rid = global_rule_id(pair["wrong"], pair["right"])
     record = {
         "op": "learn",
@@ -803,6 +992,10 @@ def record_meaning_rule(
                for r in active_fn() if r.get("kind") == "meaning"}
     if subj.casefold() + ">" + mean.casefold() in already:
         return None
+    if _store_at_capacity(active_fn):  # Ф3: защита от лавины (cap правил в сторе)
+        logger.warning("[fb-learn] стор переполнен (>=%d) — смысл не записан: scope=%s",
+                       _MAX_ACTIVE_RULES_PER_STORE, eff_scope)
+        return None
     rid = (meaning_rule_id(eff_series, subj, mean) if eff_scope == SCOPE_SERIES
            else _rule_id("lmc", eff_company, subj, mean))
     record = {
@@ -835,7 +1028,8 @@ def record_distinction_rule(
     Хранит, что A и B — РАЗНЫЕ, объединять нельзя (кейс Dream Story ≠ 23МПКТК). Уровень
     как у смысла: групповая → company (при известной компании), 1:1 → series. Идемпотентно
     по НЕУПОРЯДОЧЕННОЙ паре (A,B): «не A, а B» и «не B, а A» — одно правило. `note` —
-    формулировка LLM, иначе дефолт. Cross-kind конфликт с term-парой X→Y (R17) — Ф3.
+    формулировка LLM, иначе дефолт. Ф3 (R17): запись СНИМАЕТ ранее выученную замену
+    A→B/B→A (cross-kind supersede), чтобы в промпт не уходили оба противоположных правила.
     """
     if not is_enabled():
         return None
@@ -853,11 +1047,23 @@ def record_distinction_rule(
         scope, series, company, root=root)
     if append is None:
         return None
+    # Ф3 (R17, РИСК2): различение «A ≠ B» взаимоисключающе с заменой A→B. Снимаем
+    # ранее выученную замену на той же паре ДО записи (а не после идемпотентной
+    # развилки) — даже повтор различения гарантирует, что противоположная замена снята.
+    try:
+        _supersede_for_distinction(a, b, scope=eff_scope, series=eff_series,
+                                   company=eff_company, root=root)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[fb-learn] supersede (distinction) не удался (non-fatal): %s", e)
     pair_sorted = sorted([a.casefold(), b.casefold()])
     already = {tuple(sorted([(r.get("subject_a") or "").casefold(),
                              (r.get("subject_b") or "").casefold()]))
                for r in active_fn() if r.get("kind") == "distinction"}
     if tuple(pair_sorted) in already:
+        return None
+    if _store_at_capacity(active_fn):  # Ф3: защита от лавины (cap правил в сторе)
+        logger.warning("[fb-learn] стор переполнен (>=%d) — различение не записано: scope=%s",
+                       _MAX_ACTIVE_RULES_PER_STORE, eff_scope)
         return None
     rid = (_rule_id("ld", eff_series, *pair_sorted) if eff_scope == SCOPE_SERIES
            else _rule_id("ldc", eff_company, *pair_sorted))
@@ -910,6 +1116,10 @@ def record_guidance_rule(
                for r in active_fn() if r.get("kind") == "guidance"}
     if key in already:
         return None
+    if _store_at_capacity(active_fn):  # Ф3: защита от лавины (cap правил в сторе)
+        logger.warning("[fb-learn] стор переполнен (>=%d) — указание не записано: scope=%s",
+                       _MAX_ACTIVE_RULES_PER_STORE, eff_scope)
+        return None
     rid = (_rule_id("lh", eff_series, subj or rt) if eff_scope == SCOPE_SERIES
            else _rule_id("lhc", eff_company, subj or rt))
     record = {
@@ -935,26 +1145,49 @@ def record_guidance_rule(
 def record_classified_rule(
     classification: dict, *, series: Optional[str], company: Optional[str] = None,
     author: Optional[str] = None, source: Optional[dict] = None, root: Optional[Path] = None,
+    global_marked: bool = False,
 ) -> Optional[dict]:
-    """Пишет durable-правило от LLM-классификатора (`feedback_classify_llm`) — Ф2 (R3/R4).
+    """Пишет durable-правило от LLM-классификатора (`feedback_classify_llm`) — Ф2/Ф3.
 
     `classification` — выход `classify_edit_llm` `{durable, type, subjects, rule,
     confidence, scope_candidate}`. Маршрут по типу: distinction → `record_distinction_rule`,
     meaning → `record_meaning_rule`, прочее durable (guidance/term-на-остатке) →
     `record_guidance_rule` (не теряем). Уровень берём из `scope_candidate` (хинт Ф1 по
     типу встречи); company выводим из серии при scope=company. R6: персистим только
-    результат-правило, без сырого текста правки/ответа Claude. Порог уверенности и
-    cross-kind конфликт — Ф3 (здесь НЕ гейтим). Не durable / нечего писать → None.
+    результат-правило, без сырого текста правки/ответа Claude. Не durable → None.
+
+    Ф3:
+      • R8 — confidence НИЖЕ `_DURABLE_MIN_CONFIDENCE` → НЕ пишем (правка остаётся one-off).
+      • R7 — `global_marked` (явный маркер «везде/это бренд» снят в LLM-пути): term-like
+        пара едет в cross-company global написание (`spellings-global.jsonl`). Смысл/
+        различение/указание В cross-company global НЕ уходят НИКОГДА (🔴 REQ 2.7) — для них
+        маркер не повышает уровень, остаются company/series по типу встречи.
     """
     if not is_enabled():
         return None
     if not isinstance(classification, dict) or not classification.get("durable"):
+        return None
+    # R8 (A4): durable-порог уверенности — ниже порога правило не выучиваем (one-off).
+    # R6: в лог только метаданные (тип/уверенность), без текста правки.
+    conf = _as_confidence(classification.get("confidence"))
+    if conf < _DURABLE_MIN_CONFIDENCE:
+        logger.info("[fb-learn] durable отклонён порогом: type=%s conf=%.2f < %.2f",
+                    classification.get("type"), conf, _DURABLE_MIN_CONFIDENCE)
         return None
     ctype = classification.get("type")
     subjects = [s for s in (classification.get("subjects") or [])
                 if isinstance(s, str) and s.strip()]
     rule = (classification.get("rule") or "").strip()
     scope = classification.get("scope_candidate") or SCOPE_SERIES
+    # R7: явный маркер «везде» + term-like пара → cross-company global написание (как
+    # коннектор-путь для термов). Смысл/различение туда НЕ пускаем (REQ 2.7) — маркер
+    # для них игнорируем, падаем в обычный company/series-маршрут ниже. Не term-like
+    # пара (record_global_spelling → None) → тоже не теряем, идём обычным маршрутом.
+    if global_marked and ctype == "term" and len(subjects) >= 2:
+        g = record_global_spelling(subjects[0], subjects[1], author=author,
+                                   source=source, root=root)
+        if g:
+            return g
     if scope == SCOPE_COMPANY and not company:
         company = _company_for_series_safe(series)
     # company неизвестна → дисциплину уровня держим консервативно: пишем в серию.
@@ -1029,6 +1262,14 @@ def record_learning_from_edits(
                 if key in already:
                     continue
                 already.add(key)
+                # Ф3 (R9/R17): новая замена снимает противоположное различение на той же
+                # паре (cross-kind) и устаревшую замену того же `wrong` в ЭТОЙ серии
+                # (последняя побеждает) — до записи новой.
+                try:
+                    _supersede_for_term(pair["wrong"], pair["right"], scope=SCOPE_SERIES,
+                                        series=series, company=None, root=root)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[fb-learn] supersede (series term) не удался (non-fatal): %s", e)
                 rid = rule_id(series, pair["wrong"], pair["right"])
                 record = {
                     "op": "learn",

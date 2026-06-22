@@ -405,7 +405,10 @@ def classify_remainder_edits(
     1:1 → series) через `record_classified_rule`. Запись best-effort и под тем же флагом
     (is_enabled выше). Опасная тройка (R6): персистим лишь результат-правило, без текста
     правки/ответа Claude; в лог — только счётчики/тип/confidence.
-    Best-effort: гейт OFF / нет правок → []. Порог уверенности/дедуп cross-kind — Ф3.
+    Ф3 (R7/R8/R17): маркер «везде» пробрасывается в запись (`global_marked`) — term-like
+    с маркером → cross-company global; смысл/различение туда не уходят (REQ 2.7). Порог
+    уверенности (R8) и cross-kind конфликт (R17) применяет `record_classified_rule`.
+    Best-effort: гейт OFF / нет правок → [].
     """
     if not is_enabled():
         return []                                     # R13: без флага claude не зовём
@@ -431,8 +434,10 @@ def classify_remainder_edits(
         if not text.strip():
             continue
         # Снимаем маркер «везде/глобально…» (как record_learning_from_edits) —
-        # остаток считаем по тому же телу, что видят регекспы.
-        _is_global, body = feedback_learning._split_global_marker(text)
+        # остаток считаем по тому же телу, что видят регекспы. Ф3 (R7): сам факт
+        # маркера НЕ выбрасываем, а пробрасываем в запись (term-like с маркером →
+        # cross-company global; смысл/различение туда не уходят — REQ 2.7).
+        is_global, body = feedback_learning._split_global_marker(text)
         try:
             caught = bool(feedback_learning.extract_learned_terms(body)
                           or feedback_learning.extract_meaning_rules(body))
@@ -452,7 +457,8 @@ def classify_remainder_edits(
             try:
                 rec = feedback_learning.record_classified_rule(
                     res, series=(state or {}).get("series"),
-                    author=e.get("author"), source=state, root=root)
+                    author=e.get("author"), source=state, root=root,
+                    global_marked=is_global)
                 if rec:
                     n_written += 1
             except Exception as ex:  # noqa: BLE001
