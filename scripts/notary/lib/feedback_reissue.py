@@ -1052,7 +1052,10 @@ def reissue_one(
                 # Ленивый импорт (feedback_learning импортирует этот модуль — иначе цикл).
                 try:
                     from . import feedback_learning  # noqa: PLC0415
-                    feedback_learning.record_learning_from_edits(state, learning_edits, root=root)
+                    # meta → НЕС1/Ф2: смысл с групповой встречи едет на company-уровень,
+                    # с личной 1:1 — на серию (то же правило, что у LLM-классификатора).
+                    feedback_learning.record_learning_from_edits(
+                        state, learning_edits, meta=meta, root=root)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] self-learning hook упал (non-fatal): %s", e)
                 # D6 (Ф7): маршрутизатор фидбэка по слоям — РОЛИ → оргструктура

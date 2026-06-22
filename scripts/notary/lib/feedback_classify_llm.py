@@ -400,10 +400,12 @@ def classify_remainder_edits(
     глобальности снимаем перед проверкой — как делает `record_learning_from_edits`,
     чтобы остаток считался по тому же телу.
 
-    Ф1: только КЛАССИФИКАЦИЯ — результат возвращаем и логируем метаданными. ХРАНЕНИЕ
-    (scope=company, distinction/meaning в jsonl) подключит Ф2 в этой же точке.
-    Best-effort: гейт OFF / нет правок → []. Опасная тройка (R6): в лог — только
-    счётчики/тип/confidence, без текста правок.
+    Ф2 (R3/R4): durable-результат тут же ЗАПИСЫВАЕТСЯ в `feedback_learning` как
+    distinction/meaning/guidance со `scope` из `scope_candidate` (групповая → company,
+    1:1 → series) через `record_classified_rule`. Запись best-effort и под тем же флагом
+    (is_enabled выше). Опасная тройка (R6): персистим лишь результат-правило, без текста
+    правки/ответа Claude; в лог — только счётчики/тип/confidence.
+    Best-effort: гейт OFF / нет правок → []. Порог уверенности/дедуп cross-kind — Ф3.
     """
     if not is_enabled():
         return []                                     # R13: без флага claude не зовём
@@ -423,6 +425,7 @@ def classify_remainder_edits(
 
     results: list = []
     n_remainder = 0
+    n_written = 0
     for e in edits:
         text = (e.get("text") or "")
         if not text.strip():
@@ -439,14 +442,27 @@ def classify_remainder_edits(
             continue                                  # уже пойман детерминированно
         n_remainder += 1
         res = cf(body, participants)
-        if isinstance(res, dict):
-            results.append(res)
+        if not isinstance(res, dict):
+            continue
+        results.append(res)
+        # Ф2 (R3/R4): durable-результат пишем в feedback_learning сразу (scope из
+        # scope_candidate; company выводится из серии). Best-effort: сбой записи не
+        # валит перевыпуск и не теряет остальные правила. R6: только результат-правило.
+        if res.get("durable"):
+            try:
+                rec = feedback_learning.record_classified_rule(
+                    res, series=(state or {}).get("series"),
+                    author=e.get("author"), source=state, root=root)
+                if rec:
+                    n_written += 1
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("[fb-classify] запись durable-правила не удалась (non-fatal): %s", ex)
 
     if n_remainder:
         n_durable = sum(1 for r in results if r.get("durable"))
         logger.info(
-            "[fb-classify] series=%s остаток=%d durable=%d участников=%d",
-            (state or {}).get("series") or "?", n_remainder, n_durable,
+            "[fb-classify] series=%s остаток=%d durable=%d записано=%d участников=%d",
+            (state or {}).get("series") or "?", n_remainder, n_durable, n_written,
             _count_humans(participants),
         )
     return results

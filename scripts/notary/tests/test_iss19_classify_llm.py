@@ -286,15 +286,20 @@ class RemainderGatingTest(unittest.TestCase):
         # «не Dream Story, а 23МПКТК» — оба конца НЕ term-like (Dream Story = два
         # слова, проходит; но различение здесь регекс отдаёт?) проверяем фактический
         # остаток: классификатор зовётся на правке, которую регекспы не выучили.
+        # Ф2 добавила сюда ЗАПИСЬ durable-результата — изолируем root в tempdir,
+        # чтобы тест не писал в реальный feedback-dir (запись проверяет R3-сьют отдельно).
+        import tempfile
         calls = []
         cf = lambda t, p: (calls.append(t),
                            {"durable": True, "type": "distinction",
                             "subjects": ["Dream Story", "23МПКТК"],
                             "rule": "разные разделы", "confidence": 0.9})[1]
-        out = fcl.classify_remainder_edits(
-            {"series": "s", "feedback_id": "f"},
-            [{"text": "раздел не Dream Story, а 23МПКТК, это разные вещи"}],
-            meta={"participants": _PARTICIPANTS_GROUP}, classify_fn=cf)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = fcl.classify_remainder_edits(
+                {"series": "s", "feedback_id": "f"},
+                [{"text": "раздел не Dream Story, а 23МПКТК, это разные вещи"}],
+                meta={"participants": _PARTICIPANTS_GROUP}, classify_fn=cf,
+                root=Path(tmp))
         self.assertEqual(len(calls), 1)             # остаток → классификатор позван
         self.assertEqual(len(out), 1)
         self.assertTrue(out[0]["durable"])
