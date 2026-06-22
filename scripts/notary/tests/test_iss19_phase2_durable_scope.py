@@ -230,6 +230,27 @@ class ConflictLevelsTest(_Base):
         self.assertNotIn("COMPANY", block)
         self.assertNotIn("GLOBAL", block)
 
+    def test_two_company_meanings_same_subject_both_render(self):
+        # Н1 (цикл5 ход1): два company-уточнения ОДНОГО субъекта, выученные на РАЗНЫХ
+        # сериях компании — аддитивны, оба обязаны дойти до промпта. Раньше `_merge_levels`
+        # схлопывал их по subject и молча терял более новое (против сверхидеи).
+        fl.record_meaning_rule("seriesA", "вывод", "писать с ИП",
+                               scope="company", company=COMPANY, root=self.root)
+        fl.record_meaning_rule("seriesB", "вывод", "ставить отдельной строкой",
+                               scope="company", company=COMPANY, root=self.root)
+        block = fl.format_learned_terms_block("seriesC-другая", root=self.root)
+        self.assertIn("с ИП", block)
+        self.assertIn("отдельной строкой", block)
+
+    def test_two_series_meanings_same_subject_both_render(self):
+        # Тот же инвариант на уровне серии: два уточнения одного субъекта из разных
+        # раундов рендерятся оба (внутриуровневой аддитивности раньше не было).
+        fl.record_meaning_rule("seriesA", "отчёт", "квартальный, не годовой", root=self.root)
+        fl.record_meaning_rule("seriesA", "отчёт", "присылать в PDF", root=self.root)
+        block = fl.format_learned_terms_block("seriesA", root=self.root)
+        self.assertIn("квартальный", block)
+        self.assertIn("PDF", block)
+
 
 # ===========================================================================
 # НЕС1 — старый коннектор-путь тоже scope-по-типу-встречи
