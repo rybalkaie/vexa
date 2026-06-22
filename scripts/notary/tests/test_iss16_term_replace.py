@@ -417,17 +417,17 @@ class ReissueDeterministicIntegrationTest(unittest.TestCase):
         self.assertEqual(called["gen"], 1)
         self.assertEqual(res.get("status"), "sent")
 
-    def test_mixed_name_and_content_falls_back_to_regen(self):
-        # R7: смешанная (правка авторства + контент) → name-путь пропущен (есть контент),
-        # детерминированный term-путь не трогает (есть remap) → регенерация (как сегодня).
-        called = {"gen": 0}
+    def test_mixed_name_and_content_applied_pointwise(self):
+        # ISS-17 (R13/R14): смешанная (авторство + терсный контент) теперь применяется
+        # ТОЧЕЧНО по одному протоколу — name-remap детерминированно + term-замена
+        # детерминированно, БЕЗ регенерации. Раньше (R7-вне-скоупа) уходило в regen.
+        captured = {}
 
-        def _gen(path, meta, sid):
-            called["gen"] += 1
-            return ("#протоколвстречи 20.06.2026\n\n**Участники:** Илья\n\n"
-                    "---\n\n## Тема\n\n▪️ Регенерация.\n")
+        def _gen(*a, **k):
+            raise AssertionError("смешанный точечный путь лёг → generate_fn НЕ должна зваться")
 
         def _redeliver(meeting_meta, old_text, new_text, **k):
+            captured["new"] = new_text
             return {"status": "sent", "chat_id": 777, "message_ids": [99],
                     "revision": 1, "content_hash": "x"}
 
@@ -435,8 +435,10 @@ class ReissueDeterministicIntegrationTest(unittest.TestCase):
             "series": "iss16-term", "date": "2026-06-20",
             "meta_path": str(self.meta_path), "chat_id": 777,
             "feedback_id": "fb-iss16-mix",
+            # «не Илья, а Ольга» → oneway-remap {Илья Рыбалка→Ольга Сонина} (Ольга в
+            # expectedParticipants, не текущий спикер → не своп). Своп ушёл бы в regen.
             "edits": [
-                {"author": "Илья", "text": "не Илья, а Пётр"},
+                {"author": "Илья", "text": "не Илья, а Ольга"},
                 {"author": "Илья", "text": "замени фронтенд на frontend"},
             ],
         }
@@ -445,8 +447,17 @@ class ReissueDeterministicIntegrationTest(unittest.TestCase):
             generate_fn=_gen, redeliver_fn=_redeliver,
             save_version_fn=lambda *_a, **_k: None,
         )
-        self.assertEqual(called["gen"], 1, "смешанная правка → регенерация (R7)")
         self.assertEqual(res.get("status"), "sent")
+        new = captured["new"]
+        # Контентная часть применена точечно.
+        self.assertNotIn("фронтенд", new)
+        self.assertEqual(new.count("frontend"), 4)
+        # Авторская часть применена (Илья Рыбалка → Ольга Сонина).
+        self.assertNotIn("Илья", new)
+        self.assertIn("Ольга Сонина", new)
+        # Инварианты целы.
+        self.assertTrue(new.lstrip().startswith("#протоколвстречи"))
+        self.assertIn("⚠️", new)
 
 
 if __name__ == "__main__":

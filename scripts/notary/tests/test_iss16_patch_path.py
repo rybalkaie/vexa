@@ -591,10 +591,12 @@ class ReissuePatchIntegrationTest(unittest.TestCase):
         self.assertEqual(agg["regen_fallback"], 1)
         self.assertEqual(agg["patch_rejected"], 1)
 
-    # ---- R6: обычная регенерация БЕЗ попытки патча (remap/смесь) — без уведомления ----
+    # ---- R6: регенерация БЕЗ попытки патча (гейт OFF) — без уведомления ----
+    @mock.patch.dict(os.environ, {"ENABLE_PROTOCOL_PATCH": "0"})
     def test_no_notice_when_patch_not_attempted(self):
-        # Смешанная (имя+контент): remap есть → патч-путь не трогаем (R7) → регенерация
-        # как сегодня, БЕЗ уведомления о фолбэке (патч не пробовали).
+        # Патч-гейт OFF (тёмный запуск до активации Ф3): чисто контентная правка, которую
+        # детерминированный term-путь не разбирает → регенерация как сегодня, БЕЗ попытки
+        # патча → БЕЗ уведомления о фолбэке (⚠️-спама нет, пока путь не активирован).
         captured = {}
         gen_called = {"n": 0}
 
@@ -604,25 +606,17 @@ class ReissuePatchIntegrationTest(unittest.TestCase):
                     "---\n\n## Тема\n\n▪️ Регенерация.\n")
 
         notes = []
-        state = {
-            "series": "iss16-patch", "date": "2026-06-20",
-            "meta_path": str(self.meta_path), "chat_id": 777,
-            "feedback_id": "fb-mix-1", "round": 1,
-            "edits": [
-                {"author": "Илья", "text": "не Пётр, а Илья"},
-                {"author": "Илья", "text": "и бюджет на самом деле был 600к по итогу"},
-            ],
-        }
         res = self.fr.reissue_one(
-            state, root=self.tmp, generate_fn=_gen,
+            self._state("перефразируй вступление поживее", fid="fb-gate-off"),
+            root=self.tmp, generate_fn=_gen,
             redeliver_fn=self._capture_redeliver(captured),
             save_version_fn=lambda *_a, **_k: None,
-            patch_fn=lambda o, e: (_ for _ in ()).throw(AssertionError("patch_fn НЕ должна зваться при remap")),
+            patch_fn=lambda o, e: (_ for _ in ()).throw(AssertionError("patch_fn НЕ должна зваться при гейте OFF")),
             notify_fn=lambda *a, **k: notes.append(a),
         )
         self.assertEqual(res.get("status"), "sent")
         self.assertEqual(gen_called["n"], 1)
-        self.assertEqual(len(notes), 0, "патч не пробовали (remap) → нет уведомления о фолбэке")
+        self.assertEqual(len(notes), 0, "патч не пробовали (гейт OFF) → нет уведомления о фолбэке")
 
     # ---- R12: на сбое доставки на диске остаётся ОРИГИНАЛ ----
     def test_delivery_failure_keeps_original_on_disk(self):

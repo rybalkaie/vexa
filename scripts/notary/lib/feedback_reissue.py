@@ -867,8 +867,75 @@ def reissue_one(
             logger.warning("[reissue] патч-путь УПАЛ с исключением (фолбэк регенерация): %s", e)
             targeted_new_text = None
 
+    # Ф4 (ISS-17, R13/R14): СМЕШАННЫЙ / МНОГОПРАВОЧНЫЙ пакет — remap НЕпуст И content_edits
+    # НЕпуст. Раньше выпадал из ВСЕХ ярусов (Ф4 name требует not content_edits; Ф1 term и
+    # Ф2 patch требуют not remap) → полная регенерация = «плавание» всего текста. На бою
+    # смешанное — ЧАСТЫЙ случай (Илья правит пачкой: имя + термины + контент вместе).
+    # Чиним последовательно по ОДНОМУ протоколу: (1) детерминированный name-remap (Ф4-движок,
+    # без LLM), затем (2) контент по промежуточному протоколу — детерминированный term (Ф1) →
+    # не вышло → патч (Ф2). ВСЁ-ИЛИ-РЕГЕНЕРАЦИЯ (R14): любой под-шаг вернул None → откатываем
+    # промежуточный результат целиком и честно регенерируем (regen применит и remap
+    # транскрипта, и контент-инструкции — без потери правок, без регресса). Результат — в
+    # ТОТ ЖЕ слот targeted_new_text (R12: redeliver-до-диска, архив версий, коммит remapped
+    # транскрипта на sent). Опасная тройка (R8): name/term — без LLM; патч — протокол+правки
+    # как ДАННЫЕ, сырой ответ не персистим, в лог только метаданные.
+    if targeted_new_text is None and remap and content_edits:
+        try:
+            from . import targeted_protocol_edit as _tpe  # noqa: PLC0415
+            # (1) name-remap по СТАРОМУ протоколу — детерминированно. Тексты ИМЕННО
+            # авторских правок дают масштаб (одна реплика / все места человека).
+            _auth_texts = [
+                (edits[i].get("text") if isinstance(edits[i], dict) else "") or ""
+                for i in sorted(authorship_idx)
+            ]
+            _nres = _tpe.targeted_name_reissue(old_text, remap, _auth_texts)
+            if _nres is not None:
+                _mid_text, _nmeta = _nres
+                _ce_texts = [
+                    (e.get("text") if isinstance(e, dict) else "") or "" for e in content_edits
+                ]
+                # (2) контент по ПРОМЕЖУТОЧНОМУ протоколу: детерминированный term → патч.
+                _content_tier = None
+                _final_text = None
+                _tres = _tpe.targeted_term_reissue(_mid_text, _ce_texts)
+                if _tres is not None:
+                    _final_text, _ = _tres
+                    _content_tier = "deterministic"
+                else:
+                    from . import protocol_patch as _pp  # noqa: PLC0415
+                    if _pp.is_enabled():
+                        patch_attempted = True
+                        _known = list(current_speakers) + _author_name_pool(meta)
+                        _pres = _pp.targeted_patch_reissue(
+                            _mid_text, _ce_texts, known_names=_known,
+                            request_fn=patch_fn, meeting_sid=state.get("feedback_id"),
+                        )
+                        if _pres is not None:
+                            _final_text, _pmeta = _pres
+                            patch_applied = True
+                            patch_is_authorship = bool(_pmeta.get("is_authorship"))
+                            _content_tier = "patch"
+                if _content_tier is not None and _final_text is not None:
+                    targeted_new_text = _final_text
+                    # Опасная тройка: только tier + масштаб/под-ярус, без текста правок/реплик.
+                    logger.info(
+                        "[reissue] tier=mixed name_scope=%s content_tier=%s changes=%s meeting=%s",
+                        _nmeta.get("scope"), _content_tier, _nmeta.get("n_changes"),
+                        state.get("feedback_id"),
+                    )
+                # name лёг, контент — нет → ВСЁ-ИЛИ-РЕГЕНЕРАЦИЯ: targeted_new_text остаётся
+                # None, ниже честная регенерация применит оба слоя (без потери контента).
+        except Exception as e:  # noqa: BLE001 — смешанный путь не критичен → фолбэк регенерация
+            # warning (не info): исключение = СЛОМАЛСЯ смешанный путь (баг/дрейф), а не
+            # штатный None-фолбэк. str(e) текст реплик не несёт (опасная тройка R8).
+            logger.warning("[reissue] смешанный путь УПАЛ с исключением (фолбэк регенерация): %s", e)
+            targeted_new_text = None
+
     # Ф2 (телеметрия/РИСК4): финальный ярус доставленного перевыпуска. Детерминированный
-    # (Ф1/Ф4) и патч-путь дали targeted_new_text; иначе впереди регенерация → tier=regen.
+    # (Ф1/Ф4/смешанный-name) и патч-путь дали targeted_new_text; иначе регенерация → regen.
+    # Смешанный пакет (ISS-17) отражается под-ярусом контента: контент-патч → tier=patch
+    # (честно для success-rate РИСК4), контент-term → deterministic. Имя-remap всегда
+    # детерминированно и ортогонально — отдельного яруса телеметрии не требует.
     tier = "regen"
     if targeted_new_text is not None:
         tier = "patch" if patch_applied else "deterministic"
