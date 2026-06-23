@@ -1539,7 +1539,65 @@ def main() -> int:
     # warning, finalize не валится; протокол на диске уже есть, можно
     # переотправить вручную (через Ф6.x CLI или повторную финализацию).
     delivery_result = {"status": "not-run"}
-    if protocol_path.is_file():
+    # ISS-20 #4/#5 (инцидент 2026-06-23): пустую/провальную запись НЕ шлём в
+    # групповой чат серии (бот не должен позориться плашкой «не состоялась» перед
+    # командой). Вместо этого — ЛИЧНЫЙ алерт владельцу, чтобы он узнал о провале
+    # от бота, а не от участников встречи, и мог зайти руками.
+    _end_reason = str(meta.get("endReason") or meta.get("end_reason") or "").strip()
+    # None (а не 0) для внутреннего whisper_pyannote: пустоту по utterances
+    # детектим только у внешнего STT (прод = AssemblyAI), иначе ext_result=None
+    # ложно пометил бы каждую внутреннюю встречу как провал. endReason работает
+    # на любом бэкенде.
+    _utter_count = len(ext_result.utterances) if ext_result is not None else None
+    _recording_failed = (
+        _end_reason in {"no_one_joined", "deaf_with_participants"}
+        or _utter_count == 0
+    )
+    if _recording_failed:
+        _series_lbl = meta.get("series") or "?"
+        if _end_reason == "deaf_with_participants":
+            _why = "бот был в комнате и видел людей, но не получил звук (вероятный сбой захвата аудио)"
+        elif _end_reason == "no_one_joined":
+            _why = "за время ожидания в комнате так никто и не появился"
+        else:
+            _why = "запись получилась пустой — ни одной распознанной реплики"
+        _room_url = str(meta.get("meetingUrl") or "").strip()
+        _room_line = f"\nКомната: {_room_url}" if _room_url else ""
+        try:
+            from lib import notify  # noqa: PLC0415
+            notify.push_via_notarius(
+                f"⚠️ Ватсон: встреча «{_series_lbl}» {date_part} НЕ записана.\n"
+                f"Причина: {_why}.{_room_line}\n"
+                f"Зайти руками сейчас — скажи Альфреду: «подключи Ватсона к этой встрече»."
+            )
+        except Exception as _e:  # noqa: BLE001
+            log.warning("[delivery] owner-alert failed (non-fatal): %s", _e)
+        # ISS-20 ход1: пометить встречу ОБРАБОТАННОЙ в meta.delivered. Иначе
+        # collector (скип только по непустому delivered — collector.py
+        # `_delivery_done`) КАЖДЫЙ тик (5 мин) пере-финализирует пустую запись и
+        # шлёт алерт повторно (спам владельцу + лишний прогон STT). Пишем через
+        # канонический единый писатель meta (РИСК1) синтетический маркер:
+        # message_ids=[0] непустой → `_delivery_done`=True; decision помечает суть.
+        try:
+            from lib.llm_postprocess import _update_meta_delivered  # noqa: PLC0415
+            _update_meta_delivered(
+                _delivery_marker_meta_path(args.meta_json),
+                {
+                    "chat_id": 0,
+                    "message_ids": [0],
+                    "at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "decision": "owner-alert-failed-recording",
+                },
+            )
+        except Exception as _e:  # noqa: BLE001
+            log.warning("[delivery] failed-recording marker write failed (non-fatal): %s", _e)
+        delivery_result = {"status": "skipped-failed-recording", "endReason": _end_reason}
+        log.info(
+            "[delivery] провальная запись (endReason=%s, utter=%d) → личный алерт владельцу; "
+            "в групповой чат НЕ шлём", _end_reason or "—",
+            (_utter_count if _utter_count is not None else 0),
+        )
+    elif protocol_path.is_file():
         try:
             protocol_text_for_delivery = protocol_path.read_text(encoding="utf-8")
         except OSError as e:

@@ -258,47 +258,68 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
 
       win.logBot?.("[telemost-audio] discovering media elements…");
 
-      // Wait until at least one <audio>/<video> with audio is present
-      let attempts = 0;
-      let mediaElements: HTMLMediaElement[] = [];
-      while (attempts++ < 30) {
-        const all = Array.from(document.querySelectorAll("audio, video")) as HTMLMediaElement[];
-        mediaElements = all.filter((el) => {
-          try {
-            const ms = (el as any).srcObject as MediaStream | null;
-            return ms && ms.getAudioTracks().length > 0;
-          } catch {
-            return false;
-          }
-        });
-        if (mediaElements.length > 0) break;
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-
-      win.logBot?.(`[telemost-audio] found ${mediaElements.length} media elements with audio after ${attempts}s`);
-      if (mediaElements.length === 0) {
-        win.logBot?.("[telemost-audio] no audio sources — entering degraded mode (silent transcripts)");
-        win.__vexa_telemost_degraded = true;
-        return;
-      }
-
       const AudioCtxCls = win.AudioContext || win.webkitAudioContext;
       const audioCtx = new AudioCtxCls({ sampleRate: TARGET_RATE });
       const dest = audioCtx.createMediaStreamDestination();
-      for (const el of mediaElements) {
-        try {
-          const ms = (el as any).srcObject as MediaStream;
+
+      // ISS-20 (инцидент 2026-06-23): захват — НЕ разовый снимок при входе, а
+      // ЖИВОЕ слежение. Телемост периодически обрывает аудио-дорожки
+      // (Track ENDED) и поднимает новые при переустановке соединения; разовый
+      // снимок остаётся припаянным к мёртвым дорожкам → вечная тишина, даже
+      // когда люди говорят. Поэтому пере-сканируем DOM всю встречу и подмешиваем
+      // КАЖДУЮ новую аудио-дорожку в общий sink (dest). wired по track.id —
+      // защита от двойного подключения одной дорожки.
+      const wired = new Set<string>();
+      const rescan = (): number => {
+        let added = 0;
+        const all = Array.from(document.querySelectorAll("audio, video")) as HTMLMediaElement[];
+        for (const el of all) {
+          let ms: MediaStream | null = null;
+          try { ms = (el as any).srcObject as MediaStream | null; } catch { ms = null; }
           if (!ms) continue;
-          const sourceTracks = ms.getAudioTracks();
-          if (sourceTracks.length === 0) continue;
-          const src = audioCtx.createMediaStreamSource(new MediaStream([sourceTracks[0]]));
-          src.connect(dest);
-        } catch (e) {
-          win.logBot?.(`[telemost-audio] failed to wire element: ${(e as Error).message}`);
+          let tracks: MediaStreamTrack[] = [];
+          try { tracks = ms.getAudioTracks(); } catch { tracks = []; }
+          for (const track of tracks) {
+            if (!track || wired.has(track.id)) continue;
+            if (track.readyState === "ended") continue;
+            try {
+              const src = audioCtx.createMediaStreamSource(new MediaStream([track]));
+              src.connect(dest);
+              wired.add(track.id);
+              added++;
+              const shortId = String(track.id).slice(0, 11);
+              track.addEventListener("ended", () => {
+                wired.delete(track.id);
+                win.logBot?.(`[telemost-audio] track ended id=${shortId} — rescan подхватит замену`);
+              });
+            } catch (e) {
+              win.logBot?.(`[telemost-audio] wire failed: ${(e as Error).message}`);
+            }
+          }
         }
+        if (added > 0) {
+          win.__vexa_telemost_degraded = false;
+          win.logBot?.(`[telemost-audio] wired +${added} audio track(s), total=${wired.size}`);
+        } else if (wired.size === 0) {
+          win.__vexa_telemost_degraded = true;
+        }
+        return added;
+      };
+
+      // Стартовое ожидание первой дорожки (как раньше, ≤30 c) — но через тот же
+      // rescan, чтобы стартовый и live-путь были одной логикой.
+      let attempts = 0;
+      while (attempts++ < 30) {
+        if (rescan() > 0) break;
+        await new Promise((r) => setTimeout(r, 1000));
       }
-      const combined = dest.stream;
-      const source = audioCtx.createMediaStreamSource(combined);
+      win.logBot?.(`[telemost-audio] initial wired=${wired.size} after ${attempts}s`);
+      if (wired.size === 0) {
+        win.logBot?.("[telemost-audio] пока нет аудио-источников — rescan остаётся включённым, подхвачу как появятся");
+      }
+
+      // Граф захвата строим ВСЕГДА (даже если сейчас 0 дорожек): новые дорожки
+      // подмешиваются в dest по мере появления, ScriptProcessor читает микс.
       const proc = audioCtx.createScriptProcessor(4096, 1, 1);
 
       const bufferSize = Math.round(TARGET_RATE * (CHUNK_DURATION_MS / 1000));
@@ -331,15 +352,28 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
         }
       };
 
-      source.connect(proc);
+      const sink = audioCtx.createMediaStreamSource(dest.stream);
+      sink.connect(proc);
       proc.connect(audioCtx.destination);
+
+      // ЖИВОЕ слежение: пере-скан DOM каждые 2 c всю встречу — подхватывает
+      // новые/заменённые аудио-дорожки (см. ISS-20). Таймер гасится в stop().
+      const rescanTimer = setInterval(rescan, 2000);
+      win.__vexa_telemost_rescan_timer = rescanTimer;
+
       win.__vexa_telemost_capture_running = true;
-      win.logBot?.("[telemost-audio] capture started (16kHz mono, ~3s chunks)");
+      win.logBot?.("[telemost-audio] capture started (16kHz mono, ~3s chunks, live re-hook on)");
     }
 
     win.__vexa_telemost_start = start;
     win.__vexa_telemost_stop = () => {
       win.__vexa_telemost_capture_running = false;
+      try {
+        if (win.__vexa_telemost_rescan_timer) {
+          clearInterval(win.__vexa_telemost_rescan_timer);
+          win.__vexa_telemost_rescan_timer = null;
+        }
+      } catch {}
     };
     start().catch((e: any) => win.logBot?.(`[telemost-audio] start failed: ${e?.message}`));
   });
@@ -440,6 +474,19 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const startTs = Date.now();
   const noOneJoinedTimeoutMs = botConfig.automaticLeave?.noOneJoinedTimeout ?? 300_000;
   let endReason = "unknown";
+
+  // ISS-20 #2: «никто не пришёл» нельзя объявлять, если в панели ВИДНЫ люди —
+  // это «оглох» (вероятный сбой захвата), а не пустая комната. При живых людях
+  // ждём дольше (вдруг live-перехват #1 подцепит звук), и если к жёсткому
+  // потолку звука всё нет — выходим с ОТДЕЛЬНЫМ endReason для точечного алерта.
+  const DEAF_WITH_PEOPLE_TIMEOUT_MS = 1_800_000; // 30 мин потолок «оглох при людях»
+  let deafFlagged = false;
+  const PARTICIPANT_NOISE = ["скопировать ссылк", "копировать ссылк"]; // UI-шум панели, не имя
+  const hasRealParticipants = (): boolean =>
+    participantsPoll.getNames().some((n) => {
+      const s = (n || "").trim().toLowerCase();
+      return s.length > 0 && !PARTICIPANT_NOISE.some((t) => s.includes(t));
+    });
 
   // Ф5: состояния chunk-декаплинга.
   //   recording_active        — пишем сэмплы в текущий chunk_N.wav.
@@ -691,9 +738,25 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
 
         // До «начала встречи» работает только noOneJoinedTimeout.
         if (!meetingStarted) {
-          if (now - startTs >= noOneJoinedTimeoutMs) {
-            endReason = "no_one_joined";
-            logStep("end_no_one_joined", { elapsed_ms: now - startTs, timeout_ms: noOneJoinedTimeoutMs });
+          const elapsed = now - startTs;
+          const sawPeople = hasRealParticipants();
+          // ISS-20 #2: люди в панели → не «пустая комната». Ждём дольше (до
+          // DEAF_WITH_PEOPLE_TIMEOUT_MS), вдруг #1-перехват подцепит звук.
+          const effectiveTimeoutMs = sawPeople ? DEAF_WITH_PEOPLE_TIMEOUT_MS : noOneJoinedTimeoutMs;
+          // Один раз отметим «вижу людей, но глухо» по достижении обычного
+          // таймаута — сигнал для алерта владельцу (#5), даже если ещё ждём.
+          if (sawPeople && !deafFlagged && elapsed >= noOneJoinedTimeoutMs) {
+            deafFlagged = true;
+            logStep("deaf_with_participants_warning", {
+              elapsed_ms: elapsed, participants: participantsPoll.getNames().length,
+            });
+          }
+          if (elapsed >= effectiveTimeoutMs) {
+            endReason = sawPeople ? "deaf_with_participants" : "no_one_joined";
+            logStep(sawPeople ? "end_deaf_with_participants" : "end_no_one_joined", {
+              elapsed_ms: elapsed, timeout_ms: effectiveTimeoutMs,
+              participants: participantsPoll.getNames().length,
+            });
             clearInterval(timer);
             return resolve();
           }

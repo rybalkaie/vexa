@@ -37,7 +37,7 @@ export const BotConfigSchema = z.object({
   container_name: z.string().optional(),
   automaticLeave: z.object({
     waitingRoomTimeout: z.number().int().default(300000),
-    noOneJoinedTimeout: z.number().int().default(600000),
+    noOneJoinedTimeout: z.number().int().default(1200000), // ISS-20: 10→20 мин (поздний старт встречи не должен терять запись)
     everyoneLeftTimeout: z.number().int().default(120000)
   }).default({}),
   reconnectionIntervalMs: z.number().int().optional(),
