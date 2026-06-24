@@ -111,6 +111,16 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[regen] transcript: {transcript_path}", file=sys.stderr)
     print(f"[regen] protocol:   {protocol_path}", file=sys.stderr)
+    # Ф2 (ISS-22 б): снимок ПРОШЛОЙ версии ДО регенерации — atomic-перезапись её
+    # затрёт (РИСК2/A2). CLI не сохраняет _versions/, поэтому хватаем здесь и
+    # пробрасываем в self-review (инвариант «не потеряй задачи прошлой версии»).
+    # Best-effort: нет файла / не прочёлся → None → обычный self-review (R-b4).
+    prior_protocol_text = None
+    if protocol_path.is_file():
+        try:
+            prior_protocol_text = protocol_path.read_text(encoding="utf-8")
+        except OSError:
+            prior_protocol_text = None
     try:
         regenerate_protocol_for_meeting(
             transcript_path=transcript_path,
@@ -140,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
                 checks=("values", "roles", "memory", "diarization"),
                 meeting_sid=f"cli-{args.series}-{args.date}",
                 rewrite=True,
+                # Ф2 (ISS-22 б): прошлая версия → инвариант «не теряем задачи/решения».
+                prior_sources=[prior_protocol_text] if prior_protocol_text else None,
             )
             if n_flags:
                 print(f"[regen] self-review изменил {n_flags} пункт(ов)", file=sys.stderr)

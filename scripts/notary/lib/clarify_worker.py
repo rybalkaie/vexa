@@ -299,6 +299,10 @@ def _apply_resolution(
                     extra_findings=llm_postprocess.build_authorship_uncertainty_findings(
                         state.get("authorship_uncertain") or []
                     ),
+                    # Ф2 (ISS-22 б): снимок прошлой версии (old_protocol_text схвачен
+                    # ДО регенерации выше, :189-194) → инвариант «не теряем задачи/
+                    # решения прошлой версии». Эталон захвата call-site для команды/CLI.
+                    prior_sources=[old_protocol_text] if old_protocol_text else None,
                 )
                 if n_flags:
                     logger.info(

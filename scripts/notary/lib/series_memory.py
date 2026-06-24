@@ -406,6 +406,66 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
     return out[:_MAX_OPEN_TASKS]
 
 
+def extract_decisions(protocol_text: str) -> list[str]:
+    """Ф2 (инвариант «не теряем»): решения/договорённости ИЗ ГОТОВОГО протокола.
+
+    Буллеты под секцией решений — заголовок классифицируется ТОЙ ЖЕ
+    `_classify_heading` (через `_DECISION_HEADING_KEYS`: «Решения» / «Что внедряем»
+    / «Договорились»), что и `extract_open_tasks`/`extract_protocol_sections`. Это
+    НЕ отдельный парсер (РИСК3): переиспользует классификатор заголовков и
+    `_clean_bullet_text`, поэтому не разойдётся с вариантами написания секции и
+    не несёт статус-логики (у решений её нет). Чистая функция (без IO, без claude).
+
+    Возвращает дедуплицированный список формулировок решений, capped
+    `_MAX_KEY_POINTS`. НЕ кладёт сырые реплики — только сжатые пункты протокола.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    section = None  # carryover|tasks|theme|decisions|service|None
+    for raw_line in (protocol_text or "").splitlines():
+        hm = _HEADING_RE.match(raw_line)
+        if hm:
+            title = _THEME_NUM_PREFIX_RE.sub("", hm.group(1).strip()).strip()
+            title = re.sub(r"[*_`]{1,2}", "", title).strip()
+            section = _classify_heading(title)
+            continue
+        if section == "decisions" and _is_bullet(raw_line):
+            txt = _clean_bullet_text(raw_line)
+            k = _task_key(txt)
+            if txt and k not in seen:
+                seen.add(k)
+                out.append(txt)
+    return out[:_MAX_KEY_POINTS]
+
+
+def extract_items_from_versions(texts: list[str]) -> list[str]:
+    """Ф2/Ф3 (инвариант «финал ⊇ источников»): открытые задачи + решения из ОДНОГО
+    или НЕСКОЛЬКИХ готовых протоколов (прошлая версия и/или параллельный черновик
+    той же встречи), дедуплицированные МЕЖДУ источниками.
+
+    Обобщённый вход (`texts` — список): Ф2 подаёт одну прошлую версию, Ф3 (best-of-2)
+    переиспользует ТУ ЖЕ функцию, подавая второй независимый черновик (с прошлой
+    версией или без). Объединяет `extract_open_tasks` (несёт статус-логику Ф8/G9 —
+    carryover со статусом «закрыта» отфильтрован, поэтому закрытое транскриптом
+    НЕ воскрешается: A6/R-b5) + `extract_decisions`. БЕЗ LLM (без egress).
+
+    Дедуп по `_task_key` держит идемпотентность повторного регена (один и тот же
+    пункт из двух источников не задваивается). Битый/пустой текст → пропуск
+    (мягкая деградация R-b4: пустой список, а не падение). Чистая функция.
+    """
+    items: list[str] = []
+    seen: set[str] = set()
+    for text in texts or []:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        for it in extract_open_tasks(text) + extract_decisions(text):
+            k = _task_key(it)
+            if k and k not in seen:
+                seen.add(k)
+                items.append(it)
+    return items
+
+
 def _norm_speaker_mapping(speaker_mapping: Optional[dict]) -> dict[str, str]:
     """Ф4б: нормализует cluster→name маппинг для хранения в выжимке.
 

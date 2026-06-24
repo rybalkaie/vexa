@@ -420,6 +420,17 @@ def _job_protocol_command(
         "date": date_str,
         "transcript_filename": transcript_path.name,
     }
+    # Ф2 (ISS-22 б): снимок ПРОШЛОЙ версии протокола ДО регенерации — atomic-
+    # перезапись ниже её затрёт (РИСК2/A2). Команда не сохраняет _versions/ (это
+    # делает только clarify), поэтому хватаем здесь и пробрасываем в review как
+    # страховку инварианта «не потеряй задачи/решения прошлой версии». Best-effort:
+    # нет файла (первая сборка) / не прочёлся → None → обычный self-review (R-b4).
+    prior_protocol_text = None
+    if protocol_path.is_file():
+        try:
+            prior_protocol_text = protocol_path.read_text(encoding="utf-8")
+        except OSError:
+            prior_protocol_text = None
     try:
         regenerate_protocol_for_meeting(
             transcript_path=transcript_path,
@@ -448,6 +459,8 @@ def _job_protocol_command(
             checks=("values", "roles", "memory", "diarization"),
             meeting_sid=f"tg-cmd-{series}-{date_str}",
             rewrite=True,
+            # Ф2 (ISS-22 б): прошлая версия → инвариант «не теряем задачи/решения».
+            prior_sources=[prior_protocol_text] if prior_protocol_text else None,
         )
         if n_flags:
             logger.info(

@@ -1236,7 +1236,18 @@ def main() -> int:
     # Ф7 миграции collector синхронизируется на `_target_path`, пути совпадут.
     # Сейчас же — самый надёжный путь «<transcript-dir>/<date>-protokol.md».
     protocol_path = md_path.parent / f"{date_part}-protokol.md"
+    # Ф2 (ISS-22 б): снимок ПРОШЛОЙ версии ДО регенерации (atomic-перезапись её
+    # затрёт — РИСК2/A2). Обычная первая публикация → файла ещё нет → None → обычный
+    # self-review (R-b4). Перефинализация уже существующей встречи → прошлая версия
+    # есть → инвариант «не теряем». Для Ф3 (best-of-2) этот же `prior_sources`
+    # понесёт ВТОРОЙ независимый черновик (обобщённый вход переиспользуется).
+    prior_protocol_text = None
     if _is_protocol_enabled():
+        if protocol_path.is_file():
+            try:
+                prior_protocol_text = protocol_path.read_text(encoding="utf-8")
+            except OSError:
+                prior_protocol_text = None
         protocol_meta = dict(meta)
         protocol_meta["date"] = date_part
         protocol_meta["expectedParticipants"] = expected
@@ -1441,6 +1452,9 @@ def main() -> int:
                 # R3: ⚠️ «авторство под вопросом, поправьте» для тёзка-подстановок
                 # (system-applied, входит в content-hash). Паритет в clarify_worker.
                 extra_findings=build_authorship_uncertainty_findings(uncertain_names),
+                # Ф2 (ISS-22 б): прошлая версия (если перефинализация) → инвариант
+                # «не теряем задачи/решения». Первая публикация → None (R-b4).
+                prior_sources=[prior_protocol_text] if prior_protocol_text else None,
             )
             if n_flags:
                 log.info("[review] meeting=%s self-review изменил %d пункт(ов)", session_uid, n_flags)

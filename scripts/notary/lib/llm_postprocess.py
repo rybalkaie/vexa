@@ -5190,9 +5190,28 @@ _REVIEW_REWRITE_CHECKLIST = """Ты — придирчивый редактор-
 - НЕ трогай деление по спикерам в теле протокола — спорные места деления ты сообщишь отдельным списком (см. формат ниже), их пометит система."""
 
 
-def _build_rewrite_system_prompt(checks: tuple[str, ...]) -> str:
-    """System-prompt второго прохода Ф7: чек-лист критика + (опц.) сообщение о
-    грубых ошибках деления по спикерам (Ф4, ТЕМ ЖЕ вызовом) + контракт envelope.
+# Ф2 (ISS-22 б): инвариант «задачи не теряются между версиями». Включается в
+# system-prompt ТОЛЬКО когда на вход поданы пункты прошлой версии/второго черновика
+# (`has_prior_items`). Боевой rewrite-путь (все 4 call-site регенерации), НЕ
+# флаг-only `_build_review_system_prompt` (РИСК1: туда регенерация не ходит).
+_REVIEW_INVARIANT_SECTION = """ИНВАРИАНТ «НИЧЕГО НЕ ТЕРЯЕМ» (приоритет выше пунктов 1–5 выше):
+Отдельным блоком НИЖЕ (после транскрипта) дан список ЗАДАЧ и РЕШЕНИЙ из ПРОШЛОЙ версии этого же протокола (или из параллельного черновика той же встречи). Эти пункты уже были признаны важными — пересборка не имеет права молча потерять их «по дороге». Правила:
+- Каждый пункт из этого списка ОБЯЗАН остаться в улучшенном протоколе — на своём смысловом месте, в формулировке методички (переформулировать чище можно, но смысл и суть задачи/решения сохрани).
+- Если пункта НЕТ в черновике, но он есть в списке И транскрипт его подтверждает (или это явная задача/договорённость) — ВЕРНИ его в нужную секцию. Восстанавливай МОЛЧА: НИКАКИХ пометок «восстановлено / потеряно / добавлено критиком» в тексте — владелец должен видеть просто корректный готовый протокол.
+- НЕ возвращай пункт, если транскрипт ПРЯМО показывает, что вопрос решён или снят НА САМОЙ встрече: тогда он закрыт законно, тащить его назад как открытую задачу нельзя.
+- Список — это страховка от потери, а НЕ разрешение фантазировать: ничего сверх списка и транскрипта не добавляй."""
+
+
+def _build_rewrite_system_prompt(
+    checks: tuple[str, ...], *, has_prior_items: bool = False,
+) -> str:
+    """System-prompt второго прохода Ф7: чек-лист критика + (опц.) инвариант Ф2
+    «не теряем задачи прошлой версии» + (опц.) сообщение о грубых ошибках деления
+    по спикерам (Ф4, ТЕМ ЖЕ вызовом) + контракт envelope.
+
+    `has_prior_items` (Ф2/ISS-22 б): на вход поданы пункты прошлой версии/второго
+    черновика → добавляем секцию-инвариант. Сам СПИСОК пунктов идёт в user-prompt
+    (`review_and_rewrite_protocol`), здесь — только ПРАВИЛО.
 
     Контракт ответа — два блока, разделённых маркерами; протокол отдаётся СЫРЫМ
     markdown'ом после `===ПРОТОКОЛ===` (без JSON-эскейпа), `===ПРАВКИ===` несёт
@@ -5200,6 +5219,8 @@ def _build_rewrite_system_prompt(checks: tuple[str, ...]) -> str:
     """
     has_diar = "diarization" in checks
     parts = [_REVIEW_REWRITE_CHECKLIST]
+    if has_prior_items:  # Ф2 (ISS-22 б): инвариант «финал ⊇ прошлой версии»
+        parts.append(_REVIEW_INVARIANT_SECTION)
     if has_diar:
         parts.append(
             "Кроме редактуры — проверь ГРУБЫЕ ошибки деления по спикерам в "
@@ -5614,6 +5635,7 @@ def review_and_rewrite_protocol(
     checks: tuple[str, ...] = ("values",),
     meeting_sid: Optional[str] = None,
     timeout: Optional[int] = None,
+    prior_items: Optional[list[str]] = None,
 ) -> RewriteResult:
     """Ф7 (G8): ВТОРОЙ проход «редактор-критик». ОДИН claude-вызов (Opus), который
     и переписывает черновик по чек-листу (пропущенное / задачи без владельца /
@@ -5625,9 +5647,15 @@ def review_and_rewrite_protocol(
     маркер `degraded` (caller отдаёт черновик как финал), НЕ молчаливый провал и
     НЕ потеря встречи. Best-effort, как `review_protocol`.
 
-    G10/опасная тройка: в промпт — только черновик + транскрипт (нужны для
-    вычитки); лог несёт длину/время/счётчики, НЕ текст транскрипта/реплик; полный
-    ответ модели не сохраняется (результат — сам улучшенный протокол).
+    `prior_items` (Ф2/ISS-22 б) — обобщённый вход «дополнительные источники-пункты»:
+    задачи/решения прошлой версии протокола (или второго черновика той же встречи
+    в Ф3 best-of-2). Включает секцию-инвариант «ничего не теряем» в system-prompt и
+    подаёт сам список в user-prompt. Пусто/None → обычный второй проход (R-b4).
+
+    G10/опасная тройка: в промпт — только черновик + транскрипт + (опц.) пункты
+    прошлой версии той же встречи (нужны для вычитки); лог несёт длину/время/
+    счётчики, НЕ текст транскрипта/реплик; полный ответ модели не сохраняется
+    (результат — сам улучшенный протокол).
     """
     if not _is_protocol_review_enabled() or not _is_protocol_selfreview_enabled():
         return RewriteResult([], None, {}, "disabled")
@@ -5637,11 +5665,22 @@ def review_and_rewrite_protocol(
         return RewriteResult([], None, {}, "")
     if timeout is None:
         timeout = _selfreview_timeout()
-    system_prompt = _build_rewrite_system_prompt(checks)
+    prior_items = [s for s in (prior_items or []) if s and s.strip()]
+    system_prompt = _build_rewrite_system_prompt(checks, has_prior_items=bool(prior_items))
     user_prompt = (
         "ЧЕРНОВИК протокола (вычитать и улучшить):\n\n" + protocol_text
         + "\n\n---\n\nТРАНСКРИПТ (источник истины):\n\n" + transcript_md
     )
+    if prior_items:
+        # Ф2 (ISS-22 б): список пунктов прошлой версии/второго черновика — страховка
+        # от потери (правило в _REVIEW_INVARIANT_SECTION выше). Только формулировки
+        # пунктов (производное от сжатого протокола), НЕ сырые реплики.
+        prior_block = "\n".join(f"- {it.strip()}" for it in prior_items)
+        user_prompt += (
+            "\n\n---\n\nПУНКТЫ ПРОШЛОЙ ВЕРСИИ — задачи и решения, которые НЕ должны "
+            "пропасть (см. ИНВАРИАНТ «НИЧЕГО НЕ ТЕРЯЕМ» в инструкции):\n\n"
+            + prior_block
+        )
     started = time.monotonic()
     try:
         raw = call_claude_print(
@@ -5708,6 +5747,7 @@ def review_and_flag_protocol_file(
     meeting_sid: Optional[str] = None,
     rewrite: bool = False,
     extra_findings: Optional[list[dict]] = None,
+    prior_sources: Optional[list[str]] = None,
 ) -> int:
     """Высокоуровневая обёртка 5.2/Ф4/Ф7: читает протокол+транскрипт, прогоняет
     ревью-проход (ОДИН claude-вызов), затем правит файлы.
@@ -5729,6 +5769,14 @@ def review_and_flag_protocol_file(
     `apply_review_flags` (один хвостовой блок, идемпотентно) в ОБОИХ режимах. Так
     пометка ставится из ОБОИХ call-site (finalize + clarify_worker), переживает
     перегенерацию протокола (clarify) и входит в content-hash. Пусто → как раньше.
+
+    `prior_sources` (Ф2/ISS-22 б) — тексты прошлой версии протокола и/или второго
+    черновика ТОЙ ЖЕ встречи, схваченные call-site'ом ДО регенерации (РИСК2/A2: к
+    этому моменту файл `protocol_path` уже перезаписан новым черновиком — читать
+    «прошлую версию» отсюда было бы сравнением черновика с самим собой). Из них
+    детерминированно (без LLM) извлекаются задачи/решения, которые финал обязан
+    сохранить (инвариант «не теряем»). Действует только на rewrite-пути. Пусто →
+    обычный второй проход (мягкая деградация R-b4).
 
     Оба файла пишутся atomic, независимо и best-effort: сбой записи одного не
     валит встречу и не мешает второму. Возвращает суммарное число изменений.
@@ -5753,6 +5801,7 @@ def review_and_flag_protocol_file(
         return _selfreview_rewrite_and_apply(
             protocol_path, transcript_path, protocol_text, transcript_md,
             checks=checks, meeting_sid=meeting_sid, extra_findings=extra,
+            prior_sources=prior_sources,
         )
 
     findings = review_protocol(
@@ -5795,6 +5844,49 @@ def review_and_flag_protocol_file(
     return n_flags + n_fixes
 
 
+def _extract_prior_items(prior_sources: Optional[list[str]]) -> list[str]:
+    """Ф2 (ISS-22 б): из текстов прошлой версии/второго черновика достаёт открытые
+    задачи + решения, которые финал обязан сохранить (инвариант «не теряем»).
+
+    Делегирует в `series_memory.extract_items_from_versions` (РИСК3: переиспускает
+    `extract_open_tasks` со статус-логикой Ф8/G9 + `extract_decisions`, НЕ новый
+    парсер; БЕЗ LLM/egress). Закрытые транскриптом carryover-задачи там уже
+    отфильтрованы → инвариант не воскрешает закрытое (A6/R-b5). Обёрнуто в
+    try/except: любой неожиданный вход → [] (мягкая деградация R-b4, обычный
+    self-review без падения). G10: сам список в лог НЕ пишем — только счётчики."""
+    if not prior_sources:
+        return []
+    try:
+        return series_memory.extract_items_from_versions(
+            [s for s in prior_sources if isinstance(s, str)]
+        )
+    except Exception as e:  # noqa: BLE001 — деградация важнее, встречу не теряем
+        logger.warning(
+            "[selfreview] prior-items extract failed (non-fatal): %s", type(e).__name__,
+        )
+        return []
+
+
+def _norm_tokens_for_match(text: str) -> set[str]:
+    """Множество значимых слов (длиной ≥4) текста — для ГРУБОГО форензик-сравнения
+    «пункт присутствует в протоколе». ТОЛЬКО для счётчика восстановленных пунктов,
+    не для корректности (корректность держит сам критик по инварианту в промпте)."""
+    s = re.sub(r"[*_`]{1,2}", "", text or "")
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return {t for t in s.lower().split() if len(t) >= 4}
+
+
+def _item_present_in(item: str, text_tokens: set[str]) -> bool:
+    """Грубая эвристика «пункт присутствует в тексте» (для форензик-счётчика):
+    ≥60% значимых слов пункта встречаются в множестве слов текста. Пункт без
+    значимых слов считаем присутствующим (не шумим в счётчике потерь)."""
+    toks = _norm_tokens_for_match(item)
+    if not toks:
+        return True
+    hits = sum(1 for t in toks if t in text_tokens)
+    return hits >= max(1, int(0.6 * len(toks)))
+
+
 def _selfreview_rewrite_and_apply(
     protocol_path: Path,
     transcript_path: Path,
@@ -5804,6 +5896,7 @@ def _selfreview_rewrite_and_apply(
     checks: tuple[str, ...],
     meeting_sid: Optional[str],
     extra_findings: Optional[list[dict]] = None,
+    prior_sources: Optional[list[str]] = None,
 ) -> int:
     """Ф7 (G8): прогоняет второй проход (`review_and_rewrite_protocol`, ОДИН
     вызов) и применяет результат:
@@ -5815,9 +5908,16 @@ def _selfreview_rewrite_and_apply(
     В режиме rewrite content-находки (values/roles/memory) НЕ флажатся — критик
     исправил их прямо в тексте (A5: владелец видит финал, не пометки). Лог — ТОЛЬКО
     счётчики/метаданные (G10), без текста реплик/имён. Возвращает число изменений.
+
+    `prior_sources` (Ф2/ISS-22 б): тексты прошлой версии/второго черновика → из них
+    извлекаются задачи/решения (инвариант «не теряем»), подаются критику. Восстановление
+    молчаливое, поэтому для аудита логируем СЧЁТЧИК: сколько прошлых пунктов было под
+    угрозой (нет в черновике) и сколько критик вернул в финал — без текста пунктов.
     """
+    prior_items = _extract_prior_items(prior_sources)
     result = review_and_rewrite_protocol(
         protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
+        prior_items=prior_items,
     )
     findings = result.findings
     rewrite_applied = result.protocol is not None
@@ -5827,6 +5927,22 @@ def _selfreview_rewrite_and_apply(
         # Дисклеймер авторства (Ф4а) обязан выжить редактуру: модель просили его
         # сохранить, но подстраховываемся идемпотентной вставкой (no-op, если есть).
         base_protocol = protocol_to_tg.insert_protocol_disclaimer(base_protocol)
+
+    # Ф2 (ISS-22 б, форензика): восстановление потерянных пунктов МОЛЧАЛИВОЕ →
+    # для аудита считаем, сколько прошлых пунктов было «под угрозой» (отсутствуют в
+    # черновике) и сколько уцелело в финале после критика. Эвристика грубая —
+    # только для счётчика, НЕ для корректности (её держит критик по инварианту в
+    # промпте). G10/опасная тройка: логируем ЧИСЛА, текст пунктов/реплик — НЕ логируем.
+    n_prior = len(prior_items)
+    n_at_risk = n_recovered = 0
+    if prior_items:
+        draft_tokens = _norm_tokens_for_match(protocol_text)
+        final_tokens = _norm_tokens_for_match(base_protocol)
+        for it in prior_items:
+            if not _item_present_in(it, draft_tokens):
+                n_at_risk += 1
+                if _item_present_in(it, final_tokens):
+                    n_recovered += 1
 
     # Ф4 (D2): re-attribution однозначных реплик в ТРАНСКРИПТЕ (отдельный файл).
     n_fixes = 0
@@ -5861,14 +5977,17 @@ def _selfreview_rewrite_and_apply(
             logger.warning("[selfreview] protocol write failed %s: %s", protocol_path, e)
 
     e = result.edits or {}
-    # G10: лог — только метаданные/счётчики, без текста реплик/имён.
+    # G10: лог — только метаданные/счётчики, без текста реплик/имён. Ф2: prior-items
+    # (проверено) / at-risk (под угрозой потери) / recovered (вернул критик).
     logger.info(
         "[selfreview] meeting=%s rewrite=%s degraded=%s diar-fixes=%d diar-flags=%d "
-        "added=%d owners=%d roles=%d sharpened=%d numbers=%d",
+        "added=%d owners=%d roles=%d sharpened=%d numbers=%d "
+        "prior-items=%d at-risk=%d recovered=%d",
         meeting_sid or "?", "applied" if rewrite_applied else "skipped", result.degraded,
         n_fixes, len(diar_flags) if n_protocol_changes else 0,
         e.get("added_agreements", 0), e.get("owners_assigned", 0),
         e.get("roles_separated", 0), e.get("sharpened", 0), e.get("numbers_fixed", 0),
+        n_prior, n_at_risk, n_recovered,
     )
     return n_fixes + n_protocol_changes
 
