@@ -1923,6 +1923,78 @@ def regenerate_protocol_for_meeting(
     return protocol_path
 
 
+def _is_finalize_best_of_2_enabled() -> bool:
+    """Kill-switch Ф3 (ISS-22 в) best-of-2 на ПЕРВОЙ публикации (finalize):
+    `ENABLE_FINALIZE_BEST_OF_2` (дефолт ON; `0/false/no` → OFF). OFF → один черновик
+    + критик (поведение до Ф3), без передеплоя. ТОЛЬКО finalize читает этот гейт —
+    редкие пути (команда «протокол …», CLI) его НЕ трогают (R-c3)."""
+    raw = (os.environ.get("ENABLE_FINALIZE_BEST_OF_2") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def generate_alt_draft_for_best_of_2(
+    transcript_path: Path,
+    meeting_meta: dict,
+    *,
+    method_text: Optional[str] = None,
+    meeting_sid: Optional[str] = None,
+    series_memory: Optional[str] = None,
+    open_tasks: Optional[str] = None,
+) -> Optional[str]:
+    """Ф3 (ISS-22 в, best-of-2): генерит ВТОРОЙ независимый черновик ТОЙ ЖЕ встречи
+    В ПАМЯТИ и возвращает его текст (или None).
+
+    НЕС1: на диске уже лежит черновик A (его записал `regenerate_protocol_for_meeting`
+    на finalize-пути); второй черновик НЕ пишем atomic — вторая запись затёрла бы A.
+    Текст B уходит в `prior_sources` склейщика-критика (он принимает текст-в-памяти,
+    файл для B не нужен).
+
+    Вход тот же, что у генерации черновика A (transcript + meta + series_memory +
+    open_tasks): два НЕЗАВИСИМЫХ прогона одной встречи ловят разное — один удачнее
+    формулирует, другой не упускает (best-of-2). Сам `generate_protocol` НЕ меняем,
+    лишь зовём второй раз.
+
+    Деградация (R-c2): гейт OFF / транскрипт пуст-нечитаем / любой сбой генерации
+    (таймаут, нет CLI, ответ без шапки) → None. Caller отдаёт одинарную версию
+    (черновик A + критик); встреча НЕ теряется и finalize НЕ падает — функция НЕ
+    бросает (ловим широко, деградация важнее точности класса ошибки).
+
+    Опасная тройка (G10): egress — той же встречи (не кросс-встреча), риск принят
+    владельцем 2026-05-26; лог — только счётчик длины + класс ошибки, без текста
+    транскрипта/протокола.
+    """
+    if not _is_finalize_best_of_2_enabled():
+        return None
+    try:
+        transcript_md = transcript_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "[best-of-2] draft-B transcript read failed meeting=%s: %s",
+            meeting_sid or "?", type(exc).__name__,
+        )
+        return None
+    if not transcript_md.strip():
+        return None
+    enriched_meta = dict(meeting_meta)
+    enriched_meta.setdefault("transcript_filename", transcript_path.name)
+    try:
+        draft_b = generate_protocol(
+            transcript_md, enriched_meta,
+            method_text=method_text, meeting_sid=meeting_sid,
+            series_memory=series_memory, open_tasks=open_tasks,
+        )
+    except Exception as exc:  # noqa: BLE001 — деградация важнее: встречу не теряем (R-c2)
+        logger.warning(
+            "[best-of-2] draft-B generation failed (non-fatal) meeting=%s: %s",
+            meeting_sid or "?", type(exc).__name__,
+        )
+        return None
+    logger.info(
+        "[best-of-2] draft-B generated meeting=%s out_len=%d", meeting_sid or "?", len(draft_b),
+    )
+    return draft_b
+
+
 # ---------- Ф6 (umnyi-protokol-assemblyai): кросс-встречный фон + фильтр G11 ----------
 # Оркестрация широкого кросс-встречного фона для промпта генерации. Чистая логика
 # пула/ранжирования/лимита живёт в `series_memory` (stdlib-only); сюда вынесены два

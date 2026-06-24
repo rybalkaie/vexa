@@ -71,6 +71,7 @@ from lib.llm_postprocess import (  # noqa: E402
     clarify_speakers_via_telegram,
     deliver_protocol,
     extract_tasks,
+    generate_alt_draft_for_best_of_2,
     map_speaker_names,
     maybe_clarify_pending_deadlines,
     maybe_clarify_task_count,
@@ -1442,6 +1443,26 @@ def main() -> int:
     # 2 тяжёлых вызова суммарно (генерация + этот), НЕ третий. РИСК1: таймаут/сбой
     # второго прохода → черновик отдаётся как финал (деградация, не потеря встречи).
     if _is_protocol_enabled() and protocol_path.is_file():
+        # Ф3 (ISS-22 в, best-of-2): на ПЕРВОЙ публикации (finalize) протокол
+        # собирается из ДВУХ независимых черновиков. Черновик A уже на диске
+        # (regenerate_protocol_for_meeting выше); генерим черновик B ТОЙ ЖЕ встречи
+        # В ПАМЯТИ — без второй atomic-записи (НЕС1: она затёрла бы A) — и склеиваем
+        # лучшее из обоих ТЕМ ЖЕ движком-критиком (Ф2): B уходит в prior_sources,
+        # инвариант «не теряем» доносит до финала пункт, пойманный любым прогоном
+        # (R-c1). Сбой/гейт-OFF второго прогона → None → одинарная версия
+        # (деградация R-c2). Утяжеление ТОЛЬКО здесь — команда «протокол …» и CLI
+        # на одном прогоне (R-c3). Egress — той же встречи (опасная тройка).
+        draft_b = generate_alt_draft_for_best_of_2(
+            transcript_path=md_path,
+            meeting_meta=protocol_meta,
+            meeting_sid=session_uid,
+            series_memory=series_memory_block,  # тот же вход, что у черновика A
+            open_tasks=open_tasks_block,
+        )
+        # Источники склейки: прошлая версия (если перефинализация, Ф2) + второй
+        # черновик (Ф3). Обычная первая публикация → prior_protocol_text=None →
+        # только B. Оба None → обычный одинарный self-review (R-b4/R-c2).
+        merge_sources = [s for s in (prior_protocol_text, draft_b) if s]
         try:
             n_flags = review_and_flag_protocol_file(
                 protocol_path=protocol_path,
@@ -1452,9 +1473,11 @@ def main() -> int:
                 # R3: ⚠️ «авторство под вопросом, поправьте» для тёзка-подстановок
                 # (system-applied, входит в content-hash). Паритет в clarify_worker.
                 extra_findings=build_authorship_uncertainty_findings(uncertain_names),
-                # Ф2 (ISS-22 б): прошлая версия (если перефинализация) → инвариант
-                # «не теряем задачи/решения». Первая публикация → None (R-b4).
-                prior_sources=[prior_protocol_text] if prior_protocol_text else None,
+                # Ф2 (ISS-22 б) + Ф3 (best-of-2): прошлая версия и/или второй черновик
+                # → инвариант «не теряем задачи/решения». РИСК4: склейка идёт ЧЕРЕЗ
+                # ЭТУ файл-обёртку (полный checks-tuple + сайд-эффекты finalize:
+                # diarization-fix в транскрипт, дисклеймер, ⚠️ авторства), НЕ мимо неё.
+                prior_sources=merge_sources or None,
             )
             if n_flags:
                 log.info("[review] meeting=%s self-review изменил %d пункт(ов)", session_uid, n_flags)
