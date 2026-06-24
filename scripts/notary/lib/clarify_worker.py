@@ -230,7 +230,8 @@ def _apply_resolution(
                 # Ф8 (G9): хвост открытых задач серии из тех же выжимок (kill-switch
                 # внутри). Паритет с finalize call-site (footgun two-call-sites).
                 open_tasks_block = series_memory.build_open_tasks_block(
-                    _smem, meeting_sid=state.get("meeting_id"),
+                    _smem, series_dir=transcript_path.parent,
+                    meeting_sid=state.get("meeting_id"),
                 )
         except Exception:  # noqa: BLE001
             series_memory_block = ""

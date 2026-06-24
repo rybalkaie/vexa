@@ -102,6 +102,28 @@ _OPEN_TASK_STATUS_SUFFIX_RE = re.compile(
     r"\s*[—–-]\s*(?:🔻\s*)?висит(?:,?\s*статус\??)?[\s.!…)]*$", re.IGNORECASE
 )
 
+# Ф2 (pending-items): sidecar-статусы висяка. Файл `task-status.json` рядом с
+# `<date>-memory.json` в каталоге серии — ОДИН на серию (статус — свойство хвоста
+# серии, не отдельной встречи). Финализация его НЕ пишет (build_digest/save_digest
+# трогают только `<date>-memory.json`) → статусы переживают регенерацию (ядро Ф2,
+# снятие РИСК1). Пишут его reply-канал (Ф5) и сверщик (Ф6); читает рендер хвоста.
+TASK_STATUS_FILE = "task-status.json"
+TASK_STATUS_SCHEMA = 1
+
+# Набор статусов висяка (план Ф2). Внутренние коды; человекочитаемые ярлыки причин
+# («по встрече»/«по чату»/…) живут в поле reason, рендер — Ф3.
+STATUS_OPEN = "open"            # висит (дефолт — записи в sidecar может и не быть)
+STATUS_DONE = "done"           # закрыто-сделано
+STATUS_CANCELLED = "cancelled"  # отменён (снят без выполнения — норма, R5)
+STATUS_DOUBT = "doubt"         # под сомнением (буфер, R10/R16 — не закрываем молча)
+STATUS_AUTO_CLOSED = "auto_closed"  # закрыто-авто (сверщик/кросс-серийно, R20)
+_VALID_STATUSES = frozenset(
+    {STATUS_OPEN, STATUS_DONE, STATUS_CANCELLED, STATUS_DOUBT, STATUS_AUTO_CLOSED}
+)
+# Терминально закрытые: НЕ показываются как «висит» (ядро Ф2 — не воскресают).
+# «под сомнением» — НЕ терминальный (буфер): показывается отдельным подблоком (Ф3).
+_TERMINAL_CLOSED = frozenset({STATUS_DONE, STATUS_CANCELLED, STATUS_AUTO_CLOSED})
+
 # Служебные заголовки протокола — НЕ темы встречи.
 _DECISION_HEADING_KEYS = ("решен", "что внедряем", "договорил")
 _TASK_HEADING_KEYS = ("задач",)
@@ -353,6 +375,45 @@ def _task_key(text: str) -> str:
     """Ключ дедупликации задачи: lower, без эмфазы, схлопнутые пробелы."""
     s = re.sub(r"[*_`]{1,2}", "", text or "")
     return re.sub(r"\s+", " ", s).strip().lower()
+
+
+# Ф2 (pending-items): хвостовой «(срок: …)» табличной задачи (Ф1). Срезаем его при
+# построении КЛЮЧА СТАТУСА (см. `_status_key`), чтобы переформулировка срока между
+# встречами («пятница» → «к 15.06») не сменила ключ и не потеряла проставленный
+# статус. Только финальный скобочный срок в конце строки, не середина текста.
+_DUE_SUFFIX_RE = re.compile(r"\s*\(\s*срок\s*:[^)]*\)\s*$", re.IGNORECASE)
+
+
+def _status_key(text: str) -> str:
+    """Ф2 (pending-items): ключ задачи в sidecar статусов.
+
+    Это `_task_key` БЕЗ хвостового «(срок: …)». Свой ключ (а не общий `_task_key`)
+    специально: общий ключ держит дедуп в `resolve_open_tasks`/`extract_open_tasks`/
+    `extract_decisions` — менять его рискованно. Срок-суффикс модель переформулирует
+    между встречами, и статус, проставленный по старой формулировке, потерялся бы.
+    Срезаем срок → статус матчится по СУТИ задачи (две формулировки срока одной
+    задачи дают один ключ — это та же задача с обновлённым дедлайном, схлопывание
+    верное). Консерватизм (R16): не совпал ключ → задача покажется висящей (ложно-
+    висит < ложно-закрыто), а не молча закрытой.
+    """
+    return _task_key(_DUE_SUFFIX_RE.sub("", text or ""))
+
+
+def _open_task_text(item) -> str:
+    """Ф2 (pending-items): текст задачи из элемента `open_tasks` — строка ИЛИ объект.
+
+    Совместимость/миграция (Ф1 §5): `open_tasks` сейчас `list[str]` и таким остаётся
+    (статусы — в SIDECAR, не здесь). Но если запись окажется объектом `{'text': …}`
+    (будущая схема / ручная правка файла), элемент НЕ должен выпасть из фильтра
+    `isinstance(t, str)` в `resolve_open_tasks` — извлекаем текст. Старые `list[str]`
+    проходят как есть (миграция без потерь). Не-строка/не-объект → "" (пропуск).
+    """
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        t = item.get("text") or item.get("task") or ""
+        return t.strip() if isinstance(t, str) else ""
+    return ""
 
 
 # Ф1 (ISS-23): на 1-на-1 встречах модель часто рендерит блок задач markdown-ТАБЛИЦЕЙ
@@ -1205,6 +1266,32 @@ def format_memory_block(digests: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Ф8 — трекинг открытых задач серии во времени (G9)
 # ---------------------------------------------------------------------------
+def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
+    """Хвост открытых задач из САМОЙ СВЕЖЕЙ выжимки, дедуплицированный, БЕЗ капа.
+
+    Выделено из `resolve_open_tasks`, чтобы Ф2-слияние (`build_open_tasks_block`)
+    накладывало статусы на ПОЛНЫЙ хвост и капило уже ВИСЯЩИЕ — иначе закрытая задача
+    в первых N съела бы слот капа у живого висяка (при сниженном `OPEN_TASKS_MAX`).
+    """
+    if not digests:
+        return []
+    latest = digests[-1]
+    if not isinstance(latest, dict):
+        return []
+    raw = latest.get("open_tasks") or []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in raw:
+        # Ф2: `_open_task_text` терпит и строку, и объект `{'text': …}` — расширенная
+        # запись НЕ выпадает из фильтра (старый `isinstance(t, str)` молча терял бы её).
+        s = _open_task_text(t)
+        k = _task_key(s)
+        if s and k and k not in seen:
+            seen.add(k)
+            out.append(s)
+    return out
+
+
 def resolve_open_tasks(digests: list[dict]) -> list[str]:
     """Ф8: открытые задачи серии для подачи в промпт генерации (Вызов 1).
 
@@ -1216,22 +1303,7 @@ def resolve_open_tasks(digests: list[dict]) -> list[str]:
     Нет выжимок / нет ключа (история до Ф8) / пусто → [] (блок не строится). Capped
     `open_tasks_max()`.
     """
-    if not digests:
-        return []
-    latest = digests[-1]
-    if not isinstance(latest, dict):
-        return []
-    raw = latest.get("open_tasks") or []
-    out: list[str] = []
-    seen: set[str] = set()
-    for t in raw:
-        if not isinstance(t, str):
-            continue
-        s = t.strip()
-        k = _task_key(s)
-        if s and k and k not in seen:
-            seen.add(k)
-            out.append(s)
+    out = _resolve_open_tasks_raw(digests)
     cap = open_tasks_max()
     return out[:cap] if cap > 0 else out
 
@@ -1275,22 +1347,42 @@ def format_open_tasks_block(open_tasks: list[str]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_open_tasks_block(digests: list[dict], *, meeting_sid: Optional[str] = None) -> str:
+def build_open_tasks_block(
+    digests: list[dict],
+    *,
+    series_dir: Optional[Path] = None,
+    meeting_sid: Optional[str] = None,
+) -> str:
     """Ф8 (G9): единая точка сборки блока открытых задач для ОБОИХ триггеров
     (finalize И clarify) — как `build_cross_memory_block` для кросс-фона.
 
     Под kill-switch `is_open_tasks_enabled()`. Best-effort: выключено / нет хвоста /
     любой сбой → "" (трекинг опционален, генерацию не роняет). Приватность (опасная
-    тройка): текст задач НЕ логируем — только счётчик (число висящих) и длину блока.
+    тройка): текст задач НЕ логируем — только счётчики (висящих / закрытых / под
+    сомнением) и длину блока.
+
+    Ф2 (pending-items): `series_dir` (если передан) → накладываем sidecar-статусы на
+    свежесгенерированный хвост (`merge_open_tasks_with_status`): терминально закрытые
+    (отменён/закрыто-сделано/закрыто-авто) В ХВОСТ «висит» НЕ попадают — статусы
+    reply/сверщика переживают регенерацию и закрытое не воскресает. Подразделы
+    «закрытые»/«под сомнением» рендерит Ф3 (доступны через `merge_open_tasks_with_status`);
+    здесь — только видимый хвост висящих. `series_dir=None` → прежнее поведение Ф8.
     """
     if not is_open_tasks_enabled():
         return ""
     try:
-        tasks = resolve_open_tasks(digests)
-        block = format_open_tasks_block(tasks)
+        # Раскручиваем хвост БЕЗ капа, накладываем статусы, и капим уже ВИСЯЩИЕ —
+        # чтобы закрытая задача не съедала слот капа у живого висяка (Ф2).
+        fresh = _resolve_open_tasks_raw(digests)
+        store = load_task_status(series_dir) if series_dir is not None else {}
+        merged = merge_open_tasks_with_status(fresh, store)
+        cap = open_tasks_max()
+        hanging = merged["open"][:cap] if cap > 0 else merged["open"]
+        block = format_open_tasks_block(hanging)
         logger.info(
-            "[open-tasks] block meeting=%s carried=%d block_len=%d",
-            meeting_sid or "?", len(tasks), len(block),
+            "[open-tasks] block meeting=%s carried=%d closed=%d doubt=%d block_len=%d",
+            meeting_sid or "?", len(hanging), len(merged["closed"]),
+            len(merged["doubt"]), len(block),
         )
         return block
     except Exception as e:  # noqa: BLE001 — трекинг опционален, генерацию не роняем
@@ -1299,6 +1391,179 @@ def build_open_tasks_block(digests: list[dict], *, meeting_sid: Optional[str] = 
             meeting_sid or "?", type(e).__name__,
         )
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Ф2 (pending-items) — sidecar статусов висяка + слияние при рендере
+# ---------------------------------------------------------------------------
+def task_status_path(series_dir: Path) -> Path:
+    """Путь sidecar-файла статусов серии: `<series_dir>/task-status.json`."""
+    return Path(series_dir) / TASK_STATUS_FILE
+
+
+def load_task_status(series_dir: Optional[Path]) -> dict:
+    """Читает sidecar статусов серии → `{_status_key: record}`.
+
+    Нет каталога/файла/мусор/старая серия без sidecar → `{}` (миграция не нужна:
+    отсутствие файла = «статусов нет», все задачи висят). record:
+    `{status, reason, source, shown, text, updated}`. Запись с неизвестным `status`
+    отбрасывается (битьё не валит рендер). Финализация этот файл НЕ пишет — он живёт
+    отдельно от `<date>-memory.json`, поэтому статусы переживают регенерацию (Ф2).
+    НЕ логирует тексты (опасная тройка).
+    """
+    if series_dir is None:
+        return {}
+    p = task_status_path(series_dir)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, dict):
+        return {}
+    out: dict = {}
+    for k, rec in items.items():
+        if not isinstance(k, str) or not isinstance(rec, dict):
+            continue
+        if rec.get("status") not in _VALID_STATUSES:
+            continue
+        out[k] = rec
+    return out
+
+
+def save_task_status(series_dir: Path, store: dict) -> Optional[Path]:
+    """Atomic-запись sidecar статусов серии. Best-effort: сбой → None.
+
+    НЕ логирует тексты задач/причин (опасная тройка) — только счётчик записей.
+    """
+    p = task_status_path(series_dir)
+    payload = {"schema": TASK_STATUS_SCHEMA, "items": store}
+    try:
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        _atomic_write_text(p, text)
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning("[task-status] save failed (non-fatal): %s", type(e).__name__)
+        return None
+    logger.info("[task-status] saved items=%d", len(store))
+    return p
+
+
+def set_task_status(
+    series_dir: Path,
+    task_text: str,
+    status: str,
+    *,
+    reason: Optional[str] = None,
+    source: Optional[str] = None,
+    date: Optional[str] = None,
+) -> Optional[dict]:
+    """Ф2: выставить/обновить статус висяка в sidecar (потребители — Ф5 reply, Ф6 сверщик).
+
+    Ключ = `_status_key(task_text)` (без срок-суффикса — стабилен к переформулировке).
+    Возвращает обновлённый record или None (пустой ключ/сбой). Идемпотентно по ключу.
+    Семантика флага `shown` (R21): смена статуса СБРАСЫВАЕТ `shown=False` (новое
+    закрытие надо показать заново подразделом «закрытые»); повтор того же статуса
+    `shown` не трогает. Переоткрытие (A10) — `status=STATUS_OPEN`: задача снова висит,
+    причина/показ обнуляются. Текст храним последний виденный (для рендера Ф3).
+    """
+    if status not in _VALID_STATUSES:
+        raise ValueError(f"unknown task status: {status!r}")
+    key = _status_key(task_text)
+    if not key:
+        return None
+    store = load_task_status(series_dir)
+    prev = store.get(key) or {}
+    status_changed = status != prev.get("status")
+    if status == STATUS_OPEN:
+        rec = {
+            "status": STATUS_OPEN,
+            "reason": None,
+            "source": source or prev.get("source"),
+            "shown": False,
+            "text": (task_text or prev.get("text") or "").strip(),
+            "updated": date,
+        }
+    else:
+        rec = {
+            "status": status,
+            "reason": reason if reason is not None else prev.get("reason"),
+            "source": source or prev.get("source"),
+            # новое закрытие → показать заново; тот же статус → сохранить shown.
+            "shown": False if status_changed else bool(prev.get("shown")),
+            "text": (task_text or prev.get("text") or "").strip(),
+            "updated": date,
+        }
+    store[key] = rec
+    save_task_status(series_dir, store)
+    return rec
+
+
+def mark_status_shown(
+    series_dir: Path, task_text_or_key: str, *, by_key: bool = False
+) -> bool:
+    """R21: пометить закрытую задачу «показано» (Ф3 после рендера подраздела «закрытые»).
+
+    Идемпотентно. `by_key=True` — аргумент уже `_status_key`. Возвращает True, если
+    запись была (и теперь shown). Нет записи → False.
+    """
+    key = task_text_or_key if by_key else _status_key(task_text_or_key)
+    store = load_task_status(series_dir)
+    rec = store.get(key)
+    if not rec:
+        return False
+    if rec.get("shown"):
+        return True
+    rec["shown"] = True
+    store[key] = rec
+    save_task_status(series_dir, store)
+    return True
+
+
+def merge_open_tasks_with_status(fresh_tail: list[str], status_store: dict) -> dict:
+    """Ф2: наложение sidecar-статусов на свежесгенерированный хвост `open_tasks`.
+
+    `fresh_tail` — тексты задач из `resolve_open_tasks` (пересобирается из текста
+    протокола на каждом финализе). `status_store` — `{_status_key: record}` из
+    `load_task_status`. Возвращает три корзины (порядок хвоста сохранён):
+      • `open`   — `list[str]`: висящие (нет записи / `open` / переоткрытые) → идут
+                   в раздел «🔻 С прошлых встреч» (LLM проставит статус по транскрипту);
+      • `doubt`  — `list[dict]` `{text, reason}`: «под сомнением» (буфер R10) → Ф3
+                   рендерит отдельным подблоком; НЕ в `open` (не плоский «висит»);
+      • `closed` — `list[dict]` `{text, status, reason}`: терминально закрытые
+                   (done/cancelled/auto_closed) с `shown=False` → Ф3 рендерит
+                   подразделом «закрытые» ОДИН раз, затем `mark_status_shown`.
+    Терминально закрытые НИКОГДА не попадают в `open` → «отменён»/«закрыто-авто» не
+    воскресают как «висит» (ядро Ф2). Уже показанные закрытые (`shown=True`) не идут
+    ни в одну корзину (исчезли из выдачи — список не копится, R21). Чистая функция.
+    """
+    open_tasks: list[str] = []
+    doubt: list[dict] = []
+    closed: list[dict] = []
+    for text in fresh_tail or []:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        rec = status_store.get(_status_key(text)) if status_store else None
+        status = rec.get("status") if isinstance(rec, dict) else None
+        if status in _TERMINAL_CLOSED:
+            if not (isinstance(rec, dict) and rec.get("shown")):
+                closed.append({
+                    "text": text,
+                    "status": status,
+                    "reason": rec.get("reason") if isinstance(rec, dict) else None,
+                })
+            # shown=True → задача показана и закрыта: ни в open, ни в closed (R21).
+            continue
+        if status == STATUS_DOUBT:
+            doubt.append({
+                "text": text,
+                "reason": rec.get("reason") if isinstance(rec, dict) else None,
+            })
+            continue
+        # нет записи / open / переоткрытая → висит
+        open_tasks.append(text)
+    return {"open": open_tasks, "doubt": doubt, "closed": closed}
 
 
 # ---------------------------------------------------------------------------

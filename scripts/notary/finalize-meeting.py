@@ -835,7 +835,7 @@ def main() -> int:
             # кумулятивное состояние). Под своим kill-switch внутри. Отдельным от
             # series_memory каналом — у него обратная дисциплина (перенести + статус).
             open_tasks_block = series_memory.build_open_tasks_block(
-                series_memory_digests, meeting_sid=session_uid,
+                series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
             )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
