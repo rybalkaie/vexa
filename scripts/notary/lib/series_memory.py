@@ -226,8 +226,19 @@ def _clean_bullet_text(line: str) -> str:
     return text
 
 
+# Строка markdown-эмфазы в начале (`*курсив*`, `**жирный**`) — это НЕ буллет списка.
+# Маркер-звёздочка списка всегда идёт с пробелом («* пункт»); «*текст*»/«**жирный**»
+# (звезда сразу к не-пробелу) — эмфаза, которую `_BULLET_PREFIX_RE` ошибочно ловил как
+# буллет. Из-за этого курсивный футер протокола («*Протокол восстановлен из транскрипта…*»)
+# утекал в `extract_open_tasks` отдельной ложной задачей. Guard отсекает эмфазу, не трогая
+# настоящие буллеты `- `/`▪️`/`🟠`/`* пункт`.
+_EMPHASIS_LINE_RE = re.compile(r"^\s*\*{1,2}\S")
+
+
 def _is_bullet(line: str) -> bool:
-    return bool(_BULLET_PREFIX_RE.match(line))
+    if not _BULLET_PREFIX_RE.match(line):
+        return False
+    return not _EMPHASIS_LINE_RE.match(line)
 
 
 def _classify_heading(title: str) -> str:
@@ -344,13 +355,116 @@ def _task_key(text: str) -> str:
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
+# Ф1 (ISS-23): на 1-на-1 встречах модель часто рендерит блок задач markdown-ТАБЛИЦЕЙ
+# `| Кому | Что | Срок |` («формат Татьяны» — референс методички), а не списком `- `
+# под `**Имя**`. Без разбора таблицы хвост таких встреч пуст (R1: «на 1:1 digest почти
+# пуст, боту нечего поднимать»). Эти ключи распознают колонки шапки таблицы задач.
+_TABLE_OWNER_KEYS = ("кому", "ответствен", "кто", "owner", "исполнит")
+_TABLE_TASK_KEYS = ("что", "задач", "действ", "task", "action")
+_TABLE_DUE_KEYS = ("срок", "когда", "дедлайн", "дата", "due", "deadline")
+
+
+def _is_table_row(line: str) -> bool:
+    """Строка markdown-таблицы — начинается с `|` (после необязательных пробелов)."""
+    return line.lstrip().startswith("|")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """`| a | b | c |` → ['a','b','c'] (внешние пайпы срезаны, ячейки strip'нуты)."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _is_table_separator(cells: list[str]) -> bool:
+    """Строка-разделитель шапки таблицы: все непустые ячейки — только из `-`/`:`."""
+    nonempty = [c for c in cells if c.strip()]
+    return bool(nonempty) and all(set(c.strip()) <= set("-:") for c in nonempty)
+
+
+def _table_header_cols(cells: list[str]) -> Optional[dict]:
+    """Если строка таблицы — ШАПКА (есть и колонка исполнителя, и колонка задачи),
+    вернуть {'owner': i, 'task': j, 'due': k|None}; иначе None (строка данных).
+
+    Требуем найти ОБЕ ключевые колонки (кому+что) в одной строке — иначе строка
+    данных, случайно содержащая слово «что», не будет принята за шапку.
+    """
+    low = [c.lower() for c in cells]
+    owner = task = due = None
+    for i, c in enumerate(low):
+        if owner is None and any(k in c for k in _TABLE_OWNER_KEYS):
+            owner = i
+        if task is None and any(k in c for k in _TABLE_TASK_KEYS):
+            task = i
+        if due is None and any(k in c for k in _TABLE_DUE_KEYS):
+            due = i
+    if owner is not None and task is not None:
+        return {"owner": owner, "task": task, "due": due}
+    return None
+
+
+def _clean_table_cell(cell: str) -> str:
+    """Текст ячейки таблицы без эмфазы/⚠️-пометки ревью, схлопнутые пробелы, обрезка."""
+    s = _REVIEW_FLAG_RE.sub("", cell or "")
+    s = re.sub(r"[*_`]{1,2}", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > _MAX_POINT_LEN:
+        s = s[: _MAX_POINT_LEN - 1].rstrip() + "…"
+    return s
+
+
+def _task_from_table_cells(cells: list[str], cols: Optional[dict]) -> str:
+    """Строит «Имя: задача (срок: X)» из строки-ДАННЫХ таблицы задач.
+
+    `cols` — индексы колонок из шапки; без шапки дефолт Кому|Что|Срок = 0|1|2.
+    Срок добавляем только осмысленный (не «—»/пусто). Имя-префикс — как в bullet-пути
+    (нужно «за кем следующий шаг»), но не дублируем, если имя уже в тексте задачи.
+    Пустая задача → "" (строка пропускается). НЕ кладёт сырые реплики (РИСК4).
+    """
+    if not cells:
+        return ""
+    if cols is None:
+        owner_i, task_i, due_i = 0, 1, 2
+    else:
+        owner_i, task_i, due_i = cols.get("owner", 0), cols.get("task", 1), cols.get("due")
+
+    def _cell(i: Optional[int]) -> str:
+        if i is None or i < 0 or i >= len(cells):
+            return ""
+        return _clean_table_cell(cells[i])
+
+    owner = _cell(owner_i)
+    task = _cell(task_i)
+    if not task:
+        # Кривая/одноколоночная таблица: первая непустая ячейка = задача, без owner.
+        for c in cells:
+            cc = _clean_table_cell(c)
+            if cc:
+                task = cc
+                break
+        owner = ""
+    if not task:
+        return ""
+    due = _cell(due_i)
+    if due and set(due) - set(" .—–-"):  # есть содержимое помимо тире/точек/пробелов
+        task = f"{task} (срок: {due})"
+    if owner and owner.lower() not in task.lower():
+        task = f"{owner}: {task}"
+    return task
+
+
 def extract_open_tasks(protocol_text: str) -> list[str]:
     """Ф8: открытые (незакрытые) задачи серии ИЗ ГОТОВОГО протокола.
 
     Два источника в протоколе:
       • блок «Задачи» (section==tasks, методичка §4): задачи, назначенные на ЭТОЙ
-        встрече — НОВЫЕ открытые. Сгруппированы под подзаголовком `**Имя**` —
-        исполнителя кладём префиксом «Имя: …» (нужен для «за кем следующий шаг»).
+        встрече — НОВЫЕ открытые. Канонически сгруппированы под подзаголовком `**Имя**`
+        списком `- ` — исполнителя кладём префиксом «Имя: …» (за кем следующий шаг).
+        Ф1: на 1-на-1 встречах модель часто рендерит этот блок markdown-ТАБЛИЦЕЙ
+        `| Кому | Что | Срок |` — её тоже разбираем (иначе хвост 1:1 пуст, R1/ISS-23).
       • блок «🔻 С прошлых встреч» (section==carryover, Ф8): ПЕРЕНЕСЁННЫЕ задачи со
         статусом. Помеченные «закрыта» — ОТБРАСЫВАЕМ (закрыты на этой встрече);
         «висит»/«висит, статус?» — несём дальше, срезая суффикс статуса. Консерватизм
@@ -365,6 +479,7 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
     fresh: list[str] = []
     section = None  # carryover|tasks|theme|decisions|service|None
     current_owner: Optional[str] = None
+    table_cols: Optional[dict] = None  # Ф1: индексы колонок таблицы задач (после шапки)
     for raw_line in (protocol_text or "").splitlines():
         hm = _HEADING_RE.match(raw_line)
         if hm:
@@ -372,11 +487,24 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
             title = re.sub(r"[*_`]{1,2}", "", title).strip()
             section = _classify_heading(title)
             current_owner = None
+            table_cols = None
             continue
         if section == "tasks":
             om = _OWNER_SUBHEADING_RE.match(raw_line)
             if om:
                 current_owner = re.sub(r"\s+", " ", om.group(1)).strip()
+                continue
+            if _is_table_row(raw_line):  # Ф1: задачи markdown-таблицей (формат 1:1)
+                cells = _split_table_row(raw_line)
+                if _is_table_separator(cells):
+                    continue
+                hdr = _table_header_cols(cells)
+                if hdr is not None:
+                    table_cols = hdr
+                    continue
+                txt = _task_from_table_cells(cells, table_cols)
+                if txt:
+                    fresh.append(txt)
                 continue
             if _is_bullet(raw_line):
                 txt = _clean_task_text(raw_line)
