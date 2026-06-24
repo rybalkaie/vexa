@@ -456,10 +456,21 @@ class TestFlagPathPreserved(unittest.TestCase):
 # ==========================================================================
 class TestCallSiteParity(unittest.TestCase):
 
-    def test_both_call_sites_pass_rewrite_true(self):
-        """finalize И clarify должны звать review_and_flag_protocol_file(rewrite=True)
-        — иначе поздний clarify терял бы редактуру второго прохода."""
-        for rel in ("finalize-meeting.py", "lib/clarify_worker.py"):
+    def test_all_call_sites_pass_rewrite_true(self):
+        """ВСЕ боевые пути регенерации протокола должны звать
+        review_and_flag_protocol_file(rewrite=True) — иначе путь регенерит начисто и
+        отдаёт результат без второго прохода-критика (дыра ISS-22 а).
+
+        Ф1 (ISS-22 а): расширено с 2 до всех 4 call-site — добавлены ручная команда
+        «протокол …» (meetings_listener.py) и CLI (tools/regenerate-protocol.py).
+        Source-scan сторожит «вызов есть»; что инвариант реально срабатывает на
+        rewrite-пути — поведенческий тест Ф2 (РИСК5)."""
+        for rel in (
+            "finalize-meeting.py",
+            "lib/clarify_worker.py",
+            "meetings_listener.py",
+            "tools/regenerate-protocol.py",
+        ):
             src = (_NOTARY / rel).read_text(encoding="utf-8")
             i = src.find("review_and_flag_protocol_file(")
             self.assertNotEqual(i, -1, f"{rel}: вызов не найден")

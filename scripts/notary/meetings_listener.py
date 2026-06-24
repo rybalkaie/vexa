@@ -408,6 +408,7 @@ def _job_protocol_command(
         from notary.lib.llm_postprocess import (  # noqa: PLC0415
             ProtocolGenerationError,
             regenerate_protocol_for_meeting,
+            review_and_flag_protocol_file,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("import llm_postprocess failed: %s", e)
@@ -433,6 +434,31 @@ def _job_protocol_command(
         logger.exception("protocol generation unexpected error: %s", e)
         _err(f"❌ Неожиданная ошибка: {type(e).__name__}: {str(e)[:200]}")
         return
+
+    # Ф1 (ISS-22 а): ручная команда «протокол …» регенерит протокол ЗАНОВО, как и
+    # finalize/clarify. Закрываем дыру — прогоняем ТОТ ЖЕ второй проход-критик
+    # (rewrite=True) с теми же checks, что в finalize. Один claude-вызов (он же
+    # несёт ревизию диаризации Ф4), не третий. Транскрипт уже на руках — переиспользуем.
+    # Best-effort/паритет с clarify: нет claude / kill-switch выключен → 0 пометок,
+    # файл не трогаем, ошибка НЕ валит команду. R9: в лог только счётчики/метаданные.
+    try:
+        n_flags = review_and_flag_protocol_file(
+            protocol_path=protocol_path,
+            transcript_path=transcript_path,
+            checks=("values", "roles", "memory", "diarization"),
+            meeting_sid=f"tg-cmd-{series}-{date_str}",
+            rewrite=True,
+        )
+        if n_flags:
+            logger.info(
+                "[review] meeting=tg-cmd-%s-%s self-review изменил %d пункт(ов)",
+                series, date_str, n_flags,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[review] protocol command self-review failed (non-fatal) series=%s date=%s: %s",
+            series, date_str, e,
+        )
 
     # Файл готов — пушим результат текстом. Если > лимита — split на части.
     try:

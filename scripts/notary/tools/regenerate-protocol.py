@@ -37,6 +37,7 @@ sys.path.insert(0, str(NOTARY_DIR))
 from lib.llm_postprocess import (  # noqa: E402
     ProtocolGenerationError,
     regenerate_protocol_for_meeting,
+    review_and_flag_protocol_file,
 )
 
 DEFAULT_ROOT = os.path.expanduser("~/Projects/me/встречи")
@@ -82,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Длительность в минутах (для шапки)")
     parser.add_argument("--participants", default=None,
                         help="Участники через запятую (для шапки)")
+    parser.add_argument("--no-review", action="store_true",
+                        help="Не прогонять второй проход-критик (self-review) после "
+                             "регенерации. Дефолт — ПРОГОНЯТЬ (A1: паритет с боевыми "
+                             "путями finalize/clarify/команда). Отключай для отладки "
+                             "промта и массового бэкфилла (--out *-auto.md), чтобы "
+                             "критик не переписывал черновик. То же делает env "
+                             "NOTARY_REGEN_NO_REVIEW=1.")
     args = parser.parse_args(argv)
 
     root = Path(os.path.expanduser(args.root))
@@ -113,6 +121,32 @@ def main(argv: list[str] | None = None) -> int:
     except ProtocolGenerationError as e:
         print(f"[regen] FAILED: {e}", file=sys.stderr)
         return 1
+
+    # Ф1 (ISS-22 а): CLI — боевой путь регенерации, поэтому по умолчанию (A1)
+    # прогоняем ТОТ ЖЕ второй проход-критик (rewrite=True) с теми же checks, что
+    # finalize/clarify/команда. Один claude-вызов (внутри обёртки под тем же
+    # kill-switch ENABLE_PROTOCOL_SELFREVIEW). Отключить для отладки/бэкфилла:
+    # --no-review или env NOTARY_REGEN_NO_REVIEW=1. Best-effort: нет claude /
+    # kill-switch выключен → 0 пометок, файл не трогаем, ошибка НЕ валит CLI.
+    # R9: в stderr только счётчики, без текста реплик/задач.
+    env_skip = (os.environ.get("NOTARY_REGEN_NO_REVIEW") or "").strip().lower() not in ("", "0", "false", "no")
+    if args.no_review or env_skip:
+        print("[regen] self-review пропущен (--no-review / NOTARY_REGEN_NO_REVIEW)", file=sys.stderr)
+    else:
+        try:
+            n_flags = review_and_flag_protocol_file(
+                protocol_path=protocol_path,
+                transcript_path=transcript_path,
+                checks=("values", "roles", "memory", "diarization"),
+                meeting_sid=f"cli-{args.series}-{args.date}",
+                rewrite=True,
+            )
+            if n_flags:
+                print(f"[regen] self-review изменил {n_flags} пункт(ов)", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"[regen] self-review failed (non-fatal): {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
     print(f"[regen] OK: {protocol_path}", file=sys.stderr)
     return 0
 
