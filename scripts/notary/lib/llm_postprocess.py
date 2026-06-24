@@ -1646,6 +1646,32 @@ def stabilize_protocol_text(text: str) -> str:
     return result
 
 
+def _build_protocol_system_prompt(company: Optional[str], method_text: str) -> str:
+    """Собирает system-prompt генерации протокола: база + методичка + глоссарий
+    компании + (R6/Ф2) каталог товаров из БЕЛОГО СПИСКА knowledge/.
+
+    Выделено из `generate_protocol`, чтобы «контекст, который видит бот» был
+    тестируемым в изоляции (критерий R6: на фикстуре компании каталог ВХОДИТ,
+    финкарты НЕ входят) без живого `claude` CLI. Версионируемый шаблон формата
+    (Ф7, best-effort/lazy) сюда НЕ включён — остаётся в `generate_protocol`.
+
+    🔒 Приватность (РИСК4): каталог тянется ТОЛЬКО из `glossary.catalog_prompt_block`
+    → `context_knowledge.load_whitelisted_context` (allow-list), финкарты в промпт
+    структурно не попадают. Каталог — отдельной секцией, чтобы не разбавлять
+    тонкий soft-ASR-bias глоссария.
+    """
+    system_prompt = (
+        GENERATE_PROTOCOL_BASE_PROMPT
+        + method_text
+        + "\n\n---\n\n"
+        + glossary.glossary_prompt_block(company)
+    )
+    catalog_block = glossary.catalog_prompt_block(company)
+    if catalog_block:
+        system_prompt += "\n\n---\n\n" + catalog_block
+    return system_prompt
+
+
 def generate_protocol(
     transcript_md: str,
     meeting_meta: dict,
@@ -1691,12 +1717,8 @@ def generate_protocol(
 
     # FU-11 / Ф5: глоссарий компании в КОНЕЦ system-prompt (после методички) —
     # отдельной секцией, company-scoped (Bolong[mpfirst] не уйдёт в Anzhee-промпт).
-    system_prompt = (
-        GENERATE_PROTOCOL_BASE_PROMPT
-        + method_text
-        + "\n\n---\n\n"
-        + glossary.glossary_prompt_block(company)
-    )
+    # Ф2 (R6/R7): + каталог товаров из белого списка knowledge/ (см. helper).
+    system_prompt = _build_protocol_system_prompt(company, method_text)
 
     # F2 (Ф7): версионируемый шаблон протокола — накопленные пожелания к ФОРМАТУ
     # (правка формата → новая версия, применяется к БУДУЩИМ протоколам). Блок

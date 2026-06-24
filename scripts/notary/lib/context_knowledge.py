@@ -51,6 +51,44 @@ KNOWLEDGE_SUBPATH = "knowledge/notary"
 GLOSSARY_FILE = "glossary.yaml"
 ORG_STRUCTURE_FILE = "org-structure.yaml"
 
+# --- R6 (Ф2): БЕЛЫЙ СПИСОК knowledge/ в контекст сборки протокола --------------
+#
+# 🔒 ПРИВАТНОСТЬ (РИСК4/ВОПР2, подтверждено владельцем 2026-06-24). В контекст
+# сборки протокола встречи уезжает во ВНЕШНИЙ LLM (Anthropic). Поэтому сюда
+# подаётся ЯВНЫЙ allow-list файлов knowledge/ — НЕ deny-list, НЕ сырой дамп всего
+# каталога знаний. Всё, чего НЕТ в `PROTOCOL_CONTEXT_WHITELIST`, в промпт НЕ
+# попадает (fail-closed): новый файл знания по умолчанию НЕвидим боту, пока его
+# СОЗНАТЕЛЬНО не впишут сюда. Сомневаешься, можно ли файл — НЕ вписывай.
+#
+# glossary.yaml / org-structure.yaml в этот список НЕ входят: их читают СТРУКТУРНО
+# (`load_glossary` / `load_org_structure`) своими загрузчиками — они уже whitelisted
+# самим фактом наличия отдельного загрузчика. Здесь — только СЫРЫЕ markdown-файлы
+# знания (каталог товаров), которые подаются в промпт текстом as-is.
+#
+# Пути — относительно КОРНЯ репо контекста (`<root>/<repo>/...`), не `knowledge/notary`.
+PROTOCOL_CONTEXT_WHITELIST: tuple[str, ...] = (
+    # Каталог товаров МПервый (ENVONIX/ALTRONIX): реальные названия/артикулы, чтобы
+    # бот подставлял канон, а не фонетику (ISS-21 Gap-2). Для anzhee файла нет —
+    # graceful: его секция каталога просто не рендерится.
+    "knowledge/product-catalog-wb.md",
+)
+
+# Денилист-БЭКСТОП (defense-in-depth, НЕ основной фильтр — фильтр это allow-list
+# выше). Файлы, которые НИКОГДА не должны попасть в контекст бота: финансовые
+# карты, drive-карты (внутренняя навигация). Если кто-то по ошибке впишет такой
+# файл в whitelist — `load_whitelisted_context` его всё равно отбросит, а
+# `assert_whitelist_safe()` (вызывается в тесте) упадёт. Сверяем по basename.
+PROTOCOL_CONTEXT_DENYLIST: frozenset[str] = frozenset({
+    "accounting-tables-registry.md",   # реестр таблиц учёта (финансы)
+    "payment-planning-tables-map.md",  # карта платёжного планирования (финансы)
+    "google-drive-map.md",             # карта Google Drive (внутренняя навигация)
+})
+
+# Защитный потолок размера одного файла знания в контексте (рантайм-страховка от
+# того, что файл когда-нибудь распухнет и раздует промпт). Текущий каталог ~17 КБ.
+# Превышение НЕ молча режется — логируется WARNING (принцип «no silent caps»).
+PROTOCOL_CONTEXT_FILE_MAX_BYTES = 131072  # 128 КБ
+
 # Карта компания → имя репозитория контекста (контракт §1.5). Дефолт; каждую
 # запись можно переопределить env `NOTARY_CONTEXT_REPO_<COMPANY>` (uppercase).
 _DEFAULT_REPO_MAP = {
@@ -197,6 +235,104 @@ def knowledge_dir(company: Optional[str]) -> Optional[Path]:
     if not repo:
         return None
     return context_root() / repo / KNOWLEDGE_SUBPATH
+
+
+def repo_root(company: Optional[str]) -> Optional[Path]:
+    """Путь к корню репо контекста `<root>/<repo>` для компании. None, если репо
+    неизвестно. Нужен для whitelist-файлов, которые лежат ВЫШЕ `knowledge/notary`
+    (каталог товаров — в `knowledge/`, не в `knowledge/notary`)."""
+    repo = repo_for_company(company)
+    if not repo:
+        return None
+    return context_root() / repo
+
+
+# --- R6 (Ф2): чтение белого списка knowledge/ в контекст сборки протокола ------
+
+
+def assert_whitelist_safe() -> None:
+    """Самопроверка инвариантов whitelist (вызывается из теста R6). Падает, если:
+      • whitelist и денилист пересеклись по basename (финкарта пролезла в allow-list);
+      • путь whitelist абсолютный или содержит `..` (выход за репо).
+    Это НЕ рантайм-страховка (её несёт `load_whitelisted_context`), а контрактный
+    тест: ошибка конфигурации whitelist обязана падать громко, а не утекать."""
+    deny = {d.lower() for d in PROTOCOL_CONTEXT_DENYLIST}
+    for rel in PROTOCOL_CONTEXT_WHITELIST:
+        p = str(rel)
+        if p.startswith("/") or ".." in Path(p).parts:
+            raise AssertionError(f"whitelist-путь небезопасен (абсолютный/`..`): {p!r}")
+        if Path(p).name.lower() in deny:
+            raise AssertionError(
+                f"whitelist-файл {p!r} пересекается с денилистом (финданные в контекст бота)"
+            )
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """`child` лежит внутри `parent` (после резолва симлинков/`..`). Бэкстоп от
+    path-traversal: даже если whitelist кто-то испортит, читаем только из репо."""
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
+    """Прочитать СЫРЫЕ файлы знания из белого списка для компании (R6).
+
+    Возвращает `[(relpath, text), ...]` для тех файлов whitelist, что РЕАЛЬНО есть
+    у компании (graceful: нет репо/файла → просто пропуск, не падаем). Порядок —
+    как в `PROTOCOL_CONTEXT_WHITELIST`.
+
+    Fail-closed на приватность — итерируем ТОЛЬКО по константному whitelist (никакого
+    параметра-пути снаружи), и на каждом файле тройная страховка:
+      1. basename НЕ в денилисте (финкарты/drive — даже если просочились в whitelist);
+      2. резолв пути ВНУТРИ корня репо (path-traversal-бэкстоп);
+      3. размер ≤ потолка (распухший файл логируется, не режется молча).
+    """
+    root = repo_root(company)
+    if not root:
+        return []
+    deny = {d.lower() for d in PROTOCOL_CONTEXT_DENYLIST}
+    out: list[tuple[str, str]] = []
+    for rel in PROTOCOL_CONTEXT_WHITELIST:
+        rel = str(rel)
+        # (0) Структурная защита: абсолютный путь / `..` в whitelist — пропускаем.
+        if rel.startswith("/") or ".." in Path(rel).parts:
+            logger.warning("whitelist-путь небезопасен, пропуск: %s", rel)
+            continue
+        # (1) Денилист-бэкстоп по basename.
+        if Path(rel).name.lower() in deny:
+            logger.warning("whitelist-файл в денилисте — НЕ читаю (приватность): %s", rel)
+            continue
+        path = root / rel
+        # (2) Path-traversal бэкстоп: путь обязан быть внутри корня репо.
+        if not _is_within(path, root):
+            logger.warning("whitelist-файл вне корня репо, пропуск: %s", rel)
+            continue
+        if not path.is_file():
+            logger.info("whitelist-файл знания не найден, пропуск: %s", path)
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            logger.warning("не прочитать whitelist-файл %s: %s", path, e)
+            continue
+        # (3) Потолок размера — не молча: WARNING + обрезка по границе байтов.
+        if len(data) > PROTOCOL_CONTEXT_FILE_MAX_BYTES:
+            logger.warning(
+                "whitelist-файл %s = %d Б > потолка %d Б — урезаю (часть каталога не попадёт)",
+                path, len(data), PROTOCOL_CONTEXT_FILE_MAX_BYTES,
+            )
+            data = data[:PROTOCOL_CONTEXT_FILE_MAX_BYTES]
+        try:
+            text = data.decode("utf-8", errors="replace").strip()
+        except Exception as e:  # noqa: BLE001 — декод не должен ронять сборку
+            logger.warning("не декодировать whitelist-файл %s: %s", path, e)
+            continue
+        if text:
+            out.append((rel, text))
+    return out
 
 
 # --- Чтение YAML (lazy import, graceful) --------------------------------------
