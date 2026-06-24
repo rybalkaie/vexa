@@ -193,6 +193,62 @@ class TestTableParsingEdgeCases(unittest.TestCase):
         self.assertIn("Прислать смету", tasks[0])
         self.assertIn("(срок: пятница)", tasks[0])
 
+    def test_data_row_with_owner_and_task_keywords_not_dropped(self):
+        # Регресс (цикл5, Н1): строка-ДАННЫХ, где в ТЕКСТЕ есть и owner-слово
+        # («кто»), и task-слово («что»), не должна быть принята за шапку (шапка —
+        # только перед `|---|`). Иначе задача терялась И портила колонки следующих
+        # строк. На старом коде: 2 задачи схлопывались в 1 мангленную.
+        proto = (
+            "#протоколвстречи 01.06.2026\n\n**Участники:** Илья\n\n---\n\n"
+            "## Задачи\n\n"
+            "| Кому | Что | Срок |\n"
+            "|---|---|---|\n"
+            "| **Илья** | Решить, кто и что берёт по остаткам | сегодня |\n"
+            "| **Татьяна** | Прислать смету | завтра |\n"
+        )
+        tasks = sm.extract_open_tasks(proto)
+        self.assertEqual(len(tasks), 2)
+        self.assertTrue(any(t.startswith("Илья:") and "кто и что" in t for t in tasks))
+        # колонки второй строки НЕ повреждены: owner-префикс и срок на месте
+        tat = next(t for t in tasks if "смету" in t)
+        self.assertTrue(tat.startswith("Татьяна:"))
+        self.assertIn("(срок: завтра)", tat)
+
+    def test_synonym_header_not_emitted_as_task(self):
+        # Регресс (цикл5, Н2): шапка таблицы синонимами вне keyword-списков
+        # определяется ПО ПОЗИЦИИ (перед `|---|`) и не превращается в мусорную
+        # задачу. На старом коде давала «Участник: Поручение (срок: Срок)».
+        proto = (
+            "#протоколвстречи 01.06.2026\n\n**Участники:** Илья\n\n---\n\n"
+            "## Задачи\n\n"
+            "| Участник | Поручение | Срок |\n"
+            "|---|---|---|\n"
+            "| **Илья** | Сделать отчёт | завтра |\n"
+        )
+        tasks = sm.extract_open_tasks(proto)
+        self.assertEqual(len(tasks), 1)
+        self.assertFalse(any("Поручение" in t for t in tasks))
+        self.assertTrue(tasks[0].startswith("Илья:"))
+        self.assertIn("Сделать отчёт", tasks[0])
+        self.assertIn("(срок: завтра)", tasks[0])
+
+    def test_synonym_header_default_columns_keep_order(self):
+        # «Задание» не матчит ключ «задач», но шапка (по позиции) отброшена и
+        # колонки берутся дефолтом 0|1|2 — порядок Кому|Что|Срок сохраняется,
+        # сама шапка задачей не становится.
+        proto = (
+            "#протоколвстречи 01.06.2026\n\n**Участники:** Илья\n\n---\n\n"
+            "## Задачи\n\n"
+            "| Кому | Задание | Срок |\n"
+            "|---|---|---|\n"
+            "| **Илья** | Сделать отчёт | завтра |\n"
+        )
+        tasks = sm.extract_open_tasks(proto)
+        self.assertEqual(len(tasks), 1)
+        self.assertFalse(any(t.strip().startswith("Кому:") for t in tasks))
+        self.assertTrue(tasks[0].startswith("Илья:"))
+        self.assertIn("(срок: завтра)", tasks[0])
+
 
 # ==========================================================================
 # Регресс канонического буллет-формата (не сломали группу)

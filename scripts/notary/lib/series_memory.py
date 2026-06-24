@@ -479,10 +479,34 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
     fresh: list[str] = []
     section = None  # carryover|tasks|theme|decisions|service|None
     current_owner: Optional[str] = None
-    table_cols: Optional[dict] = None  # Ф1: индексы колонок таблицы задач (после шапки)
+    # Ф1: разбор таблицы задач. Шапку определяем ПО ПОЗИЦИИ — это строка
+    # НЕПОСРЕДСТВЕННО перед разделителем `|---|`. Это надёжнее распознавания по
+    # ключевым словам: (а) не зависит от формулировки шапки (синонимы «Участник/
+    # Поручение/Задание» вне keyword-списков иначе утекали бы мусорной задачей);
+    # (б) строку-ДАННЫХ, где в тексте есть и owner-слово («кто»), и task-слово
+    # («что»), по ключам ложно приняли бы за шапку → потеря задачи + порча колонок.
+    # Поэтому строку таблицы ПРИДЕРЖИВАЕМ на один шаг (`table_pending`): следующая
+    # строка-разделитель ⇒ придержанная была шапкой (роли колонок берём из неё, в
+    # задачи НЕ выводим); иначе придержанная — строка-данных.
+    table_cols: Optional[dict] = None
+    table_pending: Optional[list[str]] = None
+
+    def _flush_pending_task() -> None:
+        """Зафиксировать придержанную строку таблицы как задачу (она оказалась
+        данными, не шапкой: за ней не последовал разделитель)."""
+        nonlocal table_pending
+        if table_pending is None:
+            return
+        cells = table_pending
+        table_pending = None
+        txt = _task_from_table_cells(cells, table_cols)
+        if txt:
+            fresh.append(txt)
+
     for raw_line in (protocol_text or "").splitlines():
         hm = _HEADING_RE.match(raw_line)
         if hm:
+            _flush_pending_task()  # незакрытая строка-данных предыдущей таблицы
             title = _THEME_NUM_PREFIX_RE.sub("", hm.group(1).strip()).strip()
             title = re.sub(r"[*_`]{1,2}", "", title).strip()
             section = _classify_heading(title)
@@ -492,20 +516,24 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
         if section == "tasks":
             om = _OWNER_SUBHEADING_RE.match(raw_line)
             if om:
+                _flush_pending_task()
                 current_owner = re.sub(r"\s+", " ", om.group(1)).strip()
                 continue
             if _is_table_row(raw_line):  # Ф1: задачи markdown-таблицей (формат 1:1)
                 cells = _split_table_row(raw_line)
                 if _is_table_separator(cells):
+                    # Разделитель: придержанная строка перед ним — ШАПКА. Роли
+                    # колонок берём из неё (нет ключей → None → дефолт Кому|Что|Срок
+                    # при рендере). Саму шапку в задачи НЕ выводим.
+                    if table_pending is not None:
+                        table_cols = _table_header_cols(table_pending)
+                        table_pending = None
                     continue
-                hdr = _table_header_cols(cells)
-                if hdr is not None:
-                    table_cols = hdr
-                    continue
-                txt = _task_from_table_cells(cells, table_cols)
-                if txt:
-                    fresh.append(txt)
+                _flush_pending_task()   # предыдущая придержанная была данными
+                table_pending = cells   # текущую придержим — вдруг за ней разделитель
                 continue
+            # не табличная строка — закрыть незавершённую таблицу
+            _flush_pending_task()
             if _is_bullet(raw_line):
                 txt = _clean_task_text(raw_line)
                 if not txt:
@@ -524,6 +552,7 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
             txt = _OPEN_TASK_STATUS_SUFFIX_RE.sub("", txt).strip()
             if txt:
                 carried.append(txt)
+    _flush_pending_task()  # хвост: последняя строка-данных таблицы в конце протокола
     out: list[str] = []
     seen: set[str] = set()
     for t in carried + fresh:
