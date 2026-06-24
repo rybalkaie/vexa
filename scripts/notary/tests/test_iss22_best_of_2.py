@@ -489,6 +489,15 @@ class TestBestOf2OnlyInFinalize(unittest.TestCase):
         # draft_b участвует в merge_sources, merge_sources уходит в prior_sources склейки.
         self.assertIn("draft_b", fin[gi:ri + 400])
         self.assertIn("prior_sources=merge_sources", fin[ri:ri + 1300])
+        # 🔴 Усиление (цикл5 У5): merge_sources ОБЯЗАН строиться из draft_b, а не просто
+        # «draft_b где-то в диапазоне» — иначе рефактор, выронивший draft_b из
+        # merge_sources, прошёл бы source-scan (присваивание `draft_b = …` само
+        # остаётся в диапазоне), а best-of-2 стал бы мёртвым кодом (B генерится, но
+        # в склейку не попадает). Привязываем data-flow: merge_sources = [ … draft_b … ].
+        self.assertRegex(
+            fin, r"merge_sources\s*=\s*\[[^\]]*draft_b[^\]]*\]",
+            "merge_sources не строится из draft_b — best-of-2 не доходит до склейки",
+        )
 
     def test_best_of_2_through_file_wrapper_not_bare_RISK4(self):
         """🔴 РИСК4 (source-scan): finalize гонит склейку ЧЕРЕЗ файл-обёртку
