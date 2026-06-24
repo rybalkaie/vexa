@@ -261,6 +261,11 @@ CLI `tools/regenerate-protocol.py <series> <date>` — оборачивает
 `regenerate_protocol_for_meeting`. Используется для backfill архивных
 транскриптов и для отладки промта.
 
+**С Ф1 (ISS-22 а) CLI по умолчанию ПРОГОНЯЕТ self-review** (второй проход-критик,
+`review_and_flag_protocol_file(rewrite=True)`) — паритет с finalize/clarify/командой.
+Для отладки промта и backfill, где нужен сырой черновик генерации (без переписывания
+критиком), отключай: флаг `--no-review` или env `NOTARY_REGEN_NO_REVIEW=1`.
+
 ```bash
 # На VPS (под production-venv):
 cd /home/dev/meeting-notary && venv/bin/python vexa/scripts/notary/tools/regenerate-protocol.py sales-quality 2026-05-27
@@ -268,8 +273,8 @@ cd /home/dev/meeting-notary && venv/bin/python vexa/scripts/notary/tools/regener
 # На маке (под venv-cli — без pyannote/torch, того что нужно для генерации):
 cd ~/Projects/meeting-notary && .venv-cli/bin/python vexa/scripts/notary/tools/regenerate-protocol.py sales-quality 2026-05-27 --duration 21 --participants "Илья Рыбалка,Михаил Саргин,Дарья Набережная,Михаил Еремеев"
 
-# Backfill sales-quality рядом с эталоном:
-... regenerate-protocol.py sales-quality-2026-05-27 2026-05-27 --out 2026-05-27-protokol-auto.md ...
+# Backfill sales-quality рядом с эталоном (--no-review — сырой черновик, без правок критика):
+... regenerate-protocol.py sales-quality-2026-05-27 2026-05-27 --out 2026-05-27-protokol-auto.md --no-review ...
 ```
 
 ### Telegram-команда «протокол <series> <date>»
