@@ -283,10 +283,10 @@ class TestSyntheticSeriesPendingSection(unittest.TestCase):
             digests = sm.resolve_memory(series_dir, root, current_date="2026-06-10")
             self.assertTrue(digests)
             block = sm.build_open_tasks_block(digests, meeting_sid="iss23-e2e")
-            self.assertIn("## 🔻 С прошлых встреч", block)
+            self.assertIn(f"## {sm.PENDING_SECTION_HEADING}", block)
             self.assertIn("Ozon-доставку", block)        # перенесённый пункт из таблицы
             prompt = lp._format_protocol_user_prompt("транскрипт", _META, open_tasks=block)
-            self.assertIn("## 🔻 С прошлых встреч", prompt)
+            self.assertIn(f"## {sm.PENDING_SECTION_HEADING}", prompt)
             self.assertIn("Ozon-доставку", prompt)
             # инструкция-раздел идёт ПЕРЕД транскриптом
             self.assertLess(prompt.index("Ozon-доставку"), prompt.index("Транскрипт:"))

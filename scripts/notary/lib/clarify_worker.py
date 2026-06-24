@@ -229,6 +229,9 @@ def _apply_resolution(
                 )
                 # Ф8 (G9): хвост открытых задач серии из тех же выжимок (kill-switch
                 # внутри). Паритет с finalize call-site (footgun two-call-sites).
+                # Ф3 (R21): mark_shown НЕ передаём (дефолт False) — clarify это реген
+                # уже показанного протокола; помечать закрытые «показано» должен только
+                # канонический finalize, иначе коррекция теряла бы подраздел «закрытые».
                 open_tasks_block = series_memory.build_open_tasks_block(
                     _smem, series_dir=transcript_path.parent,
                     meeting_sid=state.get("meeting_id"),

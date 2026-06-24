@@ -603,7 +603,21 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
                     txt = f"{current_owner}: {txt}"
                 fresh.append(txt)
         elif section == "carryover":
+            # Ф3 (R7): раздел висяков сгруппирован по ответственному подзаголовком
+            # `**Имя**` (как блок «Задачи»). Трекаем владельца, чтобы перенос сохранял
+            # «кто следующий шаг» (Ф1), когда имя вынесено в подзаголовок, а не в строку.
+            om = _OWNER_SUBHEADING_RE.match(raw_line)
+            if om:
+                current_owner = re.sub(r"\s+", " ", om.group(1)).strip()
+                continue
+            if not raw_line.strip():
+                continue  # пустая строка-разделитель групп — владельца НЕ сбрасывает
             if not _is_bullet(raw_line):
+                # Не-буллет не-пустая строка = маркер подраздела Ф3 («🟡 …»/«✅ …»/
+                # курсивный ярлык). Сбрасываем владельца: задачи подразделов несут
+                # «Имя:» в самой строке (sidecar-ключ по полному тексту) — чужой
+                # подзаголовок к ним клеить нельзя.
+                current_owner = None
                 continue
             txt = _clean_task_text(raw_line)
             if not txt:
@@ -612,6 +626,10 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
                 continue  # закрыта на этой встрече — дальше серия её не несёт
             txt = _OPEN_TASK_STATUS_SUFFIX_RE.sub("", txt).strip()
             if txt:
+                # Имя из подзаголовка восстанавливаем (как в блоке «Задачи»), если в
+                # строке его ещё нет — round-trip префикса исполнителя при группировке.
+                if current_owner and current_owner.lower() not in txt.lower():
+                    txt = f"{current_owner}: {txt}"
                 carried.append(txt)
     _flush_pending_task()  # хвост: последняя строка-данных таблицы в конце протокола
     out: list[str] = []
@@ -1308,42 +1326,191 @@ def resolve_open_tasks(digests: list[dict]) -> list[str]:
     return out[:cap] if cap > 0 else out
 
 
+# Ф3 (pending-items, R3): мягкий заголовок раздела висяков — вариант владельца из
+# ISS-23. Подача «помощь, не контроль». ВАЖНО: содержит подстроку «с прошлых встреч»,
+# поэтому `_classify_heading` (тут), реордер секций (`llm_postprocess`) и вырезание
+# перед дистилляцией (`knowledge_distill.strip_carryover`) узнают секцию как carryover
+# по тексту — структурный якорь сохранён без 🔻 (см. их регексы по «с прошлых встреч»).
+PENDING_SECTION_HEADING = "Вопросы с прошлых встреч, по которым не ясен статус"
+
+# Ф3 (R7): префикс ответственного в начале задачи («Имя: задача …»). Владельца
+# выносим в подзаголовок группы, в строке имя срезаем — extract_open_tasks восстановит
+# его из подзаголовка при переносе (round-trip, Ф1 «кто следующий шаг»). Без двоеточия
+# / со скобкой в «owner» → задача безымянная (срок «(срок: …)» в конце не считаем).
+_PENDING_OWNER_RE = re.compile(r"^\s*([^:()\n]{1,32}?)\s*:\s+(\S.*)$")
+
+# Ф3 (R21/R10): код терминального/сомнительного статуса → человекочитаемый ярлык.
+# Причину («по встрече»/«по чату»/«по задаче») кладёт писатель (Ф5/Ф6) в reason —
+# тут только дописываем её в скобках. Маппинг — обязанность РЕНДЕРА (план, Ф2 handoff).
+_CLOSED_STATUS_LABEL = {
+    STATUS_DONE: "сделано",
+    STATUS_CANCELLED: "снято",
+    STATUS_AUTO_CLOSED: "закрыто автоматически",
+}
+
+
+def _human_closed_label(status: Optional[str], reason: Optional[str]) -> str:
+    """Ярлык закрытой задачи: «сделано (по встрече)» / «снято» / «закрыто автоматически»."""
+    base = _CLOSED_STATUS_LABEL.get(status or "", "закрыто")
+    r = (reason or "").strip()
+    return f"{base} ({r})" if r else base
+
+
+def _group_open_by_owner(tasks: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """Ф3 (R7): группировка висящих по ответственному.
+
+    Возвращает `(nameless, owned)`:
+      • `nameless` — задачи без префикса «Имя:» (рендерятся БЕЗ подзаголовка, ПЕРВЫМИ —
+        чтобы при переносе `extract_open_tasks` не приклеил им чужого владельца);
+      • `owned` — `[(owner, [task_без_имени, …]), …]` в порядке первого появления.
+    Имя в строке срезаем (оно уходит в подзаголовок **Имя**); перенос восстановит
+    «Имя: задача» из подзаголовка. Безымянные несут полный текст.
+    """
+    nameless: list[str] = []
+    order: list[str] = []
+    owned: dict[str, list[str]] = {}
+    for t in tasks or []:
+        m = _PENDING_OWNER_RE.match(t or "")
+        if not m:
+            s = (t or "").strip()
+            if s:
+                nameless.append(s)
+            continue
+        owner = re.sub(r"\s+", " ", m.group(1)).strip()
+        rest = m.group(2).strip()
+        if owner not in owned:
+            owned[owner] = []
+            order.append(owner)
+        owned[owner].append(rest)
+    return nameless, [(o, owned[o]) for o in order]
+
+
+def _group_closed_by_label(closed: list[dict]) -> list[tuple[str, list[str]]]:
+    """Ф3 (R21): закрытые сгруппированы по человекочитаемому ярлыку (статус+причина).
+
+    Ярлык — в маркер-строку, текст задачи в буллете остаётся ДОСЛОВНЫМ (без суффикса):
+    иначе при переносе `extract_open_tasks` сдвинул бы `_status_key` и задача
+    «воскресла» бы как висящая. Порядок ярлыков — первого появления.
+    """
+    order: list[str] = []
+    groups: dict[str, list[str]] = {}
+    for c in closed or []:
+        if not isinstance(c, dict):
+            continue
+        label = _human_closed_label(c.get("status"), c.get("reason"))
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        if label not in groups:
+            groups[label] = []
+            order.append(label)
+        groups[label].append(text)
+    return [(lbl, groups[lbl]) for lbl in order]
+
+
+def _render_pending_subsections(doubt: list[dict], closed: list[dict]) -> str:
+    """Ф3 (R10/R21): подразделы «под сомнением» и «закрытые» для копирования ДОСЛОВНО.
+
+    Маркеры — ПЛОСКИЕ строки (НЕ `##`-заголовки и НЕ `**жирный**`): заголовок завёл бы
+    лишнюю секцию и сломал бы вырезание дистиллятором; жирная строка спуталась бы с
+    подзаголовком ответственного (`_OWNER_SUBHEADING_RE`) и приклеила бы маркер к
+    задаче при переносе. Буллеты несут ПОЛНЫЙ текст задачи (с «Имя:») — sidecar-ключ
+    по нему; при переносе закрытые исчезнут (shown=True), сомнительные вернутся.
+    """
+    out: list[str] = []
+    if doubt:
+        out.append("🟡 Вроде закрыто — подтвердите")
+        for d in doubt:
+            if not isinstance(d, dict):
+                continue
+            t = (d.get("text") or "").strip()
+            if t:
+                out.append(f"- {t}")
+        out.append("")
+    if closed:
+        out.append("✅ Закрыто с прошлых встреч")
+        for label, items in _group_closed_by_label(closed):
+            out.append(f"_{label}:_")
+            for t in items:
+                out.append(f"- {t}")
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
 _OPEN_TASKS_BLOCK_HEADER = (
-    "ОТКРЫТЫЕ ЗАДАЧИ С ПРОШЛЫХ ВСТРЕЧ ЭТОЙ СЕРИИ — трекинг во времени.\n"
-    "Ниже задачи/договорённости, которые на ПРОШЛЫХ встречах серии остались "
-    "НЕзакрытыми. В протоколе текущей встречи добавь В САМОМ КОНЦЕ (после блока "
-    "«Задачи») отдельный раздел с заголовком ровно:\n"
-    "## 🔻 С прошлых встреч\n"
-    "и для КАЖДОЙ задачи из списка ниже выведи ОДНУ строку строго в формате:\n"
-    "- <текст задачи дословно как в списке> — <статус>\n"
-    "Если в задаче есть префикс исполнителя в начале (например «Татьяна: …») — "
-    "СОХРАНИ его дословно: он показывает, за кем следующий шаг.\n"
-    "Статус определяй ТОЛЬКО по ТЕКУЩЕМУ транскрипту этой встречи:\n"
-    "- задача обсуждалась и решена/выполнена на этой встрече → «закрыта»;\n"
-    "- задача в текущем транскрипте не всплыла → «висит»;\n"
-    "- упоминание есть, но неясно, закрыта ли она → «висит, статус?» "
-    "(НЕ угадывай «закрыта» — лучше показать висящей лишний раз).\n"
-    "ВАЖНО: это ЕДИНСТВЕННОЕ исключение из правила «факты только из текущей записи» — "
-    "сами задачи взяты из прошлых встреч серии, ты лишь проставляешь им статус по "
-    "текущей. НЕ добавляй в этот раздел новые задачи текущей встречи (они идут в "
-    "обычный блок «Задачи»). НЕ выдумывай задач, которых нет в списке ниже."
+    "ВОПРОСЫ С ПРОШЛЫХ ВСТРЕЧ ЭТОЙ СЕРИИ — мягкое напоминание-помощь, НЕ контроль и "
+    "НЕ аудит. В протоколе текущей встречи добавь В САМОМ КОНЦЕ (после блока «Задачи») "
+    "отдельный раздел с заголовком РОВНО:\n"
+    f"## {PENDING_SECTION_HEADING}\n"
+    "Тон — дружелюбная сверка, а не спрос: это вопросы, поднятые на прошлых встречах "
+    "серии и пока не закрытые явно; если что-то уже решено — участники поправят. БЕЗ "
+    "давления, БЕЗ слов «просрочка»/«опоздание»/«срыв»/«почему не сделано»."
 )
 
 
-def format_open_tasks_block(open_tasks: list[str]) -> str:
-    """Ф8: блок-инструкция «открытые задачи серии» для промпта генерации.
+def format_open_tasks_block(
+    open_tasks: list[str],
+    *,
+    doubt: Optional[list[dict]] = None,
+    closed: Optional[list[dict]] = None,
+) -> str:
+    """Ф8/Ф3: блок-инструкция раздела висяков для промпта генерации (G9).
 
-    Пустой список → "" (блок не добавляется → раздела «🔻 С прошлых встреч» в
-    протоколе не будет). Дисциплина: это НЕ справка-«не-факт» (как память серии),
-    а явная инструкция перенести перечисленные задачи со статусом — потому идёт
-    отдельным блоком ПОСЛЕ блока памяти серии (см. `_format_protocol_user_prompt`).
+    Три части под одним мягким заголовком (`PENDING_SECTION_HEADING`):
+      • Часть 1 — НЕзакрытые: сгруппированы по ответственному (R7), статус ставит
+        модель по ТЕКУЩЕМУ транскрипту (висит/закрыта); срок — только если он уже в
+        тексте, без маркеров просрочки (R6/R3);
+      • Часть 2 — подразделы «под сомнением» (R10) и «закрытые с прошлых встреч»
+        (R21): модель копирует их ДОСЛОВНО, не переоценивая статус.
+    Всё пусто → "" (раздела не будет). Дисциплина: это НЕ справка-«не-факт» (как
+    память серии), а инструкция перенести/показать — потому идёт ПОСЛЕ блока памяти.
     """
-    if not open_tasks:
+    open_tasks = open_tasks or []
+    doubt = doubt or []
+    closed = closed or []
+    if not (open_tasks or doubt or closed):
         return ""
-    lines = [_OPEN_TASKS_BLOCK_HEADER, "", "Незакрытые задачи серии:"]
-    for t in open_tasks:
-        lines.append(f"- {t}")
-    lines.append("(конец списка — статус каждой определяй по текущему транскрипту)")
+    lines = [_OPEN_TASKS_BLOCK_HEADER]
+    if open_tasks:
+        lines += [
+            "",
+            "ЧАСТЬ 1 — НЕзакрытые, сгруппируй по ответственному (НЕ плоским списком). "
+            "Для каждого человека — подзаголовок жирным `**Имя**`, под ним его задачи "
+            "строкой «- <текст задачи дословно> — <статус>». Если в задаче есть префикс "
+            "исполнителя «Имя: …» — это и есть ответственный (вынеси имя в подзаголовок; "
+            "в строке имя можно не повторять). Задачи без явного исполнителя выведи "
+            "первыми, без подзаголовка. Статус ставь ТОЛЬКО по ТЕКУЩЕМУ транскрипту: "
+            "решена/выполнена на этой встрече → «закрыта»; в транскрипте не всплыла → "
+            "«висит»; упомянута, но неясно → «висит, статус?» (НЕ угадывай «закрыта» — "
+            "лучше показать висящей лишний раз). Срок показывай ТОЛЬКО если он уже есть "
+            "в тексте задачи (в скобках «(срок: …)»); не добавляй сроков и НЕ помечай "
+            "просрочку — этого в данных нет.",
+            "",
+            "Незакрытые задачи по людям:",
+        ]
+        nameless, owned = _group_open_by_owner(open_tasks)
+        for t in nameless:
+            lines.append(f"- {t}")
+        for owner, items in owned:
+            lines.append(f"**{owner}**")
+            for it in items:
+                lines.append(f"- {it}")
+    subsections = _render_pending_subsections(doubt, closed)
+    if subsections:
+        lines += [
+            "",
+            "ЧАСТЬ 2 — приведённые НИЖЕ подразделы СКОПИРУЙ В КОНЕЦ ЭТОГО ЖЕ раздела "
+            "ДОСЛОВНО, символ в символ: НЕ меняй формулировок, НЕ группируй по людям, "
+            "НЕ проставляй им статус по транскрипту (их статус уже подтверждён вне этой "
+            "встречи). Маркеры подразделов («🟡 …», «✅ …», курсивные ярлыки) сохрани "
+            "как есть.",
+            "",
+            subsections,
+        ]
+    lines += [
+        "",
+        "(конец: у НЕзакрытых проставь статус по транскрипту; подразделы Части 2 — дословно)",
+    ]
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1352,6 +1519,7 @@ def build_open_tasks_block(
     *,
     series_dir: Optional[Path] = None,
     meeting_sid: Optional[str] = None,
+    mark_shown: bool = False,
 ) -> str:
     """Ф8 (G9): единая точка сборки блока открытых задач для ОБОИХ триггеров
     (finalize И clarify) — как `build_cross_memory_block` для кросс-фона.
@@ -1364,9 +1532,14 @@ def build_open_tasks_block(
     Ф2 (pending-items): `series_dir` (если передан) → накладываем sidecar-статусы на
     свежесгенерированный хвост (`merge_open_tasks_with_status`): терминально закрытые
     (отменён/закрыто-сделано/закрыто-авто) В ХВОСТ «висит» НЕ попадают — статусы
-    reply/сверщика переживают регенерацию и закрытое не воскресает. Подразделы
-    «закрытые»/«под сомнением» рендерит Ф3 (доступны через `merge_open_tasks_with_status`);
-    здесь — только видимый хвост висящих. `series_dir=None` → прежнее поведение Ф8.
+    reply/сверщика переживают регенерацию и закрытое не воскресает. `series_dir=None`
+    → прежнее поведение Ф8.
+
+    Ф3 (pending-items): рендерим ВСЕ три корзины — висящие (по людям, R7) + подразделы
+    «под сомнением» (R10) и «закрытые» (R21). `mark_shown=True` (канонический показ из
+    finalize) → после включения закрытых в блок зовём `mark_status_shown`: на следующих
+    встречах merge их не вернёт (показ один раз, список не копится). clarify передаёт
+    `mark_shown=False` — реген уже показанного протокола shown-состояние НЕ двигает.
     """
     if not is_open_tasks_enabled():
         return ""
@@ -1378,11 +1551,20 @@ def build_open_tasks_block(
         merged = merge_open_tasks_with_status(fresh, store)
         cap = open_tasks_max()
         hanging = merged["open"][:cap] if cap > 0 else merged["open"]
-        block = format_open_tasks_block(hanging)
+        doubt = merged["doubt"]
+        closed = merged["closed"]
+        block = format_open_tasks_block(hanging, doubt=doubt, closed=closed)
+        # R21: закрытые показываем ОДИН раз. Помечаем shown ТОЛЬКО на каноническом
+        # показе (finalize, mark_shown=True) и только если они реально попали в блок.
+        if mark_shown and closed and series_dir is not None and block:
+            for c in closed:
+                try:
+                    mark_status_shown(series_dir, c.get("text", ""))
+                except Exception:  # noqa: BLE001 — пометка best-effort, блок уже собран
+                    pass
         logger.info(
             "[open-tasks] block meeting=%s carried=%d closed=%d doubt=%d block_len=%d",
-            meeting_sid or "?", len(hanging), len(merged["closed"]),
-            len(merged["doubt"]), len(block),
+            meeting_sid or "?", len(hanging), len(closed), len(doubt), len(block),
         )
         return block
     except Exception as e:  # noqa: BLE001 — трекинг опционален, генерацию не роняем

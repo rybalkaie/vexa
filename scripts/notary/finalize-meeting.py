@@ -834,8 +834,12 @@ def main() -> int:
             # Ф8 (G9): хвост открытых задач серии из тех же выжимок (latest несёт
             # кумулятивное состояние). Под своим kill-switch внутри. Отдельным от
             # series_memory каналом — у него обратная дисциплина (перенести + статус).
+            # Ф3 (R21): finalize — канонический показ. mark_shown=True помечает
+            # закрытые «показано» после включения в блок (clarify-реген НЕ помечает,
+            # см. lib/clarify_worker.py — иначе закрытые потерялись бы при коррекции).
             open_tasks_block = series_memory.build_open_tasks_block(
                 series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
+                mark_shown=True,
             )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",

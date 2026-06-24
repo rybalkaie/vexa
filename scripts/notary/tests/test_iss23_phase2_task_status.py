@@ -334,7 +334,12 @@ class TestBuildBlockWithSidecar(unittest.TestCase):
                                sm.STATUS_AUTO_CLOSED, reason="по чату")
             block = sm.build_open_tasks_block(self._digests(), series_dir=sd, meeting_sid="ph2")
             self.assertIn("медиаплан", block)          # висящая на месте
-            self.assertNotIn("складу Ozon", block)      # авто-закрытая не воскресла
+            # Ф3: авто-закрытая НЕ висит как «висит» (Часть 1), но показана в
+            # подразделе «закрытые» (Часть 2) с причиной — один раз.
+            hanging_part = block.split("ЧАСТЬ 2")[0]
+            self.assertNotIn("складу Ozon", hanging_part)   # не воскресла как висящая
+            self.assertIn("✅ Закрыто", block)
+            self.assertIn("складу Ozon", block)             # показана в подразделе «закрытые»
 
     def test_no_series_dir_is_legacy_behavior(self):
         # Обратная совместимость: без series_dir блок = весь свежий хвост (как Ф8).
@@ -352,10 +357,11 @@ class TestBuildBlockWithSidecar(unittest.TestCase):
             sm.set_task_status(sd, "X-closed", sm.STATUS_DONE)
             with mock.patch.dict(os.environ, {"OPEN_TASKS_MAX": "3"}):
                 block = sm.build_open_tasks_block(digests, series_dir=sd)
-            # 3 висящих (A,B,C) показаны; закрытая X не заняла слот.
+            # 3 висящих (A,B,C) показаны; закрытая X не заняла слот висящих.
             for t in ("A", "B", "C"):
                 self.assertIn(t, block)
-            self.assertNotIn("X-closed", block)
+            # Ф3: закрытая X показана в подразделе «закрытые», но НЕ среди висящих.
+            self.assertNotIn("X-closed", block.split("ЧАСТЬ 2")[0])
 
     def test_log_only_counters_no_text(self):
         secret = "складу Ozon"
@@ -393,13 +399,16 @@ class TestReplayTwoMeetings(unittest.TestCase):
             self.assertTrue(digests)
             block = sm.build_open_tasks_block(digests, series_dir=sd, meeting_sid="m2")
             self.assertIn("медиаплан", block)        # живой висяк показан
-            self.assertNotIn("складу Ozon", block)    # отменённый НЕ воскрес как «висит»
+            # Ф3: отменённый НЕ висит как «висит» (Часть 1); показан в «закрытые» (Часть 2).
+            self.assertNotIn("складу Ozon", block.split("ЧАСТЬ 2")[0])
+            self.assertIn("складу Ozon", block)
             # Ещё одна регенерация (повторный финализ той же даты) — статус не сброшен.
             sm.save_meeting_digest(sd, "2026-06-03", _PROTO_TASKS,
                                    {"series": "koord", "date": "2026-06-03"})
             digests2 = sm.resolve_memory(sd, root, current_date="2026-06-10")
             block2 = sm.build_open_tasks_block(digests2, series_dir=sd, meeting_sid="m2b")
-            self.assertNotIn("складу Ozon", block2)   # всё ещё закрыт после регенерации
+            # всё ещё не висит после регенерации (показ не помечался — mark_shown=False).
+            self.assertNotIn("складу Ozon", block2.split("ЧАСТЬ 2")[0])
             # merge напрямую: отменённый в корзине closed, не в open.
             fresh = sm.resolve_open_tasks(digests2)
             merged = sm.merge_open_tasks_with_status(fresh, sm.load_task_status(sd))

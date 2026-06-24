@@ -296,7 +296,8 @@ class TestFormatAndBuildBlock(unittest.TestCase):
 
     def test_format_has_section_heading_and_tasks(self):
         block = sm.format_open_tasks_block(["Илья: сделать X", "Татьяна: прислать Y"])
-        self.assertIn("## 🔻 С прошлых встреч", block)
+        # Ф3: мягкий заголовок (вариант владельца), без 🔻.
+        self.assertIn(f"## {sm.PENDING_SECTION_HEADING}", block)
         self.assertIn("сделать X", block)
         self.assertIn("прислать Y", block)
         # дисциплина: статус определять по текущему транскрипту
@@ -348,7 +349,7 @@ class TestOpenTasksReachesGeneration(unittest.TestCase):
     def test_block_in_user_prompt(self):
         block = sm.format_open_tasks_block(["Илья: добить отчёт"])
         prompt = lp._format_protocol_user_prompt("транскрипт", _META, open_tasks=block)
-        self.assertIn("## 🔻 С прошлых встреч", prompt)
+        self.assertIn(f"## {sm.PENDING_SECTION_HEADING}", prompt)
         self.assertIn("добить отчёт", prompt)
         # блок ПЕРЕД транскриптом
         self.assertLess(prompt.index("добить отчёт"), prompt.index("Транскрипт:"))
@@ -361,7 +362,7 @@ class TestOpenTasksReachesGeneration(unittest.TestCase):
         prompt = lp._format_protocol_user_prompt(
             "транскрипт", _META, series_memory=mem, open_tasks=block)
         # открытые задачи идут ПОСЛЕ блока памяти серии (обратная дисциплина)
-        self.assertLess(prompt.index("СПРАВКА"), prompt.index("ОТКРЫТЫЕ ЗАДАЧИ"))
+        self.assertLess(prompt.index("СПРАВКА"), prompt.index("ВОПРОСЫ С ПРОШЛЫХ ВСТРЕЧ"))
 
     def test_none_open_tasks_no_block(self):
         prompt = lp._format_protocol_user_prompt("транскрипт", _META, open_tasks=None)
@@ -414,7 +415,7 @@ class TestEndToEndSynthetic(unittest.TestCase):
             digests = sm.resolve_memory(series_dir, root, current_date="2026-06-15")
             self.assertTrue(digests)
             block = sm.build_open_tasks_block(digests, meeting_sid="e2e")
-            self.assertIn("## 🔻 С прошлых встреч", block)
+            self.assertIn(f"## {sm.PENDING_SECTION_HEADING}", block)
             self.assertIn("медиаплан", block)
             # блок доходит до промпта генерации
             prompt = lp._format_protocol_user_prompt("транскрипт", _META, open_tasks=block)
