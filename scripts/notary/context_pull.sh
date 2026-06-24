@@ -22,11 +22,18 @@ LOCK_FILE="${CONTEXT_PULL_LOCK:-/tmp/meeting-notary-context-pull.lock}"
 log() { printf '%s context-pull: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 # Не наслаиваем прогоны (флок без ожидания — следующий тик и так через интервал).
-exec 9>"$LOCK_FILE" 2>/dev/null || true
+# systemd Type=oneshot и так не плодит второй инстанс юнита; флок — страховка от
+# ручного параллельного запуска. Если lock-файл НЕ открылся (напр. /tmp недоступен)
+# — НЕ выдаём ложное «уже выполняется» (иначе тик молча пропадал бы вечно), а идём
+# без блокировки с явным логом (принцип «no silent skip»).
 if command -v flock >/dev/null 2>&1; then
-  if ! flock -n 9; then
-    log "уже выполняется (lock $LOCK_FILE) — пропуск тика"
-    exit 0
+  if exec 9>"$LOCK_FILE" 2>/dev/null; then
+    if ! flock -n 9; then
+      log "уже выполняется (lock $LOCK_FILE) — пропуск тика"
+      exit 0
+    fi
+  else
+    log "не открыть lock $LOCK_FILE — иду без блокировки"
   fi
 fi
 
