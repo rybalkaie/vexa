@@ -116,6 +116,7 @@ _DEFAULT_CHAT_ARCHIVE_DIR = "~/.claude/channels/telegram-observer/archive"
 _DEFAULT_CHAT_GROUPS_FILE = "~/.claude/channels/telegram-observer/groups.json"
 _DEFAULT_CHAT_GROUPS_META = "~/.claude/channels/telegram-observer/analyzer-cwd/groups-meta.json"
 _DEFAULT_CHAT_MSGS_PER_CHAT = 40  # потолок САМЫХ СВЕЖИХ сообщений на чат (граница egress)
+_MIN_CHAT_EVIDENCE_BUDGET = 300   # минимальная доля maxlen на один чат при делении бюджета
 
 # Модель LLM-матчинга — Haiku (как фильтр значимости Ф4 / маппинг имён). Переопределимо.
 _RECONCILER_MODEL = (os.environ.get("PENDING_RECONCILER_MODEL") or "").strip() \
@@ -630,15 +631,20 @@ def gather_chat_evidence(
             cutoff = None
     ad = Path(archive_dir) if archive_dir is not None else chat_archive_dir()
     import json as _json  # noqa: PLC0415
+    # Справедливая доля egress на КАЖДЫЙ чат: делим maxlen между РЕАЛЬНО существующими
+    # архивами компании, чтобы один болтливый чат не съел весь потолок и свидетельства из
+    # остальных чатов не потерялись (R18 — «читаются чаты компании» во МНОЖЕСТВЕННОМ числе;
+    # у реальной компании их много). Знаменатель — существующие файлы (нет файла → бюджет
+    # не резервируем). Глобальный maxlen остаётся жёстким backstop'ом ниже.
+    present = [cid for cid in chat_ids if (ad / f"{cid}.jsonl").is_file()]
+    per_chat_budget = max(_MIN_CHAT_EVIDENCE_BUDGET, maxlen // len(present)) if present else maxlen
     lines: list[str] = []
     total = 0
     chats_seen = 0
     msgs = 0
     idx = 0
-    for cid in chat_ids:
+    for cid in present:
         path = ad / f"{cid}.jsonl"
-        if not path.is_file():
-            continue
         chat_lines: list[str] = []
         try:
             with path.open("r", encoding="utf-8") as fh:
@@ -675,6 +681,9 @@ def gather_chat_evidence(
         for cl in chat_lines:
             block.append(f"- {cl}")
         chunk = "\n".join(block)
+        # Доля чата: болтливый чат не вытесняет остальные (per_chat_budget выше).
+        if len(chunk) > per_chat_budget:
+            chunk = chunk[:per_chat_budget].rstrip() + " …"
         if total + len(chunk) > maxlen:
             remaining = maxlen - total
             if remaining > 80:  # влезает осмысленный хвост — добавим усечённо
@@ -929,11 +938,16 @@ def reconcile_all(
                     sd, evidence=ev_chat, matcher=matcher, date=date,
                     reason=REASON_BY_CHAT, source=SOURCE_CHAT, dry_run=dry_run, doubt_ttl=0,
                 )
-                # Слияние счётчиков двух проходов: hanging — исходное; kept пересчитан.
+                # Слияние счётчиков двух проходов. `hanging` — исходное. Закрытия/сомнения
+                # пасса 1 ТЕРМИНАЛЬНЫ (в `open` больше не попадут) → суммируем. НО `kept` и
+                # `persist_fail` пасса 1 НЕ терминальны: эти висяки остались в `open` и
+                # ПЕРЕ-обработаны чат-проходом, поэтому их финальный исход = исход пасса 2
+                # (берём из res_chat, НЕ суммируем — иначе persist_fail пасса 1 двоился бы
+                # со своим же ретраем в пассе 2, а kept занижался бы на эту величину).
                 res.closed += res_chat.closed
                 res.doubt += res_chat.doubt
-                res.persist_fail += res_chat.persist_fail
-                res.kept = max(0, res.hanging - res.closed - res.doubt - res.persist_fail)
+                res.persist_fail = res_chat.persist_fail
+                res.kept = res_chat.kept
                 res.skipped = res.skipped and res_chat.skipped
         res.doubt_pruned = pruned
         results.append(res)

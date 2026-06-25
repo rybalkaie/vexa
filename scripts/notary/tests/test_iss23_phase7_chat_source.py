@@ -541,5 +541,52 @@ class TestMainWiresChatProvider(unittest.TestCase):
         self.assertIsNone(kwargs.get("chat_evidence"))  # чат-источник OFF → Ф6-поведение
 
 
+# ── Р1 (реальность, цикл5): справедливая доля egress между чатами компании ────
+class TestFairChatBudgetR18(unittest.TestCase):
+    """Реальная компания = МНОГО чатов. Один болтливый чат НЕ должен съесть весь maxlen
+    и вытеснить свидетельства остальных (R18 — «чаты компании» во множественном числе).
+    Без деления бюджета прошёл бы только первый чат — этот тест ловит регресс."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.arch = self.root / "archive"
+        big = "к" * 300  # каждое сообщение крупное; один чат сам по себе > maxlen
+        for cid in (-1, -2, -3):
+            _write_jsonl(self.arch, cid, [
+                _msg("2026-06-24T10:00:0%dZ" % i, "чат%d-сообщение%d-%s" % (cid, i, big))
+                for i in range(8)
+            ])
+        self.groups = _write_groups(self.root / "groups.json", [
+            {"chat_id": -1, "title": "Anzhee • A"},
+            {"chat_id": -2, "title": "Anzhee • B"},
+            {"chat_id": -3, "title": "Anzhee • C"},
+        ])
+        self.sd = _seed_series(self.root / "встречи", "s", "2026-06-20", open_tasks=["висяк"])
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_all_chats_represented_under_shared_budget(self):
+        ev = pr.gather_chat_evidence(
+            self.sd, archive_dir=self.arch, groups_file=self.groups,
+            company_for_series_fn=lambda s: "anzhee", today="2026-06-25", maxlen=1500)
+        # ВСЕ три чата присутствуют (а не только первый, съевший весь бюджет)
+        self.assertIn("Переписка 1", ev)
+        self.assertIn("Переписка 2", ev)
+        self.assertIn("Переписка 3", ev)
+        # суммарно в пределах maxlen (+ небольшой хвост маркеров усечения)
+        self.assertLessEqual(len(ev), 1500 + 3 * 6)
+
+    def test_single_chat_company_unchanged(self):
+        # компания с ОДНИМ чатом: бюджет = весь maxlen (поведение не изменилось)
+        g1 = _write_groups(self.root / "g1.json", [{"chat_id": -1, "title": "Anzhee • A"}])
+        ev = pr.gather_chat_evidence(
+            self.sd, archive_dir=self.arch, groups_file=g1,
+            company_for_series_fn=lambda s: "anzhee", today="2026-06-25", maxlen=1500)
+        self.assertIn("Переписка 1", ev)
+        self.assertLessEqual(len(ev), 1500 + 6)
+
+
 if __name__ == "__main__":
     unittest.main()
