@@ -15,9 +15,20 @@
 (`<серия>/<date>-memory.json`, уже распарсенный детерминированно протокол), НЕ сырой
 транскрипт. Источники свидетельств: (Ф6) протоколы ДРУГИХ серий — кросс-серийно;
 (Ф7) ПЕРЕПИСКИ компании серии — СОХРАНЁННЫЙ архив наблюдателя `.jsonl` (НЕ Telegram,
-A8), скоуп по компании серии как граница доступа (R18); (Ф8) Bitrix — позже. Все —
-ПОВЕРХ одного ядра `reconcile_series`, доп. источник = доп. матч-проход с своим
+A8), скоуп по компании серии как граница доступа (R18); (Ф8) ЗАДАЧИ Bitrix24 —
+ТОЛЬКО для серий Anzhee (R19; у МПервый Bitrix нет), по комментариям/переписке задачи.
+Все — ПОВЕРХ одного ядра `reconcile_series`, доп. источник = доп. матч-проход с своим
 ярлыком причины («по встрече»/«по чату»/«по задаче»).
+
+Ф8 (R19) — СКОУП ТОЛЬКО Anzhee. Серия→КОМПАНИЯ (`series_markup.company_for_series`,
+тот же резолв, что Ф7) → компания `anzhee`? нет (МПервый/unknown) → Bitrix-источник
+ПРОПУСКАЕТСЯ (ни одного REST-вызова; зеркало консервативного дефолта Ф7 «unknown→0»).
+Компания anzhee → ЖИВОЙ сетевой REST через скилл-обёртку `bitrix.sh` поверх вебхука
+(вебхук СЕКРЕТ в `~/.config/bitrix/webhook` — в код/argv/лог НЕ попадает; скрипт читает
+сам). Отдельный гейт `ENABLE_PENDING_RECONCILER_BITRIX_SOURCE` (дефолт-OFF, параллельно
+гейтам Ф6/Ф7) — НОВЫЙ egress НАРУЖУ к порталу (шире чат-источника, который лишь ЧИТАЛ
+локальные файлы), отдельный opt-in владельца. Активен лишь когда ВКЛЮЧЕНЫ И центральный
+гейт `ENABLE_PENDING_RECONCILER` (гейт claude), И этот (гейт Bitrix REST).
 
 Ф7 (R18) — ГРАНИЦА ДОСТУПА. Серия→КОМПАНИЯ (`series_markup.company_for_series` поверх
 `watched.yaml`) → набор ЧАТОВ компании (`_load_chat_company_map` по префиксу `title`
@@ -93,12 +104,18 @@ REASON_BY_MEETING = "по встрече"
 # рендер Ф3 допишет её в скобках: «закрыто автоматически (по чату)» (формат уже
 # учтён в series_memory._human_closed_label, причина «по чату» там предусмотрена).
 REASON_BY_CHAT = "по чату"
+# Ф8 (R19): причина-ярлык для закрытия по ЗАДАЧЕ Bitrix. Зеркало REASON_BY_CHAT —
+# рендер Ф3 допишет в скобках: «закрыто автоматически (по задаче)» (формат
+# series_memory._human_closed_label универсален: любая reason уходит в скобки).
+REASON_BY_BITRIX = "по задаче"
 
 # Источник статуса в sidecar (для аудита «чей статус»): сверщик vs reply Ф5.
 SOURCE_RECONCILER = "reconciler"
 # Ф7: источник статуса = чат-архив (отличать в аудите от кросс-серийного «reconciler»
 # и reply «reply» Ф5). НЕ ломает существующий source="reconciler" — это доп. метка.
 SOURCE_CHAT = "chat"
+# Ф8: источник статуса = задачи Bitrix (аудит — отличать от «reconciler»/«chat»/«reply»).
+SOURCE_BITRIX = "bitrix"
 
 # Ф7 (R18 — граница доступа). Компания (код watched.yaml `anzhee`/`mpfirst`) → её
 # человекочитаемый ПРЕФИКС в `title` чата groups.json (часть до «•»: «Anzhee • …»,
@@ -116,7 +133,15 @@ _DEFAULT_CHAT_ARCHIVE_DIR = "~/.claude/channels/telegram-observer/archive"
 _DEFAULT_CHAT_GROUPS_FILE = "~/.claude/channels/telegram-observer/groups.json"
 _DEFAULT_CHAT_GROUPS_META = "~/.claude/channels/telegram-observer/analyzer-cwd/groups-meta.json"
 _DEFAULT_CHAT_MSGS_PER_CHAT = 40  # потолок САМЫХ СВЕЖИХ сообщений на чат (граница egress)
-_MIN_CHAT_EVIDENCE_BUDGET = 300   # минимальная доля maxlen на один чат при делении бюджета
+_MIN_CHAT_EVIDENCE_BUDGET = 300   # минимальная доля maxlen на один чат/задачу при делении бюджета
+
+# ── Ф8 (R19): источник «Bitrix» — ТОЛЬКО Anzhee. ЖИВОЙ сетевой REST через скилл
+# bitrix.sh поверх вебхука (вебхук СЕКРЕТ, скрипт читает сам из ~/.config/bitrix/webhook).
+_BITRIX_COMPANY = "anzhee"  # ЕДИНСТВЕННАЯ компания с Bitrix (R19 — скоуп источника)
+_DEFAULT_BITRIX_SH = "~/.claude/skills/bitrix/bitrix.sh"  # обёртка `bitrix.sh call <method> <json>`
+_DEFAULT_BITRIX_TASKS_LIMIT = 25       # потолок задач (граница egress + числа REST-вызовов)
+_DEFAULT_BITRIX_COMMENTS_PER_TASK = 20  # потолок САМЫХ СВЕЖИХ комментариев на задачу
+_DEFAULT_BITRIX_TIMEOUT = 45           # таймаут ОДНОГО вызова bitrix.sh (сек)
 
 # Модель LLM-матчинга — Haiku (как фильтр значимости Ф4 / маппинг имён). Переопределимо.
 _RECONCILER_MODEL = (os.environ.get("PENDING_RECONCILER_MODEL") or "").strip() \
@@ -230,6 +255,42 @@ def chat_groups_meta_file() -> Path:
 def chat_msgs_per_chat() -> int:
     """Потолок самых свежих сообщений на чат (граница egress). Env-override."""
     return _env_int("PENDING_RECONCILER_CHAT_MSGS_PER_CHAT", _DEFAULT_CHAT_MSGS_PER_CHAT)
+
+
+# ── Ф8: гейт источника-Bitrix + конфиг REST-обёртки ───────────────────────────
+def is_bitrix_source_enabled() -> bool:
+    """Гейт `ENABLE_PENDING_RECONCILER_BITRIX_SOURCE` — ДЕФОЛТ-OFF. ON ← `1/true/yes/on`.
+
+    ПАРАЛЛЕЛЬНЫЙ гейт (полярность как `is_chat_source_enabled` Ф7), НО шире риск:
+    Bitrix — ЖИВОЙ сетевой REST (НОВЫЙ egress НАРУЖУ к порталу + производные ПДн в
+    Claude при матчинге), а НЕ локальный файл, как чат-архив Ф7. Активен ТОЛЬКО когда
+    ВКЛЮЧЕНЫ И центральный `ENABLE_PENDING_RECONCILER` (гейт claude в reconcile_all),
+    И этот (решает, дёргать ли Bitrix REST). Оба дефолт-OFF → defense-in-depth. Боевую
+    активацию + боевой вебхук делает ВЛАДЕЛЕЦ (control-gate, [[notary-prod-deploy-interactive-only]]).
+    """
+    raw = (os.environ.get("ENABLE_PENDING_RECONCILER_BITRIX_SOURCE") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def bitrix_sh_path() -> Path:
+    """Путь к скилл-обёртке `bitrix.sh` (поверх вебхука). Env-override."""
+    return _env_path("PENDING_RECONCILER_BITRIX_SH", _DEFAULT_BITRIX_SH)
+
+
+def bitrix_tasks_limit() -> int:
+    """Потолок числа задач Bitrix за прогон (граница egress + REST-вызовов). Env-override."""
+    return _env_int("PENDING_RECONCILER_BITRIX_TASKS_LIMIT", _DEFAULT_BITRIX_TASKS_LIMIT)
+
+
+def bitrix_comments_per_task() -> int:
+    """Потолок самых свежих комментариев на задачу (граница egress). Env-override."""
+    return _env_int("PENDING_RECONCILER_BITRIX_COMMENTS_PER_TASK",
+                    _DEFAULT_BITRIX_COMMENTS_PER_TASK)
+
+
+def bitrix_timeout() -> int:
+    """Таймаут одного вызова bitrix.sh (сек). Env-override."""
+    return _env_int("PENDING_RECONCILER_BITRIX_TIMEOUT", _DEFAULT_BITRIX_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +760,277 @@ def gather_chat_evidence(
 
 
 # ---------------------------------------------------------------------------
+# Ф8 (R19): свидетельства из ЗАДАЧ Bitrix24 — ТОЛЬКО для серий Anzhee. ЖИВОЙ REST
+# через скилл `bitrix.sh` (вебхук-секрет читает сам скрипт). Сетевой вызов вынесен в
+# ИНЪЕКТИРУЕМЫЙ seam `_bitrix_call` — тесты подменяют его фейком, реальная сеть/вебхук
+# в unittest не дёргаются (как matcher Ф6 / company_for_series_fn Ф7).
+# ---------------------------------------------------------------------------
+def _bitrix_call(
+    method: str,
+    params: dict,
+    *,
+    timeout: Optional[int] = None,
+    bitrix_sh: Optional[Path] = None,
+) -> Optional[object]:
+    """Сырой вызов метода Bitrix REST через `bitrix.sh call <method> '<json>'` → `.result` | None.
+
+    Вебхук — СЕКРЕТ: его читает САМ скрипт из ~/.config/bitrix/webhook; в argv/env/лог
+    мы его НЕ передаём и НЕ цитируем. stdout скрипта = `.result` портала (он делает
+    `jq '.result'`). Любой сбой (нет скрипта / ненулевой код / таймаут / ответ не JSON)
+    → None + warning БЕЗ текста (только метод + код/тип ошибки). НЕ бросает: сбой Bitrix
+    не валит ночной прогон. Опасная тройка: НЕ логируем params/stdout/stderr (могут нести
+    фрагменты данных).
+    """
+    import json as _json  # локально (как везде в модуле)
+    import subprocess  # локально: stdlib, ленивый импорт (как у claude-обёртки)
+    sh = Path(bitrix_sh) if bitrix_sh is not None else bitrix_sh_path()
+    if not sh.is_file():
+        logger.warning("[reconciler] bitrix: скрипт-обёртка не найден → Bitrix-источник пропущен")
+        return None
+    try:
+        payload = _json.dumps(params or {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    try:
+        proc = subprocess.run(
+            [str(sh), "call", str(method), payload],
+            capture_output=True, text=True,
+            timeout=timeout or bitrix_timeout(),
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("[reconciler] bitrix: timeout on %s (non-fatal)", method)
+        return None
+    except (OSError, ValueError) as e:  # noqa: BLE001 — спавн не удался → пропуск
+        logger.warning("[reconciler] bitrix: spawn failed on %s: %s", method, type(e).__name__)
+        return None
+    if proc.returncode != 0:
+        # stderr скрипта (диагностика портала) НЕ логируем — может нести данные/детали.
+        logger.warning("[reconciler] bitrix: %s rc=%d (non-fatal)", method, proc.returncode)
+        return None
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+    try:
+        return _json.loads(out)
+    except (ValueError, TypeError):
+        logger.warning("[reconciler] bitrix: %s — ответ не JSON (non-fatal)", method)
+        return None
+
+
+def _extract_bitrix_tasks(result: object) -> list:
+    """Список задач из ответа `tasks.task.list`. Терпит `{tasks:[…]}`, голый `[…]`,
+    `{result:{tasks:[…]}}` (на случай иной обёртки портала)."""
+    if isinstance(result, dict):
+        t = result.get("tasks")
+        if isinstance(t, list):
+            return t
+        r = result.get("result")
+        if isinstance(r, dict) and isinstance(r.get("tasks"), list):
+            return r["tasks"]
+        return []
+    if isinstance(result, list):
+        return result
+    return []
+
+
+def _extract_bitrix_comments(result: object) -> list:
+    """Список комментариев из ответа `task.commentitem.list`. Терпит `[…]`, `{result:[…]}`,
+    map `{"0":{…},"1":{…}}` (старый формат может вернуть dict-of-dicts)."""
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        r = result.get("result")
+        if isinstance(r, list):
+            return r
+        return [v for v in result.values() if isinstance(v, dict)]
+    return []
+
+
+def _bx_field(d: object, *keys: str) -> str:
+    """Первое непустое строковое значение по списку ключей (терпим разный регистр полей
+    портала: `title`/`TITLE`, `description`/`DESCRIPTION`, `POST_MESSAGE`/`postMessage`)."""
+    if not isinstance(d, dict):
+        return ""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def gather_bitrix_evidence(
+    series_dir: Path,
+    *,
+    bitrix_call: Optional[Callable[[str, dict], Optional[object]]] = None,
+    company_for_series_fn: Optional[Callable[[str], Optional[str]]] = None,
+    watched: Optional[dict] = None,
+    today: Optional[str] = None,
+    days: Optional[int] = None,
+    maxlen: Optional[int] = None,
+    tasks_limit: Optional[int] = None,
+    comments_per_task: Optional[int] = None,
+    cache: Optional[dict] = None,
+) -> str:
+    """Свидетельства из ЗАДАЧ Bitrix компании серии — компактный блок (как чат-проход Ф7).
+
+    СКОУП ТОЛЬКО Anzhee (R19): серия → КОМПАНИЯ (`company_for_series_fn`, дефолт
+    `series_markup.company_for_series` поверх `watched.yaml` — ТОТ ЖЕ резолв, что Ф7).
+    Компания != "anzhee" (МПервый / unknown) → возвращаем "" и НЕ делаем НИ ОДНОГО
+    REST-вызова (у МПервый Bitrix нет вовсе; зеркало консервативного дефолта Ф7
+    «unknown→0»). НЕВЕРНЫЙ скоуп = утечка доступа, поэтому дефолт строго закрыт.
+
+    Anzhee → ЖИВОЙ REST через `bitrix_call` (дефолт — `_bitrix_call` поверх bitrix.sh;
+    в тестах инъектируется фейк → реальная сеть/вебхук НЕ дёргаются):
+      1) `tasks.task.list` — недавно ИЗМЕНЁННЫЕ задачи (окно `days` через фильтр
+         `>CHANGED_DATE`, потолок `tasks_limit`);
+      2) на каждую — `task.commentitem.list` (самые свежие `comments_per_task`);
+      3) title + description задачи + комментарии → строки через `_sanitize` (анти-инъекция),
+         подача LLM как ДАННЫЕ (рамка — в build_reconciler_user_prompt). Имя автора
+         комментария НЕ включаем (зеркало дисциплины Ф6/Ф7 — лишний egress ПДн).
+
+    ОПАСНАЯ ТРОЙКА: в лог — ТОЛЬКО счётчики (задач/комментариев/длина/серия/компания),
+    НЕ текст; сырой ответ LLM не персистим (это в reconcile_series). `cache` (опц.) —
+    memo по компании: несколько Anzhee-серий в ОДНОМ прогоне не дёргают Bitrix REST
+    повторно (egress наружу ↓ — важно, т.к. в отличие от чат-файлов это сетевой вызов).
+    Возвращает строку ("" если нет свидетельств / не Anzhee / сбой Bitrix).
+    """
+    sd = Path(series_dir)
+    series = sd.name
+    # 1) серия → компания (граница доступа). ТОЛЬКО anzhee — иначе пропуск (R19).
+    resolver = company_for_series_fn
+    if resolver is None:
+        try:
+            from .series_markup import company_for_series as _cfs  # noqa: PLC0415 — ленивый
+            resolver = lambda s: _cfs(s, watched=watched)  # noqa: E731
+        except Exception:  # noqa: BLE001 — нет реестра/деградация → компания неизвестна
+            resolver = lambda s: None  # noqa: E731
+    try:
+        company = resolver(series)
+    except Exception as e:  # noqa: BLE001 — сбой резолва компании не валит прогон
+        logger.warning("[reconciler] bitrix: company resolve failed (non-fatal): %s", type(e).__name__)
+        company = None
+    company = (str(company).strip().lower() or None) if company else None
+    if company != _BITRIX_COMPANY:
+        # МПервый / unknown → Bitrix-источник ПРОПУЩЕН (ни одного REST-вызова). R19.
+        logger.info("[reconciler] bitrix: series=%s company=%s != anzhee → пропуск (R19)",
+                    series, company or "unknown")
+        return ""
+    # memo по компании — повторный прогон другой Anzhee-серии берёт готовое (egress ↓).
+    if cache is not None and _BITRIX_COMPANY in cache:
+        return cache[_BITRIX_COMPANY]
+    call = bitrix_call if bitrix_call is not None else _bitrix_call
+    days = days if days is not None else evidence_days()
+    maxlen = maxlen if maxlen is not None else evidence_maxlen()
+    tlimit = tasks_limit if tasks_limit is not None else bitrix_tasks_limit()
+    cpt = comments_per_task if comments_per_task is not None else bitrix_comments_per_task()
+    if today is None:
+        from datetime import date as _date  # noqa: PLC0415 — stdlib-only
+        today = _date.today().isoformat()
+    cutoff = None
+    if days > 0:
+        try:
+            from datetime import date as _date, timedelta as _td  # noqa: PLC0415
+            y, m, dd = (int(x) for x in today.split("-"))
+            cutoff = (_date(y, m, dd) - _td(days=days)).isoformat()
+        except (ValueError, TypeError):
+            cutoff = None
+    # 2) недавно изменённые задачи. Фильтр/окно — на стороне портала (граница egress).
+    task_filter: dict = {}
+    if cutoff:
+        task_filter[">CHANGED_DATE"] = cutoff
+    list_params = {
+        "filter": task_filter,
+        "select": ["ID", "TITLE", "DESCRIPTION", "STATUS", "CHANGED_DATE"],
+        "order": {"CHANGED_DATE": "DESC"},
+    }
+    try:
+        raw_tasks = call("tasks.task.list", list_params)
+    except Exception as e:  # noqa: BLE001 — сбой обёртки не валит прогон
+        logger.warning("[reconciler] bitrix: tasks.task.list failed (non-fatal): %s", type(e).__name__)
+        raw_tasks = None
+    tasks = _extract_bitrix_tasks(raw_tasks)
+    if tlimit > 0:
+        tasks = tasks[:tlimit]
+    if not tasks:
+        logger.info("[reconciler] bitrix: series=%s company=anzhee tasks=0 → 0 свидетельств", series)
+        if cache is not None:
+            cache[_BITRIX_COMPANY] = ""
+        return ""
+    # Справедливая доля egress на задачу (как per-chat-бюджет Ф7): болтливая задача не
+    # съедает весь maxlen, свидетельства остальных задач не теряются. Глобальный maxlen —
+    # жёсткий backstop ниже.
+    per_task_budget = max(_MIN_CHAT_EVIDENCE_BUDGET, maxlen // len(tasks))
+    lines: list[str] = []
+    total = 0
+    tasks_seen = 0
+    comments_seen = 0
+    idx = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        title = _sanitize(_bx_field(task, "title", "TITLE"), max_len=_MAX_EVIDENCE_LINE_LEN)
+        desc = _sanitize(_bx_field(task, "description", "DESCRIPTION"), max_len=_MAX_EVIDENCE_LINE_LEN)
+        task_lines: list[str] = []
+        if title:
+            task_lines.append(title)
+        if desc:
+            task_lines.append(desc)
+        # комментарии задачи — где «по переписке видно, что закрыт» (R19). id может
+        # быть 0 (теоретически) — берём явной None-проверкой, не `or` (0 — falsy).
+        tid = task.get("id")
+        if tid is None:
+            tid = task.get("ID")
+        comments: list = []
+        if tid is not None:
+            try:
+                tid_int = int(str(tid).strip())
+            except (TypeError, ValueError):
+                tid_int = None
+            if tid_int is not None:
+                try:
+                    raw_comments = call("task.commentitem.list", {"TASKID": tid_int})
+                except Exception as e:  # noqa: BLE001 — сбой на одной задаче не валит прогон
+                    logger.warning("[reconciler] bitrix: commentitem.list failed (non-fatal): %s",
+                                   type(e).__name__)
+                    raw_comments = None
+                comments = _extract_bitrix_comments(raw_comments)
+        # самые СВЕЖИЕ комментарии (хвост; список хронологичен) — резолюция недавняя.
+        if cpt > 0 and len(comments) > cpt:
+            comments = comments[-cpt:]
+        for c in comments:
+            msg = _sanitize(_bx_field(c, "POST_MESSAGE", "postMessage", "text"),
+                            max_len=_MAX_EVIDENCE_LINE_LEN)
+            if msg:
+                task_lines.append(f"комментарий: {msg}")
+                comments_seen += 1
+        if not task_lines:
+            continue
+        tasks_seen += 1
+        idx += 1
+        block = [f"Задача {idx}:"]
+        for tl in task_lines:
+            block.append(f"- {tl}")
+        chunk = "\n".join(block)
+        if len(chunk) > per_task_budget:
+            chunk = chunk[:per_task_budget].rstrip() + " …"
+        if total + len(chunk) > maxlen:
+            remaining = maxlen - total
+            if remaining > 80:  # влезает осмысленный хвост — добавим усечённо
+                lines.append(chunk[:remaining].rstrip() + " …")
+                total = maxlen
+            logger.info("[reconciler] bitrix evidence truncated at maxlen=%d", maxlen)
+            break
+        lines.append(chunk)
+        total += len(chunk) + 2
+    logger.info("[reconciler] bitrix evidence series=%s company=anzhee tasks=%d comments=%d len=%d",
+                series, tasks_seen, comments_seen, total)
+    out = "\n\n".join(lines)
+    if cache is not None:
+        cache[_BITRIX_COMPANY] = out
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Сверка одной серии и обход всех серий
 # ---------------------------------------------------------------------------
 class ReconcileResult:
@@ -856,8 +1188,9 @@ def reconcile_all(
     only_series: Optional[str] = None,
     doubt_ttl: Optional[int] = None,
     chat_evidence: Optional[Callable[[Path], Optional[str]]] = None,
+    bitrix_evidence: Optional[Callable[[Path], Optional[str]]] = None,
 ) -> list[ReconcileResult]:
-    """Обойти ВСЕ серии под `root`, свести каждую с остальными (кросс-серийно + чаты Ф7).
+    """Обойти ВСЕ серии под `root`, свести каждую с остальными (кросс-серийно + чаты Ф7 + Bitrix Ф8).
 
     Для каждой серии A собираем свидетельства из ДРУГИХ серий и сводим. `matcher`
     инъектируется (тесты — фейк, не зовёт claude); None → боевой Haiku (caller обязан
@@ -870,6 +1203,13 @@ def reconcile_all(
     Задан и вернул непустое → ВТОРОЙ матч-проход на ещё-висящих с ярлыком «по чату»
     (зеркало «по встрече»), три исхода сохранены. Реальный claude и тут гейтит `matcher`
     (центральный гейт ниже) — провайдер лишь ЧИТАЕТ локальный архив (сети к Telegram нет).
+
+    Ф8 (R19): `bitrix_evidence(series_dir) → блок-строка|None` — ОПЦИОНАЛЬНЫЙ провайдер
+    свидетельств из ЗАДАЧ Bitrix компании серии (сам вернёт "" для не-Anzhee → скоуп
+    R19). None (дефолт) → поведение Ф6/Ф7 без изменений. Задан и вернул непустое →
+    ТРЕТИЙ матч-проход на ещё-висящих (после чат-прохода) с ярлыком «по задаче». Тот же
+    центральный гейт `matcher` (egress claude); провайдер делает ЖИВОЙ Bitrix REST — под
+    своим гейтом `ENABLE_PENDING_RECONCILER_BITRIX_SOURCE` (main() строит лишь тогда).
     """
     r = Path(root)
     if not r.is_dir():
@@ -949,6 +1289,32 @@ def reconcile_all(
                 res.persist_fail = res_chat.persist_fail
                 res.kept = res_chat.kept
                 res.skipped = res.skipped and res_chat.skipped
+        # Ф8 (R19): ТРЕТИЙ проход — свидетельства из ЗАДАЧ Bitrix компании серии (ТОЛЬКО
+        # Anzhee; провайдер сам вернёт "" для МПервый/unknown → проход не сработает).
+        # Идёт на ещё-ВИСЯЩИХ после кросс-серийного и чат-проходов (reconcile_series
+        # пере-резолвит корзину `open` → уже закрытые/сомнительные сюда не попадут).
+        # Ярлык «по задаче», source=bitrix. Слияние счётчиков — как у чат-прохода: closed/
+        # doubt пасса ТЕРМИНАЛЬНЫ (суммируем), kept/persist_fail берём из ПОСЛЕДНЕГО
+        # сработавшего прохода (Bitrix) — он пере-обработал ещё-висящих. Провайдер
+        # инъектируется (main() строит лишь при гейте Bitrix-источника ON); egress claude
+        # гейтит общий matcher, egress к Bitrix REST — внутри провайдера, под своим гейтом.
+        if bitrix_evidence is not None:
+            try:
+                ev_bx = bitrix_evidence(sd)
+            except Exception as e:  # noqa: BLE001 — сбой провайдера не валит прогон серии
+                logger.warning("[reconciler] bitrix evidence provider failed (non-fatal): %s",
+                               type(e).__name__)
+                ev_bx = None
+            if ev_bx and ev_bx.strip():
+                res_bx = reconcile_series(
+                    sd, evidence=ev_bx, matcher=matcher, date=date,
+                    reason=REASON_BY_BITRIX, source=SOURCE_BITRIX, dry_run=dry_run, doubt_ttl=0,
+                )
+                res.closed += res_bx.closed
+                res.doubt += res_bx.doubt
+                res.persist_fail = res_bx.persist_fail
+                res.kept = res_bx.kept
+                res.skipped = res.skipped and res_bx.skipped
         res.doubt_pruned = pruned
         results.append(res)
     total = {
@@ -1007,24 +1373,48 @@ def main(argv: Optional[list] = None) -> int:
     # СОХРАНЁННЫЙ архив наблюдателя, без Telegram — A8). Реестр `watched.yaml` для
     # серия→компания грузим ОДИН раз (best-effort: нет реестра → company=None →
     # консервативно 0 чат-свидетельств у такой серии).
-    chat_provider = None
-    if is_chat_source_enabled():
-        watched = None
+    # Источники-надстройки (Ф7 чаты, Ф8 Bitrix) требуют реестр серия→компания
+    # (`watched.yaml`). Грузим ОДИН раз, если включён ХОТЯ БЫ один (best-effort: нет
+    # реестра → company=None → консервативно 0 свидетельств у такой серии).
+    chat_on = is_chat_source_enabled()
+    bitrix_on = is_bitrix_source_enabled()
+    watched = None
+    if chat_on or bitrix_on:
         try:
             from notary.cli.registry import load_watched as _load_watched  # noqa: PLC0415
             watched = _load_watched()
         except Exception as e:  # noqa: BLE001 — нет PyYAML/реестра → деградация (company=None)
-            logger.info("[reconciler] chat: watched load failed (degradation): %s", type(e).__name__)
+            logger.info("[reconciler] watched load failed (degradation): %s", type(e).__name__)
             watched = None
+
+    # Ф7 (R18): чат-источник — отдельный гейт `ENABLE_PENDING_RECONCILER_CHAT_SOURCE`
+    # (дефолт-OFF). ON → подмешиваем свидетельства-переписки компании серии (читаем
+    # СОХРАНЁННЫЙ архив наблюдателя, без Telegram — A8).
+    chat_provider = None
+    if chat_on:
         logger.info("[reconciler] chat source ON (ENABLE_PENDING_RECONCILER_CHAT_SOURCE) "
                     "— подмешиваю свидетельства-переписки со скоупом по компании серии")
         chat_provider = lambda sd: gather_chat_evidence(sd, watched=watched)  # noqa: E731
     else:
-        logger.info("[reconciler] chat source OFF (дефолт) — только кросс-серийные свидетельства")
+        logger.info("[reconciler] chat source OFF (дефолт) — без свидетельств-переписок")
+
+    # Ф8 (R19): Bitrix-источник — отдельный гейт `ENABLE_PENDING_RECONCILER_BITRIX_SOURCE`
+    # (дефолт-OFF). ON → подмешиваем свидетельства из ЗАДАЧ Bitrix ТОЛЬКО для серий Anzhee
+    # (провайдер сам пропускает не-Anzhee). ЖИВОЙ REST через bitrix.sh (вебхук-секрет
+    # читает скрипт). memo по компании — несколько Anzhee-серий не дёргают REST повторно.
+    bitrix_provider = None
+    if bitrix_on:
+        logger.info("[reconciler] bitrix source ON (ENABLE_PENDING_RECONCILER_BITRIX_SOURCE) "
+                    "— подмешиваю свидетельства из задач Bitrix ТОЛЬКО для серий Anzhee (R19)")
+        _bx_cache: dict = {}
+        bitrix_provider = lambda sd: gather_bitrix_evidence(  # noqa: E731
+            sd, watched=watched, cache=_bx_cache)
+    else:
+        logger.info("[reconciler] bitrix source OFF (дефолт) — задачи Bitrix не подмешиваю")
 
     results = reconcile_all(
         root, matcher=None, dry_run=args.dry_run, only_series=args.series,
-        chat_evidence=chat_provider,
+        chat_evidence=chat_provider, bitrix_evidence=bitrix_provider,
     )
     closed = sum(x.closed for x in results)
     doubt = sum(x.doubt for x in results)
