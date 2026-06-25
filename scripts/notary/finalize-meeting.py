@@ -839,7 +839,7 @@ def main() -> int:
             # см. lib/clarify_worker.py — иначе закрытые потерялись бы при коррекции).
             open_tasks_block = series_memory.build_open_tasks_block(
                 series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
-                mark_shown=True,
+                mark_shown=True, date=date_part,
             )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
@@ -1540,6 +1540,11 @@ def main() -> int:
                 speaker_mapping=cluster_to_name,  # Ф4б (REQ 1.2): несём авторство в память серии
                 participant_filter=filter_participant_names,
                 publication=_publication,  # Ф6: вердикт гейта (PII-free) в память серии
+                # Ф4 (R8): фильтр значимости хвоста висяков. Гейт ДЕФОЛТ-OFF внутри
+                # `significant_open_tasks` (claude не зовётся без флага) → no-op в тестах
+                # и до активации владельцем; ON → мелкое разовое не копится в open_tasks.
+                significance_filter=lambda _tasks: series_memory.significant_open_tasks(
+                    _tasks, meeting_sid=session_uid),
                 prune_days=series_memory.retention_days(),
             )
         except Exception as e:  # noqa: BLE001

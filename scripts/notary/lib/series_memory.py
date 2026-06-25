@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -746,6 +747,7 @@ def build_digest(
     speaker_mapping: Optional[dict] = None,
     participant_filter: Optional[Callable[[list], list]] = None,
     publication: Optional[dict] = None,
+    significance_filter: Optional[Callable[[list[str]], list[str]]] = None,
 ) -> dict:
     """7.1: компактная выжимка-память из готового протокола.
 
@@ -809,6 +811,18 @@ def build_digest(
     # берёт его из самой свежей выжимки и подаёт в промпт генерации (Вызов 1). РИСК4:
     # только формулировки задач из уже сжатого протокола, не сырые реплики.
     open_tasks = extract_open_tasks(protocol_text or "")
+    # Ф4 (R8): фильтр значимости — мелкое разовое («отправить файл») в хвост НЕ
+    # копим, значимое («подготовить расчёт») остаётся. Применяется ЗДЕСЬ (после
+    # extract_open_tasks, ДО записи в open_tasks) — мелочь не доедет до рендера Ф3.
+    # Инъекция: None → без фильтра (прежнее поведение, чистая build_digest для
+    # unit-тестов); finalize прокидывает гейтнутую обвязку (гейт дефолт-OFF →
+    # claude не зовётся). Консервативно: сбой фильтра внутри → хвост целиком.
+    if significance_filter is not None and open_tasks:
+        try:
+            open_tasks = list(significance_filter(open_tasks))
+        except Exception as e:  # noqa: BLE001 — фильтр best-effort, выжимку не валим
+            logger.warning("[open-tasks] significance filter failed in digest (non-fatal): %s",
+                           type(e).__name__)
     if open_tasks:
         digest["open_tasks"] = open_tasks
     sm = _norm_speaker_mapping(speaker_mapping)
@@ -882,6 +896,7 @@ def save_meeting_digest(
     speaker_mapping: Optional[dict] = None,
     participant_filter: Optional[Callable[[list], list]] = None,
     publication: Optional[dict] = None,
+    significance_filter: Optional[Callable[[list[str]], list[str]]] = None,
     prune_days: int = 0,
 ) -> Optional[Path]:
     """B1 (finalize 4.0.2d): построить выжимку из ГОТОВОГО протокола и сохранить
@@ -901,7 +916,7 @@ def save_meeting_digest(
     digest = build_digest(
         protocol_text, meeting_meta, date=date,
         speaker_mapping=speaker_mapping, participant_filter=participant_filter,
-        publication=publication,
+        publication=publication, significance_filter=significance_filter,
     )
     saved = save_digest(series_dir, date, digest)
     if prune_days and prune_days > 0:
@@ -1461,7 +1476,11 @@ _OPEN_TASKS_BLOCK_HEADER = (
     f"## {PENDING_SECTION_HEADING}\n"
     "Тон — дружелюбная сверка, а не спрос: это вопросы, поднятые на прошлых встречах "
     "серии и пока не закрытые явно; если что-то уже решено — участники поправят. БЕЗ "
-    "давления, БЕЗ слов «просрочка»/«опоздание»/«срыв»/«почему не сделано»."
+    "давления, БЕЗ слов «просрочка»/«опоздание»/«срыв»/«почему не сделано».\n"
+    "Снять вопрос, НЕ выполняя его, — нормальный исход (передумали, стало неактуально, "
+    "отпала необходимость), а НЕ провал. Формулируй раздел как приглашение свериться: "
+    "по любому пункту нормально ответить «уже не нужно» — это закрывает его так же, как "
+    "и выполнение."
 )
 
 
@@ -1537,6 +1556,7 @@ def build_open_tasks_block(
     series_dir: Optional[Path] = None,
     meeting_sid: Optional[str] = None,
     mark_shown: bool = False,
+    date: Optional[str] = None,
 ) -> str:
     """Ф8 (G9): единая точка сборки блока открытых задач для ОБОИХ триггеров
     (finalize И clarify) — как `build_cross_memory_block` для кросс-фона.
@@ -1561,9 +1581,17 @@ def build_open_tasks_block(
     if not is_open_tasks_enabled():
         return ""
     try:
+        # Ф4 (R4) холодный старт: при ПЕРВОМ включении фичи на серии не вываливаем
+        # всю историю — сеем хвост максимум с 1 предыдущей встречи (самой свежей
+        # выжимки), дальше копится вперёд органически. `_resolve_open_tasks_raw` и так
+        # берёт latest, но явный срез `[-1:]` делает гарантию «≤1 встреча» видимой и
+        # независимой от его внутренней логики (refactor-proof). Онбординг детектим
+        # маркером в каталоге серии; помечаем его ниже, на каноническом показе finalize.
+        cold_start = series_dir is not None and not is_open_tasks_onboarded(series_dir)
+        digests_for_tail = (digests[-1:] if digests else []) if cold_start else digests
         # Раскручиваем хвост БЕЗ капа, накладываем статусы, и капим уже ВИСЯЩИЕ —
         # чтобы закрытая задача не съедала слот капа у живого висяка (Ф2).
-        fresh = _resolve_open_tasks_raw(digests)
+        fresh = _resolve_open_tasks_raw(digests_for_tail)
         store = load_task_status(series_dir) if series_dir is not None else {}
         merged = merge_open_tasks_with_status(fresh, store)
         cap = open_tasks_max()
@@ -1579,9 +1607,17 @@ def build_open_tasks_block(
                     mark_status_shown(series_dir, c.get("text", ""))
                 except Exception:  # noqa: BLE001 — пометка best-effort, блок уже собран
                     pass
+        # R4: после КАНОНИЧЕСКОГО показа (finalize, mark_shown=True) серия становится
+        # «тёплой» — следующая встреча уже тянет хвост обычным путём. Помечаем только
+        # на finalize (как mark_status_shown), clarify-реген онбординг НЕ сдвигает.
+        if mark_shown and series_dir is not None:
+            try:
+                mark_open_tasks_onboarded(series_dir, date=date)
+            except Exception:  # noqa: BLE001 — пометка best-effort, блок уже собран
+                pass
         logger.info(
-            "[open-tasks] block meeting=%s carried=%d closed=%d doubt=%d block_len=%d",
-            meeting_sid or "?", len(hanging), len(closed), len(doubt), len(block),
+            "[open-tasks] block meeting=%s cold_start=%s carried=%d closed=%d doubt=%d block_len=%d",
+            meeting_sid or "?", cold_start, len(hanging), len(closed), len(doubt), len(block),
         )
         return block
     except Exception as e:  # noqa: BLE001 — трекинг опционален, генерацию не роняем
@@ -1763,6 +1799,280 @@ def merge_open_tasks_with_status(fresh_tail: list[str], status_store: dict) -> d
         # нет записи / open / переоткрытая → висит
         open_tasks.append(text)
     return {"open": open_tasks, "doubt": doubt, "closed": closed}
+
+
+# ---------------------------------------------------------------------------
+# Ф4 (pending-items, R4) — холодный старт без бэкфилла истории
+# ---------------------------------------------------------------------------
+# Маркер «фича висяков на этой серии уже активно показана хотя бы раз». Отдельный
+# файл рядом с памятью серии (НЕ трогаем sidecar статусов Ф2). По нему отличаем
+# ПЕРВОЕ включение (онбординг) от установившейся работы: на первом включении хвост
+# сеем максимум с 1 предыдущей встречи, дальше копится вперёд органически (round-trip
+# carryover). Ленивый: нет файла = «ещё не онбордились» (миграция/бэкфилл не нужны).
+OPEN_TASKS_ONBOARD_FILE = "open-tasks-onboarded.json"
+OPEN_TASKS_ONBOARD_SCHEMA = 1
+
+
+def onboarding_path(series_dir: Path) -> Path:
+    """Путь маркера онбординга фичи висяков серии: `<series_dir>/open-tasks-onboarded.json`."""
+    return Path(series_dir) / OPEN_TASKS_ONBOARD_FILE
+
+
+def is_open_tasks_onboarded(series_dir: Optional[Path]) -> bool:
+    """True, если фича висяков на этой серии уже была активно показана (есть маркер).
+
+    Нет каталога/файла/мусор → False (= «первое включение», холодный старт). Best-effort:
+    любой сбой чтения → False (консервативно считаем серию не-онбордившейся; максимум —
+    лишний раз ограничим сев до 1 встречи, что безопасно). `series_dir=None` → False
+    (онбординг-состояние без каталога серии неопределимо).
+    """
+    if series_dir is None:
+        return False
+    p = onboarding_path(series_dir)
+    if not p.is_file():
+        return False
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        # Файл есть, но битый — он всё равно СВИДЕТЕЛЬСТВУЕТ о прошлом онбординге.
+        # Однако не доверяем содержимому: трактуем наличие файла как онбординг.
+        return True
+    return isinstance(data, dict)
+
+
+def mark_open_tasks_onboarded(
+    series_dir: Optional[Path], *, date: Optional[str] = None
+) -> Optional[Path]:
+    """R4: пометить серию как онбордившуюся (фича висяков показана). Идемпотентно.
+
+    Пишем маркер ОДИН раз — повторный вызов НЕ перетирает (храним исходную дату
+    онбординга, она пригодится Ф5/Ф6: «висяки тянутся с этой даты»). Best-effort:
+    сбой/нет каталога → None, генерацию не роняет. НЕ логирует ничего чувствительного.
+    `series_dir=None` → None (нечего помечать).
+    """
+    if series_dir is None:
+        return None
+    p = onboarding_path(series_dir)
+    if p.is_file():
+        return p  # уже онбордились — исходную дату не трогаем (идемпотентность)
+    payload = {"schema": OPEN_TASKS_ONBOARD_SCHEMA, "onboarded_date": date}
+    try:
+        _atomic_write_text(p, json.dumps(payload, ensure_ascii=False, indent=2))
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning("[open-tasks] onboard-mark failed (non-fatal): %s", type(e).__name__)
+        return None
+    logger.info("[open-tasks] series onboarded (cold-start seed ≤1 meeting)")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Ф4 (pending-items, R8) — фильтр значимости висяков (мелкое разовое → не копим)
+# ---------------------------------------------------------------------------
+# 🔴 LLM-гейт ДЕФОЛТ-OFF ([[reissue-llm-tier-gate-default-off]]). Без флага реальный
+# `claude` (он в PATH) НЕ зовётся → unittest не дёргает сеть и остаётся зелёным.
+# Включается владельцем control-gate'ом деплоя, как ENABLE_FEEDBACK_LLM_CLASSIFY.
+_SIGNIFICANCE_MODEL = (os.environ.get("OPEN_TASKS_SIGNIFICANCE_MODEL") or "").strip() \
+    or "claude-haiku-4-5-20251001"
+_SIGNIFICANCE_TIMEOUT = int(os.environ.get("OPEN_TASKS_SIGNIFICANCE_TIMEOUT", "30") or "30")
+
+# Опасная тройка (CLAUDE.md проекта): в промпт кладём ТОЛЬКО формулировки задач
+# (минимум контекста), транскрипт/реплики НЕ подаём; в лог — только счётчики.
+_SIGNIFICANCE_SYSTEM_PROMPT = (
+    "Ты фильтруешь список незакрытых задач, прозвучавших на встрече. Для КАЖДОЙ задачи "
+    "реши, стоит ли тянуть её в раздел «вопросы с прошлых встреч» на будущих встречах "
+    "этой серии.\n"
+    "\n"
+    "ОСТАВЬ (significant=true) — задача ЗНАЧИМАЯ: требует подготовки/решения, имеет "
+    "последствия, её забывание дорого обойдётся. Примеры: «подготовить расчёт "
+    "стоимости», «согласовать договор с юристом», «решить по найму менеджера», "
+    "«определиться со сроком запуска».\n"
+    "УБЕРИ (significant=false) — задача МЕЛКАЯ РАЗОВАЯ: одно короткое действие без "
+    "последствий, делается за минуты, забывание неважно. Примеры: «отправить файл», "
+    "«скинуть ссылку», «переслать письмо», «добавить кого-то в чат», «продублировать "
+    "сообщение».\n"
+    "\n"
+    "ВАЖНО: сомневаешься — ОСТАВЛЯЙ (significant=true). Лучше лишний раз показать "
+    "задачу, чем потерять важную.\n"
+    "\n"
+    "Ответь СТРОГО валидным JSON, без пояснений и без markdown: "
+    "{\"verdicts\": [true, false, ...]} — РОВНО по одному булеву на каждую задачу, "
+    "в ТОМ ЖЕ порядке, что и пронумерованный список ниже."
+)
+
+
+def is_significance_filter_enabled() -> bool:
+    """Гейт `ENABLE_OPEN_TASKS_SIGNIFICANCE_FILTER` — ДЕФОЛТ OFF. ON ← `1/true/yes/on`.
+
+    Сознательно opt-in (обратная полярность к `is_open_tasks_enabled`, который ON по
+    умолчанию): путь шлёт формулировки задач в Claude (опасная тройка) — оживлять его
+    при деплое нельзя без воли владельца. Без флага реальный `claude` НЕ зовётся →
+    тесты не дёргают сеть. OFF → фильтр не режет хвост (консервативно, A3: оставляем всё).
+    """
+    raw = (os.environ.get("ENABLE_OPEN_TASKS_SIGNIFICANCE_FILTER") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def build_significance_user_prompt(tasks: list[str]) -> str:
+    """R8: пользовательский промпт фильтра — пронумерованный список формулировок задач.
+
+    Только тексты задач (опасная тройка: без транскрипта/реплик). Нумерация 1..N
+    помогает модели держать порядок вердиктов; длину N дублируем явно для самоконтроля.
+    """
+    items = list(tasks or [])
+    lines = ["Задачи (по одной на строку):"]
+    for i, t in enumerate(items, 1):
+        lines.append(f"{i}. {t}")
+    lines.append("")
+    lines.append(
+        f"Верни {{\"verdicts\": [...]}} РОВНО длиной {len(items)} "
+        "(по булеву на каждую задачу, в том же порядке)."
+    )
+    return "\n".join(lines)
+
+
+def parse_significance_response(raw: str, n: int) -> Optional[list[bool]]:
+    """R8: распарсить ответ LLM в `list[bool]` длиной `n`. None на любом рассогласовании.
+
+    Терпит обёртку ```json … ```. Возвращает список ровно `n` булевых (True=значима).
+    Длина не совпала / не bool / не JSON / нет ключа `verdicts` → None (caller тогда
+    консервативно оставит все задачи). Числа 0/1 трактуем как bool (мягкость к модели).
+    """
+    if not raw or n <= 0:
+        return None
+    text = raw.strip()
+    # снять markdown-обёртку ```json … ``` / ``` … ```
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```\s*$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        # последний шанс — выдрать первый {...} из текста
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    verdicts = data.get("verdicts")
+    if not isinstance(verdicts, list) or len(verdicts) != n:
+        return None
+    out: list[bool] = []
+    for v in verdicts:
+        if isinstance(v, bool):
+            out.append(v)
+        elif v in (0, 1):
+            out.append(bool(v))
+        else:
+            return None  # мусорный элемент → весь ответ невалиден (консервативно)
+    return out
+
+
+def request_significance_verdicts(
+    tasks: list[str],
+    *,
+    timeout: Optional[int] = None,
+    model: Optional[str] = None,
+    meeting_sid: Optional[str] = None,
+) -> Optional[list[bool]]:
+    """R8: спросить у Claude (Haiku) вердикты значимости для списка задач. None на сбое.
+
+    Опасная тройка: в промпт — только формулировки задач; в лог — только счётчики
+    (число задач/оставленных, длина промпта, elapsed), без текстов. Сырой ответ НЕ
+    персистится. Не бросает: любой сбой CLI/JSON → warning + None → caller оставит всё.
+    """
+    items = list(tasks or [])
+    if not items:
+        return None
+    from .claude_cli import (  # noqa: PLC0415 — держим импорт ленивым (listener-контекст)
+        ClaudeCliError,
+        ClaudeCliNotInstalled,
+        call_claude_print,
+    )
+    user_prompt = build_significance_user_prompt(items)
+    started = time.monotonic()
+    try:
+        raw = call_claude_print(
+            user_prompt,
+            system=_SIGNIFICANCE_SYSTEM_PROMPT,
+            timeout=timeout or _SIGNIFICANCE_TIMEOUT,
+            model=model or _SIGNIFICANCE_MODEL,
+        )
+    except ClaudeCliNotInstalled:
+        logger.warning("[open-tasks] significance: `claude` не в PATH — фильтр пропущен")
+        return None
+    except ClaudeCliError as e:
+        logger.warning("[open-tasks] significance CLI error: %s", type(e).__name__)
+        return None
+    except Exception as e:  # noqa: BLE001 — никакой сбой LLM не валит финализацию
+        logger.warning("[open-tasks] significance unexpected error (non-fatal): %s", type(e).__name__)
+        return None
+    elapsed = time.monotonic() - started
+    verdicts = parse_significance_response(raw, len(items))
+    logger.info(
+        "[open-tasks] significance meeting=%s n=%d parsed=%s elapsed=%.1fs",
+        meeting_sid or "?", len(items),
+        "ok" if verdicts is not None else "parse-fail", elapsed,
+    )
+    return verdicts
+
+
+def filter_significant_tasks(
+    tasks: list[str],
+    *,
+    classifier: Optional[Callable[[list[str]], Optional[list[bool]]]] = None,
+) -> list[str]:
+    """R8: отсев мелких разовых задач из хвоста; значимые остаются. Чистая обвязка.
+
+    `classifier(items) -> list[bool]` (True=значима) инъектируется тестами/прод-
+    обвязкой. КОНСЕРВАТИВНО (A3 «сомневается → оставляет»): нет классификатора / сбой /
+    длина вердиктов не совпала / None → возвращаем ВСЁ как есть (ничего не режем).
+    Сохраняет исходный порядок. НЕ логирует тексты — только счётчики.
+    """
+    items = list(tasks or [])
+    if not items or classifier is None:
+        return items
+    try:
+        verdicts = classifier([t for t in items])
+    except Exception as e:  # noqa: BLE001 — сбой классификатора не валит финализацию
+        logger.warning("[open-tasks] significance classifier failed (non-fatal): %s", type(e).__name__)
+        return items
+    if not isinstance(verdicts, list) or len(verdicts) != len(items):
+        return items  # рассинхрон → консервативно оставляем всё
+    kept = [t for t, keep in zip(items, verdicts) if keep]
+    logger.info(
+        "[open-tasks] significance filter: in=%d kept=%d dropped=%d",
+        len(items), len(kept), len(items) - len(kept),
+    )
+    return kept
+
+
+def significant_open_tasks(
+    tasks: list[str],
+    *,
+    meeting_sid: Optional[str] = None,
+    classifier: Optional[Callable[[list[str]], Optional[list[bool]]]] = None,
+) -> list[str]:
+    """R8: применить фильтр значимости к хвосту на ФИНАЛИЗАЦИИ (после extract_open_tasks).
+
+    Полярность гейта: `classifier` инъектирован (тесты) → фильтруем им независимо от
+    гейта. Иначе смотрим `is_significance_filter_enabled()`: OFF (дефолт) → возвращаем
+    хвост БЕЗ изменений и БЕЗ обращения к claude (консервативно, A3); ON → дефолтный
+    классификатор = реальный Haiku (`request_significance_verdicts`). Best-effort
+    обёрнут в `filter_significant_tasks` (сбой → оставляем всё).
+    """
+    items = list(tasks or [])
+    if not items:
+        return items
+    if classifier is None:
+        if not is_significance_filter_enabled():
+            return items  # гейт OFF, инъекции нет → claude НЕ зовём, хвост не режем
+        def classifier(batch: list[str]) -> Optional[list[bool]]:  # noqa: E306
+            return request_significance_verdicts(batch, meeting_sid=meeting_sid)
+    return filter_significant_tasks(items, classifier=classifier)
 
 
 # ---------------------------------------------------------------------------
