@@ -316,6 +316,54 @@ class TestRoundTripSafety(unittest.TestCase):
             self.assertTrue(any("бриф для дизайнера" in d["text"] for d in merged["doubt"]))
             self.assertFalse(any("бриф для дизайнера" in t for t in merged["open"]))
 
+    def test_short_owner_name_substring_carryover_preserved(self):
+        # Регресс Н2 (цикл5): короткое имя владельца лежит ВНУТРИ слова задачи
+        # («Аня» ⊂ «з-аня-ть»). Старый подстрочный guard терял бы владельца на
+        # round-trip carryover → рушил R7 и сдвигал sidecar-ключ. Префикс «Имя:»
+        # обязан сохраниться.
+        proto = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "**Аня**\n"
+            "- занять очередь в налоговой — висит\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertIn("Аня: занять очередь в налоговой", carried)
+        self.assertNotIn("занять очередь в налоговой", carried)  # без префикса = баг
+
+    def test_short_owner_name_substring_tasks_block_preserved(self):
+        # Тот же фикс на ОСНОВНОМ (прод-активном) пути — блок «Задачи» → open_tasks
+        # на каждом финализе. «Лев» ⊂ «с-лев-а».
+        proto = (
+            "## Задачи\n\n"
+            "**Лев**\n"
+            "- проверить колонку слева в отчёте\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertIn("Лев: проверить колонку слева в отчёте", carried)
+
+    def test_owner_prefix_not_doubled_when_already_inline(self):
+        # Фикс не должен дублировать префикс, если модель оставила «Имя:» в строке.
+        proto = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "**Аня**\n"
+            "- Аня: занять очередь — висит\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertIn("Аня: занять очередь", carried)
+        self.assertFalse(any("Аня: Аня" in t for t in carried))
+
+    def test_owner_prefix_not_doubled_for_superstring_name(self):
+        # НОВ1 (цикл5 ход4): строка уже начинается с БОЛЕЕ длинного имени, начинающегося
+        # на владельца подзаголовка («Иван» ⊂ начала «Иванов:»). Префикс не задваиваем.
+        proto = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "**Иван**\n"
+            "- Иванов: подготовить отчёт — висит\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertFalse(any("Иван: Иванов" in t for t in carried))
+        self.assertIn("Иванов: подготовить отчёт", carried)
+
 
 # ==========================================================================
 # Структурные якоря заголовка переехали на мягкий вариант

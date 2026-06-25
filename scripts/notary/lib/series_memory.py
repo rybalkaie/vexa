@@ -477,6 +477,23 @@ def _clean_table_cell(cell: str) -> str:
     return s
 
 
+def _has_owner_prefix(owner: str, text: str) -> bool:
+    """`text` уже начинается с префикса-имени, начинающегося на `owner`?
+
+    ПРЕФИКС (якорь в начале строки), НЕ подстрока. Раньше сверяли `owner.lower() not in
+    text.lower()` — короткое имя («Аня», «Ян», «Лев») часто лежит ВНУТРИ слова задачи
+    («з-АНЯ-ть») → префикс не добавлялся, владелец терялся на round-trip: рушит
+    группировку по людям (R7), а в Ф5/Ф6 сдвинул бы sidecar-ключ статуса → закрытая
+    воскресла бы как висящая (слом ядра Ф2).
+
+    `[^:()\\n]*` до двоеточия — чтобы НЕ задвоить префикс, когда строка уже начинается
+    с БОЛЕЕ длинного имени, начинающегося на owner («Иван» + строка «Иванов: …» → не
+    добавляем «Иван:» поверх). Двоеточие обязательно: «занять очередь» (без двоеточия)
+    префикс получит, а «Иванов: …» — нет. Имя-токен не содержит «:()» (как `_PENDING_OWNER_RE`).
+    """
+    return bool(re.match(rf"\s*{re.escape(owner)}[^:()\n]*:", text, re.IGNORECASE))
+
+
 def _task_from_table_cells(cells: list[str], cols: Optional[dict]) -> str:
     """Строит «Имя: задача (срок: X)» из строки-ДАННЫХ таблицы задач.
 
@@ -512,7 +529,7 @@ def _task_from_table_cells(cells: list[str], cols: Optional[dict]) -> str:
     due = _cell(due_i)
     if due and set(due) - set(" .—–-"):  # есть содержимое помимо тире/точек/пробелов
         task = f"{task} (срок: {due})"
-    if owner and owner.lower() not in task.lower():
+    if owner and not _has_owner_prefix(owner, task):
         task = f"{owner}: {task}"
     return task
 
@@ -599,7 +616,7 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
                 txt = _clean_task_text(raw_line)
                 if not txt:
                     continue
-                if current_owner and current_owner.lower() not in txt.lower():
+                if current_owner and not _has_owner_prefix(current_owner, txt):
                     txt = f"{current_owner}: {txt}"
                 fresh.append(txt)
         elif section == "carryover":
@@ -628,7 +645,7 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
             if txt:
                 # Имя из подзаголовка восстанавливаем (как в блоке «Задачи»), если в
                 # строке его ещё нет — round-trip префикса исполнителя при группировке.
-                if current_owner and current_owner.lower() not in txt.lower():
+                if current_owner and not _has_owner_prefix(current_owner, txt):
                     txt = f"{current_owner}: {txt}"
                 carried.append(txt)
     _flush_pending_task()  # хвост: последняя строка-данных таблицы в конце протокола
