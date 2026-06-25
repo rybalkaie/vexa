@@ -1099,6 +1099,74 @@ def maybe_route_to_feedback_reply(token: str, chat_id: int, allowed_chat: int, m
     return claimed
 
 
+def _reply_date_str(msg: dict[str, Any]) -> Optional[str]:
+    """`YYYY-MM-DD` из unix-`date` сообщения (для поля `updated` sidecar). None при
+    отсутствии/мусоре — статус всё равно проставится (дата метаданная)."""
+    ts = msg.get("date")
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(int(ts)))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def maybe_route_to_pending_status_reply(
+    token: str, chat_id: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """Ф5 (REQ R9/R5/A10): reply на протокол со СТАТУСОМ висяка («этот закрыт»,
+    «снимаем, неактуально», «жду расчёт», «нет, не закрыто, верни X»).
+
+    Проверяется ДО шлюза правок (`maybe_route_to_feedback_reply`): иначе шлюз
+    «прожевал» бы reply как правку текста. Перехватываем КОНСЕРВАТИВНО — только
+    однозначный статус-reply на доставленный протокол серии; всё неоднозначное →
+    False → шлюз правок обрабатывает как раньше (A9). Любой участник чата (A4 —
+    без сверки личности): сам факт reply на протокол серии = гейт.
+
+    True = распознан статус-reply, статус проставлен в sidecar Ф2 + дан ack →
+    caller выходит. False = не наш случай → обычный dispatch.
+
+    Опасная тройка: НЕ логируем текст reply/висяков — только метаданные (серия,
+    код статуса, исход). Голос/аудио сюда НЕ заводим (Ф5 — текст): голос-reply
+    падает в шлюз правок как раньше (там своя транскрипция).
+    """
+    if chat_id is None:
+        return False
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text or msg.get("voice") or msg.get("audio"):
+        return False  # пусто / голос-аудио — не наш путь (текст-only, Ф5)
+    try:
+        from notary.lib import pending_status_reply  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модуль не грузится → фича просто выключена
+        logger.debug("[pending-status] import failed (feature off?): %s", e)
+        return False
+    # Дешёвый регекс-предчек ДО резолва доставленного протокола: подавляющее
+    # большинство reply'ев — правки текста (нет статус-маркера) → выходим до
+    # delivered-index lookup, отдаём их шлюзу правок без накладных.
+    if pending_status_reply.detect_status_intent(text) is None:
+        return False
+    series = _reply_context_series(chat_id, msg)
+    if not series:
+        return False  # не reply на доставленный протокол серии
+    series_dir = _protokol_root() / series
+    try:
+        result = pending_status_reply.apply_status_reply(
+            text, series_dir, date=_reply_date_str(msg), source="reply",
+        )
+    except Exception as e:  # noqa: BLE001 — обработка статуса не должна валить listener
+        logger.exception("[pending-status] обработка reply упала: %s", e)
+        return False
+    if not result:
+        return False  # не однозначный статус-reply → отдаём шлюзу правок (A9)
+    send_message(token, chat_id, result["ack"], reply_to=msg.get("message_id"))
+    logger.info(
+        "[pending-status] reply-статус принят chat=%s series=%s label=%s status=%s",
+        chat_id, series, result.get("label"), result.get("status"),
+    )
+    return True
+
+
 def _learning_digest_prefix() -> str:
     """Префикс 🧠 дайджеста самообучения — из `feedback_learning.DIGEST_PREFIX`
     (один источник истины). Fallback на литерал, если модуль не импортируется."""
@@ -1613,6 +1681,14 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # сообщение в группе. Owner-гейт и узкий триггер — внутри (обычную переписку и
     # команды коррекции не перехватывает).
     if maybe_route_to_set_chat_command(token, cid, allowed_chat, msg):
+        return
+
+    # Ф5 (REQ R9/R5/A10): reply со СТАТУСОМ висяка («этот закрыт» / «снимаем» /
+    # «жду» / «не закрыто, верни X»). ДО шлюза правок — иначе шлюз прожевал бы его
+    # как правку текста. Перехватывает консервативно (однозначный статус-reply на
+    # протокол серии); неоднозначное → False → шлюз правок ниже (A9). Любой участник
+    # чата (A4). Так же, как шлюз правок, работает и в группе (cid != allowed_chat).
+    if maybe_route_to_pending_status_reply(token, cid, allowed_chat, msg):
         return
 
     # Ф3 шлюз правок (FB1): reply на доставленный протокол в ЛЮБОМ чате серии.
