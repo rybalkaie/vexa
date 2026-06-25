@@ -360,5 +360,38 @@ class TestPrivacyLogging(_SeriesBase):
         self.assertNotIn("неактуально", blob)
 
 
+# ==========================================================================
+# Регрессии цикла-5 (ход1 Н1/Н2, ход3 У1/У2) — защита фиксов от reintroduction
+# ==========================================================================
+class TestCycle5Regressions(_SeriesBase):
+
+    def test_future_tense_not_closed(self):
+        # Н1: будущее «выполни-М завтра» — НЕ закрытие (было ложно-DONE → ложно-закрыто).
+        self.assertNotEqual(p.detect_status_intent("выполним завтра расчёт"), p.LABEL_DONE)
+        r = p.apply_status_reply("выполним завтра расчёт по складу", self.sd, date="2026-06-10")
+        if r is not None:                                   # если взяли — только как «висит»
+            self.assertEqual(r["status"], sm.STATUS_OPEN)
+        self.assertNotIn("done", str((sm.load_task_status(self.sd) or {})).lower())
+
+    def test_yo_normalization(self):
+        # Н2: формы с ё распознаются наравне с «е» (детектор ё→е, как matcher `_norm`).
+        self.assertEqual(p.detect_status_intent("решён"), p.LABEL_DONE)
+        self.assertEqual(p.detect_status_intent("не решён"), p.LABEL_REOPEN)
+
+    def test_partial_qualifier_keeps_hanging(self):
+        # У1: «почти/наполовину/частично готово» → висит (WAIT), не закрывается молча (R16).
+        for t in ("почти готово", "наполовину сделали", "частично закрыли", "не до конца сделали"):
+            self.assertEqual(p.detect_status_intent(t), p.LABEL_WAIT, t)
+        r = p.apply_status_reply("медиаплан почти готов", self.sd, date="2026-06-10")
+        self.assertEqual(r["status"], sm.STATUS_OPEN)       # остался висеть, не closed
+        hanging = self._next_block().split("ЧАСТЬ 2")[0]
+        self.assertIn("медиаплан", hanging.lower())
+
+    def test_ack_names_matched_item(self):
+        # У2: ack называет матчнутый висяк — участник видит, тот ли пункт затронут.
+        r = p.apply_status_reply("медиаплан готов", self.sd, date="2026-06-10")
+        self.assertIn("медиаплан", r["ack"].lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

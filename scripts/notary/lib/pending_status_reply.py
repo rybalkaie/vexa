@@ -87,6 +87,20 @@ _ACK = {
 }
 
 
+def _ack_with_item(label: str, matched: str) -> str:
+    """Ack + короткая ссылка на КАКОЙ висяк затронут — чтобы участник сразу видел,
+    тот ли пункт бот закрыл (ловит мис-матч до следующей встречи). Текст уходит в
+    ТОТ ЖЕ групповой чат, где протокол с этим пунктом уже опубликован, — это не
+    новый egress (опасная тройка про логи/LLM-промпт, не про user-facing ack)."""
+    base = _ACK[label]
+    item = (matched or "").strip()
+    if not item:
+        return base
+    if len(item) > 80:
+        item = item[:79].rstrip() + "…"
+    return f"{base}\n(вопрос: «{item}»)"
+
+
 # ── Детектор интента статуса (детерминированный, дефолт-ON, БЕЗ сети) ─────────
 # Порядок проверок КРИТИЧЕН: отрицание/переоткрытие и «под сомнением» проверяем
 # ДО положительного «закрыт/сделан», иначе «не закрыто»/«вроде закрыто» ложно
@@ -151,10 +165,22 @@ _DOUBT_RE = (
 _DONE_RE = (
     _re(r"\bзакры(?:т|л)\w*"),    # закрыт / закрыто / закрыли (НЕ «закрой»)
     _re(r"\bсдела(?:н|л)\w*"),    # сделано / сделан / сделали
-    _re(r"\bвыполн(?:ен|ил|им)\w*"),
-    _re(r"\bреш(?:ен|ил)\w*"),    # решено / решён / решили (НЕ «реши»)
+    _re(r"\bвыполн(?:ен|ил)\w*"),  # выполнено / выполнил (НЕ будущее «выполним»)
+    _re(r"\bреш(?:ен|ил)\w*"),    # решено / решён / решили (НЕ «реши»; ё→е в detect)
     _re(r"\bготов(?:о|а|ы)?\b"),  # готово / готов / готова / готовы (НЕ «готовлю»)
     _re(r"\bdone\b"),
+)
+# Квалификатор НЕПОЛНОГО завершения. Рядом с done-словом («почти готово»,
+# «наполовину сделали», «частично закрыли») это НЕ полный close, а «ещё в работе»
+# → WAIT (висит), не DONE. R16: молча не закрываем при неполноте (ложно-висит <
+# ложно-закрыто). «процент» намеренно НЕ ловим (тема «расчёт процентов готов» —
+# легитимный done; узкий риск «на 80 процентов» реже, чем ложно-WAIT по теме).
+_PARTIAL_RE = (
+    _re(r"\bпочти\b"),
+    _re(r"\bнаполовину\b"),
+    _re(r"\bчастичн"),          # частично / частичный
+    _re(r"\bне\s+до\s+конца\b"),
+    _re(r"\bне\s+полност"),     # не полностью
 )
 
 
@@ -173,7 +199,8 @@ def detect_status_intent(reply_text: str) -> Optional[str]:
     """
     if not reply_text or not reply_text.strip():
         return None
-    t = reply_text.strip().lower()
+    # ё→е (как matcher `_norm`): «решён»/«не решён» с ё матчатся наравне с «решен».
+    t = reply_text.strip().lower().replace("ё", "е")
     # 1) «ещё не …» / «пока не …» — ожидание, раньше отрицания закрытия.
     if _any(_WAIT_FIRST, t):
         return LABEL_WAIT
@@ -189,9 +216,10 @@ def detect_status_intent(reply_text: str) -> Optional[str]:
     # 5) под сомнением (R10) — до done, иначе «вроде закрыто» уехал бы в done.
     if _any(_DOUBT_RE, t):
         return LABEL_DOUBT
-    # 6) закрыто-сделано (R9).
+    # 6) закрыто-сделано (R9). Квалификатор неполноты («почти/наполовину/частично»)
+    #    рядом с done-словом → НЕ полный close, а «ещё в работе» (WAIT, висит): R16.
     if _any(_DONE_RE, t):
-        return LABEL_DONE
+        return LABEL_WAIT if _any(_PARTIAL_RE, t) else LABEL_DONE
     return None
 
 
@@ -347,8 +375,8 @@ def classify_reply_intent_llm(reply_text: str, items: list, participants=None) -
         )
     except Exception:  # noqa: BLE001
         return "unclear"
-    prompt = _build_intent_prompt(reply_text, items)
     try:
+        prompt = _build_intent_prompt(reply_text, items)
         raw = call_claude_print(
             prompt, system=_INTENT_SYSTEM_PROMPT,
             timeout=_INTENT_TIMEOUT, model=_INTENT_MODEL,
@@ -356,7 +384,7 @@ def classify_reply_intent_llm(reply_text: str, items: list, participants=None) -
     except (ClaudeCliNotInstalled, ClaudeCliError) as e:
         logger.warning("[pending-status] LLM-интент CLI error: %s", type(e).__name__)
         return "unclear"
-    except Exception as e:  # noqa: BLE001 — сбой LLM не валит обработку reply
+    except Exception as e:  # noqa: BLE001 — сбой LLM/сборки промпта не валит обработку
         logger.warning("[pending-status] LLM-интент сбой (non-fatal): %s", type(e).__name__)
         return "unclear"
     s = (raw or "").strip()
@@ -470,4 +498,5 @@ def apply_status_reply(
         "[pending-status] статус проставлен label=%s status=%s items=%d llm=%s",
         label, sm_status, len(items), "on" if is_intent_llm_enabled() else "off",
     )
-    return {"label": label, "status": sm_status, "matched": matched, "ack": _ACK[label]}
+    return {"label": label, "status": sm_status, "matched": matched,
+            "ack": _ack_with_item(label, matched)}
