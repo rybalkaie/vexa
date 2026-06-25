@@ -33,6 +33,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -1557,6 +1558,7 @@ def build_open_tasks_block(
     meeting_sid: Optional[str] = None,
     mark_shown: bool = False,
     date: Optional[str] = None,
+    shown_sink: Optional[list] = None,
 ) -> str:
     """Ф8 (G9): единая точка сборки блока открытых задач для ОБОИХ триггеров
     (finalize И clarify) — как `build_cross_memory_block` для кросс-фона.
@@ -1577,6 +1579,14 @@ def build_open_tasks_block(
     finalize) → после включения закрытых в блок зовём `mark_status_shown`: на следующих
     встречах merge их не вернёт (показ один раз, список не копится). clarify передаёт
     `mark_shown=False` — реген уже показанного протокола shown-состояние НЕ двигает.
+
+    FU-7 (отложенная пометка «показано» ДО подтверждённого постинга): если передан
+    `shown_sink` (список), пометку закрытых `shown` и онбординг НЕ делаем здесь —
+    вместо этого складываем `_status_key` каждого вошедшего в блок закрытого пункта в
+    `shown_sink`. Caller (finalize) дёргает `commit_pending_shown(...)` ПОСЛЕ
+    подтверждённой доставки протокола → при сбое генерации/постинга «показано» не
+    выставится и подраздел «закрытые» покажется в ретрае (R21 «показать один раз» не
+    теряется). `shown_sink=None` → прежнее поведение (`mark_shown` решает inline-пометку).
     """
     if not is_open_tasks_enabled():
         return ""
@@ -1599,22 +1609,31 @@ def build_open_tasks_block(
         doubt = merged["doubt"]
         closed = merged["closed"]
         block = format_open_tasks_block(hanging, doubt=doubt, closed=closed)
-        # R21: закрытые показываем ОДИН раз. Помечаем shown ТОЛЬКО на каноническом
-        # показе (finalize, mark_shown=True) и только если они реально попали в блок.
-        if mark_shown and closed and series_dir is not None and block:
-            for c in closed:
+        # FU-7: отложенный режим — закрытые НЕ помечаем здесь, складываем их ключи в
+        # sink; caller закоммитит «показано»+онбординг ПОСЛЕ подтверждённой доставки.
+        if shown_sink is not None:
+            if closed and series_dir is not None and block:
+                for c in closed:
+                    k = _status_key(c.get("text", ""))
+                    if k:
+                        shown_sink.append(k)
+        else:
+            # R21: закрытые показываем ОДИН раз. Помечаем shown ТОЛЬКО на каноническом
+            # показе (finalize, mark_shown=True) и только если реально попали в блок.
+            if mark_shown and closed and series_dir is not None and block:
+                for c in closed:
+                    try:
+                        mark_status_shown(series_dir, c.get("text", ""))
+                    except Exception:  # noqa: BLE001 — пометка best-effort, блок собран
+                        pass
+            # R4: после КАНОНИЧЕСКОГО показа (finalize, mark_shown=True) серия
+            # становится «тёплой» — следующая встреча тянет хвост обычным путём.
+            # Помечаем только на finalize (как mark_status_shown), clarify НЕ сдвигает.
+            if mark_shown and series_dir is not None:
                 try:
-                    mark_status_shown(series_dir, c.get("text", ""))
-                except Exception:  # noqa: BLE001 — пометка best-effort, блок уже собран
+                    mark_open_tasks_onboarded(series_dir, date=date)
+                except Exception:  # noqa: BLE001 — пометка best-effort, блок собран
                     pass
-        # R4: после КАНОНИЧЕСКОГО показа (finalize, mark_shown=True) серия становится
-        # «тёплой» — следующая встреча уже тянет хвост обычным путём. Помечаем только
-        # на finalize (как mark_status_shown), clarify-реген онбординг НЕ сдвигает.
-        if mark_shown and series_dir is not None:
-            try:
-                mark_open_tasks_onboarded(series_dir, date=date)
-            except Exception:  # noqa: BLE001 — пометка best-effort, блок уже собран
-                pass
         logger.info(
             "[open-tasks] block meeting=%s cold_start=%s carried=%d closed=%d doubt=%d block_len=%d",
             meeting_sid or "?", cold_start, len(hanging), len(closed), len(doubt), len(block),
@@ -1628,12 +1647,89 @@ def build_open_tasks_block(
         return ""
 
 
+def commit_pending_shown(
+    series_dir: Optional[Path], shown_keys: Optional[list], *, date: Optional[str] = None
+) -> None:
+    """FU-7: закоммитить «показано» закрытых пунктов + онбординг ПОСЛЕ доставки.
+
+    Caller (finalize) собирает ключи закрытых в `shown_sink` при сборке блока
+    (`build_open_tasks_block(..., shown_sink=...)`), но вызывает ЭТО только когда
+    протокол реально доставлен (delivery status == sent). Так при сбое генерации/
+    постинга подраздел «закрытые» (R21) не помечается показанным и появится в ретрае.
+    Идемпотентно, best-effort: каждый сбой проглатываем (блок уже доставлен — не валим
+    финализацию). Онбординг (R4) помечаем тут же — серия становится «тёплой» только
+    после фактического показа хвоста. НЕ логирует тексты.
+    """
+    if series_dir is None:
+        return
+    for k in shown_keys or []:
+        if not k:
+            continue
+        try:
+            mark_status_shown(series_dir, k, by_key=True)
+        except Exception:  # noqa: BLE001 — пометка best-effort, протокол уже доставлен
+            pass
+    try:
+        mark_open_tasks_onboarded(series_dir, date=date)
+    except Exception:  # noqa: BLE001 — пометка best-effort
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Ф2 (pending-items) — sidecar статусов висяка + слияние при рендере
 # ---------------------------------------------------------------------------
 def task_status_path(series_dir: Path) -> Path:
     """Путь sidecar-файла статусов серии: `<series_dir>/task-status.json`."""
     return Path(series_dir) / TASK_STATUS_FILE
+
+
+@contextlib.contextmanager
+def _status_store_lock(series_dir: Optional[Path]):
+    """FU-2: межпроцессная блокировка вокруг read-modify-write sidecar статусов.
+
+    Reply-канал (Ф5) и сверщик (Ф6) на VPS пишут `task-status.json` ОДНОЙ серии
+    параллельно. `set_task_status`/`mark_status_shown` делают load→правка→save через
+    atomic-replace: replace спасает от рваного файла, НО не от lost-update (оба
+    читают один store, последний replace затирает чужой ключ). Lock держим на
+    ОТДЕЛЬНОМ файле `<series_dir>/task-status.json.lock` — сам store подменяется
+    rename'ом, на нём блокировку держать нельзя (новый inode → lock потерян).
+    Best-effort: нет `fcntl` (не-unix) / сбой open/flock → деградируем в no-lock и
+    запись не валим (на маке unit-тесты однопоточны; на VPS unix есть всегда).
+    `series_dir=None` → нечего лочить.
+    """
+    if series_dir is None:
+        yield
+        return
+    try:
+        import fcntl  # noqa: PLC0415 — unix-only; на не-unix падаем в no-lock
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    lock_path = Path(series_dir) / (TASK_STATUS_FILE + ".lock")
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        yield  # не смогли залочить — пишем без блокировки (не валим запись)
+        return
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def load_task_status(series_dir: Optional[Path]) -> dict:
@@ -1702,36 +1798,46 @@ def set_task_status(
     закрытие надо показать заново подразделом «закрытые»); повтор того же статуса
     `shown` не трогает. Переоткрытие (A10) — `status=STATUS_OPEN`: задача снова висит,
     причина/показ обнуляются. Текст храним последний виденный (для рендера Ф3).
+
+    FU-2: read-modify-write под межпроцессным locks'ом (`_status_store_lock`) —
+    параллельные писатели Ф5/Ф6 не теряют чужой ключ. FU-3: при СБОЕ персиста
+    (`save_task_status` вернул None) возвращаем None, а не `rec` — вызывающий
+    (сверщик/reply) НЕ примет статус за записанный (Ф5 `apply_status_reply` уже
+    трактует None как «не применилось» → отдаёт шлюзу правок, без ложного ack).
     """
     if status not in _VALID_STATUSES:
         raise ValueError(f"unknown task status: {status!r}")
     key = _status_key(task_text)
     if not key:
         return None
-    store = load_task_status(series_dir)
-    prev = store.get(key) or {}
-    status_changed = status != prev.get("status")
-    if status == STATUS_OPEN:
-        rec = {
-            "status": STATUS_OPEN,
-            "reason": None,
-            "source": source or prev.get("source"),
-            "shown": False,
-            "text": (task_text or prev.get("text") or "").strip(),
-            "updated": date,
-        }
-    else:
-        rec = {
-            "status": status,
-            "reason": reason if reason is not None else prev.get("reason"),
-            "source": source or prev.get("source"),
-            # новое закрытие → показать заново; тот же статус → сохранить shown.
-            "shown": False if status_changed else bool(prev.get("shown")),
-            "text": (task_text or prev.get("text") or "").strip(),
-            "updated": date,
-        }
-    store[key] = rec
-    save_task_status(series_dir, store)
+    with _status_store_lock(series_dir):
+        store = load_task_status(series_dir)
+        prev = store.get(key) or {}
+        status_changed = status != prev.get("status")
+        if status == STATUS_OPEN:
+            rec = {
+                "status": STATUS_OPEN,
+                "reason": None,
+                "source": source or prev.get("source"),
+                "shown": False,
+                "text": (task_text or prev.get("text") or "").strip(),
+                "updated": date,
+            }
+        else:
+            rec = {
+                "status": status,
+                "reason": reason if reason is not None else prev.get("reason"),
+                "source": source or prev.get("source"),
+                # новое закрытие → показать заново; тот же статус → сохранить shown.
+                "shown": False if status_changed else bool(prev.get("shown")),
+                "text": (task_text or prev.get("text") or "").strip(),
+                "updated": date,
+            }
+        store[key] = rec
+        saved = save_task_status(series_dir, store)
+    # FU-3: сбой сохранения → сигналим None (статус НЕ персистнут), не отдаём rec.
+    if saved is None:
+        return None
     return rec
 
 
@@ -1744,16 +1850,66 @@ def mark_status_shown(
     запись была (и теперь shown). Нет записи → False.
     """
     key = task_text_or_key if by_key else _status_key(task_text_or_key)
-    store = load_task_status(series_dir)
-    rec = store.get(key)
-    if not rec:
-        return False
-    if rec.get("shown"):
-        return True
-    rec["shown"] = True
-    store[key] = rec
-    save_task_status(series_dir, store)
+    with _status_store_lock(series_dir):  # FU-2: read-modify-write под locks'ом
+        store = load_task_status(series_dir)
+        rec = store.get(key)
+        if not rec:
+            return False
+        if rec.get("shown"):
+            return True
+        rec["shown"] = True
+        store[key] = rec
+        save_task_status(series_dir, store)
     return True
+
+
+def prune_doubt_buffer(
+    series_dir: Optional[Path], *, max_age_days: int, today: Optional[str] = None
+) -> int:
+    """FU-6: ограничить рост буфера «под сомнением» (doubt) по TTL.
+
+    Подблок «🟡 Вроде закрыто — подтвердите» показывается КАЖДЫЙ раз (R10 — буфер,
+    не гейтится `shown`), поэтому без TTL он рос бы бесконечно, если doubt никто не
+    подтверждает. Здесь удаляем doubt-записи старше `max_age_days` дней по полю
+    `updated` → задача снова становится обычным «висящим» (запись исчезает из
+    sidecar). Это КОНСЕРВАТИВНО (R16): неподтверждённое «вроде закрыто» снова видно
+    как живой висяк, а не молча закрывается. Терминально закрытые и `open` НЕ трогаем;
+    записи без валидной даты (`updated`) не стареют (оставляем — консервативно).
+    `max_age_days<=0` → no-op. Возвращает число выпруненных записей. Под locks'ом
+    (FU-2) — согласовано с писателями reply/сверщика. НЕ логирует тексты.
+    """
+    if series_dir is None or max_age_days <= 0:
+        return 0
+    if today is None:
+        from datetime import date as _date  # локальный импорт: модуль stdlib-only
+        today = _date.today().isoformat()
+    try:
+        from datetime import date as _date, timedelta as _td
+        y, m, dd = (int(x) for x in today.split("-"))
+        cutoff = (_date(y, m, dd) - _td(days=max_age_days)).isoformat()
+    except (ValueError, TypeError):
+        return 0
+    removed = 0
+    with _status_store_lock(series_dir):
+        store = load_task_status(series_dir)
+        if not store:
+            return 0
+        for k in list(store.keys()):
+            rec = store.get(k) or {}
+            if rec.get("status") != STATUS_DOUBT:
+                continue
+            upd = rec.get("updated")
+            if not isinstance(upd, str) or not re.match(r"^\d{4}-\d{2}-\d{2}", upd):
+                continue  # без валидной даты doubt не стареет (консервативно)
+            if upd[:10] < cutoff:
+                del store[k]
+                removed += 1
+        if removed:
+            save_task_status(series_dir, store)
+    if removed:
+        logger.info("[task-status] doubt TTL prune: removed=%d (>%dd) in %s",
+                    removed, max_age_days, Path(series_dir).name)
+    return removed
 
 
 def merge_open_tasks_with_status(fresh_tail: list[str], status_store: dict) -> dict:

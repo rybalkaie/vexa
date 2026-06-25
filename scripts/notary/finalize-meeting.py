@@ -799,6 +799,10 @@ def main() -> int:
     # Ф8 (G9): хвост незакрытых задач серии → раздел «🔻 С прошлых встреч» в протоколе.
     # Готовый блок-инструкция, едет в ТОТ ЖЕ Вызов 1 генерации (НЕ отдельный вызов).
     open_tasks_block = ""
+    # FU-7: ключи закрытых висяков, вошедших в блок «✅ Закрыто». Пометку «показано» +
+    # онбординг коммитим ПОСЛЕ подтверждённой доставки (см. ниже), не при сборке —
+    # иначе при сбое генерации/постинга подраздел R21 потерялся бы в ретрае.
+    pending_shown_keys: list[str] = []
     # Ф4б (REQ 1.2): закреплённое человеком сопоставление спикер→имя из памяти серии
     # (правка авторства реплаем на прошлой встрече). Подаётся якорем в map_all ДО
     # догадки Ф4а. {} если нет/старые файлы без ключа (ленивое поле, УПУ3).
@@ -834,12 +838,13 @@ def main() -> int:
             # Ф8 (G9): хвост открытых задач серии из тех же выжимок (latest несёт
             # кумулятивное состояние). Под своим kill-switch внутри. Отдельным от
             # series_memory каналом — у него обратная дисциплина (перенести + статус).
-            # Ф3 (R21): finalize — канонический показ. mark_shown=True помечает
-            # закрытые «показано» после включения в блок (clarify-реген НЕ помечает,
-            # см. lib/clarify_worker.py — иначе закрытые потерялись бы при коррекции).
+            # Ф3 (R21): finalize — канонический показ. FU-7: пометку «показано»
+            # откладываем — собираем ключи закрытых в shown_sink и коммитим ПОСЛЕ
+            # подтверждённой доставки протокола (mark_shown игнорируется, когда передан
+            # shown_sink). clarify по-прежнему НЕ помечает (lib/clarify_worker.py).
             open_tasks_block = series_memory.build_open_tasks_block(
                 series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
-                mark_shown=True, date=date_part,
+                date=date_part, shown_sink=pending_shown_keys,
             )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
@@ -1676,6 +1681,22 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 log.warning("[delivery] failed (non-fatal): %s", e)
                 delivery_result = {"status": "error", "error": str(e)}
+
+    # FU-7: пометку «показано» для подраздела «✅ Закрыто» (R21) + онбординг (R4)
+    # коммитим ЗДЕСЬ — ПОСЛЕ подтверждённой доставки (status == "sent"), а не при
+    # сборке блока. При сбое генерации/постинга closed-пункты НЕ помечаются → подраздел
+    # покажется в ретрае (показ-один-раз не теряется). "skipped" (доставка не дошла до
+    # участников, алерт владельцу) → НЕ коммитим: вопросы никто не увидел. Best-effort.
+    # Гейтим тем же условием, что и СБОРКУ блока (is_enabled + has_series_slug): иначе
+    # для one-off (без серии) series_dir = корень протоколов → spurious маркер в корне.
+    if (delivery_result.get("status") == "sent"
+            and series_memory.is_enabled()
+            and series_memory.has_series_slug(meta.get("series"))):
+        try:
+            series_memory.commit_pending_shown(
+                series_dir, pending_shown_keys, date=date_part)
+        except Exception as e:  # noqa: BLE001 — пометка best-effort, протокол доставлен
+            log.warning("[open-tasks] commit shown failed (non-fatal): %s", type(e).__name__)
 
     # 4.0.3b. Ф8 LLM-proposer: кандидаты в Speechmatics vocab по стенограмме.
     # Зовём ТОЛЬКО после успешной TG-доставки протокола (status in {sent,
