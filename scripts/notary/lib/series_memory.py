@@ -1659,8 +1659,19 @@ def commit_pending_shown(
     Идемпотентно, best-effort: каждый сбой проглатываем (блок уже доставлен — не валим
     финализацию). Онбординг (R4) помечаем тут же — серия становится «тёплой» только
     после фактического показа хвоста. НЕ логирует тексты.
+
+    GATE `is_open_tasks_enabled()` (как было у старого inline-кода ВНУТРИ
+    `build_open_tasks_block`, за его early-return): пометки «показано»+онбординг
+    принадлежат ФИЧЕ висяков. finalize гейтит этот вызов по `is_enabled()` (series
+    memory) + delivery=="sent", но НЕ по `ENABLE_OPEN_TASKS_TRACKING` — а блок висяков
+    строится ещё и под ним. Без guard'а при `ENABLE_SERIES_MEMORY=on`,
+    `ENABLE_OPEN_TASKS_TRACKING=off` (поддержанный промежуточный режим — kill-switch
+    висяков отдельный) серия молча пометилась бы «онбордившейся» на пустом блоке, и при
+    последующем включении трекинга холодный старт (R4, бэкфилл ≤1 встречи) бесшумно
+    пропал бы. shown_keys в этом режиме и так пуст (блок не строился) — early-return
+    безопасен и точно повторяет прежнее поведение.
     """
-    if series_dir is None:
+    if series_dir is None or not is_open_tasks_enabled():
         return
     for k in shown_keys or []:
         if not k:
