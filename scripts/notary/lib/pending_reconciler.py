@@ -953,7 +953,13 @@ def gather_bitrix_evidence(
         tasks = tasks[:tlimit]
     if not tasks:
         logger.info("[reconciler] bitrix: series=%s company=anzhee tasks=0 → 0 свидетельств", series)
-        if cache is not None:
+        # Кэшируем пустой результат ТОЛЬКО при УСПЕШНОМ вызове (`raw_tasks is not None`):
+        # genuine «0 изменённых задач» — мемоизируем (egress ↓, смысл memo). СБОЙ REST
+        # (`raw_tasks is None` — сеть/таймаут/не-JSON) НЕ кэшируем: иначе одна транзиентная
+        # ошибка на ПЕРВОЙ Anzhee-серии отравила бы весь прогон (остальные Anzhee-серии
+        # получили бы "" без ретрая). Пусть следующая серия повторит — консервативно: лишний
+        # REST дешевле потери источника на сутки (ложно-висит < ложно-закрыто).
+        if cache is not None and raw_tasks is not None:
             cache[_BITRIX_COMPANY] = ""
         return ""
     # Справедливая доля egress на задачу (как per-chat-бюджет Ф7): болтливая задача не
@@ -973,8 +979,6 @@ def gather_bitrix_evidence(
         task_lines: list[str] = []
         if title:
             task_lines.append(title)
-        if desc:
-            task_lines.append(desc)
         # комментарии задачи — где «по переписке видно, что закрыт» (R19). id может
         # быть 0 (теоретически) — берём явной None-проверкой, не `or` (0 — falsy).
         tid = task.get("id")
@@ -1003,6 +1007,11 @@ def gather_bitrix_evidence(
             if msg:
                 task_lines.append(f"комментарий: {msg}")
                 comments_seen += 1
+        # описание задачи — статичный контекст; идёт ПОСЛЕ комментариев, чтобы при усечении
+        # по per_task_budget оно обрезалось РАНЬШЕ свежих комментариев — носителей сигнала
+        # закрытия (R19 «по комментариям/переписке»), а не наоборот (ход3-У1).
+        if desc:
+            task_lines.append(desc)
         if not task_lines:
             continue
         tasks_seen += 1

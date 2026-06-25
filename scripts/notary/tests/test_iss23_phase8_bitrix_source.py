@@ -286,6 +286,49 @@ class TestGatherBitrixEvidence(unittest.TestCase):
         self.assertEqual(ev1, ev2)
         self.assertEqual(len(rec), n_after_first)  # REST повторно НЕ дёрнут (egress ↓)
 
+    def test_failed_task_list_not_cached_retries(self):
+        # ход1-Н1: транзиентный СБОЙ tasks.task.list (raw=None) на ПЕРВОЙ Anzhee-серии НЕ
+        # отравляет memo-кэш — вторая серия повторяет вызов и получает свидетельства.
+        cache: dict = {}
+        state = {"n": 0}
+
+        def flaky(method, params):
+            if method == "tasks.task.list":
+                state["n"] += 1
+                return None if state["n"] == 1 else {"tasks": [_task(1, "T-после-ретрая")]}
+            if method == "task.commentitem.list":
+                return [_comment("закрыт")]
+            return None
+
+        ev1 = self._gather(flaky, cache=cache)
+        self.assertEqual(ev1, "")                     # сбой → пусто
+        self.assertNotIn(pr._BITRIX_COMPANY, cache)   # НЕ закэшировано (нет отравления прогона)
+        ev2 = self._gather(flaky, cache=cache)
+        self.assertIn("T-после-ретрая", ev2)          # ретрай на 2-й серии дал свидетельства
+
+    def test_comments_ordered_before_description(self):
+        # ход3-У1: описание (статичный контекст) идёт ПОСЛЕ комментариев — носителей
+        # сигнала закрытия (R19). При усечении per_task_budget с фронта обрежется описание,
+        # а не свежий комментарий. Инвариант проверяем напрямую по порядку в выводе.
+        fake = _fake_bitrix([_task(1, "T", "ОПИСАНИЕ-задачи")],
+                            {1: [_comment("КОММ-резолюция")]})
+        ev = self._gather(fake)
+        self.assertIn("КОММ-резолюция", ev)
+        self.assertIn("ОПИСАНИЕ-задачи", ev)
+        self.assertLess(ev.index("КОММ-резолюция"), ev.index("ОПИСАНИЕ-задачи"))
+
+    def test_genuine_empty_is_cached(self):
+        # обратная сторона Н1-фикса: УСПЕШНЫЙ вызов с 0 задач (портал реально пуст)
+        # кэшируется — повторный REST другой Anzhee-серии не дёргается (memo egress ↓ цел).
+        cache: dict = {}
+        rec = []
+        fake = _fake_bitrix([], record=rec)           # успешный вызов, 0 задач
+        self.assertEqual(self._gather(fake, cache=cache), "")
+        self.assertIn(pr._BITRIX_COMPANY, cache)      # genuine-empty закэширован
+        n = len(rec)
+        self.assertEqual(self._gather(fake, cache=cache), "")
+        self.assertEqual(len(rec), n)                 # повторный REST НЕ дёрнут
+
 
 # ── _bitrix_call seam: реальный subprocess поверх bitrix.sh, БЕЗ сети/вебхука ──
 class TestBitrixCallSeam(unittest.TestCase):
