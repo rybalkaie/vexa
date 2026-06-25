@@ -585,7 +585,17 @@ def reconcile_all(
         logger.warning("[reconciler] root not found: %s", r)
         return []
     if matcher is None:
-        matcher = _default_matcher
+        # Defense-in-depth опасной тройки (A7/R16): боевой Haiku (egress производных
+        # ПДн в Claude ЕЖЕДНЕВНО) зовётся ТОЛЬКО при гейте ON. main() гейтит выше —
+        # но модуль расширяют Ф7/Ф8 ПОВЕРХ этой же функции, и забытый guard у будущего
+        # caller'а открыл бы egress. Централизуем гейт здесь: matcher не задан + гейт
+        # OFF → консервативный no-op (всё keep), реальный claude НЕ зову.
+        if is_reconciler_enabled():
+            matcher = _default_matcher
+        else:
+            logger.warning("[reconciler] matcher не задан и гейт OFF → no-op (keep all), "
+                           "реальный claude НЕ зову")
+            matcher = lambda _items, _evidence: None  # noqa: E731 — консервативный no-op
     if date is None:
         from datetime import date as _date  # локальный импорт: stdlib-only
         date = _date.today().isoformat()

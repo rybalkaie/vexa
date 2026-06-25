@@ -360,6 +360,24 @@ class TestGate(unittest.TestCase):
         self.assertEqual(rc, 0)
         m.assert_called_once()
 
+    def test_reconcile_all_no_matcher_gate_off_skips_real_claude(self):
+        # Defense-in-depth опасной тройки (цикл5 У1): reconcile_all(matcher=None) при
+        # гейте OFF НЕ зовёт боевой claude (egress производных ПДн), даже в обход main()
+        # — страховка для будущих caller'ов Ф7/Ф8 поверх этой же функции.
+        sentinel = mock.Mock(side_effect=AssertionError("claude вызван при OFF-гейте!"))
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _seed_series(root, "series-a", "2026-06-20",
+                         open_tasks=["Татьяна: расчёт по складу"])
+            _seed_series(root, "series-b", "2026-06-21",
+                         key_points=["расчёт по складу готов и принят"])
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(pr, "request_reconciler_verdicts", sentinel):
+                os.environ.pop("ENABLE_PENDING_RECONCILER", None)
+                res = pr.reconcile_all(root, matcher=None, date="2026-06-25")
+        sentinel.assert_not_called()
+        self.assertEqual(sum(r.closed for r in res), 0)  # консервативно: ничего не закрыто
+
 
 # ── свидетельства: окно/объём ─────────────────────────────────────────────────
 class TestEvidenceGathering(unittest.TestCase):
