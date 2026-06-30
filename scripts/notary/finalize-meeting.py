@@ -90,6 +90,7 @@ from lib import correction_facts  # noqa: E402  # Ф2: company-замок исп
 from lib import series_memory  # noqa: E402  # Ф7: память серии встреч
 from lib import series_roster  # noqa: E402  # Ф3: ростер ролей серии (домен→роль)
 from lib import publication_gate  # noqa: E402  # Ф6: гейтинг публикации знания (E1–E5)
+from lib import delivery_gate  # noqa: E402  # Ф3 eviction: гейт доставки (R4c + R13-доставка)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -1603,34 +1604,52 @@ def main() -> int:
     # ложно пометил бы каждую внутреннюю встречу как провал. endReason работает
     # на любом бэкенде.
     _utter_count = len(ext_result.utterances) if ext_result is not None else None
-    _recording_failed = (
-        _end_reason in {"no_one_joined", "deaf_with_participants"}
-        or _utter_count == 0
+    # Ф3 (R4c + R13-доставка): вердикт гейта — ЧИСТАЯ логика в lib.delivery_gate
+    # (покрыта unittest'ом). Подавляем по СУЩЕСТВЕННОСТИ записи, а не только по
+    # метке reason (FU-4: короткую ПОЛНУЮ встречу, ошибочно помеченную
+    # `evicted_failure` порогом A7=25 мин, не теряем). `evicted_normal_end`/полная
+    # запись → доставка как обычно (R13-сторона доставки не глотает успешные
+    # встречи). turn_count = backend-agnostic число реплик-ходов протокола.
+    _gate = delivery_gate.evaluate_delivery(
+        end_reason=_end_reason,
+        turn_count=len(turns),
+        utter_count=_utter_count,
     )
-    if _recording_failed:
+    if _gate.suppressed:
         _series_lbl = meta.get("series") or "?"
-        if _end_reason == "deaf_with_participants":
-            _why = "бот был в комнате и видел людей, но не получил звук (вероятный сбой захвата аудио)"
-        elif _end_reason == "no_one_joined":
-            _why = "за время ожидания в комнате так никто и не появился"
+        if _gate.bot_already_alerted:
+            # Новые причины Ф2 (`evicted_failure`/`deaf_after_start`): бот УЖЕ позвал
+            # на помощь в момент детекта (R4a лично + R4b в групповой чат для выброса;
+            # личный алерт для deaf). finalize НЕ дублирует ни групповое, ни личное
+            # сообщение — иначе двойной алерт. Только подавляем обрывок.
+            _marker_decision = "suppressed-bot-already-alerted"
         else:
-            _why = "запись получилась пустой — ни одной распознанной реплики"
-        _room_url = str(meta.get("meetingUrl") or "").strip()
-        _room_line = f"\nКомната: {_room_url}" if _room_url else ""
-        try:
-            from lib import notify  # noqa: PLC0415
-            notify.push_via_notarius(
-                f"⚠️ Ватсон: встреча «{_series_lbl}» {date_part} НЕ записана.\n"
-                f"Причина: {_why}.{_room_line}\n"
-                f"Зайти руками сейчас — скажи Альфреду: «подключи Ватсона к этой встрече»."
-            )
-        except Exception as _e:  # noqa: BLE001
-            log.warning("[delivery] owner-alert failed (non-fatal): %s", _e)
-        # ISS-20 ход1: пометить встречу ОБРАБОТАННОЙ в meta.delivered. Иначе
-        # collector (скип только по непустому delivered — collector.py
-        # `_delivery_done`) КАЖДЫЙ тик (5 мин) пере-финализирует пустую запись и
-        # шлёт алерт повторно (спам владельцу + лишний прогон STT). Пишем через
-        # канонический единый писатель meta (РИСК1) синтетический маркер:
+            # Старые причины (`no_one_joined`/`deaf_with_participants`/пустой STT):
+            # бот в момент встречи молчал → finalize шлёт ЛИЧНЫЙ owner-alert (в группу
+            # НЕ шлём — плашкой «не состоялась» бот не позорится перед командой).
+            if _end_reason == "deaf_with_participants":
+                _why = "бот был в комнате и видел людей, но не получил звук (вероятный сбой захвата аудио)"
+            elif _end_reason == "no_one_joined":
+                _why = "за время ожидания в комнате так никто и не появился"
+            else:
+                _why = "запись получилась пустой — ни одной распознанной реплики"
+            _room_url = str(meta.get("meetingUrl") or "").strip()
+            _room_line = f"\nКомната: {_room_url}" if _room_url else ""
+            try:
+                from lib import notify  # noqa: PLC0415
+                notify.push_via_notarius(
+                    f"⚠️ Ватсон: встреча «{_series_lbl}» {date_part} НЕ записана.\n"
+                    f"Причина: {_why}.{_room_line}\n"
+                    f"Зайти руками сейчас — скажи Альфреду: «подключи Ватсона к этой встрече»."
+                )
+            except Exception as _e:  # noqa: BLE001
+                log.warning("[delivery] owner-alert failed (non-fatal): %s", _e)
+            _marker_decision = "owner-alert-failed-recording"
+        # ISS-20 ход1: пометить встречу ОБРАБОТАННОЙ в meta.delivered (в ОБЕИХ
+        # ветках подавления). Иначе collector (скип только по непустому delivered —
+        # collector.py `_delivery_done`) КАЖДЫЙ тик (5 мин) пере-финализирует пустую
+        # запись и шлёт алерт повторно (спам владельцу + лишний прогон STT). Пишем
+        # через канонический единый писатель meta (РИСК1) синтетический маркер:
         # message_ids=[0] непустой → `_delivery_done`=True; decision помечает суть.
         try:
             from lib.llm_postprocess import _update_meta_delivered  # noqa: PLC0415
@@ -1640,16 +1659,17 @@ def main() -> int:
                     "chat_id": 0,
                     "message_ids": [0],
                     "at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "decision": "owner-alert-failed-recording",
+                    "decision": _marker_decision,
                 },
             )
         except Exception as _e:  # noqa: BLE001
             log.warning("[delivery] failed-recording marker write failed (non-fatal): %s", _e)
         delivery_result = {"status": "skipped-failed-recording", "endReason": _end_reason}
+        # Только метаданные/счётчики (опасная тройка R11) — без текста реплик.
         log.info(
-            "[delivery] провальная запись (endReason=%s, utter=%d) → личный алерт владельцу; "
-            "в групповой чат НЕ шлём", _end_reason or "—",
-            (_utter_count if _utter_count is not None else 0),
+            "[delivery] обрывок/провал подавлен (endReason=%s, replies=%d, substantial=%s, "
+            "bot_alerted=%s) → в групповой чат НЕ шлём", _end_reason or "—",
+            _gate.reply_count, _gate.substantial, _gate.bot_already_alerted,
         )
     elif protocol_path.is_file():
         try:
