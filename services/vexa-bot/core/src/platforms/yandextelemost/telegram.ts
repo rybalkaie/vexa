@@ -4,7 +4,12 @@
 //
 // Токен и chat-id берутся из env (.env.notary):
 //   TELEGRAM_BOT_TOKEN  — токен @Ilia_claude_1_bot
-//   TELEGRAM_CHAT_ID    — chat_id Ильи (личка бота)
+//   TELEGRAM_CHAT_ID    — chat_id Ильи (личка бота) — дефолтный получатель
+//
+// Ф2 (ISS-28, R4b): необязательный opts.chatId позволяет адресовать сообщение
+// в ДРУГОЙ чат (групповой чат серии = seriesChatId из BOT_CONFIG) — для алерта
+// «в момент детекта» в группу встречи. Без chatId сохраняется дефолт — личка
+// Ильи (TELEGRAM_CHAT_ID), чтобы не сломать существующие вызовы admission.ts.
 //
 // Не блокирующая отправка: ошибка не должна валить адаптер.
 
@@ -17,16 +22,19 @@ let lastSentByKey: Map<string, number> = new Map();
 /**
  * Отправить сообщение в Telegram. Возвращает true при успехе.
  * dedupeKey + dedupeMs позволяет защитить от спама одинаковыми сообщениями.
+ * opts.chatId (Ф2/R4b) — переопределить получателя (напр. групповой чат серии);
+ * без него шлём в личку Ильи (TELEGRAM_CHAT_ID) — дефолт не меняется.
  */
 export async function sendTelegramMessage(
   text: string,
-  opts?: { dedupeKey?: string; dedupeMs?: number }
+  opts?: { dedupeKey?: string; dedupeMs?: number; chatId?: number | string }
 ): Promise<boolean> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
+  // Ф2/R4b: явный получатель (групповой чат серии) перекрывает дефолт-личку.
+  const chatId = opts?.chatId != null ? String(opts.chatId) : process.env.TELEGRAM_CHAT_ID;
 
   if (!token || !chatId) {
-    log("[Telegram] TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы в env, push пропущен");
+    log("[Telegram] TELEGRAM_BOT_TOKEN или chat_id не заданы (env/opts), push пропущен");
     return false;
   }
 

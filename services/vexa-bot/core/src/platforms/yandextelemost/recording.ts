@@ -25,6 +25,14 @@ import { BotConfig } from "../../types";
 import { log } from "../../utils";
 import { isHallucination } from "../../services/hallucination-filter";
 import { startParticipantsPolling } from "./participants";
+// Ф2 (ISS-28): перезаход после выброса переиспользует штатный join-флоу
+// (joinYandexTelemost + waitForYandexTelemostAdmission) и канал уведомлений
+// (sendTelegramMessage). recording.ts раньше их не импортировал — join
+// оркестрировался выше по стеку (index.ts → meetingFlow). Для авто-перезахода
+// «изнутри» ветки evicted зовём их здесь напрямую.
+import { joinYandexTelemost } from "./join";
+import { waitForYandexTelemostAdmission } from "./admission";
+import { sendTelegramMessage } from "./telegram";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -74,6 +82,44 @@ const EVICTION_TEXT_TRUNC = 300;
 // `/j/<meetingId>` — сегмент «в комнате». Любой адрес без него = вне комнаты.
 const TELEMOST_ROOM_RE = /\/j\/([A-Za-z0-9_-]+)/;
 
+// ── ISS-28 / Ф2: подтверждение выброса, перезаход, guard «штатный конец» ──
+// R2b — подтверждение: реагируем только после 2 чтений подряд без `/j/` (1 цикл
+// URL_CHECK_INTERVAL_MS ≈ 3с), чтобы под-секундный флик SPA-роутера не считался
+// выбросом. Эскалация к алертам — исчерпав 5 попыток за ~2 мин с backoff'ом.
+const EVICTION_CONFIRM_READS = 2;
+const EVICTION_MAX_ATTEMPTS = 5;
+// Защита от цикла «вернулись → Яндекс снова выбросил → вернулись …» (риск плана).
+// Per-event лимит в 5 попыток сам по себе его НЕ ловит (каждый новый выброс даёт
+// свежий бюджет). Потому ограничиваем и число УСПЕШНЫХ восстановлений за сессию:
+// после стольких возвратов очередной выброс сразу эскалируем (алерт), не цикля.
+const EVICTION_MAX_RECOVERY_CYCLES = 3;
+// Пороги backoff заданы владельцем (Q3, /план-фичи-2): 0/10/20/40/80с (=150с
+// «голого» ожидания). Реальный wall-clock больше на время самих join-попыток.
+const EVICTION_BACKOFF_MS = [0, 10_000, 20_000, 40_000, 80_000];
+// Таймаут admission на КАЖДУЮ попытку перезахода. Живая комната впускает быстро;
+// если комната мертва (встреча кончилась) — join бросит раньше (нет lobby).
+const REJOIN_ADMISSION_TIMEOUT_MS = 60_000;
+
+// R13 (guard «штатный конец ≠ сбой»), порог A7 — выбран исполнителем (план явно
+// делегирует, A7 в реестре допущений). «Существенный объём речи» = выброс при
+// уже записанном большом разговоре → встреча фактически прошла (норма), НЕ сбой.
+// Якоря плана: ранний кейс ISS-28 (≈1 мин речи) = однозначно сбой; конец
+// директората (≈52 мин) = однозначно норма. Берём середину: ≥25 мин РЕЧИ
+// (сумма speech-span по chunks, без межчанковых пауз). Ниже → кандидат в сбой
+// (перезаход; если не вернулись — алерт). Ожидаемой длительности встречи у бота
+// НЕТ (runner её не прокидывает в BOT_CONFIG) — потому порог по объёму речи, а
+// не по % длительности. Если порог не тот — поправим на наблюдении 7 июля.
+const EVICTION_NORMAL_END_MIN_SPEECH_MS = 25 * 60_000;
+
+// R5 (deaf-after-start): «оглох ПОСЛЕ начала» при УДЕРЖАНИИ `/j/`. Сигнал =
+// browser-флаг __vexa_telemost_degraded (0 живых аудио-дорожек после rescan).
+// Срабатывает только если деградация удержана этот срок ПРИ видимых реальных
+// участниках — отсекает кратковременные renegotiation-окна Телемоста (он рвёт и
+// заново поднимает дорожки) и конец встречи (люди ушли → панель пуста). 5 мин <
+// OUT_OF_CALL_SILENCE_MS (20 мин) → классифицируем deaf_after_start РАНЬШЕ, чем
+// «молчаливый» silence_out_of_call, как требует критерий R5.
+const DEAF_AFTER_START_TIMEOUT_MS = 5 * 60_000;
+
 type EvictionSnapshot = {
   navigations: { url: string; ts: string }[];
   consoleErrors: { type: string; text: string; ts: string }[];
@@ -89,6 +135,52 @@ type EvictionCapture = {
 // многострочных дампов в новом лог-канале.
 function truncOneLine(s: string, max: number): string {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+/**
+ * Browser-обёртка window.WebSocket: единственный способ достать close-КОД
+ * (Playwright его не экспонирует). Идемпотентна по `__vexa_ws_wrapped` — второй
+ * вызов на ТОМ ЖЕ документе ничего не делает. Вынесена из setupEvictionCapture
+ * отдельно, потому что Ф2-перезаход (page.goto) уничтожает window вместе с
+ * обёрткой → её надо переустановить на НОВОМ документе. Node-канал
+ * `__vexaTelemostSignal` (exposeFunction) переживает навигацию — его НЕ трогаем.
+ */
+async function installEvictionWsWrapper(page: Page): Promise<void> {
+  try {
+    await page.evaluate(() => {
+      const w = window as any;
+      if (w.__vexa_ws_wrapped) return;
+      const Orig = w.WebSocket;
+      if (typeof Orig !== "function") return;
+      const Wrapped: any = function (this: any, ...args: any[]) {
+        const ws = new Orig(...args);
+        try {
+          ws.addEventListener("close", (e: any) => {
+            try {
+              w.__vexaTelemostSignal?.({
+                kind: "ws_close",
+                url: String(args[0] || ""),
+                code: e?.code,
+                reason: String(e?.reason || ""),
+              });
+            } catch { /* контекст мог умереть на выбросе */ }
+          });
+        } catch { /* */ }
+        return ws;
+      };
+      try {
+        Wrapped.prototype = Orig.prototype;
+        Wrapped.CONNECTING = Orig.CONNECTING;
+        Wrapped.OPEN = Orig.OPEN;
+        Wrapped.CLOSING = Orig.CLOSING;
+        Wrapped.CLOSED = Orig.CLOSED;
+      } catch { /* */ }
+      w.WebSocket = Wrapped;
+      w.__vexa_ws_wrapped = true;
+    });
+  } catch (err: any) {
+    log(`${LOG_PREFIX} eviction WS wrap failed (non-fatal): ${err?.message}`);
+  }
 }
 
 /**
@@ -158,47 +250,12 @@ async function setupEvictionCapture(page: Page): Promise<EvictionCapture> {
   page.on("framenavigated", onFrameNav);
   page.on("websocket", onWebSocket);
 
-  // Browser-обёртка window.WebSocket: единственный способ достать close-КОД
-  // (Playwright его не экспонирует). Ловит сокеты, открытые ПОСЛЕ старта записи —
-  // их и переустанавливает Телемост при renegotiation (ведущая гипотеза ISS-28).
-  // Безопасно: возвращаем НАСТОЯЩИЙ сокет, только добавляем close-listener; не
-  // трогаем фреймы/поведение. Если что-то пойдёт не так — try/catch, запись не
-  // страдает. Нестандартное решение — см. пакет сдачи §7.
-  try {
-    await page.evaluate(() => {
-      const w = window as any;
-      if (w.__vexa_ws_wrapped) return;
-      const Orig = w.WebSocket;
-      if (typeof Orig !== "function") return;
-      const Wrapped: any = function (this: any, ...args: any[]) {
-        const ws = new Orig(...args);
-        try {
-          ws.addEventListener("close", (e: any) => {
-            try {
-              w.__vexaTelemostSignal?.({
-                kind: "ws_close",
-                url: String(args[0] || ""),
-                code: e?.code,
-                reason: String(e?.reason || ""),
-              });
-            } catch { /* контекст мог умереть на выбросе */ }
-          });
-        } catch { /* */ }
-        return ws;
-      };
-      try {
-        Wrapped.prototype = Orig.prototype;
-        Wrapped.CONNECTING = Orig.CONNECTING;
-        Wrapped.OPEN = Orig.OPEN;
-        Wrapped.CLOSING = Orig.CLOSING;
-        Wrapped.CLOSED = Orig.CLOSED;
-      } catch { /* */ }
-      w.WebSocket = Wrapped;
-      w.__vexa_ws_wrapped = true;
-    });
-  } catch (err: any) {
-    log(`${LOG_PREFIX} eviction WS wrap failed (non-fatal): ${err?.message}`);
-  }
+  // Browser-обёртка window.WebSocket (close-КОД). Вынесена в отдельную функцию,
+  // т.к. Ф2-перезаход переустанавливает её на новом документе (Node-listeners
+  // выше и exposeFunction переживают навигацию, а browser-обёртка — нет).
+  // Ловит сокеты, открытые ПОСЛЕ старта записи — их и переустанавливает Телемост
+  // при renegotiation (ведущая гипотеза ISS-28). Нестандартное — см. пакет §7.
+  await installEvictionWsWrapper(page);
 
   return {
     getSnapshot: () => ({
@@ -672,6 +729,18 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   // Ф1 (ISS-28) R3: снимок причины выброса (заполняется в момент детекта evicted).
   let lastEvictionSnapshot: EvictionSnapshot | null = null;
 
+  // Ф2 (ISS-28) состояние детекта/перезахода:
+  //   consecutiveOutOfRoom — счётчик подряд идущих чтений URL без `/j/` (R2b:
+  //     реагируем на 2-м, флик сбрасывает в 0).
+  //   evictionHandling — re-entrancy guard: пока идёт async-перезаход (минуты с
+  //     backoff'ом), setInterval продолжает тикать → последующие тики no-op'ят.
+  //   deafAfterStartSince — момент начала непрерывной деградации захвата при
+  //     удержании `/j/` (R5); null = не деградируем.
+  let consecutiveOutOfRoom = 0;
+  let evictionHandling = false;
+  let evictionRecoveryCount = 0; // успешных возвратов за сессию (антизацикл)
+  let deafAfterStartSince: number | null = null;
+
   // ISS-20 #2: «никто не пришёл» нельзя объявлять, если в панели ВИДНЫ люди —
   // это «оглох» (вероятный сбой захвата), а не пустая комната. При живых людях
   // ждём дольше (вдруг live-перехват #1 подцепит звук), и если к жёсткому
@@ -751,9 +820,10 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           endTs: c.endTs,
           durationS: Math.round(c.durationS),
         })),
-        // Ф1 (ISS-28) R3: причина выброса (только при endReason=evicted). По
-        // БЕЛОМУ СПИСКУ типов — навигации/console-error-warning/WS-close. Текста
-        // реплик/имён здесь нет (RISK5). null для штатных встреч.
+        // Ф1 (ISS-28) R3: причина выброса (заполняется при подтверждённом выбросе:
+        // evicted_normal_end/_failure/_recovered). По БЕЛОМУ СПИСКУ типов —
+        // навигации/console-error-warning/WS-close. Текста реплик/имён здесь нет
+        // (RISK5). null для встреч без выброса.
         eviction: lastEvictionSnapshot,
       },
       files: {
@@ -914,7 +984,10 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     }
   );
 
-  const stopCapture = await setupBrowserCapture(page);
+  // Ф2: stopCapture переопределяется при перезаходе (новый browser-capture на
+  // новом документе после page.goto) — потому let, не const. finally зовёт
+  // актуальное значение.
+  let stopCapture = await setupBrowserCapture(page);
   logStep("browser_capture_initialized");
 
   // Ф1 (ISS-28) R3: вооружаем захват причины выброса (console/nav/WS close-код).
@@ -927,6 +1000,82 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     log(`${LOG_PREFIX} eviction capture setup failed (non-fatal): ${err?.message}`);
   }
 
+  // ── Ф2 (ISS-28) хелперы перезахода/уведомлений ──
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+  // R13: сумма РЕЧЕВОГО времени по chunks (speech-span каждого chunk'а, без
+  // межчанковых пауз). Прокси «сколько реального разговора записали» — основа
+  // guard'а «штатный конец vs ранний сбой». firstSpeechMs/lastSpeechMs ставятся
+  // в обработчике аудио независимо от close, так что значение корректно и до, и
+  // после closeChunk.
+  const recordedSpeechMs = (): number =>
+    chunks.reduce(
+      (acc, c) =>
+        acc + (c.firstSpeechMs != null && c.lastSpeechMs != null ? c.lastSpeechMs - c.firstSpeechMs : 0),
+      0,
+    );
+
+  // Техпричина выброса для алерта — ТОЛЬКО метаданные (опасная тройка/R11): коды
+  // закрытия WS (числа) либо общая фраза. Тексты console-error/реплик сюда НЕ
+  // попадают.
+  const describeEvictionReason = (snap: EvictionSnapshot | null): string => {
+    const wsCodes = snap ? snap.websocketEvents.map((e) => e.code).filter((c) => c != null) : [];
+    return wsCodes.length
+      ? `соединение закрыто (код ${wsCodes.join(",")})`
+      : "соединение с Телемостом разорвано";
+  };
+
+  // R2a: одна попытка перезахода. Ре-навигация + штатный join + admission +
+  // re-init browser-capture. RISK2: exposeFunction (__vexaTelemostAudio /
+  // __vexaTelemostSignal) переживает page.goto — НЕ переэкспонируем (второй
+  // expose БРОСАЕТ); пере-запускаем ТОЛЬКО browser-часть (WS-обёртка +
+  // setupBrowserCapture, идемпотентны на свежем документе). Возвращает true,
+  // если после захода снова в комнате.
+  const rejoinTelemost = async (): Promise<boolean> => {
+    logStep("rejoin_start", { url: meetingUrl });
+    await joinYandexTelemost(page, meetingUrl, botName, botConfig);
+    const admitted = await waitForYandexTelemostAdmission(page, REJOIN_ADMISSION_TIMEOUT_MS, botConfig);
+    if (!admitted) {
+      logStep("rejoin_not_admitted");
+      return false;
+    }
+    // Re-init capture (RISK2): только browser-сторона.
+    await installEvictionWsWrapper(page);
+    stopCapture = await setupBrowserCapture(page);
+    const back = isInRoom(page.url());
+    logStep("rejoin_result", { in_room: back });
+    return back;
+  };
+
+  // R4a + R4b: уведомления при НЕустранимом сбое (перезаход исчерпан). Шлёт сам
+  // бот «в момент детекта» (он жив во время встречи). R4a — личка Ильи (дефолт
+  // sendTelegramMessage). R4b — групповой чат серии (seriesChatId); нет чата →
+  // молча скип, личный алерт всё равно ушёл (A8). Тексты фиксированные (R11) —
+  // содержимого встречи в них нет.
+  const sendEvictionAlerts = async (snap: EvictionSnapshot | null): Promise<void> => {
+    const room = meetingUrl || "?";
+    const reason = describeEvictionReason(snap);
+    const seriesLbl = series ? ` «${series}»` : "";
+    // R4a — личный алерт Илье (ссылка комнаты + причина).
+    await sendTelegramMessage(
+      `🔴 <b>Бот-протокол</b>: не смог записать встречу${seriesLbl} — выброс из Телемоста, ` +
+        `восстановиться не удалось за ${EVICTION_MAX_ATTEMPTS} попыток.\n` +
+        `Комната: <code>${room}</code>\nТехпричина: ${reason}\n` +
+        `Зайти руками сейчас — скажи Альфреду: «подключи Ватсона к этой встрече».`,
+      { dedupeKey: `evicted-owner-${sessionUid}`, dedupeMs: 10 * 60_000 },
+    );
+    // R4b — групповой чат серии (ДОСЛОВНЫЙ текст, Q2). Нет чата → молча скип.
+    if (seriesChatId != null) {
+      await sendTelegramMessage(
+        "⚠️ Бот-протокол не смог записать встречу (технический сбой на стороне Телемоста). " +
+          "Пожалуйста, поставьте встречу на запись вручную и перешлите файл Илье — он соберёт протокол.",
+        { chatId: seriesChatId, dedupeKey: `evicted-group-${sessionUid}`, dedupeMs: 10 * 60_000 },
+      );
+    } else {
+      logStep("eviction_group_alert_skipped", { reason: "no_series_chat" });
+    }
+  };
+
   // Все cleanup'ы в finally — иначе при исключении в main Promise
   // (например, в setInterval/setupBrowserCapture) WAV-fd останется
   // открытым в долгоживущем runner-процессе Ф5+ (в Ф3 docker run --rm
@@ -936,19 +1085,29 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   await new Promise<void>(async (resolve) => {
     const checkLoop = async () => {
       try {
+        // Ф2: пока идёт async-перезаход (минуты с backoff'ом) — тики no-op,
+        // чтобы не запускать второй перезаход и не дёргать URL-логику.
+        if (evictionHandling) return;
+
         const now = Date.now();
         const url = page.url();
 
-        // Ф1 (ISS-28) R1: ВЫБРОС из комнаты. Раньше тут был доменный чек
-        // `!url.includes("telemost.yandex.ru")` — он НЕ ловил уход на голый
-        // корень `telemost.yandex.ru/` (выброс в лобби), бот 20 мин слушал
-        // тишину. Теперь сигнал точный: адрес потерял `/j/<meetingId>`. Событие
-        // `evicted` логируется в пределах одного цикла проверки (не «тишина»).
-        // ВНИМАНИЕ Ф2: здесь сейчас просто ВЫХОД (как и раньше на url-change).
-        // Ф2 заменит ветку на guard «штатный конец vs сбой» + перезаход; chat_id
-        // (seriesChatId) и снимок причины уже под рукой в этой ветке.
+        // Ф1/Ф2 (ISS-28) R1+R2b+R13+R2a: ВЫБРОС из комнаты = адрес потерял
+        // `/j/<meetingId>` (раньше был доменный чек, не ловил уход на голый
+        // корень — корень `/j/`-сегмента не имеет). R2b: реагируем только после
+        // EVICTION_CONFIRM_READS чтений подряд без `/j/` (под-секундный флик
+        // SPA-роутера сбрасывает счётчик). На подтверждённом выбросе — guard R13
+        // (штатный конец vs сбой), при сбое — авто-перезаход (R2a), при
+        // исчерпании попыток — уведомления «в момент детекта» (R4a/R4b).
         if (!isInRoom(url)) {
-          endReason = "evicted";
+          consecutiveOutOfRoom++;
+          if (consecutiveOutOfRoom < EVICTION_CONFIRM_READS) {
+            logStep("eviction_suspected", { url, reads: consecutiveOutOfRoom });
+            return; // ждём подтверждения следующим циклом (~3с) — R2b
+          }
+
+          // ── Выброс ПОДТВЕРЖДЁН (2 чтения подряд без /j/) ──
+          evictionHandling = true; // синхронно ДО первого await — тики off
           // R3: снимок причины (бел. список). page.evaluate НЕ зовём — контекст
           // мог умереть от навигации; данные уже в Node-буферах капчи.
           const snap = evictionCapture ? evictionCapture.getSnapshot() : null;
@@ -957,22 +1116,105 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
             ? snap.navigations[snap.navigations.length - 1].url : null;
           const wsCloseCodes = snap
             ? snap.websocketEvents.map((e) => e.code).filter((c) => c != null) : [];
-          // В docker-лог (его персистит R6) — МЕТАДАННЫЕ + навигации/WS-коды.
-          // Тексты console-error в stdout НЕ кладём (могли бы нести ПДн) — только
-          // их число; усечённые тексты едут лишь в meta.recording.eviction.
-          logStep("evicted", {
-            url,
-            meeting_id: meetingId,
-            series_chat_id: seriesChatId,
-            meeting_started: meetingStarted,
-            last_nav: lastNav,
-            ws_events: snap ? snap.websocketEvents.length : 0,
-            ws_close_codes: wsCloseCodes,
+
+          // Закрываем текущий chunk (речь ДО выброса финализируется как chunk_N);
+          // recState=paused → при успешном возврате обработчик аудио откроет
+          // chunk_(N+1) на первом не-тихом кадре — нумерация/WAV целы (RISK2).
+          closeChunk(now, "evicted");
+          recState = "recording_paused_in_call";
+
+          const speechMs = recordedSpeechMs();
+          // В docker-лог (его персистит R6) — только МЕТАДАННЫЕ + навигации/WS-коды
+          // (тексты console-error НЕ кладём — могли бы нести ПДн; едут лишь в meta).
+          logStep("evicted_confirmed", {
+            url, meeting_id: meetingId, series_chat_id: seriesChatId,
+            meeting_started: meetingStarted, speech_ms: speechMs, last_nav: lastNav,
+            ws_events: snap ? snap.websocketEvents.length : 0, ws_close_codes: wsCloseCodes,
             console_errors: snap ? snap.consoleErrors.length : 0,
           });
-          writeMeta("evicted");
+
+          // ── R13 guard: штатный конец vs сбой ──
+          // Встреча фактически прошла, если началась И записан существенный объём
+          // речи (порог A7). Тогда выброс = `evicted_normal_end`: НЕ перезаходить,
+          // НЕ алертить, протокол отдать как обычно (Ф3 гейтит доставку по этому
+          // reason — для нас это «доставлять»).
+          if (meetingStarted && speechMs >= EVICTION_NORMAL_END_MIN_SPEECH_MS) {
+            endReason = "evicted_normal_end";
+            logStep("evicted_normal_end", { speech_ms: speechMs, threshold_ms: EVICTION_NORMAL_END_MIN_SPEECH_MS });
+            writeMeta("evicted_normal_end");
+            clearInterval(timer);
+            return resolve();
+          }
+
+          // Антизацикл: слишком много возвратов за сессию → не перезаходим
+          // снова, сразу эскалируем (Яндекс рвёт нас по кругу — руками надёжнее).
+          if (evictionRecoveryCount >= EVICTION_MAX_RECOVERY_CYCLES) {
+            endReason = "evicted_failure";
+            logStep("evicted_failure_recovery_capped", { recovery_cycles: evictionRecoveryCount });
+            try {
+              await sendEvictionAlerts(snap);
+            } catch (e: any) {
+              log(`${LOG_PREFIX} eviction alerts failed (non-fatal): ${e?.message}`);
+            }
+            writeMeta("evicted_failure");
+            clearInterval(timer);
+            return resolve();
+          }
+
+          // ── R2a: авто-перезаход (5 попыток, backoff 0/10/20/40/80с) ──
+          let recovered = false;
+          for (let attempt = 1; attempt <= EVICTION_MAX_ATTEMPTS; attempt++) {
+            const backoff = EVICTION_BACKOFF_MS[attempt - 1] ?? 80_000;
+            if (backoff > 0) await sleep(backoff);
+            // Между backoff'ами Яндекс мог сам вернуть нас в комнату.
+            if (isInRoom(page.url())) {
+              await installEvictionWsWrapper(page);
+              stopCapture = await setupBrowserCapture(page);
+              recovered = true;
+              logStep("rejoin_self_recovered", { attempt });
+              break;
+            }
+            try {
+              if (await rejoinTelemost()) {
+                recovered = true;
+                logStep("evicted_recovered", { attempt });
+                break;
+              }
+            } catch (e: any) {
+              logStep("rejoin_attempt_failed", { attempt, error: truncOneLine(e?.message || "", 200) });
+            }
+          }
+
+          if (recovered) {
+            // Снова в комнате — продолжаем запись. Сбрасываем guard'ы; recState
+            // остаётся paused → первый не-тихий кадр откроет следующий chunk.
+            evictionRecoveryCount++;
+            endReason = "unknown";
+            consecutiveOutOfRoom = 0;
+            lastNonSilenceTs = Date.now(); // backoff-окно не считать «тишиной выхода»
+            evictionHandling = false;
+            logStep("eviction_recovery_count", { cycles: evictionRecoveryCount });
+            writeMeta("evicted_recovered");
+            return;
+          }
+
+          // ── Перезаход исчерпан → НЕустранимый сбой (R4a/R4b) ──
+          endReason = "evicted_failure";
+          logStep("evicted_failure", { attempts: EVICTION_MAX_ATTEMPTS, speech_ms: speechMs });
+          try {
+            await sendEvictionAlerts(snap);
+          } catch (e: any) {
+            log(`${LOG_PREFIX} eviction alerts failed (non-fatal): ${e?.message}`);
+          }
+          writeMeta("evicted_failure");
           clearInterval(timer);
           return resolve();
+        }
+
+        // В комнате — сбросить счётчик флика, если копился (R2b).
+        if (consecutiveOutOfRoom > 0) {
+          logStep("eviction_flicker_recovered", { reads: consecutiveOutOfRoom });
+          consecutiveOutOfRoom = 0;
         }
 
         // До «начала встречи» работает только noOneJoinedTimeout.
@@ -1000,6 +1242,51 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
             return resolve();
           }
           return;
+        }
+
+        // R5 (ISS-28): «оглох ПОСЛЕ начала» при УДЕРЖАНИИ `/j/`. Сюда попадаем
+        // только если адрес ДЕРЖИТ `/j/` (выброс отработал бы выше и вышел/
+        // перезашёл) — значит это чистый ISS-20 (аудио-дорожки умерли, а
+        // подключение живо), а НЕ R1. Сигнал = browser-флаг __vexa_telemost_degraded
+        // (0 живых дорожек после rescan) + видимые реальные участники, удержанные
+        // DEAF_AFTER_START_TIMEOUT_MS. Классифицируем как ОТДЕЛЬНУЮ причину
+        // `deaf_after_start` (не «молчаливый» silence_out_of_call) + личный алерт
+        // в момент детекта. Дорожки вернулись / люди ушли → сбрасываем таймер.
+        let degraded = false;
+        try {
+          degraded = await page.evaluate(() => (window as any).__vexa_telemost_degraded === true);
+        } catch {
+          degraded = false; // контекст недоступен — не триггерим (безопасно)
+        }
+        if (degraded && hasRealParticipants()) {
+          if (deafAfterStartSince == null) {
+            deafAfterStartSince = now;
+            logStep("deaf_after_start_suspected", { participants: participantsPoll.getNames().length });
+          } else if (now - deafAfterStartSince >= DEAF_AFTER_START_TIMEOUT_MS) {
+            evictionHandling = true; // подавить тики, пока шлём алерт и выходим
+            endReason = "deaf_after_start";
+            logStep("end_deaf_after_start", {
+              degraded_for_ms: now - deafAfterStartSince,
+              participants: participantsPoll.getNames().length,
+            });
+            try {
+              await sendTelegramMessage(
+                `🔴 <b>Бот-протокол</b>: оглох на встрече${series ? ` «${series}»` : ""} — ` +
+                  `потеряны аудио-дорожки при живом подключении.\n` +
+                  `Комната: <code>${meetingUrl || "?"}</code>\n` +
+                  `Запись могла прерваться — проверь / запиши вручную.`,
+                { dedupeKey: `deaf-owner-${sessionUid}`, dedupeMs: 10 * 60_000 },
+              );
+            } catch (e: any) {
+              log(`${LOG_PREFIX} deaf alert failed (non-fatal): ${e?.message}`);
+            }
+            writeMeta("deaf_after_start");
+            clearInterval(timer);
+            return resolve();
+          }
+        } else if (deafAfterStartSince != null) {
+          logStep("deaf_after_start_recovered", { degraded, has_people: hasRealParticipants() });
+          deafAfterStartSince = null;
         }
 
         // Ф5 chunk-декаплинг: две границы тишины.
