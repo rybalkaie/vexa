@@ -99,6 +99,34 @@ class TestSafeSessionUid(unittest.TestCase):
         self.assertNotIn(" ", sid)
 
 
+class TestSafeSeriesSegment(unittest.TestCase):
+    """Серия — ОДИН безопасный сегмент пути (цикл5 У2): легальные slug'и проходят
+    как есть, разделители/traversal нейтрализуются, пустой/`.`/`..` отвергаются."""
+
+    def test_legit_slug_unchanged(self):
+        for s in ("series-koord-8399ea", "проект-координация", "weekly_sync.v2"):
+            self.assertEqual(ing.safe_series_segment(s), s, s)
+
+    def test_whitespace_trimmed(self):
+        self.assertEqual(ing.safe_series_segment("  koord  "), "koord")
+
+    def test_separators_collapsed_to_single_segment(self):
+        # Никаких '/' в результате → невозможно выйти за output_dir.
+        for s in ("a/b", "проект/координация", "../etc", "a\\b"):
+            out = ing.safe_series_segment(s)
+            self.assertNotIn("/", out, s)
+            self.assertNotIn("\\", out, s)
+
+    def test_dotdot_literal_is_safe_segment(self):
+        # 'x..y' — буквальное имя, не parent-ссылка; остаётся как есть.
+        self.assertEqual(ing.safe_series_segment("x..y"), "x..y")
+
+    def test_traversal_and_empty_rejected(self):
+        for bad in ("", "   ", ".", "..", "/", "//"):
+            with self.assertRaises(ValueError, msg=bad):
+                ing.safe_series_segment(bad)
+
+
 class TestSyntheticMeta(unittest.TestCase):
     def _meta(self):
         return ing.build_synthetic_meta(

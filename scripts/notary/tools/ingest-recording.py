@@ -48,6 +48,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -150,6 +151,21 @@ def safe_session_uid(series: str, date: str) -> str:
     от боевых (`tm-…`/`auto-…`). Без слешей/пробелов (basename-safe в wav_concat)."""
     base = f"recovery-{series}-{date}"
     return _SLUG_RE.sub("-", base).strip("-") or f"recovery-{date}"
+
+
+def safe_series_segment(series: str) -> str:
+    """Серия как ОДИН безопасный сегмент пути — без разделителей и parent-ссылок.
+
+    Серия едет в ТРИ места (ростер, синтетическая meta для finalize, путь
+    протокола обёртки) — санитизируем её ОДИН раз на входе, чтобы во всех местах
+    был идентичный безопасный вид (иначе рассинхрон путей → «протокол не найден»).
+    Легальные slug'и (латиница/кириллица/цифры/`._-`) проходят без изменений;
+    `/`, пробелы, спецсимволы схлопываются в `-`. Пустой/`.`/`..` после чистки —
+    недопустимый сегмент (traversal/пустой) → ValueError."""
+    seg = _SLUG_RE.sub("-", (series or "").strip()).strip("-")
+    if seg in ("", ".", ".."):
+        raise ValueError(f"--series пуст или даёт недопустимый сегмент пути: {series!r}")
+    return seg
 
 
 def build_synthetic_meta(
@@ -390,7 +406,10 @@ def run_finalize(meta_path: str | os.PathLike, output_dir: str | os.PathLike) ->
     env["ENABLE_PROTOCOL_DELIVERY"] = "0"  # никакой групповой/авто-доставки из finalize
     cmd = [sys.executable, finalize, str(meta_path), "--output-dir", str(output_dir)]
     log.info("[finalize] запуск (доставка заглушена): output-dir=%s", output_dir)
-    proc = subprocess.run(cmd, env=env)  # без timeout — длинная запись
+    # finalize печатает СВОЙ JSON-отчёт в stdout (finalize-meeting.py); уводим его
+    # в НАШ stderr, чтобы stdout обёртки нёс ТОЛЬКО её финальный JSON — контракт Ф5
+    # (Альфред парсит stdout). Без timeout — длинную запись нельзя обрубать (docstring).
+    proc = subprocess.run(cmd, env=env, stdout=sys.stderr)
     log.info("[finalize] rc=%s", proc.returncode)
     return proc.returncode
 
@@ -588,8 +607,15 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         log.error("%s", e)
         return 2
-    if not args.series.strip():
-        log.error("--series пуст")
+    # Санитизируем --series ДО использования: один безопасный сегмент пути во
+    # всех местах (ростер/meta/путь протокола). finalize стрипает серию внутри
+    # себя (_output_dir_for_meta) и использует как сегмент — без согласованной
+    # чистки пробельная/со-слешем серия даёт рассинхрон путей и «протокол не
+    # найден» на rc=0, либо запись за пределы output_dir.
+    try:
+        args.series = safe_series_segment(args.series)
+    except ValueError as e:
+        log.error("%s", e)
         return 2
     if not os.path.exists(args.input):
         log.error("файл не найден: %s", args.input)
@@ -605,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     # Рабочая папка прогона. tempfile — на месте, ничего лишнего не тащим (R11).
     workdir = Path(tempfile.mkdtemp(prefix="ingest-recording-"))
     degraded_note: str | None = None
+    delivery_failed = False  # протокол собран, но НЕ дошёл до Ильи → не чистим копию
     try:
         if kind in ("video", "audio"):
             protocol_path = _process_media(args, kind, workdir)
@@ -622,27 +649,52 @@ def main(argv: list[str] | None = None) -> int:
             protocol_path=protocol_path, series=args.series, date=args.date,
             degraded_note=degraded_note,
         )
+        # Документ дошёл до Ильи? Уведомление — best-effort, а ВЛОЖЕНИЕ (сам
+        # протокол) — это и есть доставка. Не дошло → НЕ рапортуем успех молча:
+        # суть фичи в том, чтобы встреча не терялась.
+        delivered_ok = bool(delivery.get("document"))
         print(json.dumps(
-            {"ok": True, "protocol_path": str(protocol_path), "kind": kind,
+            {"ok": delivered_ok, "protocol_path": str(protocol_path), "kind": kind,
              "delivered_personally": delivery},
             ensure_ascii=False,
         ))
+        if not delivered_ok:
+            # Протокол СОБРАН, но не доставлен. Сохраняем копию на диске (флаг
+            # ниже не даст finally её удалить) и отдаём rc=1, чтобы Альфред сказал
+            # Илье класс проблемы и где лежит файл — а не отрапортовал «готово».
+            delivery_failed = True
+            log.error(
+                "[ingest] протокол СОБРАН, но документ не доставлен Илье — "
+                "копия сохранена: %s", protocol_path,
+            )
+            return 1
         return 0
     except Exception as e:  # noqa: BLE001
         # Класс ошибки + сообщение БЕЗ текста реплик (R11/опасная тройка).
         log.error("[ingest] восстановление не удалось: %s: %s", type(e).__name__, e)
         return 1
     finally:
-        # Опасная тройка: не оставляем извлечённое аудио в temp. Удаляем ТОЛЬКО
-        # WAV, который сами извлекли (`workdir/recording.wav`); готовый WAV,
-        # присланный пользователем, лежит вне workdir и НЕ трогается.
-        extracted = workdir / "recording.wav"
-        try:
-            if extracted.is_file():
-                extracted.unlink()
-                log.info("[ingest] извлечённое аудио удалено (опасная тройка)")
-        except OSError:
-            pass
+        # Опасная тройка: чистим рабочую папку прогона ЦЕЛИКОМ — в ней лежат
+        # извлечённое аудио, синтетическая meta и (для транскрипта) рабочая копия
+        # текста встречи. mkdtemp сам не чистится → без этого каждый прогон копит в
+        # /tmp полный протокол/транскрипт встречи (чувствительное). Готовый WAV
+        # пользователя лежит ВНЕ workdir и не трогается. Папку оставляем ТОЛЬКО в
+        # сухом прогоне без --output-dir, где протокол лежит внутри неё и мы про
+        # него отчитались («на диске»); там хотя бы извлечённое аудио убираем.
+        # Сбой доставки (delivery_failed) при дефолтном output-dir → тоже держим:
+        # протокол лежит внутри workdir и это единственная копия для Ильи.
+        keep_workdir = not args.output_dir and (args.no_deliver or delivery_failed)
+        if keep_workdir:
+            extracted = workdir / "recording.wav"
+            try:
+                if extracted.is_file():
+                    extracted.unlink()
+                    log.info("[ingest] извлечённое аудио удалено (опасная тройка)")
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+            log.info("[ingest] рабочая папка прогона удалена (опасная тройка)")
 
 
 if __name__ == "__main__":
