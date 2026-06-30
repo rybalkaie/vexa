@@ -38,6 +38,7 @@ sys.path.insert(0, str(THIS_DIR.parent))
 from notary.cli.registry import (  # noqa: E402
     DEFAULT_REGISTRY_DIR,
     find_watched,
+    get_telegram_chat_id_for_series,
     load_watched,
     pause_until,
     release_watched_lock,
@@ -398,6 +399,19 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
     start_at = item["start_at"]
     session_uid = _safe_session_uid(item["meeting_id"], start_at)
 
+    # Ф1 (ISS-28): chat_id группового чата серии в BOT_CONFIG — задел под Ф2
+    # (уведомление «в момент детекта» R4b шлёт сам бот из recording.ts, ему нужен
+    # chat_id, т.к. из finalize «в момент» физически нельзя — НЕС1 ревью). Резолв
+    # тот же, что у доставки протокола: telegram_chat_id серии из watched.yaml
+    # (отрицательный int = группа). Нет привязки → None, в Ф2 бот молча скипнет
+    # групповое уведомление (личный алерт R4a всё равно уйдёт, A8). Best-effort:
+    # сбой чтения реестра не должен ронять запуск бота.
+    series_chat_id = None
+    try:
+        series_chat_id = get_telegram_chat_id_for_series(series, load_watched())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не смог резолвить chat_id серии %s (не критично): %s", series, e)
+
     # Создаём целевую папку серии. На маке — мак-путь, на VPS (LOCAL_DOCKER=1)
     # папка не нужна: collector кладёт .md в /srv/meeting-notary/protocols/<series>,
     # а на мак притаскивает mirror через rsync.
@@ -427,6 +441,10 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
         # camelCase ключи в bot_config, чтобы vexa-bot (TS) читал из BotConfig без конверсии.
         "series": series,
         "expectedParticipants": item.get("expected_participants") or [],
+        # Ф1 (ISS-28): chat_id группового чата серии — задел под Ф2-уведомления
+        # «в момент детекта» (recording.ts читает seriesChatId из BOT_CONFIG).
+        # None не кладём — пусть отсутствует, чтобы не путать с «привязка = 0».
+        **({"seriesChatId": series_chat_id} if series_chat_id is not None else {}),
     }
 
     # Ф4 (2026-05-29): docker label'ы для матчинга «бот ещё в звонке» в collector'е.

@@ -73,6 +73,16 @@ LOCAL_FINALIZE = os.environ.get("MEETING_NOTARY_LOCAL_FINALIZE") == "1"
 NOTARIUS_NAME_PREFIX = "vexa-notarius-"
 SERIES_LABEL = "meeting-notary.series"
 
+# Ф1 (ISS-28) R6: куда персистим `docker logs` бота, чтобы они переживали
+# `docker rm`. Логи бот-контейнера живут в дефолтном json-драйвере docker и
+# умирают при удалении контейнера (weekly cleanup-таймер снимает Exited
+# vexa-notarius-* старше 7д). Без дампа причина сбойного прогона (ISS-28:
+# close-код WS, причина навигации) теряется. На VPS — host-путь, переживает rm.
+BOT_CONTAINER_LOG_DIR = (
+    os.environ.get("MEETING_NOTARY_BOT_LOG_DIR") or "/srv/meeting-notary/logs/bot-containers"
+)
+_SAFE_CONTAINER_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
 
 def _env_float(name: str, default: float) -> float:
     """Положительный float из env, иначе default (терпим мусор/пусто)."""
@@ -569,6 +579,65 @@ def _kill_container(name: str) -> bool:
     return True
 
 
+def _persist_container_log(name: str) -> bool:
+    """Ф1 (ISS-28) R6: `docker logs <name>` → долговечный файл на хосте.
+
+    Лог бот-контейнера переживает `docker rm` (weekly cleanup/watchdog). Дамп
+    идемпотентен (перезапись). СОДЕРЖИМОЕ В ПИТОН НЕ ЧИТАЕМ (опасная тройка) —
+    редирект на диск делает удалённая/локальная шелл-команда. Best-effort и
+    тихо: сбой не должен ронять ни watchdog, ни finalize. True при rc=0.
+
+    Путь: BOT_CONTAINER_LOG_DIR/<name>.log на ХОСТЕ (переживает удаление
+    контейнера). `docker logs` пишет и stdout, и stderr — забираем оба (2>&1).
+    """
+    if not name:
+        return False
+    safe = _SAFE_CONTAINER_RE.sub("_", name)
+    log_dir_q = shlex.quote(BOT_CONTAINER_LOG_DIR)
+    dst_q = shlex.quote(f"{BOT_CONTAINER_LOG_DIR}/{safe}.log")
+    cmd = f"mkdir -p {log_dir_q} && docker logs {shlex.quote(name)} > {dst_q} 2>&1"
+    try:
+        proc = ssh_capture(cmd, timeout=60)
+    except subprocess.TimeoutExpired:
+        logger.warning("R6: persist docker logs %s — timeout", name)
+        return False
+    if proc.returncode != 0:
+        logger.warning("R6: persist docker logs %s rc=%d stderr=%s", name,
+                       proc.returncode, (proc.stderr or "").strip()[:200])
+        return False
+    logger.info("R6: лог бот-контейнера сохранён → %s.log", safe)
+    return True
+
+
+def _latest_exited_notarius_for_series(series: str | None) -> str | None:
+    """Имя самого свежего ВЫШЕДШЕГО bot-контейнера серии (для R6 persist после finalize).
+
+    Резолв по label `meeting-notary.series` (тот же ключ, что у finalize-гейта).
+    `docker ps -a` отдаёт newest-first → берём первую строку. None при
+    отсутствии/ошибке/таймауте (best-effort, не критично).
+    """
+    if not series:
+        return None
+    fmt = "{{.Names}}"
+    cmd = (
+        f"docker ps -a --filter name={NOTARIUS_NAME_PREFIX} "
+        f"--filter label={SERIES_LABEL}={shlex.quote(series)} "
+        f"--filter status=exited --format {shlex.quote(fmt)}"
+    )
+    try:
+        proc = ssh_capture(cmd, timeout=20)
+    except subprocess.TimeoutExpired:
+        logger.warning("R6: docker ps -a (series=%s) — timeout", series)
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in (proc.stdout or "").splitlines():
+        nm = line.strip()
+        if nm:
+            return nm
+    return None
+
+
 def _run_watchdog(now: datetime | None = None) -> None:
     """Найти и убить зависшие bot-контейнеры (REQ 3.2). Только на VPS.
 
@@ -603,6 +672,10 @@ def _run_watchdog(now: datetime | None = None) -> None:
         stall_sec=WATCHDOG_STALL_MIN * 60.0,
     )
     for name, series, reason in verdicts:
+        # R6 (ISS-28): персист логов ПЕРЕД kill — зависший/сбойный бот это ровно
+        # тот прогон, чью причину надо сохранить до того, как weekly cleanup
+        # снимет контейнер. Не критично для kill (best-effort, тихо).
+        _persist_container_log(name)
         killed = _kill_container(name)
         label = series or name
         push(
@@ -873,6 +946,18 @@ def _sync_series_memory(finalize_protocol_path: str, target_md: Path, session_ui
 
 def _do_finalize_and_collect(session_uid: str) -> None:
     """Запустить finalize-meeting.py на VPS для sessionUid, потом scp .md на мак."""
+    # R6 (ISS-28): персист логов бот-контейнера. Делаем ПЕРЕД finalize — контейнер
+    # уже вышел (collector гейтит finalize по живому контейнеру в main), а weekly
+    # cleanup его снимет; без дампа причина прогона теряется. До finalize, а не
+    # после — тогда persist отрабатывает независимо от исхода finalize (вкл.
+    # rc!=0/timeout, где логи особенно нужны). Series берём из meta. Best-effort.
+    try:
+        _m = _read_meta_obj(session_uid) or {}
+        _cont = _latest_exited_notarius_for_series(_m.get("series"))
+        if _cont:
+            _persist_container_log(_cont)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("R6 persist (finalize-path) не удался (не критично): %s", e)
     # 1. Финализация на VPS (без claude — на VPS его нет, источник 3 пропустится).
     meta_path = f"{VPS_TRANSCRIPTS}/{session_uid}.meta.json"
     md_path = f"{VPS_PROTOCOLS}/{session_uid}.md"

@@ -20,7 +20,7 @@
 //   5) В конце встречи пишем meta.json с (sessionUid, startTs, endTs,
 //      participants[], meetingUrl, botName, duration_s, wav_path, txt_path).
 
-import { Page } from "playwright";
+import { Page, ConsoleMessage, Frame, WebSocket as PWWebSocket } from "playwright";
 import { BotConfig } from "../../types";
 import { log } from "../../utils";
 import { isHallucination } from "../../services/hallucination-filter";
@@ -48,6 +48,171 @@ const CHUNK_SILENCE_PAUSE_MS = 5 * 60_000; // 5 мин — приостанов�
 const OUT_OF_CALL_SILENCE_MS = 20 * 60_000; // 20 мин — выход из звонка
 const URL_CHECK_INTERVAL_MS = 3_000;
 const SAMPLE_RATE = 16000;
+
+// ── ISS-28 / Ф1: детект выброса из комнаты + инструментация причины ──
+// Корень ISS-28: Телемост уводит страницу гостя с `/j/<meetingId>` на голый
+// `telemost.yandex.ru/` (выброс в лобби), аудио-дорожки умирают вместе со
+// страницей, а старый детект выхода смотрел на ДОМЕН (корень его всё ещё
+// содержит) → бот не замечал выброс, 20 мин слушал тишину. Точный сигнал =
+// «адрес потерял `/j/<meetingId>`». См. plans/notary-issues-log.md ISS-28.
+//
+// R3-инструментация (БЕЛЫЙ СПИСОК — RISK5/«опасная тройка»): в момент выброса
+// фиксируем причину со стороны Яндекса — ТОЛЬКО технический сигналинг, НЕ медиа
+// и НЕ текст реплик/имён. Захватываем три источника:
+//   • навигации главного фрейма (куда ушла страница) — причина навигации;
+//   • console-сообщения ТОЛЬКО типов error/warning (НЕ console.log/info/debug —
+//     там приложение может дампить состояние с ПДн);
+//   • WebSocket close-код (Playwright его не отдаёт → лёгкая обёртка
+//     window.WebSocket на browser-стороне проталкивает {code,reason} в Node).
+// Кольцевые буферы ограничены — память не растёт; на выбросе снимок едет в
+// docker-лог (его персистит R6) + meta.recording.eviction.
+const EVICTION_NAV_MAX = 20;
+const EVICTION_CONSOLE_MAX = 40;
+const EVICTION_WS_MAX = 40;
+const EVICTION_TEXT_TRUNC = 300;
+
+// `/j/<meetingId>` — сегмент «в комнате». Любой адрес без него = вне комнаты.
+const TELEMOST_ROOM_RE = /\/j\/([A-Za-z0-9_-]+)/;
+
+type EvictionSnapshot = {
+  navigations: { url: string; ts: string }[];
+  consoleErrors: { type: string; text: string; ts: string }[];
+  websocketEvents: { url: string; code?: number; reason?: string; closed?: boolean; ts: string }[];
+};
+
+type EvictionCapture = {
+  getSnapshot: () => EvictionSnapshot;
+  detach: () => Promise<void>;
+};
+
+// Усечь до одной строки и max символов — защита от раздувания лога/мета и от
+// многострочных дампов в новом лог-канале.
+function truncOneLine(s: string, max: number): string {
+  return String(s || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+/**
+ * R3 (ISS-28): инструментация причины выброса. Вешает Node-слушатели на
+ * console/navigation/websocket страницы + browser-обёртку window.WebSocket
+ * (close-код Playwright не отдаёт). Все буферы — кольцевые и по БЕЛОМУ СПИСКУ
+ * типов; текст реплик/имён сюда НЕ попадает (RISK5). Возвращает снимок-геттер и
+ * detach. Идемпотентна к контексту: на выбросе НЕ зовём page.evaluate (контекст
+ * уже мог умереть от навигации) — данные уже в Node-буферах.
+ */
+async function setupEvictionCapture(page: Page): Promise<EvictionCapture> {
+  const navigations: EvictionSnapshot["navigations"] = [];
+  const consoleErrors: EvictionSnapshot["consoleErrors"] = [];
+  const websocketEvents: EvictionSnapshot["websocketEvents"] = [];
+  const pushCapped = <T>(arr: T[], item: T, cap: number): void => {
+    arr.push(item);
+    if (arr.length > cap) arr.shift();
+  };
+
+  const onConsole = (msg: ConsoleMessage): void => {
+    // БЕЛЫЙ СПИСОК: только error/warning. console.log/info/debug НЕ берём.
+    const type = msg.type();
+    if (type !== "error" && type !== "warning") return;
+    pushCapped(
+      consoleErrors,
+      { type, text: truncOneLine(msg.text(), EVICTION_TEXT_TRUNC), ts: new Date().toISOString() },
+      EVICTION_CONSOLE_MAX,
+    );
+  };
+  const onFrameNav = (frame: Frame): void => {
+    if (frame !== page.mainFrame()) return; // только главный фрейм = реальный уход страницы
+    pushCapped(navigations, { url: frame.url(), ts: new Date().toISOString() }, EVICTION_NAV_MAX);
+  };
+  const onWebSocket = (ws: PWWebSocket): void => {
+    // Playwright-уровень: close-код недоступен, фиксируем факт+время+url.
+    // Близкий код (где доступен) приходит отдельно из browser-обёртки ниже.
+    let url = "(unknown)";
+    try { url = ws.url(); } catch { /* */ }
+    const u = truncOneLine(url, EVICTION_TEXT_TRUNC);
+    ws.on("close", () =>
+      pushCapped(websocketEvents, { url: u, closed: true, ts: new Date().toISOString() }, EVICTION_WS_MAX));
+    ws.on("socketerror", () =>
+      pushCapped(websocketEvents, { url: u, closed: false, ts: new Date().toISOString() }, EVICTION_WS_MAX));
+  };
+
+  // Browser→Node канал для WS close-кода. exposeFunction — ОДИН раз на сессию
+  // (Ф2-нота: при перезаходе НЕ переэкспонировать — второй expose БРОСАЕТ, как и
+  // __vexaTelemostAudio; при возврате только re-run browser-обёртки).
+  await page.exposeFunction("__vexaTelemostSignal", (payload: any): void => {
+    try {
+      if (!payload || payload.kind !== "ws_close") return;
+      pushCapped(
+        websocketEvents,
+        {
+          url: truncOneLine(String(payload.url || ""), EVICTION_TEXT_TRUNC),
+          code: typeof payload.code === "number" ? payload.code : undefined,
+          reason: truncOneLine(String(payload.reason || ""), 120),
+          closed: true,
+          ts: new Date().toISOString(),
+        },
+        EVICTION_WS_MAX,
+      );
+    } catch { /* */ }
+  });
+
+  page.on("console", onConsole);
+  page.on("framenavigated", onFrameNav);
+  page.on("websocket", onWebSocket);
+
+  // Browser-обёртка window.WebSocket: единственный способ достать close-КОД
+  // (Playwright его не экспонирует). Ловит сокеты, открытые ПОСЛЕ старта записи —
+  // их и переустанавливает Телемост при renegotiation (ведущая гипотеза ISS-28).
+  // Безопасно: возвращаем НАСТОЯЩИЙ сокет, только добавляем close-listener; не
+  // трогаем фреймы/поведение. Если что-то пойдёт не так — try/catch, запись не
+  // страдает. Нестандартное решение — см. пакет сдачи §7.
+  try {
+    await page.evaluate(() => {
+      const w = window as any;
+      if (w.__vexa_ws_wrapped) return;
+      const Orig = w.WebSocket;
+      if (typeof Orig !== "function") return;
+      const Wrapped: any = function (this: any, ...args: any[]) {
+        const ws = new Orig(...args);
+        try {
+          ws.addEventListener("close", (e: any) => {
+            try {
+              w.__vexaTelemostSignal?.({
+                kind: "ws_close",
+                url: String(args[0] || ""),
+                code: e?.code,
+                reason: String(e?.reason || ""),
+              });
+            } catch { /* контекст мог умереть на выбросе */ }
+          });
+        } catch { /* */ }
+        return ws;
+      };
+      try {
+        Wrapped.prototype = Orig.prototype;
+        Wrapped.CONNECTING = Orig.CONNECTING;
+        Wrapped.OPEN = Orig.OPEN;
+        Wrapped.CLOSING = Orig.CLOSING;
+        Wrapped.CLOSED = Orig.CLOSED;
+      } catch { /* */ }
+      w.WebSocket = Wrapped;
+      w.__vexa_ws_wrapped = true;
+    });
+  } catch (err: any) {
+    log(`${LOG_PREFIX} eviction WS wrap failed (non-fatal): ${err?.message}`);
+  }
+
+  return {
+    getSnapshot: () => ({
+      navigations: [...navigations],
+      consoleErrors: [...consoleErrors],
+      websocketEvents: [...websocketEvents],
+    }),
+    detach: async () => {
+      try { page.off("console", onConsole); } catch { /* */ }
+      try { page.off("framenavigated", onFrameNav); } catch { /* */ }
+      try { page.off("websocket", onWebSocket); } catch { /* */ }
+    },
+  };
+}
 
 function logStep(step: string, ctx: Record<string, unknown> = {}): void {
   const ts = new Date().toISOString();
@@ -461,6 +626,36 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     expected_count: Array.isArray(expectedParticipants) ? expectedParticipants.length : 0,
   });
 
+  // Ф1 (ISS-28): chat_id группового чата серии. Прокидывается runner'ом в
+  // BOT_CONFIG (runner._launch_bot → get_telegram_chat_id_for_series). Читаем из
+  // СЫРОГО env BOT_CONFIG (как series — Zod апстрима вырезает незнакомые ключи),
+  // с фолбэком на botConfig. В Ф1 НИЧЕГО им не шлём — это задел под Ф2
+  // (уведомление в групповой чат «в момент детекта», R4b). Отрицательный int =
+  // группа. Кладём в снимок выброса, чтобы Ф2 строила уведомление на готовом.
+  const seriesChatId: number | null = (() => {
+    const v = (botConfig as any).seriesChatId ?? rawBotConfig.seriesChatId;
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  })();
+  logStep("series_chat_resolved", { has_chat: seriesChatId != null });
+
+  // Ф1 (ISS-28) R1: id комнаты из `/j/<meetingId>`. Детект выброса = «адрес
+  // потерял этот сегмент» (не «ушёл с домена telemost» — корень его содержит).
+  const meetingUrl = botConfig.meetingUrl || (botConfig as any).meetingUrl || "";
+  const meetingIdMatch = String(meetingUrl).match(TELEMOST_ROOM_RE);
+  const meetingId: string | null =
+    (meetingIdMatch && meetingIdMatch[1]) ||
+    (botConfig as any).nativeMeetingId ||
+    rawBotConfig.nativeMeetingId ||
+    null;
+  // «В комнате»: адрес держит `/j/<meetingId>`. Если id не распарсился — мягкий
+  // фолбэк на наличие любого `/j/<...>` сегмента (всё равно строже старого
+  // доменного чека: корень `/` его не имеет → выброс детектится).
+  const isInRoom = (u: string): boolean => {
+    if (meetingId) return u.includes(`/j/${meetingId}`);
+    return TELEMOST_ROOM_RE.test(u);
+  };
+  logStep("room_detect_armed", { meeting_id: meetingId });
+
   // Participants polling — параллельно встрече.
   const participantsPoll = startParticipantsPolling(page, botName);
 
@@ -474,6 +669,8 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const startTs = Date.now();
   const noOneJoinedTimeoutMs = botConfig.automaticLeave?.noOneJoinedTimeout ?? 300_000;
   let endReason = "unknown";
+  // Ф1 (ISS-28) R3: снимок причины выброса (заполняется в момент детекта evicted).
+  let lastEvictionSnapshot: EvictionSnapshot | null = null;
 
   // ISS-20 #2: «никто не пришёл» нельзя объявлять, если в панели ВИДНЫ люди —
   // это «оглох» (вероятный сбой захвата), а не пустая комната. При живых людях
@@ -554,6 +751,10 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           endTs: c.endTs,
           durationS: Math.round(c.durationS),
         })),
+        // Ф1 (ISS-28) R3: причина выброса (только при endReason=evicted). По
+        // БЕЛОМУ СПИСКУ типов — навигации/console-error-warning/WS-close. Текста
+        // реплик/имён здесь нет (RISK5). null для штатных встреч.
+        eviction: lastEvictionSnapshot,
       },
       files: {
         // Backward-compat: до Ф5.3 (multi-chunk finalize) финализатор читает
@@ -716,6 +917,16 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const stopCapture = await setupBrowserCapture(page);
   logStep("browser_capture_initialized");
 
+  // Ф1 (ISS-28) R3: вооружаем захват причины выброса (console/nav/WS close-код).
+  // Не фатально, если упало — детект выброса (R1) и так работает по URL.
+  let evictionCapture: EvictionCapture | null = null;
+  try {
+    evictionCapture = await setupEvictionCapture(page);
+    logStep("eviction_capture_armed");
+  } catch (err: any) {
+    log(`${LOG_PREFIX} eviction capture setup failed (non-fatal): ${err?.message}`);
+  }
+
   // Все cleanup'ы в finally — иначе при исключении в main Promise
   // (например, в setInterval/setupBrowserCapture) WAV-fd останется
   // открытым в долгоживущем runner-процессе Ф5+ (в Ф3 docker run --rm
@@ -728,10 +939,38 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         const now = Date.now();
         const url = page.url();
 
-        // URL change.
-        if (!url.includes("telemost.yandex.ru")) {
-          endReason = "url_changed";
-          logStep("end_url_changed", { url });
+        // Ф1 (ISS-28) R1: ВЫБРОС из комнаты. Раньше тут был доменный чек
+        // `!url.includes("telemost.yandex.ru")` — он НЕ ловил уход на голый
+        // корень `telemost.yandex.ru/` (выброс в лобби), бот 20 мин слушал
+        // тишину. Теперь сигнал точный: адрес потерял `/j/<meetingId>`. Событие
+        // `evicted` логируется в пределах одного цикла проверки (не «тишина»).
+        // ВНИМАНИЕ Ф2: здесь сейчас просто ВЫХОД (как и раньше на url-change).
+        // Ф2 заменит ветку на guard «штатный конец vs сбой» + перезаход; chat_id
+        // (seriesChatId) и снимок причины уже под рукой в этой ветке.
+        if (!isInRoom(url)) {
+          endReason = "evicted";
+          // R3: снимок причины (бел. список). page.evaluate НЕ зовём — контекст
+          // мог умереть от навигации; данные уже в Node-буферах капчи.
+          const snap = evictionCapture ? evictionCapture.getSnapshot() : null;
+          lastEvictionSnapshot = snap;
+          const lastNav = snap && snap.navigations.length
+            ? snap.navigations[snap.navigations.length - 1].url : null;
+          const wsCloseCodes = snap
+            ? snap.websocketEvents.map((e) => e.code).filter((c) => c != null) : [];
+          // В docker-лог (его персистит R6) — МЕТАДАННЫЕ + навигации/WS-коды.
+          // Тексты console-error в stdout НЕ кладём (могли бы нести ПДн) — только
+          // их число; усечённые тексты едут лишь в meta.recording.eviction.
+          logStep("evicted", {
+            url,
+            meeting_id: meetingId,
+            series_chat_id: seriesChatId,
+            meeting_started: meetingStarted,
+            last_nav: lastNav,
+            ws_events: snap ? snap.websocketEvents.length : 0,
+            ws_close_codes: wsCloseCodes,
+            console_errors: snap ? snap.consoleErrors.length : 0,
+          });
+          writeMeta("evicted");
           clearInterval(timer);
           return resolve();
         }
@@ -809,6 +1048,11 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       await stopCapture();
     } catch (err: any) {
       log(`${LOG_PREFIX} stop capture failed: ${err.message}`);
+    }
+    try {
+      if (evictionCapture) await evictionCapture.detach();
+    } catch (err: any) {
+      log(`${LOG_PREFIX} eviction capture detach failed: ${err.message}`);
     }
 
     // final_exit «событие». closeChunk само-защищён (закрывает writer только
