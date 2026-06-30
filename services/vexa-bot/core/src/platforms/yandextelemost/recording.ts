@@ -137,6 +137,14 @@ function truncOneLine(s: string, max: number): string {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
+// Экранирование под parse_mode:"HTML" (telegram.ts). Динамические значения
+// (имя серии, URL комнаты) попадают в HTML-сообщения алертов; неэкранированный
+// `&`/`<`/`>` ломает парсинг → Telegram 400 «can't parse entities» и алерт о
+// СБОЕ записи не доставляется. Bot API требует экранировать ровно эти три.
+function escapeHtml(s: string): string {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 /**
  * Browser-обёртка window.WebSocket: единственный способ достать close-КОД
  * (Playwright его не экспонирует). Идемпотентна по `__vexa_ws_wrapped` — второй
@@ -475,6 +483,19 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
     const win = window as any;
 
     async function start() {
+      // Ф2 (RISK2/ISS-28): идемпотентность на ОДНОМ документе. При перезаходе
+      // через page.goto документ новый — `win` свежий, флаг сброшен → поднимаем
+      // граф заново. Но при «само-возврате» Яндекса (SPA-роутинг pushState, тот
+      // же документ) исходный граф захвата ещё ЖИВ (его 2-сек rescan сам
+      // подхватит вернувшиеся дорожки) — второй setupBrowserCapture поднял бы
+      // ВТОРОЙ AudioContext/ScriptProcessor → каждый кадр пришёл бы дважды
+      // (двойной writeSamples → битый WAV, поехавшая диаризация) и перетёр бы
+      // ссылку на старый rescan-таймер (утечка). Потому здесь — ранний выход.
+      if (win.__vexa_telemost_capture_running) {
+        win.logBot?.("[telemost-audio] capture уже идёт на этом документе — re-init пропущен");
+        return;
+      }
+      win.__vexa_telemost_capture_running = true;
       const TARGET_RATE = 16000;
       const CHUNK_DURATION_MS = 3000;
 
@@ -583,7 +604,8 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
       const rescanTimer = setInterval(rescan, 2000);
       win.__vexa_telemost_rescan_timer = rescanTimer;
 
-      win.__vexa_telemost_capture_running = true;
+      // __vexa_telemost_capture_running уже выставлен в начале start() (гард
+      // идемпотентности) — повторно здесь не ставим.
       win.logBot?.("[telemost-audio] capture started (16kHz mono, ~3s chunks, live re-hook on)");
     }
 
@@ -1053,9 +1075,9 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   // молча скип, личный алерт всё равно ушёл (A8). Тексты фиксированные (R11) —
   // содержимого встречи в них нет.
   const sendEvictionAlerts = async (snap: EvictionSnapshot | null): Promise<void> => {
-    const room = meetingUrl || "?";
-    const reason = describeEvictionReason(snap);
-    const seriesLbl = series ? ` «${series}»` : "";
+    const room = escapeHtml(meetingUrl || "?");
+    const reason = describeEvictionReason(snap); // только числовые WS-коды/фикс-фраза — спецсимволов нет
+    const seriesLbl = series ? ` «${escapeHtml(series)}»` : "";
     // R4a — личный алерт Илье (ссылка комнаты + причина).
     await sendTelegramMessage(
       `🔴 <b>Бот-протокол</b>: не смог записать встречу${seriesLbl} — выброс из Телемоста, ` +
@@ -1192,6 +1214,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
             endReason = "unknown";
             consecutiveOutOfRoom = 0;
             lastNonSilenceTs = Date.now(); // backoff-окно не считать «тишиной выхода»
+            deafAfterStartSince = null;    // deaf-таймер из ДО-выбросного окна стух — не тащим его через возврат
             evictionHandling = false;
             logStep("eviction_recovery_count", { cycles: evictionRecoveryCount });
             writeMeta("evicted_recovered");
@@ -1271,9 +1294,9 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
             });
             try {
               await sendTelegramMessage(
-                `🔴 <b>Бот-протокол</b>: оглох на встрече${series ? ` «${series}»` : ""} — ` +
+                `🔴 <b>Бот-протокол</b>: оглох на встрече${series ? ` «${escapeHtml(series)}»` : ""} — ` +
                   `потеряны аудио-дорожки при живом подключении.\n` +
-                  `Комната: <code>${meetingUrl || "?"}</code>\n` +
+                  `Комната: <code>${escapeHtml(meetingUrl || "?")}</code>\n` +
                   `Запись могла прерваться — проверь / запиши вручную.`,
                 { dedupeKey: `deaf-owner-${sessionUid}`, dedupeMs: 10 * 60_000 },
               );
