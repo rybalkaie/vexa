@@ -34,6 +34,7 @@ Company-scope (контракт §1.5): для встречи компании X
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 from pathlib import Path
@@ -75,19 +76,62 @@ PROTOCOL_CONTEXT_WHITELIST: tuple[str, ...] = (
 
 # Денилист-БЭКСТОП (defense-in-depth, НЕ основной фильтр — фильтр это allow-list
 # выше). Файлы, которые НИКОГДА не должны попасть в контекст бота: финансовые
-# карты, drive-карты (внутренняя навигация). Если кто-то по ошибке впишет такой
-# файл в whitelist — `load_whitelisted_context` его всё равно отбросит, а
-# `assert_whitelist_safe()` (вызывается в тесте) упадёт. Сверяем по basename.
+# карты, drive-карты (внутренняя навигация), экономика/финмодель/HR-конфиденшел.
+# Если кто-то по ошибке впишет такой файл в whitelist (или в манифест Ф2) —
+# `load_whitelisted_context` его всё равно отбросит, а `assert_whitelist_safe()`
+# (вызывается в тесте) упадёт. Сверяем по basename — денилист ловит файл, даже
+# если его ПЕРЕНЕСЛИ из `restricted/` в обычную папку.
 PROTOCOL_CONTEXT_DENYLIST: frozenset[str] = frozenset({
-    "accounting-tables-registry.md",   # реестр таблиц учёта (финансы)
-    "payment-planning-tables-map.md",  # карта платёжного планирования (финансы)
-    "google-drive-map.md",             # карта Google Drive (внутренняя навигация)
+    "accounting-tables-registry.md",      # реестр таблиц учёта (финансы)
+    "payment-planning-tables-map.md",     # карта платёжного планирования (финансы)
+    "google-drive-map.md",                # карта Google Drive (внутренняя навигация)
+    # Ф1 плана watson-company-memory: чувствительное МПервый. Сегодня эти файлы
+    # лежат в `restricted/` (их ловит и запрет по пути ниже), но денилист по имени
+    # переживает переезд файла в обычную папку — это и есть defense-in-depth.
+    "altronix-ekonomika.md",              # экономика линейки (финансы)
+    "finmodel-orgstruktura.md",           # финмодель оргструктуры (финансы + HR)
+    "people-confidential.md",             # HR-конфиденшел (люди, зарплаты, оценки)
+    "marketplace-affiliation-safety.md",  # аффилированность на маркетплейсах (юр. риск)
 })
 
-# Защитный потолок размера одного файла знания в контексте (рантайм-страховка от
-# того, что файл когда-нибудь распухнет и раздует промпт). Текущий каталог ~17 КБ.
-# Превышение НЕ молча режется — логируется WARNING (принцип «no silent caps»).
+# Запрет по ПУТИ: имя директории, содержимое которой не читается НИКОГДА, в любом
+# месте дерева репо (`restricted/x.md`, `company/restricted/y/z.md` — всё). Это
+# ПЕРВИЧНЫЙ барьер для чувствительного: во втором мозге МПервый вся экономика/
+# финмодель/HR лежит именно там, и новый файл, положенный туда командой, закрыт
+# автоматически — без правки этого кода.
+PROTOCOL_CONTEXT_RESTRICTED_DIRS: frozenset[str] = frozenset({"restricted"})
+
+# Чувствительные ПАТТЕРНЫ имени (fnmatch, case-insensitive; сверяются с КАЖДЫМ
+# сегментом относительного пути, поэтому папка `finmodel/` закрыта так же, как
+# файл `x-finmodel.md`).
+#
+# ⚠️ ЭТО ВТОРИЧНАЯ СТРАХОВКА, НЕ БАРЬЕР (РИСК1 плана). Реальные финфайлы МПервый в
+# `company/baza-znaniy/` названы транслитом БЕЗ этих корней — `924-uchet-dds.md`,
+# `zifriend-vzaimoraschety-itog.md`, `867-nalichnye-kassy-…md`,
+# `925-…-sebestoimosti-postavki.md`, `kak-uchityvat-kursy-valyut-…md` — и НИ ОДИН
+# паттерн их не ловит (зафиксировано тестом `test_translit_fin_names_slip_patterns`).
+# Отсюда закон Ф2: `baza-znaniy/` подключается ТОЛЬКО явным short-list'ом конкретных
+# файлов, НИКОГДА glob'ом папки. Паттерны ловят лишь «честно названное» чувствительное.
+PROTOCOL_CONTEXT_SENSITIVE_PATTERNS: tuple[str, ...] = (
+    "*ekonomik*",     # план просил `*ekonomika*`; берём корень — ловит и ekonomiki/ekonomike
+    "*economic*",     # план просил `*economics*`; корень ловит economics/economical
+    "*finmodel*",
+    "*confidential*",
+    "*konfiden*",     # транслит «конфиденциально»
+)
+
+# Защитный потолок размера ОДНОГО файла знания (рантайм-страховка от того, что файл
+# когда-нибудь распухнет и раздует промпт). Текущий каталог ~17 КБ. Превышение НЕ
+# молча режется — логируется WARNING (принцип «no silent caps»).
 PROTOCOL_CONTEXT_FILE_MAX_BYTES = 131072  # 128 КБ
+
+# Бюджет СУММАРНОГО размера знания, уходящего в промпт (Ф1). Пофайлового потолка
+# мало: с Ф2 файлов станет много (бриф компании), и раздувание промпта — это и
+# деньги (бриф уходит в ДВА Opus-вызова), и дилюция инструкций. Ориентир плана —
+# 40–60 КБ; берём 50 КБ: у МПервый база уже 31.5 КБ (o-kompanii 14.5 + каталог 17),
+# у Anzhee один `vision.md` = 18.5 КБ. Превышение = WARNING + честная обрезка ПО
+# ГРАНИЦЕ ФАЙЛОВ (не молча, не в середине файла) — см. `apply_total_budget`.
+PROTOCOL_CONTEXT_TOTAL_MAX_BYTES = 51200  # 50 КБ
 
 # Карта компания → имя репозитория контекста (контракт §1.5). Дефолт; каждую
 # запись можно переопределить env `NOTARY_CONTEXT_REPO_<COMPANY>` (uppercase).
@@ -250,20 +294,53 @@ def repo_root(company: Optional[str]) -> Optional[Path]:
 # --- R6 (Ф2): чтение белого списка knowledge/ в контекст сборки протокола ------
 
 
+def context_path_block_reason(rel: object) -> Optional[str]:
+    """ЕДИНСТВЕННАЯ точка правды «можно ли этот путь знания отдать во внешний LLM».
+
+    Возвращает ПРИЧИНУ блокировки (короткая строка для лога) либо `None`, если путь
+    допустим. Барьеры, по порядку:
+      1. структура пути — абсолютный / `~` / `..` (выход за репо);
+      2. денилист по basename (финкарты, экономика, финмодель, HR-конфиденшел);
+      3. запрет по пути — любой сегмент-директория из `PROTOCOL_CONTEXT_RESTRICTED_DIRS`
+         (всё под `restricted/`, где бы оно ни лежало);
+      4. чувствительный паттерн имени (вторичная страховка, см. РИСК1 у констант).
+
+    Зовётся из ТРЁХ мест, и это принципиально: `load_whitelisted_context` (рантайм),
+    `assert_whitelist_safe` (контрактный тест) и — с Ф2 — фильтр манифеста компании.
+    Бэкстоп живёт в КОДЕ: правкой манифеста в `*-context` его не обойти (A3 плана).
+    """
+    p = str(rel or "").strip()
+    if not p:
+        return "пустой путь"
+    parts = Path(p).parts
+    if p.startswith("/") or p.startswith("~") or ".." in parts:
+        return "небезопасный путь (абсолютный / `~` / выход за репо через `..`)"
+    if Path(p).name.lower() in {d.lower() for d in PROTOCOL_CONTEXT_DENYLIST}:
+        return "денилист (финансы / HR-конфиденшел / внутренняя карта)"
+    segments = [seg.lower() for seg in parts]
+    for seg in segments[:-1]:  # только директории — файл `restricted.md` сам по себе не секрет
+        if seg in PROTOCOL_CONTEXT_RESTRICTED_DIRS:
+            return f"путь внутри `{seg}/` (закрытая директория)"
+    for seg in segments:
+        for pattern in PROTOCOL_CONTEXT_SENSITIVE_PATTERNS:
+            if fnmatch.fnmatch(seg, pattern):
+                return f"чувствительный паттерн имени `{pattern}`"
+    return None
+
+
 def assert_whitelist_safe() -> None:
-    """Самопроверка инвариантов whitelist (вызывается из теста R6). Падает, если:
-      • whitelist и денилист пересеклись по basename (финкарта пролезла в allow-list);
-      • путь whitelist абсолютный или содержит `..` (выход за репо).
+    """Самопроверка инвариантов whitelist (вызывается из теста R6/R1): каждый путь
+    allow-list обязан проходить бэкстоп `context_path_block_reason`. Падает, если
+    в allow-list просочился денилист-файл / `restricted/` / чувствительное имя /
+    абсолютный путь или `..`.
+
     Это НЕ рантайм-страховка (её несёт `load_whitelisted_context`), а контрактный
-    тест: ошибка конфигурации whitelist обязана падать громко, а не утекать."""
-    deny = {d.lower() for d in PROTOCOL_CONTEXT_DENYLIST}
+    тест: ошибка конфигурации allow-list обязана падать громко, а не утекать."""
     for rel in PROTOCOL_CONTEXT_WHITELIST:
-        p = str(rel)
-        if p.startswith("/") or ".." in Path(p).parts:
-            raise AssertionError(f"whitelist-путь небезопасен (абсолютный/`..`): {p!r}")
-        if Path(p).name.lower() in deny:
+        reason = context_path_block_reason(rel)
+        if reason:
             raise AssertionError(
-                f"whitelist-файл {p!r} пересекается с денилистом (финданные в контекст бота)"
+                f"whitelist-путь {str(rel)!r} нарушает бэкстоп приватности: {reason}"
             )
 
 
@@ -277,6 +354,72 @@ def _is_within(child: Path, parent: Path) -> bool:
         return False
 
 
+def _real_path_block_reason(path: Path, root: Path) -> Optional[str]:
+    """Тот же бэкстоп, но по РЕАЛЬНОМУ пути файла (после резолва симлинков).
+
+    Закрывает обход через симлинк: `knowledge/ok.md → ../restricted/salaries.md`
+    имеет чистое имя в allow-list и лежит внутри репо (`_is_within` доволен), но
+    реально указывает в закрытую директорию. Сверяем ещё раз — уже по тому, что
+    файл есть на самом деле."""
+    try:
+        real_rel = path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return "реальный путь (после симлинков) вне корня репо"
+    return context_path_block_reason(str(real_rel))
+
+
+def apply_total_budget(
+    files: list[tuple[str, str]], budget: Optional[int] = None
+) -> list[tuple[str, str]]:
+    """Обрезать набор знания под СУММАРНЫЙ бюджет `PROTOCOL_CONTEXT_TOTAL_MAX_BYTES`.
+
+    Чистая (без IO) — тестируется инъекцией списка, как `filter_glossary_by_company`.
+    Порядок входа = ПРИОРИТЕТ (порядок allow-list/манифеста): файлы набираются
+    подряд, пока влезают; первый непоместившийся и весь хвост за ним отбрасываются
+    ЦЕЛИКОМ — «обрезка по границе файлов», без дырок в середине и без обрезанных
+    посреди фразы файлов.
+
+    Единственное исключение — когда ПЕРВЫЙ же файл больше всего бюджета: выбросить
+    его целиком нельзя (бриф стал бы пуст и из промпта пропал бы канон артикулов —
+    регресс ISS-21), поэтому он честно режется по бюджету, тоже с WARNING.
+
+    Превышение НИКОГДА не проходит молча: в лог уходят счётчики и ИМЕНА файлов
+    (метаданные), но НЕ их текст — Опасная тройка (R8).
+    """
+    limit = PROTOCOL_CONTEXT_TOTAL_MAX_BYTES if budget is None else int(budget)
+    out: list[tuple[str, str]] = []
+    dropped: list[tuple[str, int]] = []
+    used = 0
+    for i, (rel, text) in enumerate(files):
+        size = len(text.encode("utf-8"))
+        if used + size <= limit:
+            out.append((rel, text))
+            used += size
+            continue
+        if not out and used == 0:
+            # Первый файл сам по себе не влезает — режем по бюджету, не выбрасываем.
+            head = text.encode("utf-8")[: max(0, limit)].decode("utf-8", errors="ignore").strip()
+            logger.warning(
+                "бюджет знания: файл %s = %d Б один превышает бюджет %d Б — урезан по бюджету "
+                "(часть файла в промпт не попадёт)",
+                rel, size, limit,
+            )
+            if head:
+                out.append((rel, head))
+                used = len(head.encode("utf-8"))
+        else:
+            dropped.append((rel, size))
+        dropped.extend((r, len(t.encode("utf-8"))) for r, t in files[i + 1:])
+        break
+    if dropped:
+        logger.warning(
+            "бюджет знания исчерпан (%d Б из %d Б): %d файл(ов) НЕ вошли в бриф — %s. "
+            "Обрезка по границе файлов; порядок allow-list = приоритет (правь состав манифеста)",
+            used, limit, len(dropped), ", ".join(r for r, _ in dropped),
+        )
+    return out
+
+
 def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
     """Прочитать СЫРЫЕ файлы знания из белого списка для компании (R6).
 
@@ -285,30 +428,39 @@ def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
     как в `PROTOCOL_CONTEXT_WHITELIST`.
 
     Fail-closed на приватность — итерируем ТОЛЬКО по константному whitelist (никакого
-    параметра-пути снаружи), и на каждом файле тройная страховка:
-      1. basename НЕ в денилисте (финкарты/drive — даже если просочились в whitelist);
+    параметра-пути снаружи), и на каждом файле страховка в пять слоёв:
+      1. `context_path_block_reason` — денилист / `restricted/` / чувствительный
+         паттерн / абсолютный путь / `..` (единый бэкстоп, он же у манифеста Ф2);
       2. резолв пути ВНУТРИ корня репо (path-traversal-бэкстоп);
-      3. размер ≤ потолка (распухший файл логируется, не режется молча).
+      3. тот же бэкстоп по РЕАЛЬНОМУ пути после симлинков (`_real_path_block_reason`);
+      4. размер файла ≤ пофайлового потолка (распухший логируется, не режется молча);
+      5. суммарный размер ≤ бюджета (`apply_total_budget`, обрезка по границе файлов).
+
+    Опасная тройка (R8): в лог уходят ПУТИ и СЧЁТЧИКИ (файлы, байты) — текст знания
+    не логируется никогда, иначе утечка логов = утечка коммерческих данных.
     """
     root = repo_root(company)
     if not root:
         return []
-    deny = {d.lower() for d in PROTOCOL_CONTEXT_DENYLIST}
     out: list[tuple[str, str]] = []
     for rel in PROTOCOL_CONTEXT_WHITELIST:
         rel = str(rel)
-        # (0) Структурная защита: абсолютный путь / `..` в whitelist — пропускаем.
-        if rel.startswith("/") or ".." in Path(rel).parts:
-            logger.warning("whitelist-путь небезопасен, пропуск: %s", rel)
-            continue
-        # (1) Денилист-бэкстоп по basename.
-        if Path(rel).name.lower() in deny:
-            logger.warning("whitelist-файл в денилисте — НЕ читаю (приватность): %s", rel)
+        # (1) Единый бэкстоп приватности по заявленному пути.
+        reason = context_path_block_reason(rel)
+        if reason:
+            logger.warning("whitelist-файл НЕ читаю (%s): %s", reason, rel)
             continue
         path = root / rel
         # (2) Path-traversal бэкстоп: путь обязан быть внутри корня репо.
         if not _is_within(path, root):
             logger.warning("whitelist-файл вне корня репо, пропуск: %s", rel)
+            continue
+        # (3) Симлинк-бэкстоп: реальный путь тоже обязан проходить бэкстоп.
+        real_reason = _real_path_block_reason(path, root)
+        if real_reason:
+            logger.warning(
+                "whitelist-файл НЕ читаю — реальный путь заблокирован (%s): %s", real_reason, rel
+            )
             continue
         if not path.is_file():
             logger.info("whitelist-файл знания не найден, пропуск: %s", path)
@@ -318,7 +470,7 @@ def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
         except OSError as e:
             logger.warning("не прочитать whitelist-файл %s: %s", path, e)
             continue
-        # (3) Потолок размера — не молча: WARNING + обрезка по границе байтов.
+        # (4) Пофайловый потолок — не молча: WARNING + обрезка по границе байтов.
         if len(data) > PROTOCOL_CONTEXT_FILE_MAX_BYTES:
             logger.warning(
                 "whitelist-файл %s = %d Б > потолка %d Б — урезаю (часть каталога не попадёт)",
@@ -332,6 +484,13 @@ def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
             continue
         if text:
             out.append((rel, text))
+    # (5) Суммарный бюджет промпта — WARNING + честная обрезка по границе файлов.
+    out = apply_total_budget(out)
+    if out:
+        logger.info(
+            "знание компании %s: файлов=%d, байт=%d (текст знания не логируется — Опасная тройка)",
+            company, len(out), sum(len(t.encode("utf-8")) for _, t in out),
+        )
     return out
 
 
