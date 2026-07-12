@@ -318,7 +318,12 @@ def context_path_block_reason(rel: object) -> Optional[str]:
     if Path(p).name.lower() in {d.lower() for d in PROTOCOL_CONTEXT_DENYLIST}:
         return "денилист (финансы / HR-конфиденшел / внутренняя карта)"
     segments = [seg.lower() for seg in parts]
-    for seg in segments[:-1]:  # только директории — файл `restricted.md` сам по себе не секрет
+    # ВСЕ сегменты, включая последний: путь может указывать на саму директорию
+    # (`company/restricted`), а фильтр манифеста Ф2 зовёт эту функцию БЕЗ проверки
+    # `is_file()` — там такой путь прошёл бы. Файл, буквально названный `restricted`
+    # (без расширения), не существует ни в одном `*-context` (проверено), а
+    # `restricted.md` — другой сегмент и под запрет не попадает.
+    for seg in segments:
         if seg in PROTOCOL_CONTEXT_RESTRICTED_DIRS:
             return f"путь внутри `{seg}/` (закрытая директория)"
     for seg in segments:
@@ -366,6 +371,29 @@ def _real_path_block_reason(path: Path, root: Path) -> Optional[str]:
     except (ValueError, OSError):
         return "реальный путь (после симлинков) вне корня репо"
     return context_path_block_reason(str(real_rel))
+
+
+def _hardlink_block_reason(path: Path) -> Optional[str]:
+    """Второй обход, симметричный симлинку: ЖЁСТКАЯ ссылка (hardlink).
+
+    У симлинка есть «цель», и `resolve()` её раскрывает — поэтому `knowledge/ok.md →
+    restricted/salaries.md` мы ловим. У hardlink'а цели НЕТ: это второе ИМЯ того же
+    инода, и `resolve()` возвращает сам путь, не выдавая содержимое. То есть
+    `ln restricted/people-confidential.md knowledge/ok.md` утащил бы HR-файл в промпт
+    мимо ВСЕХ проверок по пути — имя-то чистое.
+
+    Признак: `st_nlink > 1` (на файл ссылаются ≥2 имени). Git иноды не переносит —
+    после `clone`/`pull` (и после `context_pull.sh` на VPS) у каждого файла nlink=1,
+    поэтому >1 означает, что ссылку сделали руками локально. Fail-closed: не читаем.
+    Цена ложного срабатывания — файл знания не попал в промпт + WARNING; цена
+    пропуска — зарплаты во внешнем LLM. Асимметрия однозначная.
+    """
+    try:
+        if path.stat().st_nlink > 1:
+            return "жёсткая ссылка (hardlink) — имя файла не доказывает его содержимое"
+    except OSError as e:
+        return f"не прочитать метаданные файла ({type(e).__name__})"
+    return None
 
 
 def apply_total_budget(
@@ -428,13 +456,15 @@ def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
     как в `PROTOCOL_CONTEXT_WHITELIST`.
 
     Fail-closed на приватность — итерируем ТОЛЬКО по константному whitelist (никакого
-    параметра-пути снаружи), и на каждом файле страховка в пять слоёв:
+    параметра-пути снаружи), и на каждом файле страховка в шесть слоёв:
       1. `context_path_block_reason` — денилист / `restricted/` / чувствительный
          паттерн / абсолютный путь / `..` (единый бэкстоп, он же у манифеста Ф2);
       2. резолв пути ВНУТРИ корня репо (path-traversal-бэкстоп);
       3. тот же бэкстоп по РЕАЛЬНОМУ пути после симлинков (`_real_path_block_reason`);
-      4. размер файла ≤ пофайлового потолка (распухший логируется, не режется молча);
-      5. суммарный размер ≤ бюджета (`apply_total_budget`, обрезка по границе файлов).
+      4. жёсткая ссылка (`_hardlink_block_reason`) — симлинк ловит слой (3), а
+         hardlink «чистое имя → restricted/» не поймал бы никто, кроме этого;
+      5. размер файла ≤ пофайлового потолка (распухший логируется, не режется молча);
+      6. суммарный размер ≤ бюджета (`apply_total_budget`, обрезка по границе файлов).
 
     Опасная тройка (R8): в лог уходят ПУТИ и СЧЁТЧИКИ (файлы, байты) — текст знания
     не логируется никогда, иначе утечка логов = утечка коммерческих данных.
@@ -465,12 +495,20 @@ def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
         if not path.is_file():
             logger.info("whitelist-файл знания не найден, пропуск: %s", path)
             continue
+        # (4) Hardlink-бэкстоп: симлинк ловит слой (3), жёсткую ссылку — только этот
+        # (у неё нет цели, `resolve()` бессилен). Проверяем ПОСЛЕ `is_file()`: у
+        # отсутствующего файла `stat()` упал бы, и graceful-пропуск «нет каталога у
+        # anzhee» стал бы шумным WARNING.
+        hard_reason = _hardlink_block_reason(path)
+        if hard_reason:
+            logger.warning("whitelist-файл НЕ читаю (%s): %s", hard_reason, rel)
+            continue
         try:
             data = path.read_bytes()
         except OSError as e:
             logger.warning("не прочитать whitelist-файл %s: %s", path, e)
             continue
-        # (4) Пофайловый потолок — не молча: WARNING + обрезка по границе байтов.
+        # (5) Пофайловый потолок — не молча: WARNING + обрезка по границе байтов.
         if len(data) > PROTOCOL_CONTEXT_FILE_MAX_BYTES:
             logger.warning(
                 "whitelist-файл %s = %d Б > потолка %d Б — урезаю (часть каталога не попадёт)",
@@ -484,7 +522,7 @@ def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
             continue
         if text:
             out.append((rel, text))
-    # (5) Суммарный бюджет промпта — WARNING + честная обрезка по границе файлов.
+    # (6) Суммарный бюджет промпта — WARNING + честная обрезка по границе файлов.
     out = apply_total_budget(out)
     if out:
         logger.info(

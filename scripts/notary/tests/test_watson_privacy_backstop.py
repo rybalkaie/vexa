@@ -147,6 +147,15 @@ class TestContextPathBlockReason(unittest.TestCase):
         ):
             self.assertIsNotNone(ck.context_path_block_reason(rel), rel)
 
+    def test_restricted_as_last_segment_blocked(self):
+        """Путь-ДИРЕКТОРИЯ `company/restricted` тоже закрыт.
+
+        На рантайме такой путь отсекает `is_file()`, но фильтр манифеста Ф2 зовёт эту
+        функцию как ЕДИНУЮ точку правды — без файловой проверки. Пропусти мы его, и
+        запись-папка в манифесте открыла бы всю `restricted/`."""
+        for rel in ("restricted", "company/restricted", "COMPANY/Restricted"):
+            self.assertIsNotNone(ck.context_path_block_reason(rel), rel)
+
     def test_structural_escapes_blocked(self):
         for rel in ("/etc/hosts", "~/secrets.md", "knowledge/../../../etc/hosts", ""):
             self.assertIsNotNone(ck.context_path_block_reason(rel), rel)
@@ -372,6 +381,29 @@ class TestTotalBudget(unittest.TestCase):
         self.assertGreaterEqual(ck.PROTOCOL_CONTEXT_TOTAL_MAX_BYTES, 40 * 1024)
         self.assertLessEqual(ck.PROTOCOL_CONTEXT_TOTAL_MAX_BYTES, 60 * 1024)
 
+    def test_non_first_oversized_file_is_dropped_WHOLE(self):
+        """⚠️ ГРАНИЦА ЗАЩИТЫ, а не баг — читай перед правкой манифеста в Ф2.
+
+        Спасение «oversized файл режется, а не выбрасывается» действует ТОЛЬКО для
+        ПЕРВОГО файла (там иначе бриф стал бы пустым). Файл, стоящий НЕ первым, при
+        исчерпанном бюджете выбрасывается ЦЕЛИКОМ. Отсюда закон Ф2: каталог артикулов
+        обязан стоять в манифесте ПЕРВЫМ — иначе он молча (нет, громко: WARNING)
+        вылетит из промпта, и бот вернётся к фонетике ASR (регресс ISS-21)."""
+        files = [("small.md", "y" * 10), ("catalog.md", "x" * 200)]
+        out = ck.apply_total_budget(files, budget=50)
+        self.assertEqual([r for r, _ in out], ["small.md"], "каталог выброшен ЦЕЛИКОМ, не урезан")
+
+    def test_catalog_is_first_in_whitelist(self):
+        """ISS-21-инвариант, вытекающий из теста выше: раз порядок = приоритет, а
+        не-первый oversized файл выбрасывается целиком — каталог артикулов обязан быть
+        ПЕРВЫМ в allow-list/манифесте. Ф2 добавляет файлы ПОСЛЕ него, не перед."""
+        self.assertTrue(ck.PROTOCOL_CONTEXT_WHITELIST, "allow-list не пуст")
+        self.assertEqual(
+            ck.PROTOCOL_CONTEXT_WHITELIST[0], _CATALOG,
+            "каталог артикулов сдвинут с первого места — при переполнении бюджета "
+            "он вылетит целиком (ISS-21). Ставь новые файлы ПОСЛЕ него.",
+        )
+
 
 # ===========================================================================
 # Симлинк-обход и контрактный self-check allow-list
@@ -397,6 +429,36 @@ class TestSymlinkAndAssertSafe(_FixtureContextMixin, unittest.TestCase):
         self.assertEqual(files, [], "симлинк в restricted/ не пробивает бэкстоп")
         self.assertNotIn("SYMLINK_SECRET_SENTINEL_77779999", "\n".join(records))
 
+    def test_hardlink_into_restricted_is_blocked(self):
+        """ЖЁСТКАЯ ссылка — второй обход, симметричный симлинку.
+
+        У симлинка есть цель, и `resolve()` её раскрывает. У hardlink'а цели нет: это
+        второе ИМЯ того же инода, `resolve()` возвращает сам путь, и проверки «по пути»
+        видят чистое `knowledge/ok-catalog.md`. Без отдельного барьера
+        `ln restricted/salaries.md knowledge/ok-catalog.md` утащил бы зарплаты в промпт."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "mpfirst-context"
+            (repo / "restricted").mkdir(parents=True)
+            (repo / "knowledge").mkdir(parents=True)
+            secret = repo / "restricted" / "salaries.md"
+            secret.write_text("HARDLINK_SECRET_SENTINEL_31337000\n", encoding="utf-8")
+            os.link(secret, repo / "knowledge" / "ok-catalog.md")  # НЕ symlink
+
+            os.environ["MEETING_NOTARY_CONTEXT_DIR"] = tmp
+            self._patch_whitelist(("knowledge/ok-catalog.md",))
+            with _capture_logs("notary.lib.context_knowledge") as records:
+                files = ck.load_whitelisted_context("mpfirst")
+
+        self.assertEqual(files, [], "hardlink в restricted/ не пробивает бэкстоп")
+        self.assertNotIn("HARDLINK_SECRET_SENTINEL_31337000", "\n".join(records))
+
+    def test_normal_file_is_not_mistaken_for_hardlink(self):
+        """Обратная сторона: обычный файл (nlink=1) читается как ни в чём не бывало —
+        fail-closed не должен стать fail-always. Реальные `*-context` приезжают через
+        git (`context_pull.sh`), где nlink всегда 1."""
+        files = ck.load_whitelisted_context("mpfirst")
+        self.assertEqual([r for r, _ in files], [_CATALOG], "боевой каталог по-прежнему читается")
+
     def test_assert_whitelist_safe_passes_on_real_whitelist(self):
         ck.assert_whitelist_safe()  # боевой allow-list чист — не бросает
 
@@ -413,6 +475,47 @@ class TestSymlinkAndAssertSafe(_FixtureContextMixin, unittest.TestCase):
 
 
 # ===========================================================================
+# Анти-инъекция: знание компании подаётся как ДАННЫЕ, а не как команды
+# ===========================================================================
+class TestKnowledgeIsFramedAsData(_FixtureContextMixin, unittest.TestCase):
+    """Конвенция плана: «знание в промпте обёрнуто как ДАННЫЕ (анти-инъекция)».
+
+    Знание — недоверенный вход: файлы правит вся команда, текст приезжает копипастой
+    из Platrum/Google Drive, а попадает оно в SYSTEM-промпт (самое привилегированное
+    место). В проекте этот приём уже применён к правкам участников, свидетельствам
+    висяков и пожеланиям формата — знание было единственным входом без рамки."""
+
+    _METHOD = "# Метод (заглушка)\n"
+
+    def test_catalog_block_is_wrapped_in_data_frame(self):
+        block = glossary.catalog_prompt_block("mpfirst")
+        self.assertIn(glossary.KNOWLEDGE_DATA_FRAME_HEADER, block, "рамка-ДАННЫЕ открыта")
+        self.assertIn(glossary.KNOWLEDGE_DATA_FRAME_END, block, "рамка-ДАННЫЕ закрыта")
+
+    def test_knowledge_text_sits_INSIDE_the_frame(self):
+        """Текст знания — между открытием и закрытием рамки, а не рядом с ней."""
+        block = glossary.catalog_prompt_block("mpfirst")
+        start = block.index(glossary.KNOWLEDGE_DATA_FRAME_HEADER)
+        end = block.index(glossary.KNOWLEDGE_DATA_FRAME_END)
+        catalog_at = block.index(_CATALOG_TOKEN)
+        self.assertTrue(start < catalog_at < end, "знание внутри рамки-ДАННЫХ")
+
+    def test_our_own_rule_stays_OUTSIDE_the_frame(self):
+        """Правило R7 — наша инструкция модели. Внутри блока «это не команды» она
+        обесценилась бы сама собой, поэтому обязана быть ПОСЛЕ закрытия рамки."""
+        block = glossary.catalog_prompt_block("mpfirst")
+        end = block.index(glossary.KNOWLEDGE_DATA_FRAME_END)
+        rule_at = block.index("ЛУЧШУЮ ДОГАДКУ")
+        self.assertGreater(rule_at, end, "правило R7 вне блока данных")
+
+    def test_frame_reaches_the_real_system_prompt(self):
+        """Рамка доезжает до промпта, который реально уходит во внешний LLM."""
+        sp = llm_postprocess._build_protocol_system_prompt("mpfirst", self._METHOD)
+        self.assertIn(glossary.KNOWLEDGE_DATA_FRAME_HEADER, sp)
+        self.assertIn(_CATALOG_TOKEN, sp, "каталог на месте (ISS-21 не сломан)")
+
+
+# ===========================================================================
 # R8 (часть) — статический грep: текст знания в logger не передаётся
 # ===========================================================================
 class TestNoKnowledgeTextInLoggerCalls(unittest.TestCase):
@@ -423,9 +526,18 @@ class TestNoKnowledgeTextInLoggerCalls(unittest.TestCase):
     _MODULES = (
         _NOTARY / "lib" / "context_knowledge.py",
         _NOTARY / "lib" / "glossary.py",
+        # ПОСЛЕДНИЙ РУБЕЖ: именно этот модуль отправляет собранный промпт (со знанием
+        # внутри) во внешний LLM. Читать знание бесполезно запрещать, если его выведет
+        # в лог тот, кто его отсылает. Сегодня там только счётчики (`prompt_len=%d`) —
+        # тест фиксирует это как КОНТРАКТ, а не как везение.
+        _NOTARY / "lib" / "claude_cli.py",
     )
-    # Имена переменных, в которых в этих модулях лежит СОДЕРЖИМОЕ файла знания.
-    _FORBIDDEN = {"text", "data", "head", "blob", "content", "body"}
+    # Имена переменных, в которых в этих модулях лежит СОДЕРЖИМОЕ файла знания
+    # (или собранный промпт, внутри которого это содержимое).
+    _FORBIDDEN = {
+        "text", "data", "head", "blob", "content", "body",
+        "full_prompt", "prompt", "system", "system_prompt", "user_prompt",
+    }
     # …но обёрнутые в счётчик/метаданные они безвредны и разрешены: `len(data)` —
     # это байты, `type(data).__name__` — имя типа. Утечкой было бы САМО значение.
     _COUNTER_WRAPPERS = {"len", "sum", "bool", "type", "id"}
