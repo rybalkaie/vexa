@@ -160,6 +160,12 @@ test_data/
 *.txt
 !**/requirements.txt
 !scripts/notary/auto_vocab/proposer_prompt.txt
+# Ф2 плана watson-company-memory: манифест знания компании — это .txt по спецификации
+# (его правит команда руками, не программист). Фикстуры манифеста нужны тестам
+# tests/test_watson_company_manifest.py — без них на свежем клоне отвалятся R3/R4/R5
+# (тот же капкан, что ниже словил корпус галлюцинаций: глобальный *.txt съедает файлы,
+# которые читаются на рантайме).
+!scripts/notary/tests/fixtures/**/*.txt
 # v0.10.5.3 fix: hallucinations corpus files were silently dropped when
 # *.txt was added globally. The corpus is loaded by hallucination-filter.ts
 # at runtime — without these files the bot ships with empty filter,

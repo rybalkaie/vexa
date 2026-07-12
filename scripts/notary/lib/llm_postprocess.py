@@ -60,6 +60,7 @@ from .claude_cli import (
     call_claude_print,
 )
 from . import clarify_state
+from . import context_knowledge
 from . import glossary
 from . import protocol_to_tg
 from . import series_markup
@@ -1646,29 +1647,43 @@ def stabilize_protocol_text(text: str) -> str:
     return result
 
 
-def _build_protocol_system_prompt(company: Optional[str], method_text: str) -> str:
+def _build_protocol_system_prompt(
+    company: Optional[str],
+    method_text: str,
+    *,
+    bundle: Optional["context_knowledge.KnowledgeBundle"] = None,
+) -> str:
     """Собирает system-prompt генерации протокола: база + методичка + глоссарий
-    компании + (R6/Ф2) каталог товаров из БЕЛОГО СПИСКА knowledge/.
+    компании + каталог товаров + (Ф2, R5) секция «Знание о компании».
 
     Выделено из `generate_protocol`, чтобы «контекст, который видит бот» был
     тестируемым в изоляции (критерий R6: на фикстуре компании каталог ВХОДИТ,
     финкарты НЕ входят) без живого `claude` CLI. Версионируемый шаблон формата
     (Ф7, best-effort/lazy) сюда НЕ включён — остаётся в `generate_protocol`.
 
-    🔒 Приватность (РИСК4): каталог тянется ТОЛЬКО из `glossary.catalog_prompt_block`
-    → `context_knowledge.load_whitelisted_context` (allow-list), финкарты в промпт
-    структурно не попадают. Каталог — отдельной секцией, чтобы не разбавлять
-    тонкий soft-ASR-bias глоссария.
+    Порядок секций НЕ произволен (план, РИСК «дилюция»): глоссарий (тонкий soft-ASR-
+    bias) → каталог (канон артикулов) → бриф компании. Бриф — последним, чтобы объёмное
+    бизнес-знание не разбавляло два точных инструмента распознавания перед ним.
+
+    🔒 Приватность: состав знания — манифест компании ∩ бэкстоп Ф1 (единая точка правды
+    `context_path_block_reason`); финансы/HR/`restricted` в промпт не попадают, даже
+    если их впишут в манифест. Диск читается ОДИН раз (`load_protocol_knowledge`), обе
+    секции рендерятся из одного bundle — иначе бюджет применился бы дважды.
     """
+    if bundle is None:
+        bundle = context_knowledge.load_protocol_knowledge(company)
     system_prompt = (
         GENERATE_PROTOCOL_BASE_PROMPT
         + method_text
         + "\n\n---\n\n"
         + glossary.glossary_prompt_block(company)
     )
-    catalog_block = glossary.catalog_prompt_block(company)
+    catalog_block = glossary.catalog_prompt_block(company, bundle=bundle)
     if catalog_block:
         system_prompt += "\n\n---\n\n" + catalog_block
+    knowledge_block = glossary.company_knowledge_block(company, bundle=bundle)
+    if knowledge_block:
+        system_prompt += "\n\n---\n\n" + knowledge_block
     return system_prompt
 
 
@@ -1717,8 +1732,23 @@ def generate_protocol(
 
     # FU-11 / Ф5: глоссарий компании в КОНЕЦ system-prompt (после методички) —
     # отдельной секцией, company-scoped (Bolong[mpfirst] не уйдёт в Anzhee-промпт).
-    # Ф2 (R6/R7): + каталог товаров из белого списка knowledge/ (см. helper).
-    system_prompt = _build_protocol_system_prompt(company, method_text)
+    # Ф2: + каталог товаров и секция «Знание о компании» из манифеста (см. helper).
+    #
+    # Знание грузим ЗДЕСЬ (а не внутри helper'а), чтобы одним чтением накрыть две
+    # задачи: собрать промпт и увидеть, что из манифеста НЕ подключилось.
+    knowledge = context_knowledge.load_protocol_knowledge(company)
+    system_prompt = _build_protocol_system_prompt(company, method_text, bundle=knowledge)
+
+    # Ф2 (follow-up 1 из Ф1): ВИДИМЫЙ сигнал о тихой поломке. Манифест знания правит
+    # команда в своём репо, а бэкстоп живёт в коде — человек впишет файл, код его
+    # отсечёт, и без этого алерта об этом знал бы только лог VPS, которого никто не
+    # читает. Молчим, когда всё хорошо (rejected пуст → push не зовётся вовсе);
+    # дедуп по НАБОРУ проблем — та же поломка не спамит на каждой встрече.
+    # Best-effort: сломанный алерт не имеет права уронить генерацию протокола.
+    try:
+        context_knowledge.alert_manifest_problems(company, knowledge)
+    except Exception:  # noqa: BLE001
+        pass
 
     # F2 (Ф7): версионируемый шаблон протокола — накопленные пожелания к ФОРМАТУ
     # (правка формата → новая версия, применяется к БУДУЩИМ протоколам). Блок

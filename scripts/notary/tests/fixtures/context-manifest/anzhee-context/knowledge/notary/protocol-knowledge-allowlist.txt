@@ -1,0 +1,6 @@
+# Фикстура манифеста Anzhee (тесты Ф2 плана watson-company-memory).
+# Знание Anzhee, которого бот раньше не видел ВОВСЕ (R4). Каталога товаров у Anzhee
+# нет — секция каталога не рендерится, а бриф рендерится.
+
+knowledge/notary/dry-rental-brief.md
+company/team.md

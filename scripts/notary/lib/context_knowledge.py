@@ -35,10 +35,12 @@ Company-scope (контракт §1.5): для встречи компании X
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import NamedTuple, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -448,88 +450,343 @@ def apply_total_budget(
     return out
 
 
-def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
-    """Прочитать СЫРЫЕ файлы знания из белого списка для компании (R6).
+# --- Ф2 (R3/R9): per-company МАНИФЕСТ знания для протокола ---------------------
+#
+# Состав знания, который видит бот, ведёт КОМАНДА — текстовым файлом в своём репо
+# контекста, без деплоя кода (A3/R9 плана `watson-company-memory`):
+#
+#     <repo>/knowledge/notary/protocol-knowledge-allowlist.txt
+#
+# Формат (нарочно примитивный — его правит не программист):
+#     # строка-комментарий
+#     catalog: knowledge/product-catalog-wb.md      ← каталог товаров (канон артикулов)
+#     company/o-kompanii-mpervyi.md                 ← файл брифа компании
+#
+# Путь — относительно КОРНЯ репо контекста. Префикс `catalog:` помечает каталог
+# товаров: он рендерится отдельной секцией со своим правилом подстановки товаров
+# (R7) и ставится ПЕРВЫМ в бюджете. Без префикса — файл «брифа компании» (R5).
+#
+# 🔒 ГРАНИЦА (A3, инвариант Ф1). Манифест — это ДАННЫЕ в чужом репо, их правит
+# команда, НЕ прогоняя наши тесты. Поэтому манифест НЕ может расширить права: любой
+# его путь проходит тот же `context_path_block_reason`, что и хардкод-whitelist.
+# Вписать в манифест финансы/HR/`restricted` можно — прочитать их нельзя.
+PROTOCOL_KNOWLEDGE_MANIFEST_FILE = "protocol-knowledge-allowlist.txt"
+MANIFEST_CATALOG_PREFIX = "catalog:"
 
-    Возвращает `[(relpath, text), ...]` для тех файлов whitelist, что РЕАЛЬНО есть
-    у компании (graceful: нет репо/файла → просто пропуск, не падаем). Порядок —
-    как в `PROTOCOL_CONTEXT_WHITELIST`.
+# `\s+#` — комментарий в конце строки (не режем `#` внутри имени файла, хотя таких
+# у нас нет: путь `a#b.md` остался бы целым, а `a.md  # коммент` — обрезался).
+_MANIFEST_INLINE_COMMENT_RE = re.compile(r"\s+#.*$")
 
-    Fail-closed на приватность — итерируем ТОЛЬКО по константному whitelist (никакого
-    параметра-пути снаружи), и на каждом файле страховка в шесть слоёв:
-      1. `context_path_block_reason` — денилист / `restricted/` / чувствительный
-         паттерн / абсолютный путь / `..` (единый бэкстоп, он же у манифеста Ф2);
-      2. резолв пути ВНУТРИ корня репо (path-traversal-бэкстоп);
-      3. тот же бэкстоп по РЕАЛЬНОМУ пути после симлинков (`_real_path_block_reason`);
-      4. жёсткая ссылка (`_hardlink_block_reason`) — симлинк ловит слой (3), а
-         hardlink «чистое имя → restricted/» не поймал бы никто, кроме этого;
-      5. размер файла ≤ пофайлового потолка (распухший логируется, не режется молча);
-      6. суммарный размер ≤ бюджета (`apply_total_budget`, обрезка по границе файлов).
 
-    Опасная тройка (R8): в лог уходят ПУТИ и СЧЁТЧИКИ (файлы, байты) — текст знания
-    не логируется никогда, иначе утечка логов = утечка коммерческих данных.
+class KnowledgeBundle(NamedTuple):
+    """Знание компании, готовое к вставке в промпт (результат `load_protocol_knowledge`).
+
+    catalog  — файлы каталога товаров (канон названий/артикулов), секция R6/R7.
+    brief    — файлы «брифа компании» (позиционирование/линейки/кто есть кто), секция R5.
+    rejected — [(путь, причина)] того, что в промпт НЕ попало: бэкстоп, нет файла,
+               не влез в бюджет. Основа ВИДИМОГО СИГНАЛА (follow-up 1 из Ф1): без него
+               человек правит манифест и не знает, что бот его файл не взял.
+    source   — откуда взят СОСТАВ: `manifest` (файл компании) | `code-fallback`
+               (константа в коде = поведение как до Ф2) | `none` (репо неизвестно).
+    """
+
+    catalog: list[tuple[str, str]]
+    brief: list[tuple[str, str]]
+    rejected: list[tuple[str, str]]
+    source: str
+
+
+def manifest_path(company: Optional[str]) -> Optional[Path]:
+    """Путь к манифесту знания компании. None, если репо компании неизвестно."""
+    kdir = knowledge_dir(company)
+    if not kdir:
+        return None
+    return kdir / PROTOCOL_KNOWLEDGE_MANIFEST_FILE
+
+
+def parse_manifest(text: str) -> tuple[list[str], list[str]]:
+    """Текст манифеста → `(пути каталога, пути брифа)`. Чистая, без IO (тестируется
+    инъекцией строки, как `filter_glossary_by_company`).
+
+    Пустые строки и `#`-комментарии игнорируются; порядок сохраняется (= приоритет
+    при бюджете); дубли схлопываются (первое вхождение побеждает). Разбор НЕ судит
+    о безопасности пути — это работа `context_path_block_reason` на чтении.
+    """
+    catalog: list[str] = []
+    brief: list[str] = []
+    seen: set[str] = set()
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = _MANIFEST_INLINE_COMMENT_RE.sub("", line).strip()
+        if not line:
+            continue
+        is_catalog = line.lower().startswith(MANIFEST_CATALOG_PREFIX)
+        if is_catalog:
+            line = line[len(MANIFEST_CATALOG_PREFIX):].strip()
+        # Нормализуем бытовые формы записи пути, чтобы дубль `./a.md` и `a.md` не
+        # проехал дважды. `/`-абсолют и `..` НЕ чиним — их обязан отбить бэкстоп.
+        while line.startswith("./"):
+            line = line[2:]
+        line = line.strip().strip('"').strip("'").strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        (catalog if is_catalog else brief).append(line)
+    return catalog, brief
+
+
+def read_manifest(company: Optional[str]) -> Optional[tuple[list[str], list[str]]]:
+    """Манифест компании с диска. `None` — файла нет / не читается / он пуст по сути
+    (тогда вызыватель уходит в код-фолбэк). Graceful, как весь загрузчик."""
+    mpath = manifest_path(company)
+    if not mpath or not mpath.is_file():
+        return None
+    try:
+        text = mpath.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        logger.warning("не прочитать манифест знания %s: %s — код-фолбэк", mpath, e)
+        return None
+    catalog, brief = parse_manifest(text)
+    if not catalog and not brief:
+        logger.warning(
+            "манифест знания %s пуст (ни одного пути) — код-фолбэк (поведение как до Ф2)", mpath
+        )
+        return None
+    return catalog, brief
+
+
+def resolve_knowledge_manifest(company: Optional[str]) -> tuple[list[str], list[str], str]:
+    """Эффективный СОСТАВ знания компании: `(каталог, бриф, источник)`.
+
+    Манифест есть → он источник истины («бот читает ИМЕННО их», критерий R3).
+    Манифеста нет / он пуст → код-фолбэк `PROTOCOL_CONTEXT_WHITELIST` (РИСК2: канон
+    артикулов ISS-21 не должен пропасть только оттого, что манифест не доехал).
+
+    Здесь НЕТ фильтрации по безопасности — только состав. Фильтр один, и он на
+    чтении (`_read_knowledge_file` → `context_path_block_reason`).
+    """
+    manifest = read_manifest(company)
+    if manifest is None:
+        return list(PROTOCOL_CONTEXT_WHITELIST), [], "code-fallback"
+    catalog, brief = manifest
+    # ISS-21-страховка, но НЕ подмена воли команды: если файл код-фолбэка (каталог
+    # товаров) физически есть у компании, а в манифесте его забыли — громко скажем.
+    # Не дописываем его молча: критерий R3 требует «бот читает ИМЕННО их».
+    root = repo_root(company)
+    if root:
+        listed = set(catalog) | set(brief)
+        for rel in PROTOCOL_CONTEXT_WHITELIST:
+            if rel not in listed and (root / rel).is_file():
+                logger.warning(
+                    "каталог товаров %s ЕСТЬ в репозитории, но НЕ вписан в манифест — "
+                    "он НЕ попадёт в промпт (канон артикулов будет потерян, ISS-21)", rel,
+                )
+    return catalog, brief, "manifest"
+
+
+# --- Видимый сигнал: «твой файл не подключён, причина Y» (follow-up 1 из Ф1) ----
+
+
+def manifest_report(company: Optional[str], bundle: Optional[KnowledgeBundle] = None) -> str:
+    """Человекочитаемый отчёт «что бот РЕАЛЬНО видит у компании» — для CLI-самопроверки
+    (`tools/check-knowledge-manifest.py`) и как тело Telegram-алерта.
+
+    Зачем: манифест правит команда, а бэкстоп живёт в коде. Без этого отчёта отказ
+    виден только в логе VPS, которого никто не читает, — и человек уверен, что бот
+    знает про его файл, хотя бот не знает (тихая поломка, РИСК из Ф1).
+
+    Опасная тройка: в отчёте ТОЛЬКО пути, размеры и причины — ни байта содержимого.
+    """
+    b = bundle if bundle is not None else load_protocol_knowledge(company)
+    lines: list[str] = []
+    total = sum(len(t.encode("utf-8")) for _, t in list(b.catalog) + list(b.brief))
+    src = {
+        "manifest": f"манифест knowledge/notary/{PROTOCOL_KNOWLEDGE_MANIFEST_FILE}",
+        "code-fallback": "код-фолбэк (манифеста нет — поведение как до Ф2)",
+        "none": "репозиторий контекста компании неизвестен",
+    }.get(b.source, b.source)
+    lines.append(f"Компания: {company or '—'} · источник состава: {src}")
+    lines.append(
+        f"В промпт войдёт: каталог={len(b.catalog)}, бриф={len(b.brief)}, "
+        f"итого {total} Б из бюджета {PROTOCOL_CONTEXT_TOTAL_MAX_BYTES} Б"
+    )
+    for rel, text in b.catalog:
+        lines.append(f"  ✅ каталог  {rel} ({len(text.encode('utf-8'))} Б)")
+    for rel, text in b.brief:
+        lines.append(f"  ✅ бриф     {rel} ({len(text.encode('utf-8'))} Б)")
+    for rel, reason in b.rejected:
+        lines.append(f"  ❌ НЕ вошёл {rel} — {reason}")
+    return "\n".join(lines)
+
+
+def alert_manifest_problems(
+    company: Optional[str],
+    bundle: KnowledgeBundle,
+    *,
+    pusher: object = None,
+) -> bool:
+    """Видимый сигнал владельцу в Telegram: файлы из манифеста НЕ подключены.
+
+    Шлём ТОЛЬКО когда есть что сказать (`rejected` непуст) — молчание при здоровом
+    манифесте, никакого спама на каждой встрече. Дедуп — по НАБОРУ проблем: та же
+    поломка не повторяется 6 ч (окно `notify`), но НОВАЯ (другой файл/причина) даёт
+    новый ключ и доходит сразу.
+
+    `pusher` инъектируется (как в `stt_weekly_guard`): в проде — `notify.push`, в
+    тестах — заглушка. Никогда не бросает: сломанный алерт не должен ронять протокол.
+    """
+    if not bundle.rejected:
+        return False
+    head = f"⚠️ Знание компании «{company}»: {len(bundle.rejected)} файл(ов) НЕ подключены к боту"
+    body = "\n".join(f"• {rel} — {reason}" for rel, reason in bundle.rejected)
+    tail = (
+        f"Протокол соберётся БЕЗ них. Состав правится в "
+        f"{KNOWLEDGE_SUBPATH}/{PROTOCOL_KNOWLEDGE_MANIFEST_FILE} репозитория контекста."
+    )
+    msg = f"{head}\n{body}\n{tail}"
+    key = "knowledge-manifest:%s:%s" % (
+        company,
+        hashlib.sha256("|".join(f"{r}:{c}" for r, c in bundle.rejected).encode("utf-8")).hexdigest()[:12],
+    )
+    if pusher is None:
+        try:
+            from . import notify  # noqa: PLC0415 — lazy: тестам не нужен tg-send
+            pusher = notify.push
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        return bool(pusher(msg, dedupe_key=key))  # type: ignore[operator]
+    except Exception as e:  # noqa: BLE001 — алерт не имеет права уронить сборку
+        logger.warning("не отправить алерт о манифесте знания: %s", type(e).__name__)
+        return False
+
+
+def _read_knowledge_file(root: Path, rel: str) -> tuple[Optional[str], Optional[str]]:
+    """Прочитать ОДИН файл знания через все бэкстопы. → `(text, reason)`.
+
+    Ровно один из двух непуст: либо текст (файл допущен), либо причина отказа
+    (человекочитаемая — она уходит в WARNING и в видимый сигнал `manifest_report`).
+    Тело общее для обоих источников состава — манифеста компании и код-фолбэка,
+    чтобы барьеры физически не могли разойтись между путями.
+
+    Слои (порядок важен — от дешёвых к дорогим):
+      1. `context_path_block_reason` — ЕДИНАЯ точка правды: денилист / `restricted/` /
+         чувствительный паттерн / абсолютный путь / `..`;
+      2. резолв ВНУТРИ корня репо (path-traversal);
+      3. тот же бэкстоп по РЕАЛЬНОМУ пути после симлинков;
+      4. жёсткая ссылка (у неё нет цели — слой 3 бессилен);
+      5. пофайловый потолок размера (урезаем, не молча).
+    Суммарный бюджет — слой 6, он общий для набора (`apply_total_budget`).
+    """
+    reason = context_path_block_reason(rel)
+    if reason:
+        return None, reason
+    path = root / rel
+    if not _is_within(path, root):
+        return None, "путь вне корня репозитория контекста"
+    real_reason = _real_path_block_reason(path, root)
+    if real_reason:
+        return None, f"реальный путь (после симлинков) заблокирован: {real_reason}"
+    if not path.is_file():
+        return None, "файла нет в репозитории контекста"
+    hard_reason = _hardlink_block_reason(path)
+    if hard_reason:
+        return None, hard_reason
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return None, f"не прочитать файл ({type(e).__name__})"
+    if len(data) > PROTOCOL_CONTEXT_FILE_MAX_BYTES:
+        logger.warning(
+            "файл знания %s = %d Б > пофайлового потолка %d Б — урезаю (часть не попадёт)",
+            rel, len(data), PROTOCOL_CONTEXT_FILE_MAX_BYTES,
+        )
+        data = data[:PROTOCOL_CONTEXT_FILE_MAX_BYTES]
+    try:
+        text = data.decode("utf-8", errors="replace").strip()
+    except Exception as e:  # noqa: BLE001 — декод не должен ронять сборку
+        return None, f"не декодировать файл ({type(e).__name__})"
+    if not text:
+        return None, "файл пуст"
+    return text, None
+
+
+def load_protocol_knowledge(company: Optional[str]) -> KnowledgeBundle:
+    """ГЛАВНАЯ точка входа Ф2: собрать знание компании для сборки протокола.
+
+    Состав берётся из ДВУХ возможных источников (см. `resolve_knowledge_manifest`):
+      • манифест компании `knowledge/notary/protocol-knowledge-allowlist.txt` — его
+        ведёт КОМАНДА без деплоя кода (R3/R9);
+      • нет манифеста → код-фолбэк `PROTOCOL_CONTEXT_WHITELIST` = поведение как до
+        Ф2 (каталог WB у МПервый, пусто у Anzhee). РИСК2 плана: манифест мог не
+        доехать на VPS (таймер `context_pull` ещё не активирован, ЗАВ1) — тогда
+        канон артикулов ISS-21 обязан остаться в промпте, и он остаётся.
+
+    Возвращает `KnowledgeBundle`: каталог и бриф РАЗДЕЛЕНЫ (R5 — «Знание о компании»
+    отдельной секцией, чтобы не разбавлять soft-ASR-bias каталога), плюс `rejected`
+    — то, что НЕ доехало до промпта, с причиной (видимый сигнал, follow-up 1 из Ф1).
+
+    Бюджет (50 КБ) применяется к каталогу и брифу СУММАРНО и режет с хвоста, поэтому
+    каталог всегда идёт первым — иначе при переполнении он выпал бы целиком (ISS-21).
+
+    Опасная тройка (R8): в лог уходят ПУТИ, ПРИЧИНЫ и СЧЁТЧИКИ — текст знания не
+    логируется никогда.
     """
     root = repo_root(company)
     if not root:
-        return []
-    out: list[tuple[str, str]] = []
-    for rel in PROTOCOL_CONTEXT_WHITELIST:
-        rel = str(rel)
-        # (1) Единый бэкстоп приватности по заявленному пути.
-        reason = context_path_block_reason(rel)
-        if reason:
-            logger.warning("whitelist-файл НЕ читаю (%s): %s", reason, rel)
-            continue
-        path = root / rel
-        # (2) Path-traversal бэкстоп: путь обязан быть внутри корня репо.
-        if not _is_within(path, root):
-            logger.warning("whitelist-файл вне корня репо, пропуск: %s", rel)
-            continue
-        # (3) Симлинк-бэкстоп: реальный путь тоже обязан проходить бэкстоп.
-        real_reason = _real_path_block_reason(path, root)
-        if real_reason:
-            logger.warning(
-                "whitelist-файл НЕ читаю — реальный путь заблокирован (%s): %s", real_reason, rel
-            )
-            continue
-        if not path.is_file():
-            logger.info("whitelist-файл знания не найден, пропуск: %s", path)
-            continue
-        # (4) Hardlink-бэкстоп: симлинк ловит слой (3), жёсткую ссылку — только этот
-        # (у неё нет цели, `resolve()` бессилен). Проверяем ПОСЛЕ `is_file()`: у
-        # отсутствующего файла `stat()` упал бы, и graceful-пропуск «нет каталога у
-        # anzhee» стал бы шумным WARNING.
-        hard_reason = _hardlink_block_reason(path)
-        if hard_reason:
-            logger.warning("whitelist-файл НЕ читаю (%s): %s", hard_reason, rel)
-            continue
-        try:
-            data = path.read_bytes()
-        except OSError as e:
-            logger.warning("не прочитать whitelist-файл %s: %s", path, e)
-            continue
-        # (5) Пофайловый потолок — не молча: WARNING + обрезка по границе байтов.
-        if len(data) > PROTOCOL_CONTEXT_FILE_MAX_BYTES:
-            logger.warning(
-                "whitelist-файл %s = %d Б > потолка %d Б — урезаю (часть каталога не попадёт)",
-                path, len(data), PROTOCOL_CONTEXT_FILE_MAX_BYTES,
-            )
-            data = data[:PROTOCOL_CONTEXT_FILE_MAX_BYTES]
-        try:
-            text = data.decode("utf-8", errors="replace").strip()
-        except Exception as e:  # noqa: BLE001 — декод не должен ронять сборку
-            logger.warning("не декодировать whitelist-файл %s: %s", path, e)
-            continue
-        if text:
-            out.append((rel, text))
-    # (6) Суммарный бюджет промпта — WARNING + честная обрезка по границе файлов.
-    out = apply_total_budget(out)
-    if out:
+        return KnowledgeBundle(catalog=[], brief=[], rejected=[], source="none")
+
+    catalog_rel, brief_rel, source = resolve_knowledge_manifest(company)
+    rejected: list[tuple[str, str]] = []
+
+    # Каталог ВСЕГДА впереди брифа: `apply_total_budget` режет хвост, и порядок
+    # здесь — единственное, что защищает канон артикулов от переполнения бюджета.
+    read: list[tuple[str, str, str]] = []  # (kind, rel, text)
+    for kind, rels in (("catalog", catalog_rel), ("brief", brief_rel)):
+        for rel in rels:
+            text, reason = _read_knowledge_file(root, str(rel))
+            if reason:
+                logger.warning("знание НЕ подключено (%s): %s", reason, rel)
+                rejected.append((str(rel), reason))
+                continue
+            read.append((kind, str(rel), text or ""))
+
+    # (6) Суммарный бюджет. `apply_total_budget` сам логирует WARNING; здесь мы
+    # ДОБИРАЕМ выпавшее в `rejected`, чтобы человек увидел это не только в логе VPS.
+    kept = apply_total_budget([(rel, text) for _kind, rel, text in read])
+    kept_map = {rel: text for rel, text in kept}
+    for _kind, rel, text in read:
+        if rel not in kept_map:
+            rejected.append((rel, "не влез в бюджет знания (порядок манифеста = приоритет)"))
+        elif len(kept_map[rel]) < len(text):
+            rejected.append((rel, "урезан по бюджету знания (в промпт вошла только часть)"))
+
+    catalog = [(rel, kept_map[rel]) for kind, rel, _t in read if kind == "catalog" and rel in kept_map]
+    brief = [(rel, kept_map[rel]) for kind, rel, _t in read if kind == "brief" and rel in kept_map]
+
+    if catalog or brief:
         logger.info(
-            "знание компании %s: файлов=%d, байт=%d (текст знания не логируется — Опасная тройка)",
-            company, len(out), sum(len(t.encode("utf-8")) for _, t in out),
+            "знание компании %s (источник: %s): каталог=%d, бриф=%d, байт=%d, не подключено=%d "
+            "(текст знания не логируется — Опасная тройка)",
+            company, source, len(catalog), len(brief),
+            sum(len(t.encode("utf-8")) for _, t in catalog + brief), len(rejected),
         )
-    return out
+    return KnowledgeBundle(catalog=catalog, brief=brief, rejected=rejected, source=source)
+
+
+def load_whitelisted_context(company: Optional[str]) -> list[tuple[str, str]]:
+    """Совместимость: ВЕСЬ допущенный набор знания одним списком (каталог + бриф).
+
+    Была главной точкой входа до Ф2 (тогда набор = только `PROTOCOL_CONTEXT_WHITELIST`).
+    Сейчас — тонкая обёртка над `load_protocol_knowledge`, чтобы существующие
+    вызыватели и тесты R6/ISS-21 продолжали работать без правок. Новый код, которому
+    важно РАЗДЕЛЕНИЕ каталога и брифа (рендер секций) или список отклонённых файлов,
+    должен звать `load_protocol_knowledge` напрямую.
+    """
+    bundle = load_protocol_knowledge(company)
+    return list(bundle.catalog) + list(bundle.brief)
 
 
 # --- Чтение YAML (lazy import, graceful) --------------------------------------

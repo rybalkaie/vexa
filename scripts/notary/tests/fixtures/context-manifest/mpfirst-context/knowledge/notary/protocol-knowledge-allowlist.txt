@@ -1,0 +1,19 @@
+# Фикстура манифеста МПервый (тесты Ф2 плана watson-company-memory).
+# Намеренно «отравлена» чувствительными путями: тест доказывает, что вписать их в
+# манифест МОЖНО, а прочитать — НЕЛЬЗЯ (бэкстоп Ф1 живёт в коде, A3).
+
+# Каталог — первым (канон артикулов, ISS-21).
+catalog: knowledge/product-catalog-wb.md
+
+# Безопасный бриф.
+company/brands/altronix/identity.md
+knowledge/notary/komanda-roli.md
+company/baza-znaniy/pozitsionirovanie.md
+
+# ── Ниже — то, что бэкстоп ОБЯЗАН отбить (каждая строка = отдельный слой) ──
+restricted/salaries.md                 # запрет по пути `restricted/`
+knowledge/altronix-ekonomika.md        # денилист по имени
+knowledge/finmodel-2027.md             # чувствительный паттерн имени
+company/net-takogo-fayla.md            # файла нет на диске
+/etc/hosts                             # абсолютный путь
+knowledge/../../../../etc/passwd       # побег из репо через `..`
