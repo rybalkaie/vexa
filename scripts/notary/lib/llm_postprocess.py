@@ -5296,6 +5296,7 @@ _REWRITE_EDIT_KEYS = (
     "roles_separated",    # переотнесено к верному человеку (смешение зон)
     "sharpened",          # плоских формулировок → конкретизировано
     "numbers_fixed",      # чисел/инверсий поправлено по транскрипту
+    "knowledge_fixed",    # Ф3: канон из знания компании подставлен молча (A4)
 )
 
 _REVIEW_REWRITE_CHECKLIST = """Ты — придирчивый редактор-критик протокола встречи (ВТОРОЙ проход). Тебе дан ЧЕРНОВИК протокола (его собрала модель первым проходом) и исходный ТРАНСКРИПТ — источник истины. Задача: вычитать черновик и вернуть УЛУЧШЕННУЮ версию, которую владельцу не придётся править руками.
@@ -5305,10 +5306,14 @@ _REVIEW_REWRITE_CHECKLIST = """Ты — придирчивый редактор-
 2. ЗАДАЧИ БЕЗ ВЛАДЕЛЬЦА — задача без ответственного, хотя из транскрипта видно, кто её взял → проставь владельца в формате «<задача> — <Имя>». Если из записи владелец НЕ следует — не выдумывай, оставь как есть.
 3. СМЕШЕНИЕ РОЛЕЙ/ЗОН — задача / решение приписаны не тому человеку (перепутаны функциональные зоны) → переотнеси к верному по транскрипту.
 4. ПЛОСКИЕ ФОРМУЛИРОВКИ — обтекаемый пункт без сути («обсудили вопрос», «решили по складу») → переформулируй конкретно по транскрипту (что именно решили, с какой цифрой / сроком), НЕ добавляя того, чего в записи нет.
-5. ЧИСЛА И ИНВЕРСИИ — число / сумма / процент в черновике не сходится с транскриптом, либо смысл перевёрнут («успеваем» ↔ «не успеваем», «хватает» ↔ «не хватает», «вырос» ↔ «упал») → исправь по транскрипту.
+5. ЧИСЛА И ИНВЕРСИИ — число / сумма / процент в черновике не сходится с транскриптом, либо смысл перевёрнут («успеваем» ↔ «не успеваем», «хватает» ↔ «не хватает», «вырос» ↔ «упал») → исправь по транскрипту."""
 
-ЖЁСТКИЕ ПРАВИЛА:
-- Источник истины — ТОЛЬКО транскрипт. Ничего не выдумывай и не доноси «из общего знания».
+
+# ЖЁСТКИЕ ПРАВИЛА вынесены из чек-листа отдельной константой (Ф3), чтобы секция
+# «6. ЗНАНИЕ КОМПАНИИ» вставала МЕЖДУ пунктами и правилами — иначе пункт 6 оказался
+# бы после «жёстких правил» и читался как приписка к ним, а не как пункт чек-листа.
+_REVIEW_REWRITE_HARD_RULES = """ЖЁСТКИЕ ПРАВИЛА:
+- Источник истины по СОДЕРЖАНИЮ встречи — ТОЛЬКО транскрипт: что обсудили, что решили, кто что взял. Ничего не выдумывай и не доноси «из общего знания».
 - СОХРАНИ формат и структуру методички (шапка `#протоколвстречи`, секции, дисклеймер автора в начале тела, эмодзи-маркеры) — это редактура, НЕ пересборка с нуля.
 - Не выхолащивай: не удаляй верные содержательные пункты ради «чистоты». Лучше оставить как было, чем переписать верное в неверное.
 - НЕ трогай деление по спикерам в теле протокола — спорные места деления ты сообщишь отдельным списком (см. формат ниже), их пометит система."""
@@ -5326,23 +5331,49 @@ _REVIEW_INVARIANT_SECTION = """ИНВАРИАНТ «НИЧЕГО НЕ ТЕРЯЕ
 - Список — это страховка от потери, а НЕ разрешение фантазировать: ничего сверх списка и транскрипта не добавляй."""
 
 
+# Ф3 (R6/R7, A4): сверка со ЗНАНИЕМ КОМПАНИИ. Включается только когда знание реально
+# подано в user-prompt (`has_knowledge`) — иначе критику нечем сверять и пункт был бы
+# приглашением фантазировать (УПУ1: до Ф3 строка в чек-листе жила БЕЗ справки).
+#
+# Разводка с правилом «источник истины — ТОЛЬКО транскрипт» (оно выше по промпту и
+# остаётся в силе): транскрипт отвечает на вопрос ЧТО обсуждали, справка — КАК ЭТО
+# ПРАВИЛЬНО НАЗЫВАЕТСЯ и КТО ЗА ЭТО ОТВЕЧАЕТ. Справка не добавляет в протокол фактов.
+_REVIEW_KNOWLEDGE_SECTION = """6. ЗНАНИЕ КОМПАНИИ — ниже (после транскрипта) дана СПРАВКА компании: канон названий товаров/моделей/брендов, кто за что отвечает, доменные термины. Черновик мог переврать название товара, приписать зону ответственности не тому человеку или разойтись со справкой в факте о компании. Сверь — и действуй ПО ПРАВИЛУ:
+- КАНОН (название товара/модели/бренда, имя человека, его роль/зона) есть в справке ОДНОЗНАЧНО, а в черновике он искажён → ИСПРАВЬ МОЛЧА прямо в тексте на каноничный вариант. Никаких пометок и оговорок: владелец должен увидеть просто правильный протокол. Посчитай такие правки в `knowledge_fixed`.
+- СПОРНО (справка не покрывает / соответствие неоднозначное / несколько кандидатов / факт черновика противоречит справке, но кто прав — по записи не видно) → НЕ переписывай молча и НЕ выдумывай. Оставь текст как есть и сообщи это отдельным finding'ом `{"section": "knowledge", "quote": "<фрагмент строки протокола, как он есть>", "note": "<в чём сомнение, 3-10 слов>"}` — систему пометит его «⚠️ сверьте: …» сама.
+- Справка — СПРАВОЧНИК, а НЕ содержание встречи: НЕ добавляй в протокол факты, темы и товары из справки, которых на встрече не было. Не обсуждали — значит в протоколе этого нет.
+- Правило «не выдумывай» сильнее желания исправить: сомневаешься — ⚠️-хедж, а не догадка."""
+
+
 def _build_rewrite_system_prompt(
     checks: tuple[str, ...], *, has_prior_items: bool = False,
+    has_knowledge: bool = False,
 ) -> str:
-    """System-prompt второго прохода Ф7: чек-лист критика + (опц.) инвариант Ф2
-    «не теряем задачи прошлой версии» + (опц.) сообщение о грубых ошибках деления
-    по спикерам (Ф4, ТЕМ ЖЕ вызовом) + контракт envelope.
+    """System-prompt второго прохода Ф7: чек-лист критика + (опц.) сверка со знанием
+    компании (Ф3) + (опц.) инвариант Ф2 «не теряем задачи прошлой версии» + (опц.)
+    сообщение о грубых ошибках деления по спикерам (Ф4, ТЕМ ЖЕ вызовом) + контракт
+    envelope.
 
     `has_prior_items` (Ф2/ISS-22 б): на вход поданы пункты прошлой версии/второго
     черновика → добавляем секцию-инвариант. Сам СПИСОК пунктов идёт в user-prompt
     (`review_and_rewrite_protocol`), здесь — только ПРАВИЛО.
 
+    `has_knowledge` (Ф3/УПУ1, R6/R7): в user-prompt реально подана СПРАВКА компании
+    (каталог + бриф) → добавляем пункт 6 чек-листа и правило применения A4 (канон →
+    молча правим, спорное → ⚠️-хедж через findings). Знания нет → пункта нет: сверять
+    было бы не с чем, и он превратился бы в приглашение фантазировать (УПУ1 — ровно
+    та дыра, ради которой Ф3 и существует). Сама СПРАВКА идёт в user-prompt
+    (`review_and_rewrite_protocol`), здесь — только ПРАВИЛО.
+
     Контракт ответа — два блока, разделённых маркерами; протокол отдаётся СЫРЫМ
     markdown'ом после `===ПРОТОКОЛ===` (без JSON-эскейпа), `===ПРАВКИ===` несёт
-    маленький JSON (только diarization-находки + счётчики правок).
+    маленький JSON (findings: диаризация + спорное знание, плюс счётчики правок).
     """
     has_diar = "diarization" in checks
     parts = [_REVIEW_REWRITE_CHECKLIST]
+    if has_knowledge:  # Ф3 (R6/R7, A4): пункт 6 — сверка со справкой компании
+        parts.append(_REVIEW_KNOWLEDGE_SECTION)
+    parts.append(_REVIEW_REWRITE_HARD_RULES)
     if has_prior_items:  # Ф2 (ISS-22 б): инвариант «финал ⊇ прошлой версии»
         parts.append(_REVIEW_INVARIANT_SECTION)
     if has_diar:
@@ -5358,11 +5389,42 @@ def _build_rewrite_system_prompt(
         '"speaker_to": "<только для fix: кому реплика принадлежит>"}'
         if has_diar else ""
     )
+    knowledge_finding = (
+        '{"section": "knowledge", "quote": "<фрагмент строки ПРОТОКОЛА, где сомнение>", '
+        '"note": "<в чём расхождение со справкой, 3-10 слов>"}'
+        if has_knowledge else ""
+    )
+    finding_examples = ", ".join(f for f in (diar_finding, knowledge_finding) if f)
     edits_contract = ", ".join(f'"{k}": <int>' for k in _REWRITE_EDIT_KEYS)
-    findings_note = (
-        "`findings` — ТОЛЬКО грубые ошибки деления по спикерам (verdict fix|flag)."
-        if has_diar else
-        "`findings` сейчас не запрошен — оставь пустым массивом."
+    if has_diar and has_knowledge:
+        findings_note = (
+            "`findings` — ТОЛЬКО (а) грубые ошибки деления по спикерам (verdict "
+            "fix|flag) и (б) СПОРНЫЕ места против справки компании (section "
+            "`knowledge`). Канон, который ты уже исправил в тексте, в findings НЕ "
+            "дублируй."
+        )
+    elif has_diar:
+        findings_note = (
+            "`findings` — ТОЛЬКО грубые ошибки деления по спикерам (verdict fix|flag)."
+        )
+    elif has_knowledge:
+        findings_note = (
+            "`findings` — ТОЛЬКО СПОРНЫЕ места против справки компании (section "
+            "`knowledge`). Канон, который ты уже исправил в тексте, в findings НЕ "
+            "дублируй."
+        )
+    else:
+        findings_note = "`findings` сейчас не запрошен — оставь пустым массивом."
+    # ⚠️-пометки в теле протокола ставит СИСТЕМА по findings (единый формат,
+    # идемпотентность, дедуп) — модель их от себя не пишет. Ф3 не меняет это
+    # правило, а расширяет его на knowledge: спорный факт → finding, не самосуд.
+    flag_rule = (
+        "никаких ⚠️-пометок от себя не добавляй — спорное деление спикеров и "
+        "спорные места против справки компании пометит система по твоему списку "
+        "findings"
+        if has_knowledge else
+        "никаких ⚠️-пометок от себя не добавляй — спорное деление спикеров "
+        "пометит система по твоему списку findings"
     )
     return (
         "\n\n".join(parts)
@@ -5370,14 +5432,13 @@ def _build_rewrite_system_prompt(
         "Верни РОВНО два блока, разделённых строками-маркерами, без markdown-обёртки "
         "и без пояснений вокруг:\n\n"
         + _REWRITE_DIAG_MARKER + "\n"
-        + '{"findings": [' + diar_finding + '], "edits": {' + edits_contract + "}}\n"
+        + '{"findings": [' + finding_examples + '], "edits": {' + edits_contract + "}}\n"
         + _REWRITE_PROTOCOL_MARKER + "\n"
         "<полный улучшенный протокол целиком, начиная со строки #протоколвстречи>\n\n"
         "В блоке ПРАВКИ: `edits` — СЧЁТЧИКИ (целые числа) того, что ты поправил по "
         "пунктам чек-листа (без текста, только количества). " + findings_note + " "
         "В блоке ПРОТОКОЛ — финальный markdown-текст, который увидит владелец "
-        "(никаких ⚠️-пометок от себя не добавляй — спорное деление спикеров "
-        "пометит система по твоему списку findings)."
+        "(" + flag_rule + ")."
     )
 
 
@@ -5522,13 +5583,24 @@ def _normalize_for_match(s: str) -> str:
     return re.sub(r"\s+", " ", out).strip().lower()
 
 
+# Ф3 (R7, A4): глагол ⚠️-пометки зависит от секции. knowledge — «сверьте» (владельца
+# просят СВЕРИТЬ факт со знанием компании, а не перечитать транскрипт), остальные —
+# «проверь» (как было до Ф3). Формулировка «⚠️ сверьте: …» задана решением владельца A4.
+_INLINE_FLAG_VERB = {"knowledge": "сверьте"}
+_DEFAULT_INLINE_FLAG_VERB = "проверь"
+
+
 def _format_tail_finding(f: dict) -> str:
     """Строка хвостового блока «## ⚠️ Проверить» для одного finding.
 
     roles (6.2): спикер-уровневый флаг — `⚠️ <спикер>: <что смешано>`.
     diarization (Ф4): сомнительное деление — `⚠️ спикер под вопросом: «<реплика>» — <note>`.
+    knowledge (Ф3): спорное против справки компании — `⚠️ сверьте: <note> — «<quote>»`.
     values (5.2): не нашли строку для inline — `⚠️ <note> — «<quote>»`.
     """
+    if f.get("section") == "knowledge":
+        # A4: спорный факт НЕ переписан молча — владелец видит, что именно сверить.
+        return f"{REVIEW_FLAG_MARKER} сверьте: {f['note']} — «{f['quote']}»"
     if f.get("section") == "roles":
         return f"{REVIEW_FLAG_MARKER} {f['quote']}: {f['note']}"
     if f.get("section") == "diarization":
@@ -5598,7 +5670,9 @@ def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
         if best_idx == -1:
             unmatched.append(f)
             continue
-        flag = f"{REVIEW_FLAG_MARKER} проверь: {note}"
+        # Ф3: knowledge → «⚠️ сверьте: …» (A4), остальные секции → «⚠️ проверь: …».
+        verb = _INLINE_FLAG_VERB.get(sec, _DEFAULT_INLINE_FLAG_VERB)
+        flag = f"{REVIEW_FLAG_MARKER} {verb}: {note}"
         # Идемпотентность: этот note уже стоит на строке?
         if flag in lines[best_idx]:
             continue
@@ -5752,6 +5826,31 @@ class RewriteResult(NamedTuple):
     degraded: str
 
 
+def _build_knowledge_review_block(
+    knowledge: "context_knowledge.KnowledgeBundle",
+) -> str:
+    """Ф3 (УПУ1): СПРАВКА компании для критик-вызова — ровно те же два блока, что
+    видела генерация: каталог (канон артикулов, R6/R7) + «Знание о компании» (R5).
+
+    Собирается из ГОТОВОГО bundle (`company=None` здесь безопасен: при поданном
+    bundle обе функции с диска не читают) — знание за критик-проход загружается
+    ОДИН раз, в `_selfreview_rewrite_and_apply`, и бюджет Ф1 применяется однократно
+    (инвариант Ф2).
+
+    Критик обязан видеть ТО ЖЕ знание, что видела генерация: иначе он «поправил» бы
+    каноничное название, взятое генерацией из справки, которой сам не видит.
+
+    🔒 Опасная тройка: рендер идёт через `glossary.*`, поэтому знание приходит уже
+    обёрнутым в анти-инъекционную рамку ДАННЫХ (`KNOWLEDGE_DATA_FRAME_HEADER`), а
+    наши правила остаются СНАРУЖИ неё — сторожат тесты Ф1/Ф2, второй рамки не пишем.
+    """
+    blocks = [
+        glossary.catalog_prompt_block(None, bundle=knowledge),
+        glossary.company_knowledge_block(None, bundle=knowledge),
+    ]
+    return "\n\n---\n\n".join(b for b in blocks if b and b.strip())
+
+
 def review_and_rewrite_protocol(
     protocol_text: str,
     transcript_md: str,
@@ -5760,6 +5859,7 @@ def review_and_rewrite_protocol(
     meeting_sid: Optional[str] = None,
     timeout: Optional[int] = None,
     prior_items: Optional[list[str]] = None,
+    knowledge: Optional["context_knowledge.KnowledgeBundle"] = None,
 ) -> RewriteResult:
     """Ф7 (G8): ВТОРОЙ проход «редактор-критик». ОДИН claude-вызов (Opus), который
     и переписывает черновик по чек-листу (пропущенное / задачи без владельца /
@@ -5776,9 +5876,16 @@ def review_and_rewrite_protocol(
     в Ф3 best-of-2). Включает секцию-инвариант «ничего не теряем» в system-prompt и
     подаёт сам список в user-prompt. Пусто/None → обычный второй проход (R-b4).
 
-    G10/опасная тройка: в промпт — только черновик + транскрипт + (опц.) пункты
-    прошлой версии той же встречи (нужны для вычитки); лог несёт длину/время/
-    счётчики, НЕ текст транскрипта/реплик; полный ответ модели не сохраняется
+    `knowledge` (Ф3/УПУ1, R6/R7) — ГОТОВЫЙ `KnowledgeBundle` компании встречи (его
+    грузит `_selfreview_rewrite_and_apply` ОДИН раз). Включает пункт 6 чек-листа
+    («сверь со знанием компании») и подаёт саму СПРАВКУ в user-prompt. До Ф3 критик
+    знания не видел вовсе — сверять было не с чем (УПУ1). Нет bundle / пустой bundle /
+    нет `"knowledge"` в `checks` → пункт не добавляется, поведение как до Ф3.
+
+    G10/опасная тройка: в промпт — черновик + транскрипт + (опц.) пункты прошлой
+    версии той же встречи + (опц.) справка компании, обёрнутая как ДАННЫЕ (рамка
+    `glossary.KNOWLEDGE_DATA_FRAME_HEADER` — анти-инъекция); лог несёт длину/время/
+    счётчики, НЕ текст транскрипта/реплик/знания; полный ответ модели не сохраняется
     (результат — сам улучшенный протокол).
     """
     if not _is_protocol_review_enabled() or not _is_protocol_selfreview_enabled():
@@ -5790,11 +5897,29 @@ def review_and_rewrite_protocol(
     if timeout is None:
         timeout = _selfreview_timeout()
     prior_items = [s for s in (prior_items or []) if s and s.strip()]
-    system_prompt = _build_rewrite_system_prompt(checks, has_prior_items=bool(prior_items))
+    # Ф3: справка идёт в промпт, только если её и запросили (`checks`), и она реально
+    # непустая. Пустой bundle (нет манифеста / компания не определилась) → пункта 6
+    # в чек-листе НЕТ: правило «сверь со справкой» без справки — приглашение выдумывать.
+    knowledge_block = (
+        _build_knowledge_review_block(knowledge)
+        if ("knowledge" in checks and knowledge is not None) else ""
+    )
+    has_knowledge = bool(knowledge_block.strip())
+    system_prompt = _build_rewrite_system_prompt(
+        checks, has_prior_items=bool(prior_items), has_knowledge=has_knowledge,
+    )
     user_prompt = (
         "ЧЕРНОВИК протокола (вычитать и улучшить):\n\n" + protocol_text
         + "\n\n---\n\nТРАНСКРИПТ (источник истины):\n\n" + transcript_md
     )
+    if has_knowledge:
+        # Ф3 (УПУ1): САМА справка — отдельным входом в user-prompt (по образцу
+        # prior_items: правило в system, данные в user). Внутри — рамка ДАННЫХ.
+        user_prompt += (
+            "\n\n---\n\nСПРАВКА КОМПАНИИ (канон названий, ролей и терминов — для "
+            "сверки, НЕ содержание встречи; см. пункт 6 чек-листа):\n\n"
+            + knowledge_block
+        )
     if prior_items:
         # Ф2 (ISS-22 б): список пунктов прошлой версии/второго черновика — страховка
         # от потери (правило в _REVIEW_INVARIANT_SECTION выше). Только формулировки
@@ -5856,9 +5981,14 @@ def review_and_rewrite_protocol(
             meeting_sid or "?", len(protocol), len(protocol_text),
         )
         return RewriteResult(findings, None, edits, "rewrite-too-short")
+    # G10/опасная тройка: про знание в логе — только ЧИСЛА (сколько файлов справки
+    # подано критику и её объём в байтах). Ни строки текста справки/протокола.
     logger.info(
-        "[selfreview] meeting=%s elapsed=%.1fs out_len=%d findings=%d degraded=no",
+        "[selfreview] meeting=%s elapsed=%.1fs out_len=%d findings=%d "
+        "knowledge-files=%d knowledge-bytes=%d degraded=no",
         meeting_sid or "?", elapsed, len(protocol), len(findings),
+        (len(knowledge.catalog) + len(knowledge.brief)) if has_knowledge and knowledge else 0,
+        len(knowledge_block.encode("utf-8")) if has_knowledge else 0,
     )
     return RewriteResult(findings, protocol, edits, "no")
 
@@ -5872,6 +6002,7 @@ def review_and_flag_protocol_file(
     rewrite: bool = False,
     extra_findings: Optional[list[dict]] = None,
     prior_sources: Optional[list[str]] = None,
+    series: Optional[str] = None,
 ) -> int:
     """Высокоуровневая обёртка 5.2/Ф4/Ф7: читает протокол+транскрипт, прогоняет
     ревью-проход (ОДИН claude-вызов), затем правит файлы.
@@ -5902,6 +6033,12 @@ def review_and_flag_protocol_file(
     сохранить (инвариант «не теряем»). Действует только на rewrite-пути. Пусто →
     обычный второй проход (мягкая деградация R-b4).
 
+    `series` (Ф3/УПУ1) — серия встречи: по ней критик получает СПРАВКУ компании
+    (каталог + бриф) и сверяет с ней названия товаров, роли и факты (R6/R7). Только
+    rewrite-путь и только при `"knowledge"` в `checks`. НЕ передан → критик работает
+    как до Ф3 (без справки — сверять не с чем). Все 4 боевых call-site обязаны его
+    передавать; сторожит `TestCallSiteParity` (иначе тихая потеря проверки).
+
     Оба файла пишутся atomic, независимо и best-effort: сбой записи одного не
     валит встречу и не мешает второму. Возвращает суммарное число изменений.
     D4/G10: лог — ТОЛЬКО счётчики/метаданные, без текста реплик/имён.
@@ -5925,7 +6062,7 @@ def review_and_flag_protocol_file(
         return _selfreview_rewrite_and_apply(
             protocol_path, transcript_path, protocol_text, transcript_md,
             checks=checks, meeting_sid=meeting_sid, extra_findings=extra,
-            prior_sources=prior_sources,
+            prior_sources=prior_sources, series=series,
         )
 
     findings = review_protocol(
@@ -6011,6 +6148,36 @@ def _item_present_in(item: str, text_tokens: set[str]) -> bool:
     return hits >= max(1, int(0.6 * len(toks)))
 
 
+def _load_review_knowledge(
+    checks: tuple[str, ...], series: Optional[str],
+) -> Optional["context_knowledge.KnowledgeBundle"]:
+    """Ф3 (УПУ1): знание компании для критик-прохода — ОДНО чтение диска за проход.
+
+    Компания выводится ТОЙ ЖЕ функцией, что и в генерации (`series_markup.
+    company_for_series` — разметка `watched.yaml` первична, Ф6), а НЕ оргструктурным
+    `context_knowledge.company_for_series`: иначе критик мог бы получить знание другой
+    компании (или пустое) и «поправить» канон, который генерация законно взяла из
+    справки.
+
+    Гейты self-review проверяем ЗДЕСЬ только чтобы не читать 60 КБ зря при выключенном
+    критике — на корректность это не влияет (`review_and_rewrite_protocol` всё равно
+    вернёт `disabled`). Best-effort: сбой чтения знания НЕ имеет права уронить проход —
+    вернём None, критик отработает как до Ф3 (деградация, не потеря встречи).
+    """
+    if "knowledge" not in checks:
+        return None
+    if not _is_protocol_review_enabled() or not _is_protocol_selfreview_enabled():
+        return None
+    try:
+        company = series_markup.company_for_series(series)
+        return context_knowledge.load_protocol_knowledge(company)
+    except Exception as e:  # noqa: BLE001 — знание опционально, встреча важнее
+        logger.warning(
+            "[selfreview] knowledge load failed (non-fatal): %s", type(e).__name__,
+        )
+        return None
+
+
 def _selfreview_rewrite_and_apply(
     protocol_path: Path,
     transcript_path: Path,
@@ -6021,6 +6188,7 @@ def _selfreview_rewrite_and_apply(
     meeting_sid: Optional[str],
     extra_findings: Optional[list[dict]] = None,
     prior_sources: Optional[list[str]] = None,
+    series: Optional[str] = None,
 ) -> int:
     """Ф7 (G8): прогоняет второй проход (`review_and_rewrite_protocol`, ОДИН
     вызов) и применяет результат:
@@ -6037,11 +6205,18 @@ def _selfreview_rewrite_and_apply(
     извлекаются задачи/решения (инвариант «не теряем»), подаются критику. Восстановление
     молчаливое, поэтому для аудита логируем СЧЁТЧИК: сколько прошлых пунктов было под
     угрозой (нет в черновике) и сколько критик вернул в финал — без текста пунктов.
+
+    `series` (Ф3/УПУ1): серия встречи → компания → СПРАВКА компании критику (R6/R7).
+    Правило A4: канон критик правит в тексте МОЛЧА (счётчик `knowledge_fixed`), спорное
+    возвращает findings `section="knowledge"` → система ставит «⚠️ сверьте: …» тем же
+    механизмом, что diarization-флаги (единый формат, идемпотентность). Серии нет /
+    компания не определилась / знания нет → поведение как до Ф3.
     """
     prior_items = _extract_prior_items(prior_sources)
+    knowledge = _load_review_knowledge(checks, series)
     result = review_and_rewrite_protocol(
         protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
-        prior_items=prior_items,
+        prior_items=prior_items, knowledge=knowledge,
     )
     findings = result.findings
     rewrite_applied = result.protocol is not None
@@ -6086,8 +6261,16 @@ def _selfreview_rewrite_and_apply(
         f for f in findings
         if f.get("section") == "diarization" and f.get("verdict") != "fix"
     ]
+    # Ф3 (R7, A4): спорное против справки компании — НЕ молчаливая переписка, а видимая
+    # пометка «⚠️ сверьте: …». Канон критик уже поправил в теле молча (knowledge_fixed);
+    # сюда приходит только то, в чём он не уверен. Единый механизм пометок с diarization:
+    # inline к строке протокола, не нашлась строка → хвостовой блок «## ⚠️ Проверить».
+    knowledge_flags = [
+        f for f in findings
+        if f.get("section") == "knowledge" and f.get("quote") and f.get("note")
+    ]
     extra = [f for f in (extra_findings or []) if f.get("quote") and f.get("note")]
-    flag_findings = diar_flags + extra
+    flag_findings = diar_flags + knowledge_flags + extra
     flagged = apply_review_flags(base_protocol, flag_findings)
 
     # Пишем протокол, если он реально изменился относительно черновика на диске
@@ -6102,15 +6285,20 @@ def _selfreview_rewrite_and_apply(
 
     e = result.edits or {}
     # G10: лог — только метаданные/счётчики, без текста реплик/имён. Ф2: prior-items
-    # (проверено) / at-risk (под угрозой потери) / recovered (вернул критик).
+    # (проверено) / at-risk (под угрозой потери) / recovered (вернул критик). Ф3
+    # (R8): knowledge-fixed — сколько канон-правок критик сделал молча, knowledge-flags
+    # — сколько спорных мест помечено «⚠️ сверьте». ТОЛЬКО ЧИСЛА: ни текста правок, ни
+    # текста справки/реплик в лог не уходит (опасная тройка).
     logger.info(
         "[selfreview] meeting=%s rewrite=%s degraded=%s diar-fixes=%d diar-flags=%d "
         "added=%d owners=%d roles=%d sharpened=%d numbers=%d "
+        "knowledge-fixed=%d knowledge-flags=%d "
         "prior-items=%d at-risk=%d recovered=%d",
         meeting_sid or "?", "applied" if rewrite_applied else "skipped", result.degraded,
         n_fixes, len(diar_flags) if n_protocol_changes else 0,
         e.get("added_agreements", 0), e.get("owners_assigned", 0),
         e.get("roles_separated", 0), e.get("sharpened", 0), e.get("numbers_fixed", 0),
+        e.get("knowledge_fixed", 0), len(knowledge_flags) if n_protocol_changes else 0,
         n_prior, n_at_risk, n_recovered,
     )
     return n_fixes + n_protocol_changes

@@ -139,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
     # --no-review или env NOTARY_REGEN_NO_REVIEW=1. Best-effort: нет claude /
     # kill-switch выключен → 0 пометок, файл не трогаем, ошибка НЕ валит CLI.
     # R9: в stderr только счётчики, без текста реплик/задач.
+    # Ф3 (watson-company-memory): + check "knowledge" и `series` — ручная перегенерация
+    # тоже идёт через сверку со СПРАВКОЙ компании (A10), как и боевой finalize.
     env_skip = (os.environ.get("NOTARY_REGEN_NO_REVIEW") or "").strip().lower() not in ("", "0", "false", "no")
     if args.no_review or env_skip:
         print("[regen] self-review пропущен (--no-review / NOTARY_REGEN_NO_REVIEW)", file=sys.stderr)
@@ -147,9 +149,10 @@ def main(argv: list[str] | None = None) -> int:
             n_flags = review_and_flag_protocol_file(
                 protocol_path=protocol_path,
                 transcript_path=transcript_path,
-                checks=("values", "roles", "memory", "diarization"),
+                checks=("values", "roles", "memory", "diarization", "knowledge"),
                 meeting_sid=f"cli-{args.series}-{args.date}",
                 rewrite=True,
+                series=args.series,  # Ф3 (УПУ1): → компания → справка компании критику
                 # Ф2 (ISS-22 б): прошлая версия → инвариант «не теряем задачи/решения».
                 prior_sources=[prior_protocol_text] if prior_protocol_text else None,
             )

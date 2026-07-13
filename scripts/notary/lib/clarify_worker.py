@@ -289,14 +289,18 @@ def _apply_resolution(
         # Ф7 (G8): rewrite=True — паритет с finalize. Поздний clarify тоже отдаёт
         # вычитанный второй проходом протокол (иначе доразметка теряла бы редактуру
         # критика). ТЕМ ЖЕ одним вызовом, что diarization — не третий вызов.
+        # Ф3 (watson-company-memory): + check "knowledge" и `series` — паритет с
+        # finalize по СПРАВКЕ компании (память `review-checks-two-call-sites`): без
+        # них поздний clarify молча отдавал бы протокол без сверки с каноном.
         if protocol_regenerated:
             try:
                 n_flags = llm_postprocess.review_and_flag_protocol_file(
                     protocol_path=protocol_path,
                     transcript_path=transcript_path,
-                    checks=("values", "roles", "memory", "diarization"),  # Ф7+Ф4: те же checks, что в finalize, ОДНИМ вызовом
+                    checks=("values", "roles", "memory", "diarization", "knowledge"),
                     meeting_sid=state.get("meeting_id"),
                     rewrite=True,
+                    series=meta_block.get("series"),
                     # R3: паритет с finalize — после перегенерации заново ставим ⚠️
                     # «авторство под вопросом» для тёзка-подстановок (иначе доразметка
                     # теряла бы пометку). Имена сохранены в state при первой clarify.

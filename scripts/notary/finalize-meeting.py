@@ -1187,6 +1187,40 @@ def main() -> int:
         raise
     log.info("Protocol written → %s", md_path)
 
+    # 4a-ter. Забор РЕШЕНИЙ из готового протокола в журнал второго мозга (Д2.2, R4).
+    # Гейт ENABLE_MEETING_DECISION_DRAFTS (дефолт OFF) — на боевые встречи без флага
+    # ноль влияния. Скраб fail-closed внутри prepare_extraction (Опасная тройка не
+    # уходит в LLM). Извлечение — тем же claude --print, что и маппинг имён (подписка
+    # владельца). Результат — черновик в транспорт-очередь mac←VPS (queue_path).
+    # Best-effort: ЛЮБОЙ сбой здесь НЕ валит финализацию (протокол уже на диске).
+    if os.environ.get("ENABLE_MEETING_DECISION_DRAFTS", "0") != "0":
+        try:
+            from lib import meeting_decisions as _mdec
+            from lib.claude_cli import call_claude_print as _ccp
+            _prep = _mdec.prepare_extraction(
+                markdown, series=meta.get("series"), date=date_part)
+            if not _prep.get("ok"):
+                log.info("[decision-drafts] пропуск извлечения: %s", _prep.get("reason"))
+            else:
+                _draft = _ccp(
+                    _prep["prompt"],
+                    timeout=int(os.environ.get("MEETING_DECISION_TIMEOUT", "120")),
+                )
+                _norm = (_draft or "").strip()
+                if _norm and not _norm.lower().startswith("решение не выявлено"):
+                    _rec = _mdec.to_queue_record(
+                        _draft, series=meta.get("series"),
+                        date=date_part, meeting_sid=session_uid)
+                    _qp = _mdec.queue_path()
+                    _qp.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_qp, "a", encoding="utf-8") as _qf:
+                        _qf.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+                    log.info("[decision-drafts] черновик решения дописан → %s", _qp)
+                else:
+                    log.warning("[decision-drafts] пустой ответ извлечения — пропуск")
+        except Exception as e:  # noqa: BLE001 — забор НИКОГДА не валит финализацию
+            log.warning("[decision-drafts] non-fatal: %s", e)
+
     # 4a-bis. Ф1-доработки (2026-06-04): «чистое время обсуждения» (REQ 2.1/2.2).
     # По словам транскрипта (type=word) считаем firstSpeechMs=min(start_time),
     # lastSpeechMs=max(end_time) и кладём в meta.recording. Это превращает
@@ -1455,6 +1489,11 @@ def main() -> int:
     # критик-склейщик; на редких путях (команда/CLI) — два (генерация + критик).
     # РИСК1: таймаут/сбой второго прохода → черновик отдаётся как финал (деградация,
     # не потеря встречи).
+    # Ф3 (watson-company-memory): добавлен check "knowledge" + `series` — критик ТЕМ ЖЕ
+    # вызовом сверяет черновик со СПРАВКОЙ компании (канон товаров/моделей, роли, факты
+    # из знания). Канон правит молча, спорное помечает «⚠️ сверьте: …» (A4). Компанию
+    # по серии выводит сам llm_postprocess — ТОЙ ЖЕ функцией, что генерация
+    # (series_markup.company_for_series), иначе критик увидел бы знание другой компании.
     if _is_protocol_enabled() and protocol_path.is_file():
         # Ф3 (ISS-22 в, best-of-2): на ПЕРВОЙ публикации (finalize) протокол
         # собирается из ДВУХ независимых черновиков. Черновик A уже на диске
@@ -1480,9 +1519,10 @@ def main() -> int:
             n_flags = review_and_flag_protocol_file(
                 protocol_path=protocol_path,
                 transcript_path=md_path,
-                checks=("values", "roles", "memory", "diarization"),
+                checks=("values", "roles", "memory", "diarization", "knowledge"),
                 meeting_sid=session_uid,
                 rewrite=True,
+                series=meta.get("series"),  # Ф3 (УПУ1): → компания → справка критику
                 # R3: ⚠️ «авторство под вопросом, поправьте» для тёзка-подстановок
                 # (system-applied, входит в content-hash). Паритет в clarify_worker.
                 extra_findings=build_authorship_uncertainty_findings(uncertain_names),

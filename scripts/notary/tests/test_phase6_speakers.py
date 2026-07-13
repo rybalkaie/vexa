@@ -317,9 +317,16 @@ class TestReviewSurvivesRevision(unittest.TestCase):
             self.assertTrue(rev.called)
             # Объединённый проход на ревизии — те же checks, что в finalize.
             # Ф7 расширил набор: + "memory" (дисциплина «прошлое = справка»); Ф4: +
-            # "diarization" (поздний реген не должен терять ⚠️ «спикер под вопросом»).
-            # Всё тем же ОДНИМ вызовом (НЕ отдельный проход).
-            self.assertEqual(rev.call_args.kwargs.get("checks"), ("values", "roles", "memory", "diarization"))
+            # "diarization" (поздний реген не должен терять ⚠️ «спикер под вопросом»);
+            # Ф3 плана watson-company-memory: + "knowledge" (поздний clarify тоже сверяет
+            # черновик со справкой компании — иначе теряет проверку, которую делает
+            # finalize). Всё тем же ОДНИМ вызовом (НЕ отдельный проход).
+            self.assertEqual(
+                rev.call_args.kwargs.get("checks"),
+                ("values", "roles", "memory", "diarization", "knowledge"),
+            )
+            # Ф3: серия обязана доехать — без неё справки компании у критика не будет.
+            self.assertTrue(rev.call_args.kwargs.get("series"))
             # Порядок: регенерация → ревью (вернуло ⚠️) → до-сыл.
             simplified = [c if isinstance(c, str) else c[0] for c in order]
             self.assertEqual(simplified, ["regen", "review", "redeliver"])

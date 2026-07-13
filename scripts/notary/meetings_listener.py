@@ -452,13 +452,16 @@ def _job_protocol_command(
     # несёт ревизию диаризации Ф4), не третий. Транскрипт уже на руках — переиспользуем.
     # Best-effort/паритет с clarify: нет claude / kill-switch выключен → 0 пометок,
     # файл не трогаем, ошибка НЕ валит команду. R9: в лог только счётчики/метаданные.
+    # Ф3 (watson-company-memory): + check "knowledge" и `series` — ручная команда тоже
+    # сверяет черновик со СПРАВКОЙ компании (паритет всех 4 боевых call-site).
     try:
         n_flags = review_and_flag_protocol_file(
             protocol_path=protocol_path,
             transcript_path=transcript_path,
-            checks=("values", "roles", "memory", "diarization"),
+            checks=("values", "roles", "memory", "diarization", "knowledge"),
             meeting_sid=f"tg-cmd-{series}-{date_str}",
             rewrite=True,
+            series=series,  # Ф3 (УПУ1): → компания → справка компании критику
             # Ф2 (ISS-22 б): прошлая версия → инвариант «не теряем задачи/решения».
             prior_sources=[prior_protocol_text] if prior_protocol_text else None,
         )
