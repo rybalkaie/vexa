@@ -286,10 +286,14 @@ class TestRisk1TranslitNamesSlipPatterns(_FixtureContextMixin, unittest.TestCase
     """⚠️ ЭТО НЕ БАГ-ТЕСТ, А ДОКАЗАТЕЛЬСТВО ГРАНИЦЫ (РИСК1 плана).
 
     Реальные финфайлы МПервый в `company/baza-znaniy/` названы транслитом без корней
-    `ekonomika`/`finmodel`/`confidential` — паттерны их НЕ ловят, и glob-инклюд папки
-    отправил бы ДДС и взаиморасчёты во внешний LLM. Тест фиксирует это чёрным по
-    белому, чтобы Ф2 не соблазнилась глобом: первичная защита `baza-znaniy` — ЯВНЫЙ
-    short-list конкретных файлов в манифесте, паттерны там ничего не гарантируют."""
+    `ekonomika`/`finmodel`/`confidential` — паттерны ПО ИМЕНИ их НЕ ловят. Это по-прежнему
+    так, и потому первичная защита `baza-znaniy` — ЯВНЫЙ short-list в манифесте, а glob
+    папки запрещён: имя файла не доказывает его содержимое.
+
+    Что изменилось в Ф1 плана `knowledge-content-barrier`: раньше на этом защита и
+    заканчивалась (файл, вписанный в манифест, уезжал во внешнюю модель), теперь такой файл
+    ловит барьер по СОДЕРЖИМОМУ. Тесты ниже фиксируют оба факта: имя молчит — содержимое
+    останавливает."""
 
     def test_translit_fin_names_are_NOT_caught_by_patterns(self):
         """Фиксация факта: паттерн-бэкстоп по этим именам молчит."""
@@ -305,13 +309,22 @@ class TestRisk1TranslitNamesSlipPatterns(_FixtureContextMixin, unittest.TestCase
         ):
             self.assertIsNone(ck.context_path_block_reason(rel), rel)
 
-    def test_glob_style_include_WOULD_leak_finance(self):
-        """Симуляция glob'а папки: финфайлы прошли бы в промпт → glob ЗАПРЕЩЁН."""
+    def test_glob_style_include_is_stopped_by_content_barrier(self):
+        """Симуляция glob'а папки. РАНЬШЕ (до Ф1 плана `knowledge-content-barrier`) финфайлы
+        прошли бы в промпт — тест это и фиксировал. ТЕПЕРЬ их ловит барьер по СОДЕРЖИМОМУ:
+        имя по-прежнему ничего не гарантирует (тест выше), а внутрь мы наконец смотрим.
+
+        Закон «baza-znaniy — только поимённо, НИКОГДА glob папки» при этом ОСТАЁТСЯ в силе:
+        контент-барьер ловит ДЕНЬГИ, а не «всё чувствительное» (файл со стратегией сделки он
+        пропустит). Он последняя линия, а не разрешение глобить."""
         self._patch_whitelist(tuple(_TRANSLIT_FIN) + (_SAFE_KNOWLEDGE,))
         files = ck.load_whitelisted_context("mpfirst")
         rels = [r for r, _ in files]
-        for rel in _TRANSLIT_FIN:
-            self.assertIn(rel, rels, "…и именно поэтому glob по baza-znaniy/ запрещён (РИСК1)")
+        blob = "\n".join(t for _, t in files)
+        for rel, sentinel in _TRANSLIT_FIN.items():
+            self.assertNotIn(rel, rels, f"финфайл {rel} прошёл барьер по содержимому")
+            self.assertNotIn(sentinel, blob, f"текст {rel} уехал бы во внешнюю модель")
+        self.assertIn(_SAFE_KNOWLEDGE, rels, "безопасный сосед по папке остался (не ловим всё подряд)")
 
     def test_explicit_shortlist_keeps_finance_out(self):
         """А вот КАК надо (контракт для Ф2): манифест перечисляет файлы поимённо —

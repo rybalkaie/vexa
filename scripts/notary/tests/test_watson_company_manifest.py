@@ -364,13 +364,20 @@ class TestR9ManifestCannotOpenFinances(_ContextRoot, unittest.TestCase):
 
     def test_translit_fin_neighbour_not_listed_stays_out(self):
         """РИСК1 наглядно: транслит-финфайл лежит В ТОЙ ЖЕ папке, что разрешённый, и
-        паттернами НЕ ловится. Его держит снаружи ровно одно — он не вписан в манифест.
-        Это и есть закон «baza-znaniy — только поимённо, НИКОГДА glob папки»."""
+        паттернами ПО ИМЕНИ НЕ ловится. Его держат снаружи два независимых слоя: он не вписан
+        в манифест И (с Ф1 плана `knowledge-content-barrier`) его ловит барьер по содержимому.
+        Закон «baza-znaniy — только поимённо, НИКОГДА glob папки» остаётся в силе."""
         sp = llm_postprocess._build_protocol_system_prompt("mpfirst", _METHOD)
         self.assertIn(_BAZA_OK, sp)          # сосед из той же папки — вошёл (он в манифесте)
         self.assertNotIn(_TRANSLIT_FIN, sp)  # финфайл — нет (его в манифесте нет)
-        # Докажем, что дело именно в манифесте, а не в бэкстопе: бэкстоп его НЕ блокирует.
+        # Слой 1 (имя) на нём по-прежнему МОЛЧИТ — именно поэтому и понадобился слой 2.
         self.assertIsNone(ck.context_path_block_reason("company/baza-znaniy/924-uchet-dds.md"))
+        # Слой 2 (содержимое) — ловит: вписать такой файл в манифест теперь недостаточно.
+        self.assertIsNotNone(
+            ck.context_path_block_reason(
+                "company/baza-znaniy/924-uchet-dds.md", text="# Учет ДДС\n\nОстаток по кассе.\n"
+            )
+        )
 
     def test_manifest_filter_uses_the_single_backstop(self):
         """Инвариант Ф1: фильтр манифеста ОБЯЗАН звать `context_path_block_reason`, а не
@@ -378,9 +385,12 @@ class TestR9ManifestCannotOpenFinances(_ContextRoot, unittest.TestCase):
         seen: list[str] = []
         orig = ck.context_path_block_reason
 
-        def spy(rel):
+        # `text=` появился в Ф1 плана `knowledge-content-barrier`: та же точка правды теперь
+        # умеет судить и по СОДЕРЖИМОМУ (имени мало — финфайлы названы транслитом). Шпион
+        # обязан пропускать аргумент дальше, иначе он проверял бы не боевую функцию.
+        def spy(rel, text=None):
             seen.append(str(rel))
-            return orig(rel)
+            return orig(rel, text=text)
 
         ck.context_path_block_reason = spy
         self.addCleanup(lambda: setattr(ck, "context_path_block_reason", orig))

@@ -302,22 +302,278 @@ def repo_root(company: Optional[str]) -> Optional[Path]:
     return context_root() / repo
 
 
+# --- Ф1 плана `knowledge-content-barrier`: БАРЬЕР ПО СОДЕРЖИМОМУ ---------------
+#
+# ЗАЧЕМ. Барьеры выше судят файл ПО ИМЕНИ. Независимый аудит доказал, что этого мало:
+# финансовые файлы `company/baza-znaniy/` названы транслитом (`867-nalichnye-kassy-…`,
+# `924-uchet-dds`, `925-…sebestoimosti-postavki`, `837-planirovanie-oplat-…`) и проходят
+# ВСЕ проверки имени. Манифест ведёт команда без ревью кода — одна строка, и деньги
+# компании уехали бы во внешнюю модель. Здесь мы смотрим ВНУТРЬ файла.
+#
+# ЭМПИРИКА, на которой построены пороги (замерено на боевых `*-context`, 2026-07-13):
+#   • Реальные финфайлы базы знаний ЧАСТО НЕ СОДЕРЖАТ СУММ вообще. `924-uchet-dds` —
+#     это заголовок + ссылка на видео; `922-…reklamnykh-integratsiy` — заголовок +
+#     ссылка на закрытую таблицу. Барьер «ищем ₽» их бы НЕ поймал. Зато их безошибочно
+#     выдаёт ТЕМА документа (заголовок + имя файла) — поэтому она первый и главный слой.
+#   • Боевые файлы знания (каталоги, роли, позиционирование) упоминают деньги ТОЛЬКО в
+#     дисклеймерах («Что здесь НЕ лежит: цены, себестоимость, маржа») и в определениях
+#     терминов. Поэтому строки-отрицания из подсчёта плотности исключаются, а одиночное
+#     упоминание мягкого термина не блокирует — иначе отвалился бы каталог товаров, и
+#     бот снова начал бы врать в артикулах (ISS-21, ровно та боль, ради которой всё).
+#
+# ГРАНИЦЫ СЛОВ ОБЯЗАТЕЛЬНЫ. Каталог Anzhee полон «стРУБцин» и «тРУБок», каталог WB —
+# артикулов с цифрами; «товар пРИБЫЛ на склад» — это не «прибыль». Все маркеры ниже —
+# регексы с `\b` (в Python он работает с кириллицей), НЕ поиск подстроки.
+#
+# Опасная тройка: наружу (лог, Telegram) уходит только ТИП маркера и счётчик. Ни текст
+# файла, ни найденные суммы не логируются и не попадают в причину отказа.
+
+_SEP = r"[    ]"  # пробел, nbsp, narrow-nbsp, thin-space (разделители тысяч)
+
+# Денежная сумма: «1 250 000 ₽», «42 000,00 руб.», «$1,200». Разделитель тысяч — только
+# пробельные из `_SEP` (НЕ `\s`: перевод строки склеил бы «пункт 5» и «руб» с разных строк).
+_FIN_MONEY_RE = re.compile(
+    rf"\d(?:[\d{_SEP[1:-1]}]*\d)?(?:[.,]\d+)?{_SEP}*"
+    r"(?:₽|€|\$|¥|\bруб[а-яё]*\b|\bр\.|\brub\b|\busd\b|\beur\b|\bcny\b|\bюан[а-яё]*\b)",
+    re.IGNORECASE,
+)
+_FIN_MONEY_PREFIX_RE = re.compile(rf"(?:₽|€|\$|¥){_SEP}?\d")
+
+# ЖЁСТКИЕ термины денежного учёта: в боевых файлах знания их НОЛЬ (проверено на обоих
+# `*-context`), поэтому одного вхождения вне дисклеймера достаточно для отказа.
+# `\bза[йё]м\b|займ[аыуе]\b|…` — НЕ `займ\w*`: иначе «это займёт 5 минут» = финансы.
+_FIN_HARD_RE = re.compile(
+    r"\bддс\b"
+    r"|\bвзаиморасч[её]т\w*"
+    r"|\bоклад\w*|\bзарплат\w*|\bзаработн\w+" + _SEP + r"+плат\w+|\bфонд" + _SEP + r"+оплаты" + _SEP + r"+труда\b"
+    r"|\bреинвестир\w*"
+    r"|\bдебиторк\w*|\bдебиторск\w*|\bкредиторк\w*|\bкредиторск\w*"
+    r"|\bкасс[аыуеой]\b|\bкассам\w*|\bкассах\b|\bкассов\w*"  # «кассета» НЕ ловится (\b)
+    r"|\bза[йё]м\b|\bзайм[аыуе]\b|\bзаймов\b|\bзаймам[и]?\b|\bзаймах\b|\bссуд[аыуе]\b"
+    r"|\bp&l\b|\bпи[- ]?энд[- ]?эл\b",
+    re.IGNORECASE,
+)
+
+# МЯГКИЕ термины: встречаются и в легитимных файлах (дисклеймер каталога, определение
+# термина в брифе, зона ответственности в «кто за что отвечает»). Блокируют только
+# ПЛОТНОСТЬЮ. `\bприбыл[ьи]\b` — не `прибыл\w*`: «товар прибыл» это глагол.
+_FIN_SOFT_RE = re.compile(
+    r"\bмарж[аиуе]\b|\bмаржинальн\w*"
+    r"|\bсебестоимост\w*"
+    r"|\bнаценк\w*"
+    r"|\bприбыл[ьи]\b|\bприбыльн\w*"
+    r"|\bвыручк\w*"
+    r"|\bоборот[аеуы]?\b|\bоборотн\w*"
+    r"|\bдилерск\w*"
+    r"|\bпрайс\w*"
+    r"|\bррц\b|\brrc\b"
+    r"|\bзакупочн\w*"
+    r"|\bрентабельн\w*"
+    r"|\bюнитк\w*|\bюнит[- ]эконом\w*|\bunit[- ]эконом\w*",
+    re.IGNORECASE,
+)
+
+# ТЕМА документа = заголовок H1 + имя файла. Заявление «этот документ ПРО деньги» —
+# сильнее любого упоминания в теле. Транслит обязателен: имена файлов базы знаний —
+# `nalichnye-kassy`, `uchet-dds`, `sebestoimost`, `vzaimoraschety`, `planirovanie-oplat`.
+_FIN_TOPIC_STRONG_RE = re.compile(
+    r"\bддс\b|\bdds\b"
+    r"|взаиморасч|vzaimorasch"
+    r"|себестоимост|sebestoimost"
+    r"|\bкасс[аыои]\b|\bкассам|\bкассах|nalichnye|\bkass[aeouy]"
+    r"|\bза[йё]м\b|\bзайм[аыуео]|\bzaym|ссуд[аыое]"
+    r"|реинвестир|reinvest"
+    r"|зарплат|zarplat|\bоклад|\boklad"
+    r"|\bмарж[аиуе]\b|маржинальн|marzh"
+    r"|эконом|ekonomik|economic"
+    r"|финмодел|finmodel|финанс|finans"
+    r"|бюджет|budget|\bсмет[аыу]\b"
+    r"|прайс|\bprice\b"
+    r"|курс\w*" + _SEP + r"+валют|kursy-valyut|valyut"
+    r"|\bприбыл[ьи]\b|pribyl"
+    r"|выручк|vyruchk"
+    r"|дебитор|debitor|кредитор"
+    r"|наценк|natsenk"
+    r"|оплат|oplat"
+    r"|сверк\w*" + _SEP + r"+остатк|sverka-ostatkov"
+    r"|дивиденд|divident|инвестиц|investic",
+    re.IGNORECASE,
+)
+# Мягкая тема: «учёт», «расход», «доход», «отчёт» сами по себе бывают и не про деньги
+# («учёт рабочего времени»). Блокируют только с ПОДКРЕПЛЕНИЕМ (ссылка на таблицу учёта,
+# метка финдепартамента, денежный термин или сумма в теле).
+_FIN_TOPIC_SOFT_RE = re.compile(
+    r"уч[её]т|учитыва|\bucheta?\b|uchityvat|\buchet"
+    r"|расход|rashod|доход|dohod"
+    r"|закупк|zakupk",
+    re.IGNORECASE,
+)
+
+# Метка базы знаний Platrum: шапка-цитата статьи несёт «раздел «Финансовый департамент»».
+# Прямое заявление источника, что документ финансовый.
+_FIN_PLATRUM_RE = re.compile(
+    r"раздел\s*[«\"']?\s*(?:финансов\w+|бухгалтер\w+)\s+департамент", re.IGNORECASE
+)
+# Файл сам объявляет себя закрытым — уважаем это, даже если денег внутри нет.
+_CLOSED_MARK_RE = re.compile(
+    r"конфиденциальн\w*|закрыт\w+\s+слой|\bconfidential\b|не\s+для\s+распространения", re.IGNORECASE
+)
+# Процент рядом с финансовым термином: «Маржинальность более 20%» — это финансовый
+# критерий, хотя ни одной суммы в файле нет.
+_FIN_PERCENT_RE = re.compile(rf"\d+(?:[.,]\d+)?{_SEP}*%")
+
+# ⚠️ ТОЛЬКО URL-ссылки на Google-документы — НЕ голые ID! В шапке боевого каталога WB
+# лежат три ГОЛЫХ ID таблиц (`10kEZ…`!`Артикулы`) без домена: посчитай мы их «ссылками
+# на таблицы учёта» — каталог товаров отвалился бы целиком (ISS-21). Голые ID — забота
+# `redact_internal_ids` (вырезаются на выходе), а не барьера.
+_GSHEET_URL_RE = re.compile(
+    r"docs\.google\.com/(?:spreadsheets|document|presentation)"
+    r"|drive\.google\.com/(?:drive/)?(?:folders|u/\d+/folders)",
+    re.IGNORECASE,
+)
+# Строка-дисклеймер: «Что здесь НЕ лежит: цены, себестоимость, маржа». Легитимные файлы
+# знания перечисляют денежные слова именно так — в отрицании. Такие строки в подсчёт
+# плотности не идут, иначе каталог товаров блокировал бы сам себя своим же дисклеймером.
+_FIN_DISCLAIMER_RE = re.compile(
+    r"не\s+лежит|не\s+лежат|лежать\s+не\s+должн|не\s+должн\w*\s+быть"
+    r"|здесь\s+нет|тут\s+нет|чего\s+здесь\s+нет|внутри\s+нет|\bне\s+вынош"
+    r"|сюда\s+не\b|не\s+вписыва|\bнельзя\b|не\s+вход\w+|не\s+содержит"
+    r"|без\s+цен|отсутству\w+|не\s+указыва\w+|это\s+не\b|\bне\s+про\b",
+    re.IGNORECASE,
+)
+
+# Пороги плотности мягких терминов. Замер на боевых (худший случай — `dry-rental-brief`:
+# 4 вида, 6 вхождений СЫРЫХ, но почти все в дисклеймере → после фильтра 1–2) против
+# закрытых (`dry-rental.md`: 12 вхождений, 4 вида; `o-kompanii-mpervyi.md`: 22/8).
+FIN_SOFT_MIN_HITS = 5    # вхождений мягких терминов вне дисклеймеров
+FIN_SOFT_MIN_KINDS = 4   # ИЛИ разных видов мягких терминов
+FIN_GSHEET_MAP_MIN = 3   # ссылок на Google-таблицы → это карта учётных таблиц
+
+
+def _doc_title(text: str) -> str:
+    """Заголовок документа — первый markdown-H1. Пусто, если его нет."""
+    for line in (text or "").splitlines()[:40]:
+        s = line.strip()
+        if s.startswith("# "):
+            return s[2:].strip()
+    return ""
+
+
+def content_block_reason(text: str, rel: object = None) -> Optional[str]:
+    """Судит файл знания ПО СОДЕРЖИМОМУ: «это про деньги компании?» → причина отказа.
+
+    Чистая (без IO) — тестируется инъекцией строки, как `parse_manifest`. Зовётся ТОЛЬКО
+    из `context_path_block_reason(rel, text=…)`: единая точка правды одна, второго фильтра
+    в проекте нет (конвенция плана `watson-company-memory`).
+
+    Причина отказа — метаданные (тип маркера + счётчик), НИКОГДА не цитата из файла и не
+    найденная сумма: причина уходит в лог VPS и в Telegram владельцу (Опасная тройка).
+
+    Предел (осознанный, зафиксирован в плане): барьер ловит ДЕНЬГИ, а не «всё
+    чувствительное». Файл без денежных маркеров, но чувствительный по сути (стратегия
+    сделки), он не поймает — остаток закрывает уведомление о ПРИНЯТЫХ файлах.
+    """
+    if not text or not str(text).strip():
+        return None
+    body = str(text)
+    topic = f"{_doc_title(body)} {Path(str(rel or '')).name}".strip()
+
+    # (1) ТЕМА документа — главный слой: реальные финфайлы базы знаний опознаются только им
+    # (сумм внутри может не быть вовсе, см. эмпирику у констант).
+    m = _FIN_TOPIC_STRONG_RE.search(topic)
+    if m:
+        return f"тема документа финансовая (маркер «{m.group(0).lower()}» в заголовке/имени файла)"
+
+    # (2) Метка источника: статья базы знаний из финансового департамента.
+    if _FIN_PLATRUM_RE.search(body):
+        return "документ финансового департамента (метка базы знаний)"
+
+    # (3) Файл сам объявил себя закрытым — только по ЗАГОЛОВКУ: слово «конфиденциально»
+    # в теле легитимного файла (напр. «условия конфиденциальны») блокировать не за что.
+    m = _CLOSED_MARK_RE.search(_doc_title(body))
+    if m:
+        return f"файл помечен закрытым («{m.group(0).lower()}» в заголовке)"
+
+    # (4) Денежные суммы. В боевых файлах знания их НОЛЬ — одной достаточно (fail-closed).
+    money = len(_FIN_MONEY_RE.findall(body)) + len(_FIN_MONEY_PREFIX_RE.findall(body))
+    if money:
+        return f"денежные суммы в тексте ({money} шт.)"
+
+    # Построчный разбор: строки-дисклеймеры («Что здесь НЕ лежит: цены, маржа») из подсчёта
+    # исключаем — именно так легитимные файлы упоминают деньги.
+    hard = 0
+    soft_hits = 0
+    soft_kinds: set[str] = set()
+    percent_with_term = False
+    for line in body.splitlines():
+        if _FIN_DISCLAIMER_RE.search(line):
+            continue
+        h = _FIN_HARD_RE.findall(line)
+        s = _FIN_SOFT_RE.findall(line)
+        hard += len(h)
+        soft_hits += len(s)
+        soft_kinds.update(x.lower() for x in s)
+        if (h or s) and _FIN_PERCENT_RE.search(line):
+            percent_with_term = True
+
+    # (5) Жёсткий термин учёта: ДДС / взаиморасчёты / оклад / касса / займ. В боевых — ноль.
+    if hard:
+        return f"термины денежного учёта ({hard} вхожд.)"
+
+    # (6) Финансовый показатель в процентах («маржинальность более 20%») — денег в рублях
+    # может не быть, а финансовый критерий есть.
+    if percent_with_term:
+        return "финансовый показатель в процентах (маржинальность / рентабельность)"
+
+    gsheets = len(_GSHEET_URL_RE.findall(body))
+    # (7) Карта учётных таблиц: файл-навигатор по закрытым Google-таблицам. Ровно за это
+    # `accounting-tables-registry.md` и `google-drive-map.md` держат в денилисте.
+    if gsheets >= FIN_GSHEET_MAP_MIN:
+        return f"навигация по закрытым Google-таблицам ({gsheets} ссылок)"
+
+    # (8) Плотность мягких терминов. Одно упоминание — шум (дисклеймер, определение
+    # термина, зона ответственности); пять — документ про деньги.
+    if soft_hits >= FIN_SOFT_MIN_HITS or len(soft_kinds) >= FIN_SOFT_MIN_KINDS:
+        return f"плотность финансовых терминов ({soft_hits} вхожд., {len(soft_kinds)} видов)"
+
+    # (9) Ссылка на таблицу учёта + денежный термин: обвязка вокруг закрытой таблицы.
+    if gsheets and (soft_hits or hard):
+        return f"ссылка на закрытую Google-таблицу рядом с денежными терминами ({gsheets} шт.)"
+
+    # (10) Мягкая тема («учёт», «расход») — только с подкреплением: сама по себе она
+    # бывает и не про деньги («учёт рабочего времени»).
+    m = _FIN_TOPIC_SOFT_RE.search(topic)
+    if m and (gsheets or soft_hits or hard):
+        return f"учётный документ («{m.group(0).lower()}» в заголовке + денежные признаки внутри)"
+    return None
+
+
 # --- R6 (Ф2): чтение белого списка knowledge/ в контекст сборки протокола ------
 
 
-def context_path_block_reason(rel: object) -> Optional[str]:
+def context_path_block_reason(rel: object, text: Optional[str] = None) -> Optional[str]:
     """ЕДИНСТВЕННАЯ точка правды «можно ли этот путь знания отдать во внешний LLM».
 
-    Возвращает ПРИЧИНУ блокировки (короткая строка для лога) либо `None`, если путь
+    Возвращает ПРИЧИНУ блокировки (короткая строка для лога) либо `None`, если файл
     допустим. Барьеры, по порядку:
       1. структура пути — абсолютный / `~` / `..` (выход за репо);
       2. денилист по basename (финкарты, экономика, финмодель, HR-конфиденшел);
       3. запрет по пути — любой сегмент-директория из `PROTOCOL_CONTEXT_RESTRICTED_DIRS`
          (всё под `restricted/`, где бы оно ни лежало);
-      4. чувствительный паттерн имени (вторичная страховка, см. РИСК1 у констант).
+      4. чувствительный паттерн имени (вторичная страховка, см. РИСК1 у констант);
+      5. **СОДЕРЖИМОЕ файла** (`content_block_reason`) — только если `text` передан.
 
-    Зовётся из ТРЁХ мест, и это принципиально: `load_whitelisted_context` (рантайм),
-    `assert_whitelist_safe` (контрактный тест) и — с Ф2 — фильтр манифеста компании.
+    `text=None` → работают барьеры 1–4 (путь известен, файл ещё не прочитан: так зовут
+    self-check allow-list и любая проверка «можно ли вписать такой путь»). `text` передан
+    → добавляется барьер 5. Это НЕ второй фильтр, а тот же самый: слой 5 живёт здесь же,
+    и обойти его, минуя эту функцию, нельзя.
+
+    Зачем слой 5 (план `knowledge-content-barrier`, эмпирика аудита). Слои 1–4 судят файл
+    ПО ИМЕНИ, а финансовые файлы базы знаний названы транслитом — `867-nalichnye-kassy-…`,
+    `924-uchet-dds`, `925-…sebestoimosti-postavki` — и ни один паттерн их не ловит. Впиши
+    такой файл в манифест (а манифест ведёт команда, без ревью кода) — и деньги компании
+    уехали бы во внешнюю модель. Слой 5 смотрит внутрь и судит по содержимому.
+
     Бэкстоп живёт в КОДЕ: правкой манифеста в `*-context` его не обойти (A3 плана).
     """
     p = str(rel or "").strip()
@@ -341,6 +597,8 @@ def context_path_block_reason(rel: object) -> Optional[str]:
         for pattern in PROTOCOL_CONTEXT_SENSITIVE_PATTERNS:
             if fnmatch.fnmatch(seg, pattern):
                 return f"чувствительный паттерн имени `{pattern}`"
+    if text is not None:
+        return content_block_reason(text, rel=p)
     return None
 
 
@@ -737,6 +995,177 @@ def alert_manifest_problems(
         return False
 
 
+# --- Ф1: уведомление о ПРИНЯТЫХ файлах (дифф состава брифа) --------------------
+#
+# ЗАЧЕМ. Сигнал `alert_manifest_problems` выше шлёт владельцу только ОТКЛОНЁННЫЕ файлы.
+# Принятые проходят молча — а значит, расширение состава знания (то самое, из-за которого
+# что-то может уехать во внешнюю модель) невидимо. Барьер по содержимому ловит ДЕНЬГИ, но
+# не «всё чувствительное»: файл со стратегией сделки он пропустит. Уведомление о принятых
+# закрывает остаток — владелец видит КАЖДЫЙ новый файл, попавший в промпт.
+#
+# Молчим, когда состав не менялся: иначе на каждой встрече приходил бы один и тот же
+# список — и его перестали бы читать (а с ним и настоящие сигналы).
+
+_COMPOSITION_FILE = "knowledge_composition.json"
+# Файл вырос существенно — это тоже расширение состава (кто-то влил в него много нового
+# текста), но пороги высокие: квартальное обновление каталога (+5%) молчит, а удвоение —
+# нет. Без этого «состав тот же» скрывал бы подмену содержимого файла.
+_COMPOSITION_GROWTH_RATIO = 1.5
+_COMPOSITION_GROWTH_MIN_BYTES = 2048
+
+
+def _notary_state_dir() -> Path:
+    """Каталог состояния нотариуса (`config/` на VPS) — тот же, что у `knowledge_ratchet`
+    и `auto_vocab/state`: берётся из `SPEECHMATICS_VOCAB_PATH`."""
+    vocab = os.environ.get(
+        "SPEECHMATICS_VOCAB_PATH", "/srv/meeting-notary/config/speechmatics-vocab.json"
+    )
+    return Path(vocab).expanduser().parent
+
+
+def composition_state_path() -> Path:
+    """Путь к снимку состава знания. Env `NOTARY_KNOWLEDGE_COMPOSITION_PATH` → override."""
+    env = os.environ.get("NOTARY_KNOWLEDGE_COMPOSITION_PATH")
+    if env:
+        return Path(env).expanduser()
+    return _notary_state_dir() / _COMPOSITION_FILE
+
+
+def load_composition_state() -> dict:
+    """Снимок состава `{company: {rel: размер}}`. Нет файла / битый → пустой (graceful)."""
+    path = composition_state_path()
+    if not path.is_file():
+        return {}
+    try:
+        import json  # noqa: PLC0415 — lazy, как yaml: модуль нужен только этой ветке
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("снимок состава не объект")
+        return {k: v for k, v in data.items() if isinstance(v, dict)}
+    except Exception as e:  # noqa: BLE001 — битый снимок не имеет права ронять протокол
+        logger.warning(
+            "снимок состава знания битый (%s) — считаем, что снимка нет", type(e).__name__
+        )
+        return {}
+
+
+def _save_composition_state(state: dict) -> bool:
+    """Атомарная запись снимка (tmp + replace, как `knowledge_ratchet._write_atomic`)."""
+    path = composition_state_path()
+    try:
+        import json  # noqa: PLC0415
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except OSError as e:
+        logger.warning("не сохранить снимок состава знания: %s", type(e).__name__)
+        return False
+
+
+def bundle_composition(bundle: KnowledgeBundle) -> dict[str, int]:
+    """Состав брифа как `{путь: размер в байтах}` — то, что реально ушло бы в промпт."""
+    return {
+        str(rel): len(text.encode("utf-8"))
+        for rel, text in list(bundle.catalog) + list(bundle.brief)
+    }
+
+
+def diff_knowledge_composition(
+    company: Optional[str], bundle: KnowledgeBundle, *, persist: bool = True
+) -> tuple[list[tuple[str, int]], list[tuple[str, int, int]], bool]:
+    """Сравнить состав брифа с прошлой сборкой. → `(добавленные, выросшие, первый_запуск)`.
+
+    `добавленные` — [(путь, размер)] файлов, которых в прошлом снимке не было.
+    `выросшие`    — [(путь, было, стало)] файлов, распухших выше порога.
+    `первый_запуск` — снимка для этой компании ещё нет: значит СРАВНИВАТЬ НЕ С ЧЕМ.
+      Тогда `добавленные` пуст НАМЕРЕННО: иначе на первой же встрече после деплоя владелец
+      получил бы «в бриф добавлено 5 файлов» — весь текущий состав, который он и так знает.
+      Снимок при этом сохраняется (baseline), и со следующей сборки дифф работает честно.
+
+    Пустой состав снимок НЕ перезаписывает: пустой bundle — это деградация (репо контекста
+    не доехал на VPS), а не «состав обнулился». Иначе после восстановления репо все файлы
+    выглядели бы новыми — и уведомление пришло бы на ровном месте.
+    """
+    current = bundle_composition(bundle)
+    key = str(company or "").strip().lower() or "—"
+    state = load_composition_state()
+    previous = state.get(key)
+    if not current:
+        return [], [], previous is None
+    first_run = not isinstance(previous, dict) or not previous
+    added: list[tuple[str, int]] = []
+    grown: list[tuple[str, int, int]] = []
+    if not first_run:
+        for rel, size in current.items():
+            was = previous.get(rel)
+            if not isinstance(was, int):
+                added.append((rel, size))
+            elif size >= was * _COMPOSITION_GROWTH_RATIO and size - was >= _COMPOSITION_GROWTH_MIN_BYTES:
+                grown.append((rel, was, size))
+    if persist and (first_run or added or grown or current != previous):
+        state[key] = current
+        _save_composition_state(state)
+    return added, grown, first_run
+
+
+def _kb(n: int) -> str:
+    return f"{n / 1024:.1f} КБ".replace(".0 КБ", " КБ")
+
+
+def alert_new_knowledge_files(
+    company: Optional[str], bundle: KnowledgeBundle, *, pusher: object = None
+) -> bool:
+    """Видимый сигнал владельцу: в бриф компании ДОБАВИЛСЯ файл (B3).
+
+    Шлём только на ИЗМЕНЕНИЕ состава — молчим, когда бриф тот же (никакого спама на каждой
+    встрече). Канал и дисциплина — те же, что у `alert_manifest_problems` (Telegram, дедуп,
+    инъекция `pusher`, никогда не бросает).
+
+    Опасная тройка: в сообщении только имя файла и размер — ни байта содержимого.
+    """
+    try:
+        added, grown, first_run = diff_knowledge_composition(company, bundle)
+    except Exception as e:  # noqa: BLE001 — дифф не имеет права уронить сборку протокола
+        logger.warning("не сравнить состав знания: %s", type(e).__name__)
+        return False
+    if first_run or (not added and not grown):
+        return False
+    lines: list[str] = []
+    for rel, size in added[:_ALERT_MAX_ITEMS]:
+        lines.append(f"• в бриф добавлен: {rel} ({_kb(size)})")
+    for rel, was, now in grown[:_ALERT_MAX_ITEMS]:
+        lines.append(f"• вырос файл: {rel} ({_kb(was)} → {_kb(now)})")
+    extra = max(0, len(added) + len(grown) - len(lines))
+    if extra:
+        lines.append(f"• …и ещё {extra}")
+    head = f"📎 Знание компании «{company}»: состав брифа расширен"
+    tail = (
+        "Эти файлы теперь уходят во внешнюю модель при сборке КАЖДОГО протокола. "
+        f"Состав правится в {KNOWLEDGE_SUBPATH}/{PROTOCOL_KNOWLEDGE_MANIFEST_FILE} "
+        "репозитория контекста. Если файл не должен там быть — убери строку."
+    )
+    msg = f"{head}\n" + "\n".join(lines) + f"\n{tail}"
+    key = "knowledge-added:%s:%s" % (
+        company,
+        hashlib.sha256(
+            "|".join([f"+{r}:{s}" for r, s in added] + [f">{r}:{n}" for r, _w, n in grown]).encode("utf-8")
+        ).hexdigest()[:12],
+    )
+    if pusher is None:
+        try:
+            from . import notify  # noqa: PLC0415 — lazy: тестам не нужен tg-send
+            pusher = notify.push
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        return bool(pusher(msg, dedupe_key=key))  # type: ignore[operator]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("не отправить алерт о новых файлах знания: %s", type(e).__name__)
+        return False
+
+
 # Внутренняя навигация наружу не уходит (цикл из 5 ходов, Н4). В шапке боевого каталога
 # товаров («где брать живьём») лежат ID трёх ЗАКРЫТЫХ Google-таблиц — людям они там нужны,
 # файл это источник истины команды. Но файл целиком уходит во ВНЕШНИЙ LLM, а политика
@@ -751,6 +1180,15 @@ def alert_manifest_problems(
 _INTERNAL_ID_RE = re.compile(
     r"\b(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{25,}\b"
 )
+# Второй заход — ID В КОНТЕКСТЕ ссылки (`docs.google.com/spreadsheets/d/<id>`). Регекс выше
+# требует смешанного регистра И цифры, чтобы не трогать артикулы товаров; ID, состоящий из
+# одних строчных букв, он бы пропустил. Здесь регистр не важен: то, что стоит после
+# `/spreadsheets/d/`, — идентификатор по построению, чем бы оно ни выглядело (Ф1 B4).
+_INTERNAL_ID_IN_URL_RE = re.compile(
+    r"(docs\.google\.com/(?:spreadsheets|document|presentation)/d/"
+    r"|drive\.google\.com/(?:drive/)?(?:u/\d+/)?folders/)([A-Za-z0-9_-]{20,})",
+    re.IGNORECASE,
+)
 _INTERNAL_ID_PLACEHOLDER = "‹идентификатор скрыт›"
 
 
@@ -759,11 +1197,16 @@ def redact_internal_ids(text: str) -> tuple[str, int]:
 
     Чистая (без IO) — тестируется инъекцией строки. Возвращает счётчик, а не сам найденный
     идентификатор: в лог уходит «скрыто 3 шт.», а не то, что именно скрыли (Опасная тройка).
+
+    Два прохода: по форме ID (длинная смешанно-регистровая строка — так ID лежат в шапке
+    боевого каталога, голыми, без домена) и по КОНТЕКСТУ ссылки (`/spreadsheets/d/<id>` —
+    там ID может быть любым). Домен и текст ссылки остаются: скрывается только ключ доступа.
     """
     if not text:
         return "", 0
     out, n = _INTERNAL_ID_RE.subn(_INTERNAL_ID_PLACEHOLDER, text)
-    return out, n
+    out, n2 = _INTERNAL_ID_IN_URL_RE.subn(rf"\g<1>{_INTERNAL_ID_PLACEHOLDER}", out)
+    return out, n + n2
 
 
 def _read_knowledge_file(root: Path, rel: str) -> tuple[Optional[str], Optional[str]]:
@@ -813,7 +1256,16 @@ def _read_knowledge_file(root: Path, rel: str) -> tuple[Optional[str], Optional[
         return None, f"не декодировать файл ({type(e).__name__})"
     if not text:
         return None, "файл пуст"
-    # (5.5) Внутренняя навигация: ID закрытых Google-таблиц из шапок файлов знания наружу
+    # (5.5) БАРЬЕР ПО СОДЕРЖИМОМУ (Ф1 плана `knowledge-content-barrier`). Та же единая
+    # точка правды, что и слой 1, — просто теперь у неё есть текст файла.
+    #
+    # Порядок принципиален: судим ИСХОДНЫЙ текст, ДО `redact_internal_ids`. Редактирование
+    # вырезает ID таблиц, а они — один из признаков финансового документа («обвязка вокруг
+    # закрытой таблицы учёта»): сначала отредактируй, потом суди — и сам признак исчезнет.
+    content_reason = context_path_block_reason(rel, text=text)
+    if content_reason:
+        return None, content_reason
+    # (5.6) Внутренняя навигация: ID закрытых Google-таблиц из шапок файлов знания наружу
     # не отдаём. В лог — только СЧЁТЧИК, не то, что скрыли (Опасная тройка).
     text, hidden = redact_internal_ids(text)
     if hidden:
