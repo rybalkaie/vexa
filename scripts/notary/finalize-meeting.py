@@ -1586,10 +1586,13 @@ def main() -> int:
                 speaker_mapping=cluster_to_name,  # Ф4б (REQ 1.2): несём авторство в память серии
                 participant_filter=filter_participant_names,
                 publication=_publication,  # Ф6: вердикт гейта (PII-free) в память серии
-                # Ф4 (R8): фильтр значимости хвоста висяков. Гейт ДЕФОЛТ-OFF внутри
-                # `significant_open_tasks` (claude не зовётся без флага) → no-op в тестах
-                # и до активации владельцем; ON → мелкое разовое не копится в open_tasks.
-                significance_filter=lambda _tasks: series_memory.significant_open_tasks(
+                # Ф4 (R8) + Ф4 watson (НЕС1/R12): классификатор значимости хвоста висяков,
+                # семантика «tag-and-keep». Гейт ДЕФОЛТ-OFF внутри `tag_open_tasks_significance`
+                # (claude не зовётся без флага) → no-op в тестах и до активации владельцем; ON →
+                # мелкое разовое ПОМЕЧАЕТСЯ `minor` (в раздел протокола не едет, как и раньше),
+                # но остаётся в выжимке — иначе утреннему дайджесту нечего показать в блоке
+                # «просто напоминаю».
+                significance_filter=lambda _tasks: series_memory.tag_open_tasks_significance(
                     _tasks, meeting_sid=session_uid),
                 prune_days=series_memory.retention_days(),
             )

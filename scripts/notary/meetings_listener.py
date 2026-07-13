@@ -853,6 +853,32 @@ def _reply_context_series(cid: int, msg: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _reply_context_series_digest(cid: int, msg: dict[str, Any]) -> Optional[str]:
+    """Ф4 (watson, R11/РИСК5): серия из реплая на УТРЕННИЙ ДАЙДЖЕСТ открытых вопросов.
+
+    Штатный `_reply_context_series` знает только сообщения ПРОТОКОЛОВ (индекс
+    `meta.delivered`) — id дайджеста там нет, поэтому «сделано» ответом на дайджест
+    без этой ветки уехало бы в шлюз правок вместо учёта висяков. Ищем id в sidecar
+    отправок серии (`morning-digest.json`, пишет `lib/morning_digest`). Дальше — тот
+    же `pending_status_reply`, тот же sidecar статусов Ф2: второго канала статусов нет.
+    """
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return None
+    try:
+        from notary.lib import morning_digest  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модуль не грузится → фича просто выключена
+        logger.debug("[morning-digest] import failed (feature off?): %s", e)
+        return None
+    try:
+        return morning_digest.digest_series_for_message(
+            cid, reply_to.get("message_id"), root=_protokol_root(),
+        )
+    except Exception as e:  # noqa: BLE001 — резолв best-effort, listener не валим
+        logger.debug("[morning-digest] резолв серии по reply не удался: %s", type(e).__name__)
+        return None
+
+
 def maybe_route_to_set_chat_command(
     token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
 ) -> bool:
@@ -1149,9 +1175,9 @@ def maybe_route_to_pending_status_reply(
     # delivered-index lookup, отдаём их шлюзу правок без накладных.
     if pending_status_reply.detect_status_intent(text) is None:
         return False
-    series = _reply_context_series(chat_id, msg)
+    series = _reply_context_series(chat_id, msg) or _reply_context_series_digest(chat_id, msg)
     if not series:
-        return False  # не reply на доставленный протокол серии
+        return False  # не reply ни на протокол серии, ни на её утренний дайджест
     series_dir = _protokol_root() / series
     try:
         result = pending_status_reply.apply_status_reply(

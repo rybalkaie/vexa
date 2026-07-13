@@ -405,15 +405,23 @@ def classify_reply_intent_llm(reply_text: str, items: list, participants=None) -
 # ── Резолв висяков серии (универсум для матчинга) ────────────────────────────
 def load_series_pending(series_dir: Optional[Path]) -> list:
     """Тексты висяков серии, на которые мог сослаться reply: свежий хвост
-    (`resolve_open_tasks`) ∪ тексты из sidecar (для переоткрытия закрытого, A10 —
-    закрытый пункт уже мог выпасть из хвоста, но ещё показан в «✅ Закрыто» того же
-    протокола). Дедуп по `_status_key`, порядок: хвост → только-в-sidecar. Сбой/нет
-    каталога → []."""
+    (`resolve_open_tasks`) ∪ МЕЛОЧЬ утреннего дайджеста (`resolve_minor_open_tasks`)
+    ∪ тексты из sidecar (для переоткрытия закрытого, A10 — закрытый пункт уже мог
+    выпасть из хвоста, но ещё показан в «✅ Закрыто» того же протокола). Дедуп по
+    `_status_key`, порядок: хвост → мелочь → только-в-sidecar. Сбой/нет каталога → [].
+
+    Ф4 (watson, R12): мелочь в универсуме нужна, потому что она ВИДНА участнику — в
+    дайджесте, блоком «просто напоминаю». Статуса по ней не просят, но если человек
+    всё же ответит «сделал» — ответ обязан попасть В ЭТОТ пункт, а не сматчиться на
+    похожий значимый висяк (ложное закрытие чужой задачи). На протокол мелочь при этом
+    не влияет: путь протокола её не тянет (`_resolve_open_tasks_raw`)."""
     if series_dir is None:
         return []
+    fresh: list = []
     try:
         digests = series_memory.list_series_digests(Path(series_dir))
-        fresh = series_memory.resolve_open_tasks(digests)
+        fresh = list(series_memory.resolve_open_tasks(digests))
+        fresh += list(series_memory.resolve_minor_open_tasks(digests))
     except Exception as e:  # noqa: BLE001
         logger.warning("[pending-status] резолв хвоста серии не удался (non-fatal): %s", type(e).__name__)
         fresh = []

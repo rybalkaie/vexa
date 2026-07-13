@@ -401,6 +401,17 @@ def _status_key(text: str) -> str:
     return _task_key(_DUE_SUFFIX_RE.sub("", text or ""))
 
 
+def is_minor_item(item) -> bool:
+    """Ф4 (watson, R12): помечен ли элемент `open_tasks` как МЕЛОЧЬ («просто напоминаю»).
+
+    Мелочь = элемент-объект с `minor: true` (кладёт `tag_open_tasks_significance` на
+    финализации). Голая строка → НЕ мелочь: это дефолт-класс (УПУ2). Так уже накопленные
+    выжимки, собранные ДО включения гейта значимости, трактуются консервативно —
+    как значимые (их лучше показать лишний раз, чем молча скрыть весь хвост).
+    """
+    return bool(isinstance(item, dict) and item.get("minor"))
+
+
 def _open_task_text(item) -> str:
     """Ф2 (pending-items): текст задачи из элемента `open_tasks` — строка ИЛИ объект.
 
@@ -748,7 +759,7 @@ def build_digest(
     speaker_mapping: Optional[dict] = None,
     participant_filter: Optional[Callable[[list], list]] = None,
     publication: Optional[dict] = None,
-    significance_filter: Optional[Callable[[list[str]], list[str]]] = None,
+    significance_filter: Optional[Callable[[list[str]], list]] = None,
 ) -> dict:
     """7.1: компактная выжимка-память из готового протокола.
 
@@ -812,12 +823,17 @@ def build_digest(
     # берёт его из самой свежей выжимки и подаёт в промпт генерации (Вызов 1). РИСК4:
     # только формулировки задач из уже сжатого протокола, не сырые реплики.
     open_tasks = extract_open_tasks(protocol_text or "")
-    # Ф4 (R8): фильтр значимости — мелкое разовое («отправить файл») в хвост НЕ
-    # копим, значимое («подготовить расчёт») остаётся. Применяется ЗДЕСЬ (после
-    # extract_open_tasks, ДО записи в open_tasks) — мелочь не доедет до рендера Ф3.
-    # Инъекция: None → без фильтра (прежнее поведение, чистая build_digest для
-    # unit-тестов); finalize прокидывает гейтнутую обвязку (гейт дефолт-OFF →
-    # claude не зовётся). Консервативно: сбой фильтра внутри → хвост целиком.
+    # Ф4 (R8): фильтр значимости — мелкое разовое («отправить файл») в раздел
+    # протокола не тянем, значимое («подготовить расчёт») остаётся. Применяется ЗДЕСЬ
+    # (после extract_open_tasks, ДО записи в open_tasks). Инъекция: None → без фильтра
+    # (прежнее поведение, чистая build_digest для unit-тестов); finalize прокидывает
+    # гейтнутую обвязку (гейт дефолт-OFF → claude не зовётся). Консервативно: сбой
+    # фильтра внутри → хвост целиком.
+    # Ф4 (watson, НЕС1): контракт фильтра расширен — он может не ВЫБРАСЫВАТЬ мелочь,
+    # а ПОМЕЧАТЬ её (`tag_open_tasks_significance` → `{"text": …, "minor": true}`).
+    # Тогда мелочь остаётся в хранилище (её показывает утренний дайджест блоком
+    # «просто напоминаю», R12), но путь протокола её всё равно пропускает. Фильтр
+    # старой «drop»-семантики (list[str] → list[str]) работает как раньше.
     if significance_filter is not None and open_tasks:
         try:
             open_tasks = list(significance_filter(open_tasks))
@@ -897,7 +913,7 @@ def save_meeting_digest(
     speaker_mapping: Optional[dict] = None,
     participant_filter: Optional[Callable[[list], list]] = None,
     publication: Optional[dict] = None,
-    significance_filter: Optional[Callable[[list[str]], list[str]]] = None,
+    significance_filter: Optional[Callable[[list[str]], list]] = None,
     prune_days: int = 0,
 ) -> Optional[Path]:
     """B1 (finalize 4.0.2d): построить выжимку из ГОТОВОГО протокола и сохранить
@@ -1323,6 +1339,12 @@ def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
     Выделено из `resolve_open_tasks`, чтобы Ф2-слияние (`build_open_tasks_block`)
     накладывало статусы на ПОЛНЫЙ хвост и капило уже ВИСЯЩИЕ — иначе закрытая задача
     в первых N съела бы слот капа у живого висяка (при сниженном `OPEN_TASKS_MAX`).
+
+    Ф4 (watson, R12): МЕЛОЧЬ (`minor: true`) сюда НЕ входит — это путь ПРОТОКОЛА
+    (раздел «🔻 С прошлых встреч»), а мелочь по решению владельца в протокол не
+    тянется. Её показывает только утренний дайджест, отдельным блоком «просто
+    напоминаю» (`resolve_minor_open_tasks`). Отсюда же берётся авто-снятие мелочи
+    после встречи (R12): не попав в протокол, она не переедет в следующую выжимку.
     """
     if not digests:
         return []
@@ -1333,6 +1355,8 @@ def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for t in raw:
+        if is_minor_item(t):
+            continue
         # Ф2: `_open_task_text` терпит и строку, и объект `{'text': …}` — расширенная
         # запись НЕ выпадает из фильтра (старый `isinstance(t, str)` молча терял бы её).
         s = _open_task_text(t)
@@ -1341,6 +1365,34 @@ def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
             seen.add(k)
             out.append(s)
     return out
+
+
+def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
+    """Ф4 (watson, R12): МЕЛОЧЬ из самой свежей выжимки — блок «просто напоминаю».
+
+    Зеркало `_resolve_open_tasks_raw` для второй корзины: элементы с `minor: true`.
+    Живут ровно одну встречу — показываются в утреннем дайджесте следующей встречи
+    серии и, если их никто не поднял, исчезают сами (в протокол они не попадают →
+    в новую выжимку не переносятся). Нет выжимок / гейт значимости выключен (тогда
+    помеченных нет вовсе) → [] (блока не будет). Капим тем же `open_tasks_max()`.
+    """
+    if not digests:
+        return []
+    latest = digests[-1]
+    if not isinstance(latest, dict):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in latest.get("open_tasks") or []:
+        if not is_minor_item(t):
+            continue
+        s = _open_task_text(t)
+        k = _task_key(s)
+        if s and k and k not in seen:
+            seen.add(k)
+            out.append(s)
+    cap = open_tasks_max()
+    return out[:cap] if cap > 0 else out
 
 
 def resolve_open_tasks(digests: list[dict]) -> list[str]:
@@ -1416,6 +1468,17 @@ def _group_open_by_owner(tasks: list[str]) -> tuple[list[str], list[tuple[str, l
             order.append(owner)
         owned[owner].append(rest)
     return nameless, [(o, owned[o]) for o in order]
+
+
+def group_open_tasks_by_owner(tasks: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """Публичная обёртка `_group_open_by_owner` для внешних рендеров (Ф4 watson: PDF
+    утреннего дайджеста группирует висяки по ответственным ТОЙ ЖЕ логикой, что и
+    раздел протокола, — один разбор «Имя: задача», без второй реализации).
+
+    Возвращает `(nameless, owned)`. `nameless` — задачи без явного ответственного:
+    рендер ОБЯЗАН показать их отдельным бакетом, а не проглотить (УПУ2).
+    """
+    return _group_open_by_owner(tasks)
 
 
 def _group_closed_by_label(closed: list[dict]) -> list[tuple[str, list[str]]]:
@@ -2237,6 +2300,60 @@ def filter_significant_tasks(
         len(items), len(kept), len(items) - len(kept),
     )
     return kept
+
+
+def tag_open_tasks_significance(
+    tasks: list[str],
+    *,
+    meeting_sid: Optional[str] = None,
+    classifier: Optional[Callable[[list[str]], Optional[list[bool]]]] = None,
+) -> list:
+    """Ф4 (watson, НЕС1): «tag-and-keep» вместо «drop» — то, что зовёт финализация.
+
+    Тот же классификатор значимости, но мелочь НЕ выбрасывается из `open_tasks`, а
+    ПОМЕЧАЕТСЯ: значимая задача остаётся голой строкой (схема не меняется, старые
+    читатели живут), мелкая становится `{"text": …, "minor": true}`. Зачем: дайджест
+    (R12) ОБЯЗАН показать мелочь блоком «просто напоминаю» — выброшенную из выжимки
+    показать неоткуда. В протокол мелочь при этом всё равно не едет: путь протокола
+    (`_resolve_open_tasks_raw`) помеченные элементы пропускает — поведение прежнего
+    «drop» для протокола сохранено ровно.
+
+    Полярность гейта и консерватизм — как у `significant_open_tasks`: гейт OFF (дефолт)
+    и нет инъекции → claude НЕ зовётся, возвращаем хвост КАК ЕСТЬ (голые строки = все
+    значимы, дефолт-класс УПУ2). Сбой классификатора / рассинхрон длины вердиктов →
+    тоже всё как есть (мелочь не теряем и лишнего не прячем). НЕ логирует тексты.
+    """
+    items = [t for t in (tasks or []) if isinstance(t, str) and t.strip()]
+    if not items:
+        return list(tasks or [])
+    if classifier is None:
+        if not is_significance_filter_enabled():
+            return items  # гейт OFF, инъекции нет → claude НЕ зовём, ничего не метим
+
+        def classifier(batch: list[str]) -> Optional[list[bool]]:  # noqa: E306
+            return request_significance_verdicts(batch, meeting_sid=meeting_sid)
+
+    try:
+        verdicts = classifier(list(items))
+    except Exception as e:  # noqa: BLE001 — сбой классификатора не валит финализацию
+        logger.warning("[open-tasks] significance classifier failed (non-fatal): %s",
+                       type(e).__name__)
+        return items
+    if not isinstance(verdicts, list) or len(verdicts) != len(items):
+        return items  # рассинхрон → консервативно: всё значимо
+    out: list = []
+    minor = 0
+    for text, keep in zip(items, verdicts):
+        if keep:
+            out.append(text)
+        else:
+            out.append({"text": text, "minor": True})
+            minor += 1
+    logger.info(
+        "[open-tasks] significance tag meeting=%s in=%d significant=%d minor=%d",
+        meeting_sid or "?", len(items), len(items) - minor, minor,
+    )
+    return out
 
 
 def significant_open_tasks(
