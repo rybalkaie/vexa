@@ -1367,14 +1367,12 @@ def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
     return out
 
 
-def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
-    """Ф4 (watson, R12): МЕЛОЧЬ из самой свежей выжимки — блок «просто напоминаю».
+def _resolve_minor_open_tasks_raw(digests: list[dict]) -> list[str]:
+    """Мелочь из самой свежей выжимки, дедуплицированная, БЕЗ капа.
 
-    Зеркало `_resolve_open_tasks_raw` для второй корзины: элементы с `minor: true`.
-    Живут ровно одну встречу — показываются в утреннем дайджесте следующей встречи
-    серии и, если их никто не поднял, исчезают сами (в протокол они не попадают →
-    в новую выжимку не переносятся). Нет выжимок / гейт значимости выключен (тогда
-    помеченных нет вовсе) → [] (блока не будет). Капим тем же `open_tasks_max()`.
+    Выделено из `resolve_minor_open_tasks` по той же причине, что `_resolve_open_tasks_raw`
+    из `resolve_open_tasks`: потребитель, накладывающий sidecar-статусы, обязан капить
+    уже ВИСЯЩИЕ — иначе закрытая мелочь в первых N съест слот капа у живой.
     """
     if not digests:
         return []
@@ -1391,6 +1389,19 @@ def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
         if s and k and k not in seen:
             seen.add(k)
             out.append(s)
+    return out
+
+
+def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
+    """Ф4 (watson, R12): МЕЛОЧЬ из самой свежей выжимки — блок «просто напоминаю».
+
+    Зеркало `resolve_open_tasks` для второй корзины: элементы с `minor: true`.
+    Живут ровно одну встречу — показываются в утреннем дайджесте следующей встречи
+    серии и, если их никто не поднял, исчезают сами (в протокол они не попадают →
+    в новую выжимку не переносятся). Нет выжимок / гейт значимости выключен (тогда
+    помеченных нет вовсе) → [] (блока не будет). Капим тем же `open_tasks_max()`.
+    """
+    out = _resolve_minor_open_tasks_raw(digests)
     cap = open_tasks_max()
     return out[:cap] if cap > 0 else out
 

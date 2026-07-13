@@ -422,6 +422,218 @@ class TestListenerWiring(unittest.TestCase):
         self.assertTrue(timer.is_file(), f"нет таймера: {timer}")
         self.assertIn("send_morning_digest.py", unit.read_text(encoding="utf-8"))
 
+    def test_tick_grid_matches_timer(self):
+        # `TICK_MINUTES` — то, на что код округляет момент отправки; сетка таймера —
+        # то, когда он реально может выстрелить. Разъедутся → «не позже чем за час до
+        # начала» поплывёт МОЛЧА. Пусть лучше падает тест.
+        repo = _NOTARY.parents[2]
+        timer = (repo / "systemd" / "meeting-notary-morning-digest.timer").read_text(encoding="utf-8")
+        self.assertIn(f"OnCalendar=*:0/{md.TICK_MINUTES}", timer,
+                      f"сетка таймера разошлась с TICK_MINUTES={md.TICK_MINUTES}")
+
+
+# ==========================================================================
+# Сторожа инвариантов, найденных циклом из 5 ходов (ход 1)
+# ==========================================================================
+class TestCycleGuards(unittest.TestCase):
+    """Инварианты, которые дайджест обязан держать наравне с протоколом."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmpdir.name)
+        self.fx = _SeriesFixture(self.tmp)
+        self.sent: list = []
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _sender(self, chat_id, md_text, caption, date):
+        self.sent.append({"chat_id": chat_id, "date": date})
+        return 4242
+
+    def _send(self, **kw):
+        return md.send_series_digest(
+            self.fx.series, date="2026-07-14", root=self.tmp,
+            chat_resolver=lambda _s: -100500, sender=self._sender, **kw)
+
+    # Н1 — кап применяется ПОСЛЕ наложения статусов, как в каноне протокола.
+    def test_closed_tasks_do_not_eat_cap_of_live_ones(self):
+        # Хвост: 3 закрытые задачи ИДУТ ПЕРВЫМИ, за ними 2 живых. Кап = 3.
+        # Капнув ДО статусов (баг), дайджест увидел бы только 3 закрытых → 0 висяков.
+        # Канон: раскрутить хвост целиком → наложить статусы → капить уже ВИСЯЩИЕ → 2.
+        closed = [f"Илья: закрытая задача {i}" for i in range(1, 4)]
+        live = ["Илья: живой висяк A", "Татьяна: живой висяк Б"]
+        self.fx.write_digest("2026-07-13", closed + live)
+        for t in closed:
+            sm.set_task_status(self.fx.dir, t, sm.STATUS_DONE, source="test")
+        with mock.patch.dict("os.environ", {"OPEN_TASKS_MAX": "3"}):
+            items = md.collect_items(self.fx.dir)
+        self.assertEqual(items["open"], live,
+                         "закрытые задачи съели слоты капа у живых висяков")
+
+    def test_minor_cap_also_applied_after_status(self):
+        # То же для второй корзины: закрытая руками мелочь не должна съедать кап.
+        closed_minor = [{"text": f"Илья: мелочь закрытая {i}", "minor": True} for i in range(1, 4)]
+        live_minor = [{"text": "Илья: мелочь живая", "minor": True}]
+        self.fx.write_digest("2026-07-13", ["Илья: значимый висяк"] + closed_minor + live_minor)
+        for t in closed_minor:
+            sm.set_task_status(self.fx.dir, t["text"], sm.STATUS_DONE, source="test")
+        with mock.patch.dict("os.environ", {"OPEN_TASKS_MAX": "3"}):
+            items = md.collect_items(self.fx.dir)
+        self.assertEqual(items["minor"], ["Илья: мелочь живая"])
+
+    # Н2 — аварийный рычаг учёта висяков гасит и этот канал.
+    def test_open_tasks_kill_switch_silences_digest(self):
+        # `ENABLE_OPEN_TASKS_TRACKING=0` — рубильник «поехал трекинг, гаси показ».
+        # Он гасит раздел висяков в протоколе и ОБЯЗАН гасить дайджест: иначе владелец
+        # продолжит получать PDF с теми же битыми данными и не найдёт, чем их унять.
+        self.fx.write_digest("2026-07-13", ["Илья: висяк"])
+        with mock.patch.dict("os.environ", {"ENABLE_OPEN_TASKS_TRACKING": "0"}):
+            self.assertFalse(md.is_enabled())
+            res = self._send()
+        self.assertEqual(self.sent, [], "дайджест ушёл при выключенном учёте висяков")
+        self.assertEqual(res["reason"], "disabled")
+
+    def test_digest_kill_switch_still_works_independently(self):
+        # Свой рубильник дайджеста продолжает работать сам по себе (не регресс).
+        with mock.patch.dict("os.environ", {"ENABLE_MORNING_DIGEST": "0"}):
+            self.assertFalse(md.is_enabled())
+
+    # Н3 — «не позже чем за час» держится на сетке таймера, а не только на бумаге.
+    def test_send_time_never_later_than_one_hour_before(self):
+        # Отправка возможна ТОЛЬКО на тике сетки `OnCalendar=*:0/15`. Для каждой минуты
+        # старта проверяем: тик, на котором дайджест реально уйдёт, не позже start-1ч.
+        for minute in range(0, 60):
+            start = _msk(2026, 7, 14, 9, minute)  # утренние встречи — самый жёсткий случай
+            send_at = md.digest_send_at(start)
+            self.assertEqual(send_at.minute % md.TICK_MINUTES, 0,
+                             f"момент отправки не лёг на сетку таймера (старт 09:{minute:02d})")
+            self.assertLessEqual(send_at, start - timedelta(minutes=md.LEAD_MINUTES),
+                                 f"дайджест уйдёт позже чем за час до начала (старт 09:{minute:02d})")
+
+    def test_nine_msk_not_shifted_by_rounding(self):
+        # Округление вниз не должно двигать штатные 09:00 (они кратны сетке).
+        self.assertEqual(md.digest_send_at(_msk(2026, 7, 14, 12)), _msk(2026, 7, 14, 9))
+
+    # Н4 — провал записи состояния виден, а не выдаётся за успех.
+    def test_state_write_failure_is_reported(self):
+        # Дайджест ушёл, а sidecar не записался → следующий тик пошлёт ПОВТОР.
+        # Отменить отправку нельзя, но авария обязана быть громкой (reason + ERROR),
+        # иначе тик рапортует «успех», а в чат серии капают дубли.
+        self.fx.write_digest("2026-07-13", ["Илья: висяк"])
+        with mock.patch.object(md, "record_sent", return_value=None):
+            with self.assertLogs("notary.morning_digest", level="ERROR"):
+                res = self._send()
+        self.assertEqual(res["status"], "sent")
+        self.assertEqual(res["reason"], "state-write-failed")
+
+    # У3 — отказ доставки владелец УЗНАЁТ (канон протокола: тихих отказов не бывает).
+    def test_owner_alerted_when_digest_not_delivered(self):
+        self.fx.write_digest("2026-07-13", ["Илья: висяк"])
+        alerts: list = []
+        with mock.patch.object(md, "_alert_owner", side_effect=lambda *a: alerts.append(a)):
+            md.run(now=_msk(2026, 7, 14, 9, 1),
+                   queue=[_queue_item(self.fx.series, _msk(2026, 7, 14, 12))],
+                   root=self.tmp,
+                   chat_resolver=lambda _s: None,          # серия ни к чему не привязана
+                   sender=self._sender)
+        self.assertEqual(self.sent, [])
+        self.assertEqual([a[2] for a in alerts], ["no-chat"])
+
+    def test_no_alert_on_normal_silence(self):
+        # Нет висяков → дайджест штатно молчит. Это НЕ отказ — владельца не дёргаем.
+        self.fx.write_digest("2026-07-13", [])
+        alerts: list = []
+        with mock.patch.object(md, "_alert_owner", side_effect=lambda *a: alerts.append(a)):
+            md.run(now=_msk(2026, 7, 14, 9, 1),
+                   queue=[_queue_item(self.fx.series, _msk(2026, 7, 14, 12))],
+                   root=self.tmp, chat_resolver=lambda _s: -100500, sender=self._sender)
+        self.assertEqual(alerts, [])
+
+
+class TestDigestReplyNeverSilent(unittest.TestCase):
+    """У1/У2: канал, который сам просит ответить, не имеет права молчать.
+
+    Дайджеста нет в индексе доставленных протоколов → шлюз правок его не узнаёт и в
+    ГРУППОВОМ чате (куда дайджест и приходит) молча дропает reply. Поэтому reply на
+    дайджест обрабатывает свой роут и ВСЕГДА отвечает.
+    """
+
+    def _msg(self, **kw):
+        m = {"message_id": 777, "reply_to_message": {"message_id": 4242}}
+        m.update(kw)
+        return m
+
+    def _listener(self):
+        import importlib
+        return importlib.import_module("meetings_listener")
+
+    def _psr(self):
+        # listener тянет статус-модуль как `notary.lib.pending_status_reply` — патчить
+        # надо ИМЕННО этот объект (`lib.pending_status_reply` в sys.modules — другой).
+        import importlib
+        return importlib.import_module("notary.lib.pending_status_reply")
+
+    def test_voice_reply_gets_hint_not_silence(self):
+        ml = self._listener()
+        replies: list = []
+        with mock.patch.object(ml, "_reply_context_series_digest", return_value="koordinatsiya"), \
+             mock.patch.object(ml, "send_message", side_effect=lambda t, c, txt, **k: replies.append(txt)):
+            claimed = ml.maybe_route_to_digest_reply("tok", -100500, self._msg(voice={"file_id": "x"}))
+        self.assertTrue(claimed, "reply на дайджест обязан быть прожёван, а не уйти в шлюз правок")
+        self.assertEqual(len(replies), 1)
+        self.assertIn("текстом", replies[0])
+
+    def test_unresolved_status_reply_gets_hint_not_silence(self):
+        # Человек ЯВНО дал статус («сделано»), но бот не понял, о какой задаче речь.
+        # Вот это молчанием оставлять нельзя: он уверен, что вопрос закрыт, а в учёте пусто.
+        ml = self._listener()
+        replies: list = []
+        with mock.patch.object(ml, "_reply_context_series_digest", return_value="koordinatsiya"), \
+             mock.patch.object(ml, "send_message", side_effect=lambda t, c, txt, **k: replies.append(txt)), \
+             mock.patch.object(self._psr(), "apply_status_reply", return_value=None):
+            claimed = ml.maybe_route_to_digest_reply("tok", -100500, self._msg(text="сделано"))
+        self.assertTrue(claimed)
+        self.assertEqual(len(replies), 1)
+        self.assertIn("Не понял", replies[0])
+
+    def test_small_talk_reply_is_silent_not_noisy(self):
+        # А вот реакция без статус-маркера («ок», «спасибо») — не попытка учёта.
+        # Бот в рабочем чате её не комментирует: иначе дайджест станет источником шума.
+        ml = self._listener()
+        replies: list = []
+        with mock.patch.object(ml, "_reply_context_series_digest", return_value="koordinatsiya"), \
+             mock.patch.object(ml, "send_message", side_effect=lambda t, c, txt, **k: replies.append(txt)):
+            for chatter in ("ок", "спасибо!", "+"):
+                claimed = ml.maybe_route_to_digest_reply("tok", -100500, self._msg(text=chatter))
+                self.assertTrue(claimed, "reply на дайджест не должен уходить в шлюз правок")
+        self.assertEqual(replies, [], "бот зашумил рабочий чат ответами на болтовню")
+
+    def test_status_reply_still_acked(self):
+        ml = self._listener()
+        replies: list = []
+        ack = {"label": "done", "status": "done", "matched": "Илья: отчёт", "ack": "✅ Принял: отчёт — сделано"}
+        with mock.patch.object(ml, "_reply_context_series_digest", return_value="koordinatsiya"), \
+             mock.patch.object(ml, "send_message", side_effect=lambda t, c, txt, **k: replies.append(txt)), \
+             mock.patch.object(self._psr(), "apply_status_reply", return_value=ack):
+            claimed = ml.maybe_route_to_digest_reply("tok", -100500, self._msg(text="отчёт сделал"))
+        self.assertTrue(claimed)
+        self.assertEqual(replies, ["✅ Принял: отчёт — сделано"])
+
+    def test_not_a_digest_reply_passes_through(self):
+        # Не reply на дайджест → роут не вмешивается (протоколы идут прежним путём).
+        ml = self._listener()
+        with mock.patch.object(ml, "_reply_context_series_digest", return_value=None):
+            self.assertFalse(ml.maybe_route_to_digest_reply("tok", -100500, self._msg(text="сделано")))
+
+    def test_digest_route_runs_before_feedback_gate(self):
+        # Порядок в handle_message: дайджест-роут ДО шлюза правок, иначе тот дропнет.
+        src = (_NOTARY / "meetings_listener.py").read_text(encoding="utf-8")
+        i_digest = src.index("if maybe_route_to_digest_reply(")
+        i_feedback = src.index("if maybe_route_to_feedback_reply(")
+        self.assertLess(i_digest, i_feedback,
+                        "роут дайджеста обязан стоять ДО шлюза правок")
+
 
 if __name__ == "__main__":
     logging.disable(logging.CRITICAL)

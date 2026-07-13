@@ -60,6 +60,13 @@ MSK = timezone(timedelta(hours=3))
 SEND_HOUR_MSK = 9
 LEAD_MINUTES = 60
 
+# Шаг сетки systemd-таймера (`OnCalendar=*:0/15`). Момент отправки округляем ВНИЗ до
+# него: слать можно только на тике, поэтому «точный» момент 08:20 фактически означал бы
+# отправку на тике 08:30 — то есть ПОЗЖЕ, чем за час до встречи в 09:20, а R10 требует
+# «не позже». Округление вниз даёт запас 0–15 мин и штатные 09:00 не двигает (кратны сетке).
+# Меняешь `OnCalendar` в таймере — меняй и это число.
+TICK_MINUTES = 15
+
 # Sidecar отправок рядом с памятью серии. Держит ДВЕ вещи: (а) идемпотентность
 # «один дайджест на серию в день» (R13 — таймер тикает часто, дублей быть не должно);
 # (б) карту `message_id → серия`, по которой listener роутит ОТВЕТ на дайджест в тот же
@@ -91,7 +98,8 @@ _MINOR_HEADING = "Просто напоминаю (статус не нужен)
 
 
 def is_enabled() -> bool:
-    """Kill-switch `ENABLE_MORNING_DIGEST` (дефолт ON; `0/false/no` → OFF).
+    """Можно ли слать дайджест: свой kill-switch `ENABLE_MORNING_DIGEST` (дефолт ON;
+    `0/false/no` → OFF) И аварийный рычаг учёта висяков `ENABLE_OPEN_TASKS_TRACKING`.
 
     Полярность ON — сознательно (в отличие от LLM-ярусов, у которых дефолт-OFF по
     [[reissue-llm-tier-gate-default-off]]): здесь НЕТ обращения к LLM и нет нового
@@ -99,9 +107,17 @@ def is_enabled() -> bool:
     протоколом. Фактический предохранитель — сам systemd-таймер: пока владелец не
     поставил юнит на VPS, отправлять некому. Env-выключатель нужен, чтобы погасить
     рассылку в проде без передеплоя.
+
+    Рычаг висяков проверяем ЗДЕСЬ, а не заводим второй: дайджест — витрина ТОГО ЖЕ
+    учёта. `ENABLE_OPEN_TASKS_TRACKING=0` — аварийный рубильник «поехал трекинг висяков,
+    гаси показ»; он гасит раздел «🔻 С прошлых встреч» в протоколе и ОБЯЗАН гасить этот
+    канал тоже. Иначе владелец, выключив трекинг при сбое, продолжал бы каждое утро
+    получать PDF с теми же битыми данными — и не знал бы, каким вторым рычагом их унять.
     """
     raw = (os.environ.get("ENABLE_MORNING_DIGEST") or "").strip().lower()
-    return raw not in ("0", "false", "no")
+    if raw in ("0", "false", "no"):
+        return False
+    return series_memory.is_open_tasks_enabled()
 
 
 def protocols_root() -> Path:
@@ -131,16 +147,25 @@ def _parse_start(raw: Any) -> Optional[datetime]:
 
 
 def digest_send_at(start_at: datetime) -> datetime:
-    """R10: момент отправки = 09:00 МСК дня встречи, но НЕ позже `start - 1 час`.
+    """R10: момент отправки = 09:00 МСК дня встречи, но НЕ позже `start - 1 час`,
+    округлённый ВНИЗ до сетки таймера (`TICK_MINUTES`).
 
     Встреча в 12:00 МСК → 09:00 МСК. Встреча в 09:30 МСК → 08:30 МСК (сдвиг раньше,
     «не позже чем за час до начала»). Встреча в 07:00 МСК → 06:00 МСК. Возвращает
     aware-datetime в МСК.
+
+    Округление вниз обязательно: отправка возможна только на тике таймера, а тики идут
+    по сетке. Без него встреча в 09:20 дала бы момент 08:20 → ближайший тик 08:30 →
+    дайджест за 50 минут до начала, то есть ПОЗЖЕ обещанного часа. Со сдвигом вниз тот
+    же случай уходит на тике 08:15 (за 65 минут) — «не позже чем за час» держится всегда.
     """
     start_msk = start_at.astimezone(MSK)
     nine = start_msk.replace(hour=SEND_HOUR_MSK, minute=0, second=0, microsecond=0)
     lead = start_msk - timedelta(minutes=LEAD_MINUTES)
-    return min(nine, lead)
+    target = min(nine, lead)
+    return target.replace(
+        minute=(target.minute // TICK_MINUTES) * TICK_MINUTES, second=0, microsecond=0,
+    )
 
 
 def due_meetings_today(
@@ -199,6 +224,11 @@ def collect_items(series_dir: Path) -> dict:
     `minor` — мелочь (`minor: true`, R12) под теми же статусами: закрытую руками мелочь
               не напоминаем.
     Сбой/нет каталога → пустые корзины (дайджест просто не уйдёт). НЕ логирует тексты.
+
+    Порядок операций — КАК В КАНОНЕ протокола (`series_memory.build_open_tasks_block`):
+    хвост раскручиваем БЕЗ капа, накладываем статусы, и капим уже ВИСЯЩИЕ. Капнуть до
+    наложения статусов нельзя: закрытые задачи в первых N съели бы слоты капа у живых
+    висяков, и дайджест молча показал бы огрызок хвоста (при сниженном `OPEN_TASKS_MAX`).
     """
     empty = {"open": [], "minor": []}
     try:
@@ -206,10 +236,13 @@ def collect_items(series_dir: Path) -> dict:
         if not digests:
             return empty
         store = series_memory.load_task_status(Path(series_dir))
-        fresh = series_memory.resolve_open_tasks(digests)
+        cap = series_memory.open_tasks_max()
+        fresh = series_memory._resolve_open_tasks_raw(digests)
         hanging = series_memory.merge_open_tasks_with_status(fresh, store).get("open") or []
-        minor_all = series_memory.resolve_minor_open_tasks(digests)
+        minor_all = series_memory._resolve_minor_open_tasks_raw(digests)
         minor = series_memory.merge_open_tasks_with_status(minor_all, store).get("open") or []
+        if cap > 0:
+            hanging, minor = hanging[:cap], minor[:cap]
     except Exception as e:  # noqa: BLE001 — дайджест best-effort, ничего не валим
         logger.warning("[morning-digest] сбор висяков не удался (non-fatal): %s", type(e).__name__)
         return empty
@@ -441,6 +474,49 @@ def _default_sender(chat_id: int, md_text: str, caption: str, date: str) -> Opti
         return None
 
 
+# Исходы, о которых владелец обязан УЗНАТЬ (а не искать в journalctl). Канон проекта:
+# тихих отказов доставки не бывает — у протокола сбой рендера/постинга поднимает алерт
+# владельцу (REQ 1.4), и дайджест наследует то же правило. Без этого фича, работающая
+# раз в день, могла бы молча не работать неделями: «висяков нет» и «дайджест не ушёл»
+# для участника выглядят одинаково — как пустой чат.
+# Штатное молчание (`empty` / `already` / `disabled`) сюда НЕ входит: это не отказ.
+_ALERT_REASONS = ("send-failed", "no-chat", "state-write-failed")
+
+
+def _alert_owner(series: str, date: str, reason: str) -> None:
+    """Видимый сигнал владельцу: с дайджестом сегодня что-то пошло не так.
+
+    Дедуп по (серия, дата, причина): таймер тикает каждые 15 мин, и один и тот же
+    провал не должен спамить владельца — `notify.push` глушит повтор на окно дедупа,
+    но НОВАЯ причина или другая серия дойдут сразу.
+
+    Опасная тройка: в сообщении только метаданные (серия, дата, код причины) —
+    ни одной формулировки задачи.
+    """
+    text = {
+        "send-failed": (
+            f"⚠️ Дайджест «Открытые вопросы» по серии «{series}» ({date}) НЕ отправлен: "
+            f"сбой рендера PDF или Telegram.\nЖурнал: journalctl -u meeting-notary-morning-digest -n 50"
+        ),
+        "no-chat": (
+            f"⚠️ Дайджест «Открытые вопросы» по серии «{series}» ({date}) НЕ отправлен: "
+            f"серия не привязана к чату и лички нет.\nПривязать: написать в нужном чате "
+            f"«серию {series} шли сюда»."
+        ),
+        "state-write-failed": (
+            f"⚠️ Дайджест по серии «{series}» ({date}) отправлен, но состояние НЕ записалось "
+            f"— на следующем тике возможен ПОВТОР сообщения. Проверь место и права на диске."
+        ),
+    }.get(reason)
+    if not text:
+        return
+    try:
+        from . import notify  # noqa: PLC0415
+        notify.push(text, dedupe_key=f"morning-digest-fail:{series}:{date}:{reason}")
+    except Exception as e:  # noqa: BLE001 — сломанный алерт не валит тик
+        logger.warning("[morning-digest] алерт владельцу не ушёл (non-fatal): %s", type(e).__name__)
+
+
 def send_series_digest(
     series: str,
     *,
@@ -460,6 +536,12 @@ def send_series_digest(
     series_dir = (Path(root) if root is not None else protocols_root()) / series
     res: dict = {"series": series, "date": date, "status": "skipped",
                  "open": 0, "minor": 0, "reason": None, "message_id": None}
+    if not is_enabled():
+        # Fail-closed: гейт стоит и здесь, а не только в `run()`. Любой будущий вход
+        # (команда «пришли дайджест сейчас», ручной CLI) обязан упереться в тот же
+        # рубильник — рычаг не должен обходиться в обход тика.
+        res["reason"] = "disabled"
+        return res
     if already_sent(series_dir, date):
         res["reason"] = "already"
         return res
@@ -484,9 +566,21 @@ def send_series_digest(
     if not mid:
         res["reason"] = "send-failed"
         return res
-    record_sent(series_dir, date, chat_id=chat_id, message_id=mid)
+    saved = record_sent(series_dir, date, chat_id=chat_id, message_id=mid)
     res["status"] = "sent"
     res["message_id"] = mid
+    if saved is None:
+        # Дайджест УЖЕ ушёл, а идемпотентность не записалась → следующий тик (через
+        # 15 мин) отправит его повторно, и так до начала встречи. Отменить отправку
+        # нельзя, поэтому единственное честное действие — сделать аварию ГРОМКОЙ:
+        # ERROR в журнал (не warning) + reason в результате тика. Молчаливый `sent`
+        # тут врал бы: состояние на диске не соответствует отправленному.
+        res["reason"] = "state-write-failed"
+        logger.error(
+            "[morning-digest] серия %s: дайджест отправлен, но состояние НЕ записано — "
+            "на следующем тике возможен ПОВТОР. Проверь права/место на диске: %s",
+            series, digest_state_path(series_dir),
+        )
     return res
 
 
@@ -537,6 +631,10 @@ def run(
             res["series"], res["date"], res["status"], res.get("reason"),
             res["open"], res["minor"], dry_run,
         )
+        # Отказ доставки владелец узнаёт сразу, а не через недели «тишины в чате».
+        # В dry-run не алертим: это диагностический прогон, ничего не ломалось.
+        if not dry_run and res.get("reason") in _ALERT_REASONS:
+            _alert_owner(res["series"], res["date"], res["reason"])
     return out
 
 

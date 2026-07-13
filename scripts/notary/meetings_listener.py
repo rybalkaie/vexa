@@ -1138,6 +1138,83 @@ def _reply_date_str(msg: dict[str, Any]) -> Optional[str]:
         return None
 
 
+# Ф4 (watson, R11): ответы на утренний дайджест. Дайджест САМ просит ответить, поэтому
+# молчание в этом канале недопустимо — а молчание было бы ровно тем, что происходит по
+# умолчанию: дайджеста нет в индексе доставленных протоколов, значит шлюз правок его не
+# узнаёт и в ГРУППОВОМ чате (а дайджест по решению владельца идёт именно туда) молча
+# дропает такой reply. Поэтому reply на дайджест разбираем отдельным роутом и ВСЕГДА
+# отвечаем: статус — подтверждением, всё остальное — подсказкой, как ответить.
+DIGEST_VOICE_HINT = (
+    "Голосом статус по дайджесту пока не понимаю 🙏 Напишите ответом на это сообщение "
+    "текстом — например: «сделано», «не успел, жду расчёт» или «снимаем, неактуально»."
+)
+DIGEST_UNPARSED_HINT = (
+    "Не понял, по какому вопросу статус 🙏 Ответьте на это сообщение, назвав задачу и "
+    "статус — например: «отчёт по марже — сделано» или «презентация — снимаем, неактуально». "
+    "Если вопрос будете обсуждать на встрече — отвечать не нужно, бот услышит и пометит сам."
+)
+
+
+def maybe_route_to_digest_reply(
+    token: str, chat_id: Optional[int], msg: dict[str, Any]
+) -> bool:
+    """Ф4 (watson, R11): ЛЮБОЙ reply на утренний дайджест «Открытые вопросы к встрече».
+
+    Стоит ДО `maybe_route_to_pending_status_reply` и ДО шлюза правок, и — в отличие от
+    них — прожёвывает reply на дайджест ЦЕЛИКОМ (всегда True, если это реплай на
+    дайджест). Причина: дайджест — НЕ протокол. Шлюзу правок в нём нечего править, а в
+    групповом чате он такие reply молча дропает — участник, которого шапка дайджеста
+    попросила ответить, получал бы тишину и думал, что статус учтён.
+
+    Разбор:
+      • текст с однозначным статусом → `pending_status_reply` (тот же sidecar Ф2, второго
+        канала статусов нет) → ack;
+      • голос/аудио → подсказка «напишите текстом» (статус-канал текст-only, Ф5; голос
+        транскрибируется в listener НИЖЕ по потоку, уже после роутов — сюда не доедет);
+      • текст без статуса / не резолвится конкретный висяк → подсказка, как ответить.
+
+    Опасная тройка: НЕ логируем текст reply/висяков — только серию, код статуса, исход.
+    """
+    if chat_id is None:
+        return False
+    series = _reply_context_series_digest(chat_id, msg)
+    if not series:
+        return False  # не reply на дайджест — не наш путь
+    if msg.get("voice") or msg.get("audio"):
+        send_message(token, chat_id, DIGEST_VOICE_HINT, reply_to=msg.get("message_id"))
+        logger.info("[morning-digest] голос-reply на дайджест series=%s → подсказка", series)
+        return True
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return True  # стикер/фото на дайджест — молча жуём, отвечать не на что
+    try:
+        from notary.lib import pending_status_reply  # noqa: PLC0415
+        # Подсказку даём, только если человек ПЫТАЛСЯ дать статус (есть статус-маркер).
+        # Реакция без маркера («ок», «спасибо», «+», вопрос в чат) — не попытка учёта:
+        # бот в рабочем чате реплики не комментирует, иначе дайджест превращается в
+        # источник шума, который вдобавок легко раскачать повторами. Молчание здесь
+        # ничего не теряет — терялся бы только НЕПОНЯТЫЙ статус, а его мы ловим ниже.
+        if pending_status_reply.detect_status_intent(text) is None:
+            logger.info("[morning-digest] reply без статус-маркера series=%s → молчим", series)
+            return True
+        result = pending_status_reply.apply_status_reply(
+            text, _protokol_root() / series, date=_reply_date_str(msg), source="digest-reply",
+        )
+    except Exception as e:  # noqa: BLE001 — обработка статуса не должна валить listener
+        logger.exception("[morning-digest] обработка reply на дайджест упала: %s", e)
+        return True  # сообщение всё равно наше — в шлюз правок его отдавать нельзя
+    if result:
+        send_message(token, chat_id, result["ack"], reply_to=msg.get("message_id"))
+        logger.info(
+            "[morning-digest] статус с дайджеста принят series=%s label=%s status=%s",
+            series, result.get("label"), result.get("status"),
+        )
+        return True
+    send_message(token, chat_id, DIGEST_UNPARSED_HINT, reply_to=msg.get("message_id"))
+    logger.info("[morning-digest] reply на дайджест не распознан series=%s → подсказка", series)
+    return True
+
+
 def maybe_route_to_pending_status_reply(
     token: str, chat_id: Optional[int], allowed_chat: int, msg: dict[str, Any]
 ) -> bool:
@@ -1175,9 +1252,9 @@ def maybe_route_to_pending_status_reply(
     # delivered-index lookup, отдаём их шлюзу правок без накладных.
     if pending_status_reply.detect_status_intent(text) is None:
         return False
-    series = _reply_context_series(chat_id, msg) or _reply_context_series_digest(chat_id, msg)
+    series = _reply_context_series(chat_id, msg)
     if not series:
-        return False  # не reply ни на протокол серии, ни на её утренний дайджест
+        return False  # не reply на доставленный протокол серии (дайджест — свой роут)
     series_dir = _protokol_root() / series
     try:
         result = pending_status_reply.apply_status_reply(
@@ -1710,6 +1787,14 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # сообщение в группе. Owner-гейт и узкий триггер — внутри (обычную переписку и
     # команды коррекции не перехватывает).
     if maybe_route_to_set_chat_command(token, cid, allowed_chat, msg):
+        return
+
+    # Ф4 (watson, R11): reply на УТРЕННИЙ ДАЙДЖЕСТ «Открытые вопросы к встрече».
+    # Стоит ПЕРВЫМ из reply-роутов и прожёвывает такой ответ целиком: дайджест — не
+    # протокол, шлюзу правок в нём нечего править, и в групповом чате (куда дайджест и
+    # приходит) он молча дропнул бы ответ участника. Статус → в тот же sidecar Ф2;
+    # голос / нераспознанное → подсказка, но НЕ молчание: канал сам просил ответить.
+    if maybe_route_to_digest_reply(token, cid, msg):
         return
 
     # Ф5 (REQ R9/R5/A10): reply со СТАТУСОМ висяка («этот закрыт» / «снимаем» /
