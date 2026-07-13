@@ -390,8 +390,8 @@ class TestB3AddedFilesNotified(unittest.TestCase):
             ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True)
             before = ck.load_composition_state()
             empty = ck.KnowledgeBundle(catalog=[], brief=[], rejected=[], source="none")
-            added, grown, _first = ck.diff_knowledge_composition("mpfirst", empty)
-            self.assertEqual((added, grown), ([], []))
+            added, changed, grown, _first = ck.diff_knowledge_composition("mpfirst", empty)
+            self.assertEqual((added, changed, grown), ([], [], []))
             self.assertEqual(ck.load_composition_state(), before, "пустой состав затёр снимок")
 
     def test_broken_snapshot_does_not_crash(self):
@@ -677,6 +677,299 @@ class TestCycle5Regressions(unittest.TestCase):
                 done.wait(timeout=ck._COMPOSITION_LOCK_WAIT_SEC + 5),
                 "вложенный захват лока повесил процесс — бот замолчал бы навсегда",
             )
+
+
+# --- Приёмка Ф1: барьер обязан ВИДЕТЬ ДЕНЬГИ, а не гадать по имени ------------
+#
+# Приёмка (независимый аудитор + перепроверка оркестратора на боевых данных) сломала первую
+# версию барьера: она держалась на теме документа (H1 + имя файла). Убери финансовую подсказку
+# из имени — и 8 форматов денег из 8 уезжали во внешнюю модель, при 20 зелёных тестах фазы.
+#
+# Все файлы ниже — с НЕВИННЫМ именем и НЕВИННЫМ заголовком. Пройти barrier они могут только
+# если он реально увидел деньги в тексте.
+
+_INNOCENT_NAMES = ("itogi-kvartala.md", "svodka.md", "zakupki.md")
+
+# (метка, строка) — то, что человек пишет от руки в выжимке.
+_MONEY_FORMATS: list[tuple[str, str]] = [
+    ("разделитель точкой",        "Закупка партии — 1.250.000"),
+    ("множители без валюты",      "Оборот 1,25 млн, закупка 800 тыс."),
+    ("сумма в «к»",               "Сделка на 250к"),
+    ("валюта ПЕРЕД суммой",       "Контейнер: USD 12 000"),
+    ("доллары словом",            "Поставщик выставил 12 000 долларов"),
+    ("евро словом",               "Логистика 3 000 евро"),
+    ("условные единицы",          "Расчёт по курсу: 5 000 у.е."),
+    ("валюта только в шапке",     "| Статья | Сумма, ₽ |\n|---|---|\n| Аренда | 120 000 |\n| Логистика | 45 000 |"),
+    ("ФОТ и оклады людей",        "ФОТ отдела 450 000. Менеджер — 90 000"),
+    ("EBITDA",                    "EBITDA за квартал выросла"),
+    ("cash flow",                 "Считаем cash flow помесячно"),
+    ("НДС",                       "НДС к возмещению оформляем в срок"),
+]
+
+# 🛑 Ловушки-легитимы. Каждая — из БОЕВОГО файла или его ближайшей окрестности. Отвергни
+# барьер хоть одну — отвалится каталог товаров, и бот снова начнёт врать в названиях моделей
+# (ISS-21, ровно та боль, ради которой знание вообще заводили).
+_LEGIT_LINES: list[tuple[str, str]] = [
+    ("боевой: счастливые пользователи",
+     "1. **Более 3 000 счастливых пользователей** караоке-систем Altronix — сотни отзывов"),
+    ("боевой: артикул с ёмкостью",
+     "| Li-Ion 18650 1200mAh | Li-Ion Аккумулятор 18650 1200mAh | 209705542 |"),
+    ("боевой: дата в тексте",           "Состав на 24.06.2026."),
+    ("боевой: 60% клавиатура",
+     "| Blazar GBR[BS] | Клавиатура-конструктор механическая 60% серая | 247140799 |"),
+    ("дисклеймер каталога + счёт позиций",
+     "Что здесь НЕ лежит: цены, себестоимость. Здесь только 1 200 позиций."),
+    ("струбцина и трубки",              "Струбцина для пиксельных трубок, товар прибыл на склад"),
+    ("артикулы",                        "Модели H19x40Z и BAR42x3-UV — крепёж"),
+    ("размеры товара",                  "Габариты 600 x 400 мм, вес 12 кг"),
+    ("«займёт 5 минут»",                "Настройка — это займёт 5 минут"),
+    ("более 500 моделей",               "Более 500 моделей в линейке"),
+    ("4K-разрешение",                   "Экран 4к, поддержка 60 Гц"),
+    ("телефон",                         "Телефон: +7 495 123 45 67"),
+]
+
+
+class TestAcceptanceB1MoneyWithoutNameHint(unittest.TestCase):
+    """B1 (пересдача): деньги ловятся БЕЗ подсказки в имени файла и заголовке."""
+
+    def test_all_money_formats_are_blocked(self):
+        for label, line in _MONEY_FORMATS:
+            for name in _INNOCENT_NAMES:
+                with self.subTest(формат=label, имя=name):
+                    reason = ck.content_block_reason(f"# Итоги квартала\n\n{line}\n", rel=name)
+                    self.assertIsNotNone(
+                        reason,
+                        f"деньги «{label}» уехали во внешнюю модель: имя и заголовок невинны, "
+                        "барьер обязан увидеть их в ТЕКСТЕ",
+                    )
+
+    def test_reason_carries_no_amount(self):
+        """Опасная тройка: причина отказа уходит в лог VPS и в Telegram. В ней — тип маркера
+        и счётчик, НИКОГДА не сама сумма."""
+        for label, line in _MONEY_FORMATS:
+            reason = ck.content_block_reason(f"# Итоги квартала\n\n{line}\n", rel="svodka.md") or ""
+            for leak in ("1.250.000", "250к", "12 000", "450 000", "120 000", "90 000", "800 тыс"):
+                with self.subTest(формат=label, утечка=leak):
+                    self.assertNotIn(leak, reason, f"причина отказа цитирует сумму: {reason!r}")
+
+
+class TestAcceptanceB1NoFalsePositives(unittest.TestCase):
+    """B2 под давлением B1. Расширяя денежные маркеры, ломают именно это — поэтому
+    каждая ловушка проверяется в САМОМ уязвимом окружении: файл каталога, где рядом лежат
+    и денежные слова (в дисклеймере), и числа."""
+
+    def test_legit_lines_still_pass(self):
+        for label, line in _LEGIT_LINES:
+            with self.subTest(строка=label):
+                reason = ck.content_block_reason(
+                    "# Каталог товаров — канон названий моделей\n\n"
+                    "> **Что здесь НЕ лежит:** цены, дилерские условия, себестоимость, маржа.\n\n"
+                    f"{line}\n",
+                    rel="product-catalog-wb.md",
+                )
+                self.assertIsNone(
+                    reason,
+                    f"каталог отвергнут из-за «{label}» → бот снова врёт в названиях моделей "
+                    f"(ISS-21). Причина: {reason}",
+                )
+
+    def test_grouped_number_alone_is_not_money(self):
+        """Ядро защиты B2. «3 000» само по себе деньгами НЕ считается — смысл ему придаёт
+        соседнее слово. Правило «группированное число = деньги» отвергло бы боевой файл
+        позиционирования МПервый."""
+        self.assertIsNone(
+            ck.content_block_reason("# Позиционирование\n\nБолее 3 000 счастливых пользователей\n",
+                                    rel="pozitsionirovanie.md")
+        )
+        self.assertIsNotNone(
+            ck.content_block_reason("# Позиционирование\n\nЗакупка партии — 3 000 000\n",
+                                    rel="pozitsionirovanie.md"),
+            "то же число в денежном контексте обязано блокировать",
+        )
+
+    def test_money_context_word_alone_is_not_money(self):
+        """Обратная сторона: денежное слово БЕЗ числа тоже ничего не блокирует — иначе
+        отвалились бы боевые `komanda-roli.md` («согласование оплат подрядчиков») и
+        `values.md` («чистая прибыль приоритетнее оборота»)."""
+        for line in (
+            "Аналитика и просчёт для закупки товаров · согласование оплат подрядчиков",
+            "Чистая прибыль приоритетнее оборота.",
+            "Финансовые отчёты · контроль финансов организации · оплаты закупок товаров",
+        ):
+            with self.subTest(строка=line[:40]):
+                self.assertIsNone(
+                    ck.content_block_reason(f"# Кто за что отвечает\n\n{line}\n", rel="komanda-roli.md")
+                )
+
+    def test_new_regexes_stay_linear(self):
+        """Анти-DoS для НОВЫХ ярусов (группировка, множители, таблица с валютой в шапке).
+        Худший случай: большая числовая таблица, в каждой строке — денежное слово, то есть
+        ярус 3 включён на каждой строке. 40 КБ обязаны разбираться мгновенно: пофайловый
+        потолок знания — 128 КБ, а барьер зовётся на сборке КАЖДОГО протокола."""
+        import time
+
+        row = "| Закупка | 1 250 000 | 18650 1200mAh | 600 x 400 мм |\n"
+        payload = "# Остатки\n\n" + row * 800  # ≈ 40 КБ
+        started = time.perf_counter()
+        ck.content_block_reason(payload, rel="ostatki.md")
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 3.0, f"барьер думал {elapsed:.1f} с — ReDoS в новых ярусах")
+
+
+class TestAcceptanceB3ContentHash(unittest.TestCase):
+    """B3 (пересдача): «тихая утечка становится невозможной».
+
+    Снимок «имя+размер» ловил только распухание файла. Приёмка воспроизвела обход на боевом
+    `komanda-roli.md`: дописали 164 Б с окладами → рост меньше порога (2 КБ) → алерт молчит,
+    а файл уже уехал в Claude. Теперь состав сверяется по ХЕШУ содержимого."""
+
+    _ACCEPTED = {
+        "knowledge/product-catalog-wb.md": "# Каталог\n\nPulsar 63ML-BG — клавиатура.\n",
+        "knowledge/notary/komanda-roli.md": "# Кто за что отвечает\n\nМихаил — закупки.\n",
+    }
+
+    def _fixture(self, fx):
+        fx.add(dict(self._ACCEPTED))
+        fx.manifest([f"catalog: {list(self._ACCEPTED)[0]}", list(self._ACCEPTED)[1]])
+
+    def test_small_edit_of_accepted_file_is_reported(self):
+        """Правка ПРИНЯТОГО файла меньше порога роста. Барьер по деньгам её не видит и не
+        должен (это не деньги) — ровно для такого остатка B3 и существует: страховка на
+        случай, когда контент-барьер промахнулся."""
+        with _FixtureRepo() as fx:
+            self._fixture(fx)
+            sent: list[str] = []
+            ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True)  # baseline
+
+            leak = "\nСтратегия по сделке с сетью: соглашаемся не раньше третьего раунда.\n"
+            self.assertLess(len(leak.encode()), ck._COMPOSITION_GROWTH_MIN_BYTES,
+                            "тест обязан бить именно ПОД порогом роста")
+            p = fx.repo / "knowledge/notary/komanda-roli.md"
+            p.write_text(p.read_text(encoding="utf-8") + leak, encoding="utf-8")
+
+            def pusher(msg, **kw):
+                sent.append(msg)
+                return True
+
+            self.assertTrue(
+                ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=pusher),
+                "правка принятого файла прошла МОЛЧА — владелец не узнает никогда",
+            )
+            self.assertIn("komanda-roli.md", sent[0])
+            self.assertIn("изменён", sent[0])
+            self.assertNotIn("Стратегия", sent[0], "в алерт утекло содержимое файла")
+
+    def test_oklady_appended_to_accepted_file_are_stopped_by_barrier(self):
+        """Тот же обход, но именно ДЕНЬГАМИ (эксплойт приёмки дословно). Здесь срабатывает
+        уже B1: файл не «изменён», а ОТВЕРГНУТ — в промпт он не попадает вовсе, и владелец
+        узнаёт об этом соседним каналом (`alert_manifest_problems`)."""
+        with _FixtureRepo() as fx:
+            self._fixture(fx)
+            ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True)
+
+            p = fx.repo / "knowledge/notary/komanda-roli.md"
+            p.write_text(
+                p.read_text(encoding="utf-8")
+                + "\nФОТ отдела — 450 000. Михаил — 120 000 фикс. Татьяна — 90 000 фикс.\n",
+                encoding="utf-8",
+            )
+            bundle = fx.load()
+            self.assertNotIn(
+                "komanda-roli.md", "\n".join(r for r, _ in list(bundle.catalog) + list(bundle.brief)),
+                "оклады уехали во внешнюю модель",
+            )
+            self.assertTrue(bundle.rejected, "файл выпал молча — владельцу ничего не скажут")
+            sent: list[str] = []
+            self.assertTrue(
+                ck.alert_manifest_problems("mpfirst", bundle, pusher=lambda m, **kw: sent.append(m) or True)
+            )
+            self.assertNotIn("450 000", sent[0], "в алерт утекла сумма из файла")
+
+    def test_old_snapshot_without_hashes_migrates_silently(self):
+        """МИГРАЦИЯ. На VPS уже лежит снимок СТАРОГО формата (имя+размер, без хеша). Первая
+        сборка с новым кодом НЕ имеет права прислать «изменено всё» — это спам ровно в тот
+        момент, когда доверие к каналу важнее всего."""
+        with _FixtureRepo() as fx:
+            self._fixture(fx)
+            bundle = fx.load()
+            import json
+
+            legacy = {  # ← формат v1: голые размеры, хешей нет
+                "mpfirst": {rel: len(text.encode("utf-8")) for rel, text in
+                            list(bundle.catalog) + list(bundle.brief)}
+            }
+            snap = Path(os.environ["NOTARY_KNOWLEDGE_COMPOSITION_PATH"])
+            snap.write_text(json.dumps(legacy), encoding="utf-8")
+
+            sent: list[str] = []
+            self.assertFalse(
+                ck.alert_new_knowledge_files("mpfirst", bundle,
+                                             pusher=lambda m, **kw: sent.append(m) or True),
+                f"миграция снимка прислала владельцу «изменено всё»: {sent}",
+            )
+            state = ck.load_composition_state()["mpfirst"]
+            self.assertTrue(
+                all(isinstance(v, dict) and v.get("sha") for v in state.values()),
+                "хеши не дописаны — следующая правка снова пройдёт молча",
+            )
+
+    def test_after_migration_edit_is_caught(self):
+        """Вторая половина миграции: как только хеш известен, правка любого размера видна."""
+        with _FixtureRepo() as fx:
+            self._fixture(fx)
+            import json
+
+            bundle = fx.load()
+            snap = Path(os.environ["NOTARY_KNOWLEDGE_COMPOSITION_PATH"])
+            snap.write_text(json.dumps({"mpfirst": {rel: len(t.encode("utf-8")) for rel, t in
+                                                    list(bundle.catalog) + list(bundle.brief)}}),
+                            encoding="utf-8")
+            ck.alert_new_knowledge_files("mpfirst", bundle, pusher=lambda m, **kw: True)  # молчаливая миграция
+
+            p = fx.repo / "knowledge/notary/komanda-roli.md"
+            p.write_text(p.read_text(encoding="utf-8") + "\nПлан на осень: переговоры с сетью.\n",
+                         encoding="utf-8")
+            sent: list[str] = []
+            self.assertTrue(
+                ck.alert_new_knowledge_files("mpfirst", fx.load(),
+                                             pusher=lambda m, **kw: sent.append(m) or True),
+                "после миграции правка снова прошла молча",
+            )
+            self.assertIn("изменён", sent[0])
+
+    def test_unchanged_composition_stays_silent(self):
+        """Молчание, когда менять нечего, — обязательное условие: иначе алерт превратится в
+        шум и его перестанут читать вместе с настоящими сигналами."""
+        with _FixtureRepo() as fx:
+            self._fixture(fx)
+            ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True)
+            for _ in range(3):
+                self.assertFalse(
+                    ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True),
+                    "состав не менялся, а алерт ушёл — это спам на каждой встрече",
+                )
+
+    def test_same_size_different_content_is_a_new_alert(self):
+        """Ключ дедупа — по хешу, а не по размеру. Правка «одну строку убрали, другую
+        дописали» размер не меняет: по размеру дедуп `notify.push` погасил бы второй алерт
+        как повтор первого, и правка осталась бы невидимой."""
+        with _FixtureRepo() as fx:
+            self._fixture(fx)
+            ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True)
+            keys: list[str] = []
+
+            def pusher(msg, **kw):
+                keys.append(kw.get("dedupe_key", ""))
+                return True
+
+            p = fx.repo / "knowledge/notary/komanda-roli.md"
+            base = p.read_text(encoding="utf-8")
+            for tail in ("\nААААА\n", "\nБББББ\n"):  # одинаковая длина, разное содержимое
+                p.write_text(base + tail, encoding="utf-8")
+                ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=pusher)
+            self.assertEqual(len(keys), 2, "второй алерт не ушёл вовсе")
+            self.assertNotEqual(keys[0], keys[1],
+                                "разное содержимое дало тот же ключ дедупа — правка невидима")
 
 
 if __name__ == "__main__":
