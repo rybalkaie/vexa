@@ -5180,6 +5180,23 @@ def _is_protocol_selfreview_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def _is_knowledge_review_enabled() -> bool:
+    """Kill-switch сверки со ЗНАНИЕМ компании (Ф3): `ENABLE_PROTOCOL_KNOWLEDGE_REVIEW`
+    (дефолт ON; `0/false/no` → OFF).
+
+    Зачем СВОЙ рычаг, а не общий `ENABLE_PROTOCOL_SELFREVIEW`: сверка канона —
+    единственная фича, которая МОЛЧА переписывает текст протокола (A4: без блока
+    «что поправил»). Пойдёт вразнос (кривой канон в манифесте, модель путает
+    похожие артикулы) — гасить надо ЕЁ, а не весь второй проход: иначе вместе с
+    ней уедут редактура Ф7, ревизия диаризации Ф4 и инвариант «не теряем задачи»
+    (ISS-22). Правка кода тут не выход: деплой бота — ручная редкая операция.
+
+    OFF → знание не грузится, пункта 6 в чек-листе нет, справка в промпт не идёт =
+    поведение ровно как до Ф3; остальной критик работает как работал."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_KNOWLEDGE_REVIEW") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
 _REVIEW_VALUES_SECTION = """### Секция "values" — подозрительные числа и инверсии смысла
 
 Сверь КАЖДОЕ число и КАЖДОЕ утверждение в протоколе с транскриптом. Помечай ТОЛЬКО реально подозрительное:
@@ -5229,10 +5246,23 @@ _REVIEW_DIARIZATION_SECTION = """### Секция "diarization" — грубые
 Порог ОЧЕНЬ высокий: на нормально размеченной встрече находок быть НЕ должно. Если сомневаешься, реальная ли это ошибка деления, — ставь `flag` или вообще не сообщай. НЕ трогай нормальную смену тем у одного человека, монолог, короткие поддакивания, уточнения своей же мысли. Лучше пропустить, чем переставить верную реплику."""
 
 
+# Секции, которые умеет ФЛАГ-проход: для каждой ниже в промпт кладётся инструкция.
+# `checks` — общий кортеж на оба прохода, и секции rewrite-прохода в нём есть тоже
+# ("knowledge" Ф3 живёт ТОЛЬКО там, где критику подана справка компании). В контракт
+# флаг-прохода такие секции пускать НЕЛЬЗЯ: инструкции для них здесь нет, справки в
+# промпте нет — и модель оказалась бы приглашена вернуть finding по секции, сверять
+# которую ей не с чем (ровно УПУ1: «правило без справки = приглашение фантазировать»).
+_FLAG_PASS_SECTIONS = ("values", "roles", "memory", "diarization")
+
+
 def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
     """Собирает system-prompt ревью-прохода из включённых секций.
 
     Ф7 добавит сюда свою секцию "memory" (см. проектную заметку выше).
+
+    Контракт (`section`-enum) строится по `_FLAG_PASS_SECTIONS` — только по тем
+    секциям, инструкцию к которым модель здесь реально получила; всё прочее из
+    `checks` игнорируется (см. комментарий у константы).
     """
     sections: list[str] = []
     if "values" in checks:
@@ -5244,8 +5274,9 @@ def _build_review_system_prompt(checks: tuple[str, ...]) -> str:
     if "diarization" in checks:  # Ф4: грубые ошибки деления по спикерам (fix/flag)
         sections.append(_REVIEW_DIARIZATION_SECTION)
     sections_text = "\n\n".join(sections)
-    allowed_sections = ", ".join(f'"{c}"' for c in checks) or '"values"'
-    section_enum = "|".join(checks) or "values"
+    contract = tuple(c for c in checks if c in _FLAG_PASS_SECTIONS)
+    allowed_sections = ", ".join(f'"{c}"' for c in contract) or '"values"'
+    section_enum = "|".join(contract) or "values"
     has_diar = "diarization" in checks
     # Описание `quote` и поля fix-правки добавляем в контракт ТОЛЬКО когда секция
     # diarization включена (иначе не путаем модель полями отсутствующей секции).
@@ -5340,9 +5371,10 @@ _REVIEW_INVARIANT_SECTION = """ИНВАРИАНТ «НИЧЕГО НЕ ТЕРЯЕ
 # ПРАВИЛЬНО НАЗЫВАЕТСЯ и КТО ЗА ЭТО ОТВЕЧАЕТ. Справка не добавляет в протокол фактов.
 _REVIEW_KNOWLEDGE_SECTION = """6. ЗНАНИЕ КОМПАНИИ — ниже (после транскрипта) дана СПРАВКА компании: канон названий товаров/моделей/брендов, кто за что отвечает, доменные термины. Черновик мог переврать название товара, приписать зону ответственности не тому человеку или разойтись со справкой в факте о компании. Сверь — и действуй ПО ПРАВИЛУ:
 - КАНОН (название товара/модели/бренда, имя человека, его роль/зона) есть в справке ОДНОЗНАЧНО, а в черновике он искажён → ИСПРАВЬ МОЛЧА прямо в тексте на каноничный вариант. Никаких пометок и оговорок: владелец должен увидеть просто правильный протокол. Посчитай такие правки в `knowledge_fixed`.
-- СПОРНО (справка не покрывает / соответствие неоднозначное / несколько кандидатов / факт черновика противоречит справке, но кто прав — по записи не видно) → НЕ переписывай молча и НЕ выдумывай. Оставь текст как есть и сообщи это отдельным finding'ом `{"section": "knowledge", "quote": "<фрагмент строки протокола, как он есть>", "note": "<в чём сомнение, 3-10 слов>"}` — систему пометит его «⚠️ сверьте: …» сама.
+- 🔇 ПОРОГ МОЛЧАНИЯ (сильнее остальных правил этого пункта): справка НЕПОЛНА по определению — в ней заведомо нет всего, о чём говорят на встрече, а у части компаний каталога товаров НЕТ ВОВСЕ. Название, термин или человек, которых в справке ПРОСТО НЕТ, — это НОРМА, а не ошибка черновика: молчи, оставь как есть, ничего не помечай. Отсутствие в справке ≠ повод для пометки.
+- СПОРНО (справка РАСХОДИТСЯ с черновиком — говорит иное, — а кто прав, по записи не видно; либо справка даёт несколько кандидатов) → НЕ переписывай молча и НЕ выдумывай. Оставь текст как есть и сообщи отдельным finding'ом `{"section": "knowledge", "quote": "<фрагмент строки протокола, как он есть>", "note": "<в чём расхождение со справкой, 3-10 слов>"}` — система пометит его «⚠️ сверьте: …» сама. Порог ВЫСОКИЙ: на нормальной встрече таких мест обычно нет вовсе, один-два — потолок. Лучше промолчать, чем засыпать протокол пометками.
 - Справка — СПРАВОЧНИК, а НЕ содержание встречи: НЕ добавляй в протокол факты, темы и товары из справки, которых на встрече не было. Не обсуждали — значит в протоколе этого нет.
-- Правило «не выдумывай» сильнее желания исправить: сомневаешься — ⚠️-хедж, а не догадка."""
+- Правило «не выдумывай» сильнее желания исправить: нет однозначного канона в справке — не правь; колеблешься между пометкой и молчанием — молчи."""
 
 
 def _build_rewrite_system_prompt(
@@ -5531,6 +5563,13 @@ def _normalize_findings_list(findings: object) -> list[dict]:
         note = (f.get("note") or "").strip()
         if not quote or not note:
             continue
+        # `note` модель пишет САМА (не цитата) и он всегда попадает в тело протокола,
+        # который уходит команде в Telegram и в PDF. Промпт просит 3-10 слов; кламп —
+        # потолок ущерба, если модель ошибётся или её уговорит инъекция из файла знания
+        # (их правит команда, текст туда мог прийти извне): целый абзац «от бота» в
+        # протокол не пролезет. На норму не влияет.
+        if len(note) > _FINDING_NOTE_MAX:
+            note = note[:_FINDING_NOTE_MAX - 1].rstrip() + "…"
         section = (f.get("section") or "values").strip() or "values"
         item = {"section": section, "quote": quote, "note": note}
         if section == "diarization":
@@ -5589,6 +5628,21 @@ def _normalize_for_match(s: str) -> str:
 _INLINE_FLAG_VERB = {"knowledge": "сверьте"}
 _DEFAULT_INLINE_FLAG_VERB = "проверь"
 
+# Потолки текста, который МОДЕЛЬ протаскивает в тело протокола (он уходит команде в
+# Telegram и в PDF). `note` она сочиняет сама (промпт просит 3-10 слов); `quote` обязан
+# быть цитатой протокола/транскрипта, но проверить это нельзя — не нашлась строка →
+# текст уезжает в хвостовой блок КАК ЕСТЬ. Клампы не влияют на норму, а инъекции (файлы
+# знания правит команда, текст туда мог прийти извне) ограничивают ущерб: вписать «от
+# имени бота» целый абзац в протокол нельзя. Поиск/re-attribution работают с ПОЛНЫМ
+# quote из finding — клампится только рендер.
+_FINDING_NOTE_MAX = 200
+_TAIL_QUOTE_MAX = 300
+
+
+def _clip(s: str, limit: int) -> str:
+    s = s or ""
+    return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
+
 
 def _format_tail_finding(f: dict) -> str:
     """Строка хвостового блока «## ⚠️ Проверить» для одного finding.
@@ -5597,18 +5651,22 @@ def _format_tail_finding(f: dict) -> str:
     diarization (Ф4): сомнительное деление — `⚠️ спикер под вопросом: «<реплика>» — <note>`.
     knowledge (Ф3): спорное против справки компании — `⚠️ сверьте: <note> — «<quote>»`.
     values (5.2): не нашли строку для inline — `⚠️ <note> — «<quote>»`.
+
+    `quote` здесь клампится (см. `_TAIL_QUOTE_MAX`): в этот блок попадает то, что НЕ
+    нашлось в протоколе, — то есть ровно то, что модель могла сочинить.
     """
+    quote = _clip(f["quote"], _TAIL_QUOTE_MAX)
     if f.get("section") == "knowledge":
         # A4: спорный факт НЕ переписан молча — владелец видит, что именно сверить.
-        return f"{REVIEW_FLAG_MARKER} сверьте: {f['note']} — «{f['quote']}»"
+        return f"{REVIEW_FLAG_MARKER} сверьте: {f['note']} — «{quote}»"
     if f.get("section") == "roles":
-        return f"{REVIEW_FLAG_MARKER} {f['quote']}: {f['note']}"
+        return f"{REVIEW_FLAG_MARKER} {quote}: {f['note']}"
     if f.get("section") == "diarization":
-        return f"{REVIEW_FLAG_MARKER} спикер под вопросом: «{f['quote']}» — {f['note']}"
+        return f"{REVIEW_FLAG_MARKER} спикер под вопросом: «{quote}» — {f['note']}"
     if f.get("section") == "authorship":
         # R3: тёзка-подстановка — «⚠️ авторство под вопросом, поправьте: <имя>».
-        return f"{REVIEW_FLAG_MARKER} {f['note']}: {f['quote']}"
-    return f"{REVIEW_FLAG_MARKER} {f['note']} — «{f['quote']}»"
+        return f"{REVIEW_FLAG_MARKER} {f['note']}: {quote}"
+    return f"{REVIEW_FLAG_MARKER} {f['note']} — «{quote}»"
 
 
 def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
@@ -5808,11 +5866,23 @@ def review_protocol(
         logger.warning("[review] meeting=%s claude error: %s", meeting_sid or "?", str(e)[:200])
         return []
     findings = _parse_review_response(raw)
+    # Fail-closed: принимаем находки ТОЛЬКО по секциям, которые этот проход умеет и
+    # реально запросил. Модель могла вернуть секцию, инструкции к которой не получала
+    # (напр. "knowledge" Ф3 — её справка живёт только на rewrite-пути): такая находка
+    # была бы догадкой без источника, а система пометила бы ею протокол владельца.
+    allowed = {c for c in checks if c in _FLAG_PASS_SECTIONS} or {"values"}
+    kept = [f for f in findings if f.get("section") in allowed]
+    n_dropped = len(findings) - len(kept)
+    if n_dropped:
+        logger.warning(
+            "[review] meeting=%s отброшено findings вне запрошенных секций: %d",
+            meeting_sid or "?", n_dropped,
+        )
     logger.info(
         "[review] meeting=%s checks=%s findings=%d",
-        meeting_sid or "?", ",".join(checks), len(findings),
+        meeting_sid or "?", ",".join(checks), len(kept),
     )
-    return findings
+    return kept
 
 
 class RewriteResult(NamedTuple):
@@ -6163,10 +6233,17 @@ def _load_review_knowledge(
     критике — на корректность это не влияет (`review_and_rewrite_protocol` всё равно
     вернёт `disabled`). Best-effort: сбой чтения знания НЕ имеет права уронить проход —
     вернём None, критик отработает как до Ф3 (деградация, не потеря встречи).
+
+    `ENABLE_PROTOCOL_KNOWLEDGE_REVIEW=0` гасит ТОЛЬКО сверку со знанием (молчаливую
+    правку канона), оставляя весь остальной второй проход живым — см.
+    `_is_knowledge_review_enabled`.
     """
     if "knowledge" not in checks:
         return None
     if not _is_protocol_review_enabled() or not _is_protocol_selfreview_enabled():
+        return None  # критика нет вовсе — про knowledge молчим, это не про него
+    if not _is_knowledge_review_enabled():
+        logger.info("[selfreview] knowledge-сверка выключена (ENABLE_PROTOCOL_KNOWLEDGE_REVIEW=0)")
         return None
     try:
         company = series_markup.company_for_series(series)

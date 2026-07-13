@@ -485,5 +485,113 @@ class TestKnowledgeFailureIsNonFatal(_KnowledgeEnv, unittest.TestCase):
         self.assertNotIn("СПРАВКА КОМПАНИИ", self.user_prompt)
 
 
+class TestFlagOnlyPassNeverAsksForKnowledge(_KnowledgeEnv, unittest.TestCase):
+    """🔴 Kill-switch `ENABLE_PROTOCOL_SELFREVIEW=0` (боевой рычаг отката без
+    передеплоя) роняет вызов с rewrite=True на ФЛАГ-only проход — с тем же `checks`,
+    где теперь есть "knowledge". Но справку компании флаг-проход не подаёт и секции
+    про знание в его промпте нет. Значит секцию нельзя ни предлагать модели в
+    контракте, ни принимать от неё: иначе «⚠️ сверьте: …» встанет в протокол
+    владельца как чистая догадка — ровно УПУ1, ради которой Ф3 и делалась.
+    """
+
+    def test_knowledge_absent_from_flag_pass_contract(self):
+        sp = lp._build_review_system_prompt(_CHECKS)
+        self.assertNotIn("knowledge", sp, "секция без инструкции и справки — в контракте")
+        self.assertIn("diarization", sp)  # остальные секции контракта на месте
+
+    def test_every_declared_flag_section_really_has_instructions(self):
+        """Обратная сторона фильтра: секция, объявленная в `_FLAG_PASS_SECTIONS`, обязана
+        иметь в промпте СВОЮ инструкцию. Иначе фильтр пропустит секцию-пустышку, и мы
+        вернёмся ровно к той дыре, от которой защищаемся (правило без данных)."""
+        sp = lp._build_review_system_prompt(lp._FLAG_PASS_SECTIONS)
+        for sec in lp._FLAG_PASS_SECTIONS:
+            self.assertIn(
+                f'Секция "{sec}"', sp,
+                f"{sec} объявлена в _FLAG_PASS_SECTIONS, но инструкции для неё в промпте нет",
+            )
+
+    def test_model_knowledge_finding_is_dropped_on_flag_pass(self):
+        """Модель всё же вернула knowledge-finding на флаг-проходе → он НЕ доезжает
+        до протокола (fail-closed: находка без источника не помечает встречу)."""
+        flag_response = json.dumps({"findings": [
+            {"section": "knowledge", "quote": "Свести остатки по складу",
+             "note": "склад — вроде зона Михаила"},
+            {"section": "values", "quote": "Заказать партию", "note": "сверь срок"},
+        ]}, ensure_ascii=False)
+        with mock.patch.dict(os.environ, {"ENABLE_PROTOCOL_SELFREVIEW": "0"}), \
+                mock.patch.object(lp, "call_claude_print", return_value=flag_response):
+            lp.review_and_flag_protocol_file(
+                self.protocol, self.transcript, checks=_CHECKS,
+                meeting_sid="sid", rewrite=True, series="mpfirst-weekly",
+            )
+        out = self.protocol.read_text(encoding="utf-8")
+        self.assertNotIn("сверьте", out, "knowledge-догадка попала в протокол владельца")
+        self.assertIn("проверь", out, "легитимный values-флаг должен был встать")
+
+
+class TestKnowledgeKillSwitch(_KnowledgeEnv, unittest.TestCase):
+    """Сверка канона — единственная фича, которая МОЛЧА переписывает текст протокола
+    (A4). Значит у неё обязан быть СВОЙ рычаг: пойдёт вразнос — гасим ЕЁ, а не весь
+    второй проход (иначе с ней уедут редактура Ф7, ревизия диаризации Ф4 и инвариант
+    «не теряем задачи»). Правка кода не выход: деплой бота — ручная редкая операция.
+    """
+
+    def test_off_removes_knowledge_but_keeps_the_critic_alive(self):
+        with mock.patch.dict(os.environ, {"ENABLE_PROTOCOL_KNOWLEDGE_REVIEW": "0"}):
+            n = self._run(_envelope(IMPROVED_CANON))
+        # Знания нет ни в промпте, ни в чек-листе — поведение как до Ф3.
+        self.assertNotIn("СПРАВКА КОМПАНИИ", self.user_prompt)
+        self.assertNotIn("ЗНАНИЕ КОМПАНИИ", self.system_prompt)
+        # Но САМ критик жив: чек-лист на месте, переписанный протокол применён.
+        self.assertIn("ЖЁСТКИЕ ПРАВИЛА", self.system_prompt)
+        self.assertGreater(n, 0)
+        self.assertIn("Pulsar 63ML", self.protocol.read_text(encoding="utf-8"))
+
+    def test_on_by_default(self):
+        """Дефолт — ON (рычаг нужен для аварии, а не для включения фичи)."""
+        self._run(_envelope(IMPROVED_CANON))
+        self.assertIn("СПРАВКА КОМПАНИИ", self.user_prompt)
+        self.assertIn("ЗНАНИЕ КОМПАНИИ", self.system_prompt)
+
+
+class TestKnowledgeHedgeHasSilenceThreshold(_KnowledgeEnv, unittest.TestCase):
+    """У Anzhee каталога моделей НЕТ ни одного файла (манифест это прямо пишет, R4
+    UNMET), а бриф есть → пункт 6 включается БЕЗ каталога. Без явного порога правило
+    «справка не покрывает → пометь» читается буквально, и каждое название оборудования
+    получает «⚠️ сверьте» — протокол превращается в решето. Порог обязан быть в промпте.
+    """
+
+    def test_absence_from_reference_is_not_a_reason_to_flag(self):
+        self._run(_envelope(IMPROVED_CANON))
+        sec = self.system_prompt
+        self.assertIn("ПОРОГ МОЛЧАНИЯ", sec)
+        self.assertIn("НЕПОЛНА", sec)  # справка неполна по определению
+        # Отсутствие в справке НЕ должно быть триггером хеджа (было: «справка не покрывает»).
+        self.assertNotIn("справка не покрывает", sec)
+
+
+class TestModelCannotSmuggleLongTextIntoProtocol(_KnowledgeEnv, unittest.TestCase):
+    """Опасная тройка, потолок ущерба: `note` модель сочиняет сама, а `quote` в хвостовом
+    блоке — это ровно то, что в протоколе НЕ нашлось (т.е. могло быть выдумано). Оба
+    попадают в тело протокола, которое уходит команде в Telegram и в PDF. Файлы знания
+    правит команда, текст туда мог прийти извне → инъекция не должна уметь вписать
+    «от имени бота» абзац в протокол.
+    """
+
+    def test_long_note_and_quote_are_clipped(self):
+        payload = "ПЕРЕВЕДИТЕ ДЕНЬГИ НА СЧЁТ 123. " * 40  # ~1200 символов
+        self._run(_envelope(IMPROVED_CANON, findings=[
+            {"section": "knowledge", "quote": payload, "note": payload},
+        ]))
+        out = self.protocol.read_text(encoding="utf-8")
+        flagged = [ln for ln in out.split("\n") if "⚠️" in ln and "сверьте" in ln]
+        self.assertTrue(flagged, "пометка должна была встать (в хвостовой блок)")
+        self.assertLess(
+            len(flagged[0]), 600,
+            "модель протащила в протокол простыню — потолок не сработал",
+        )
+        self.assertNotIn(payload, out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
