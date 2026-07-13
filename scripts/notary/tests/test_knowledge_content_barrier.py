@@ -511,6 +511,174 @@ class TestB5NoContentInLogs(unittest.TestCase):
         self.assertEqual(offenders, [], f"logger получает содержимое файла знания: {offenders}")
 
 
+# --- Сторожа дыр, найденных циклом из 5 ходов ---------------------------------
+#
+# Все шесть дыр ниже были живыми при 20 зелёных тестах фазы. Барьер приватности будут
+# править (план прямо разрешает «ослабить порог», если легитимный файл отвергнут) —
+# без этих тестов правка вернёт дыру молча, и узнают о ней по факту утечки финансов.
+
+
+class TestCycle5Regressions(unittest.TestCase):
+    """Н1–Н5 цикла из 5 ходов: каждая дыра пропускала деньги компании во внешнюю модель
+    или глушила единственный сигнал о том, что состав знания расширился."""
+
+    def test_hard_term_in_disclaimer_line_still_blocks(self):
+        """Н1. Слова-триггеры дисклеймера («нельзя», «это не», «отсутствуют») — рядовая
+        лексика финансового регламента. Пока они гасили строку целиком, ОДНО такое слово
+        рядом с жёстким термином пропускало финфайл в промпт."""
+        doc = (
+            "# Регламент работы с партнёрами\n\n"
+            "Нельзя закрывать взаиморасчёты с партнёром без подписанного акта сверки.\n"
+        )
+        self.assertIsNotNone(
+            ck.content_block_reason(doc, rel="reglament-partnery.md"),
+            "жёсткий термин в строке со словом «нельзя» пропустил финфайл в промпт",
+        )
+
+    def test_percent_criterion_in_disclaimer_line_still_blocks(self):
+        """Н1 (тот же приём через процент). Боевой `912-chek-list-vybora-tovarov-mp.md`
+        ловится ТОЛЬКО финансовым процентом — сумм в рублях в нём нет вовсе."""
+        doc = "# Чек-лист выбора товара\n\nНельзя брать товар с маржинальностью ниже 20%.\n"
+        self.assertIsNotNone(
+            ck.content_block_reason(doc, rel="chek-list-vybora.md"),
+            "финансовый критерий в процентах со словом «нельзя» пропустил файл в промпт",
+        )
+
+    def test_disclaimer_still_protects_the_catalog(self):
+        """Обратная сторона Н1: фильтр дисклеймеров обязан остаться для МЯГКИХ терминов —
+        иначе каталог товаров блокирует сам себя своим же дисклеймером («Что здесь НЕ
+        лежит: цены, себестоимость, маржа») и бот снова врёт в артикулах (ISS-21)."""
+        self.assertIsNone(
+            ck.content_block_reason(
+                _SAFE_FILES["knowledge/product-catalog-anzhee.md"],
+                rel="knowledge/product-catalog-anzhee.md",
+            ),
+            "каталог товаров отвергнут собственным дисклеймером — это регресс ISS-21",
+        )
+
+    def test_alert_survives_dead_telegram(self):
+        """Н2. Снимок состава фиксировался ДО отправки: один сбой Telegram — и файл,
+        уехавший во внешнюю модель, больше никогда бы не всплыл («состав тот же» → молчим).
+        Ровно та тихая утечка, которую B3 объявляет невозможной."""
+        with _FixtureRepo() as fx:
+            fx.add(_SAFE_FILES)
+            fx.manifest([f"catalog: {list(_SAFE_FILES)[0]}"])
+            ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=lambda m, **kw: True)
+
+            fx.add({"company/strategiya-sdelki.md": "# Стратегия сделки\n\nПереговорная позиция.\n"})
+            fx.manifest([f"catalog: {list(_SAFE_FILES)[0]}", "company/strategiya-sdelki.md"])
+
+            def dead(msg, **kw):
+                raise RuntimeError("Telegram 502")
+
+            self.assertFalse(ck.alert_new_knowledge_files("mpfirst", fx.load(), pusher=dead))
+            self.assertNotIn(
+                "company/strategiya-sdelki.md",
+                ck.load_composition_state().get("mpfirst", {}),
+                "снимок зафиксирован при мёртвом канале — алерт потерян навсегда",
+            )
+
+            sent: list[str] = []
+            self.assertTrue(
+                ck.alert_new_knowledge_files(
+                    "mpfirst", fx.load(), pusher=lambda m, **kw: sent.append(m) or True
+                ),
+                "канал ожил, а алерт о новом файле так и не пришёл",
+            )
+            self.assertIn("company/strategiya-sdelki.md", sent[0])
+            self.assertIn(
+                "company/strategiya-sdelki.md",
+                ck.load_composition_state().get("mpfirst", {}),
+                "после успешной отправки снимок обязан зафиксироваться (иначе спам)",
+            )
+
+    def test_snapshot_of_other_company_survives_concurrent_write(self):
+        """Н4. Снимок общий для всех компаний, а сборки идут из четырёх процессов
+        (`finalize-meeting`, `meetings_listener`, `clarify_worker`, ручной regenerate).
+        Read-modify-write без лока затирал чужой ключ → следующая сборка видела `first_run`
+        и МОЛЧАЛА о новом файле."""
+        with _FixtureRepo() as fx:
+            B = ck.KnowledgeBundle
+            ck.persist_knowledge_composition("mpfirst", B([("a.md", "x" * 10)], [], [], "m"))
+            ck.persist_knowledge_composition("anzhee", B([("z.md", "y" * 5)], [], [], "m"))
+            ck.persist_knowledge_composition(
+                "mpfirst", B([("a.md", "x" * 10)], [("new.md", "n" * 99)], [], "m")
+            )
+            state = ck.load_composition_state()
+            self.assertIn("anzhee", state, "ключ соседней компании затёрт конкурентной записью")
+            self.assertIn("new.md", state.get("mpfirst", {}), "новый файл не попал в снимок")
+
+    def test_money_regex_stays_linear_on_numeric_table(self):
+        """Н3. `_FIN_MONEY_RE` с открытыми квантификаторами уходил в квадратичный
+        бэктрекинг: 16 КБ чисел → 11 с, 40 КБ → 98 с. Пофайловый потолок знания — 128 КБ,
+        то есть одна числовая таблица в манифесте вешала сборку КАЖДОГО протокола."""
+        import time
+
+        payload = "1 " * 20000  # 40 КБ цифр и пробелов, валюты нет — худший случай
+        started = time.perf_counter()
+        ck.content_block_reason(payload, rel="tablitsa-ostatkov.md")
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 3.0, f"барьер думал {elapsed:.1f} с — вернулся ReDoS")
+
+    def test_money_is_still_caught_after_redos_fix(self):
+        """Обратная сторона Н3: ограничение квантификаторов не должно ослепить барьер."""
+        for amount in ("итого 1 250 000 ₽", "42 000,00 руб.", "$1,200", "1 234 567 890 123,00 ₽"):
+            self.assertIsNotNone(
+                ck.content_block_reason(f"# Заметки\n\nЗакупка: {amount}\n", rel="zametki.md"),
+                f"денежная сумма «{amount}» перестала ловиться",
+            )
+
+    def test_hard_terms_cover_instrumental_case(self):
+        """Н5. Класс `[аыуеой]` матчит ОДИН символ, поэтому окончания «-ой»/«-ом» мимо:
+        «расчёт кассой», «под займом» проходили насквозь."""
+        for word in ("кассой", "займом"):
+            self.assertTrue(
+                ck._FIN_HARD_RE.search(f"оплата {word} по договору"),
+                f"жёсткий термин в творительном падеже («{word}») не ловится",
+            )
+        for safe in ("кассета", "это займёт 5 минут", "струбцина", "трубка"):
+            self.assertFalse(
+                ck._FIN_HARD_RE.search(f"в комплекте {safe}"),
+                f"«{safe}» ошибочно принято за финансовый термин — отвалится каталог (ISS-21)",
+            )
+
+    def test_aligned_amounts_are_still_caught(self):
+        """Ход 4, регрессия ФИКСА Н3. Ограничивая квантификаторы ради ReDoS, легко зажать
+        их слишком туго — и барьер ослепнет на суммах, выровненных пробелами в таблице.
+        Несосчитанная сумма = финансовый файл в промпте, то есть дыра в приватности."""
+        for line in (
+            "Итого: 1 250 000 ₽",
+            "Итого:  1 250 000    ₽",
+            "| Выручка | 1 250 000     ₽ |",
+        ):
+            self.assertTrue(
+                ck._FIN_MONEY_RE.search(line), f"денежная сумма не поймана: {line!r}"
+            )
+
+    def test_composition_lock_never_deadlocks_on_reentry(self):
+        """Ход 4, риск ФИКСА Н4. `flock` НЕ реентрантен: два `LOCK_EX` на один файл из
+        одного процесса встают намертво. Блокирующий захват превратил бы любой будущий
+        вложенный вызов в вечный вис сборки протокола на VPS — без единой ошибки в логе.
+        Захват обязан быть с таймаутом: не дождались → пишем без лока, но НЕ висим."""
+        import threading
+
+        with _FixtureRepo():
+            done = threading.Event()
+
+            def nested():
+                with ck._composition_lock():          # внешний
+                    with ck._composition_lock():      # вложенный — не имеет права повиснуть
+                        pass
+                done.set()
+
+            t = threading.Thread(target=nested, daemon=True)
+            t.start()
+            self.assertTrue(
+                done.wait(timeout=ck._COMPOSITION_LOCK_WAIT_SEC + 5),
+                "вложенный захват лока повесил процесс — бот замолчал бы навсегда",
+            )
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.CRITICAL)
     unittest.main(verbosity=2)

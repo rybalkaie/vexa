@@ -34,13 +34,16 @@ Company-scope (контракт §1.5): для встречи компании X
 
 from __future__ import annotations
 
+import fcntl
 import fnmatch
 import hashlib
 import logging
 import os
 import re
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import NamedTuple, Optional, TypedDict
+from typing import Iterator, NamedTuple, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -332,8 +335,19 @@ _SEP = r"[    ]"  # пробел, nbsp, narrow-nbsp, thin-space (разде
 
 # Денежная сумма: «1 250 000 ₽», «42 000,00 руб.», «$1,200». Разделитель тысяч — только
 # пробельные из `_SEP` (НЕ `\s`: перевод строки склеил бы «пункт 5» и «руб» с разных строк).
+#
+# ⚠️ Квантификаторы ОГРАНИЧЕНЫ ({0,24}, {0,12}), а не `*` — это защита от квадратичного
+# бэктрекинга, не косметика (цикл из 5 ходов, Н3). С `*` движок на тексте из чисел и
+# пробелов БЕЗ валюты в конце перебирает все разбиения хвоста: замерено 16 КБ → 11 с,
+# 40 КБ → 98 с. Пофайловый потолок — 128 КБ, то есть один файл с числовой таблицей
+# (остатки, размеры, прайс-выгрузка) вешал бы сборку КАЖДОГО протокола на минуты.
+#
+# Границы подобраны так, чтобы НЕ ослепить барьер (тот же цикл, ход 4): 24 знака покрывают
+# «1 234 567 890 123,00», а 12 разделителей — выравнивание пробелами в таблицах
+# («Итого:  1 250 000    ₽»). Слишком тесная граница здесь = дыра в приватности, а не
+# просто «строгий регекс»: несосчитанная сумма пропускает финансовый файл в промпт.
 _FIN_MONEY_RE = re.compile(
-    rf"\d(?:[\d{_SEP[1:-1]}]*\d)?(?:[.,]\d+)?{_SEP}*"
+    rf"\d(?:[\d{_SEP[1:-1]}]{{0,24}}\d)?(?:[.,]\d+)?{_SEP}{{0,12}}"
     r"(?:₽|€|\$|¥|\bруб[а-яё]*\b|\bр\.|\brub\b|\busd\b|\beur\b|\bcny\b|\bюан[а-яё]*\b)",
     re.IGNORECASE,
 )
@@ -348,8 +362,11 @@ _FIN_HARD_RE = re.compile(
     r"|\bоклад\w*|\bзарплат\w*|\bзаработн\w+" + _SEP + r"+плат\w+|\bфонд" + _SEP + r"+оплаты" + _SEP + r"+труда\b"
     r"|\bреинвестир\w*"
     r"|\bдебиторк\w*|\bдебиторск\w*|\bкредиторк\w*|\bкредиторск\w*"
-    r"|\bкасс[аыуеой]\b|\bкассам\w*|\bкассах\b|\bкассов\w*"  # «кассета» НЕ ловится (\b)
-    r"|\bза[йё]м\b|\bзайм[аыуе]\b|\bзаймов\b|\bзаймам[и]?\b|\bзаймах\b|\bссуд[аыуе]\b"
+    # Падежи перечислены поимённо, а не `касс\w*`/`займ\w*`: иначе «кассета» и «это
+    # займёт 5 минут» стали бы финансами. Творительный («кассой», «займом») добавлен
+    # циклом из 5 ходов (Н5): класс `[аыуеой]` матчит ОДИН символ и окончание «-ой»/«-ом» не ловил.
+    r"|\bкасс[аыуеой]\b|\bкассой\b|\bкассам\w*|\bкассах\b|\bкассов\w*"  # «кассета» НЕ ловится (\b)
+    r"|\bза[йё]м\b|\bзайм[аыуе]\b|\bзаймом\b|\bзаймов\b|\bзаймам[и]?\b|\bзаймах\b|\bссуд[аыуе]\b"
     r"|\bp&l\b|\bпи[- ]?энд[- ]?эл\b",
     re.IGNORECASE,
 )
@@ -500,21 +517,35 @@ def content_block_reason(text: str, rel: object = None) -> Optional[str]:
         return f"денежные суммы в тексте ({money} шт.)"
 
     # Построчный разбор: строки-дисклеймеры («Что здесь НЕ лежит: цены, маржа») из подсчёта
-    # исключаем — именно так легитимные файлы упоминают деньги.
+    # МЯГКИХ терминов исключаем — именно так легитимные файлы упоминают деньги.
+    #
+    # ⚠️ Дисклеймер гасит ТОЛЬКО плотность МЯГКИХ терминов (цикл из 5 ходов, Н1).
+    # Слова-триггеры дисклеймера широки («нельзя», «это не», «отсутствуют») — и они же
+    # обычная лексика финансового регламента. Пока под ними стояли ВСЕ сигналы, одно слово
+    # переворачивало вердикт барьера:
+    #   «Нельзя закрывать взаиморасчёты без акта сверки»      → файл проходил в промпт
+    #   «Нельзя брать товар с маржинальностью ниже 20%»        → файл проходил в промпт
+    # Поэтому жёсткий термин и финансовый процент считаются ВСЕГДА: первый блокирует с
+    # первого вхождения, второй — это финансовый КРИТЕРИЙ, а не упоминание денег в
+    # отрицании. Мягкие термины остаются под фильтром — их порог держится на плотности,
+    # и без фильтра каталог товаров блокировал бы сам себя своим же дисклеймером
+    # («Что здесь НЕ лежит: цены, себестоимость, маржа»).
+    # Проверено на боевых обеих компаний: ни одной строки, где дисклеймер соседствует с
+    # жёстким термином или процентом, — регресса каталога фикс не даёт.
     hard = 0
     soft_hits = 0
     soft_kinds: set[str] = set()
     percent_with_term = False
     for line in body.splitlines():
-        if _FIN_DISCLAIMER_RE.search(line):
-            continue
         h = _FIN_HARD_RE.findall(line)
         s = _FIN_SOFT_RE.findall(line)
         hard += len(h)
-        soft_hits += len(s)
-        soft_kinds.update(x.lower() for x in s)
         if (h or s) and _FIN_PERCENT_RE.search(line):
             percent_with_term = True
+        if _FIN_DISCLAIMER_RE.search(line):
+            continue
+        soft_hits += len(s)
+        soft_kinds.update(x.lower() for x in s)
 
     # (5) Жёсткий термин учёта: ДДС / взаиморасчёты / оклад / касса / займ. В боевых — ноль.
     if hard:
@@ -1064,6 +1095,95 @@ def _save_composition_state(state: dict) -> bool:
         return False
 
 
+# Сколько ждать лок снимка, прежде чем писать без него. Критическая секция — чтение и
+# запись пары килобайт JSON, то есть миллисекунды; 2 с — это запас на порядки.
+_COMPOSITION_LOCK_WAIT_SEC = 2.0
+_COMPOSITION_LOCK_POLL_SEC = 0.05
+
+
+@contextmanager
+def _composition_lock() -> "Iterator[None]":
+    """Эксклюзивный лок на снимок состава — как `knowledge_ratchet._lock()`.
+
+    Снимок общий для ВСЕХ компаний (`{company: {...}}`), а обновляется он циклом
+    read-modify-write. Сборки протокола идут из разных процессов (`finalize-meeting`,
+    `meetings_listener`, `clarify_worker`, ручной `regenerate-protocol`) и пересекаются
+    во времени: без лока второй пишущий затирает ключ первого целиком — и добавленный
+    файл другой компании выпадает из снимка. Следующая сборка увидит `first_run` и
+    ПРОМОЛЧИТ — то есть новый файл уедет во внешнюю модель без уведомления (цикл из 5
+    ходов, Н4).
+
+    ⚠️ Захват НЕ блокирующий (`LOCK_NB` + опрос), и это принципиально. `flock` не
+    реентрантен: два `LOCK_EX` на один файл ИЗ ОДНОГО процесса встают намертво друг
+    против друга. Блокирующий вариант превратил бы любой будущий вложенный вызов
+    («давайте зафиксируем снимок прямо внутри диффа») в вечный вис сборки протокола на
+    VPS — бот замолчал бы без единой ошибки в логе. Не дождались за `_LOCK_WAIT` →
+    пишем без лока и говорим об этом в лог: редкая гонка переживаема, вечный вис — нет.
+    Та же дисциплина, что во всём модуле: снимок важен, но ронять протокол он не вправе.
+    """
+    path = composition_state_path()
+    lf = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lf = open(path.with_suffix(path.suffix + ".lock"), "w")
+    except OSError as e:
+        logger.warning("снимок состава: лок недоступен (%s) — пишу без него", type(e).__name__)
+        lf = None
+    locked = False
+    if lf is not None:
+        deadline = time.monotonic() + _COMPOSITION_LOCK_WAIT_SEC
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:  # BlockingIOError — лок держит кто-то другой
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "снимок состава: лок занят дольше %.0f с — пишу без него",
+                        _COMPOSITION_LOCK_WAIT_SEC,
+                    )
+                    break
+                time.sleep(_COMPOSITION_LOCK_POLL_SEC)
+    try:
+        yield
+    finally:
+        if lf is not None:
+            try:
+                if locked:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+            finally:
+                lf.close()
+
+
+def persist_knowledge_composition(company: Optional[str], bundle: KnowledgeBundle) -> bool:
+    """Зафиксировать текущий состав как эталон для следующего диффа.
+
+    Отделена от `diff_knowledge_composition` НАМЕРЕННО (цикл из 5 ходов, Н2): снимок
+    обязан обновляться ТОЛЬКО после того, как владелец реально узнал о новых файлах.
+    Записать его раньше отправки — значит потерять алерт навсегда при первом же сбое
+    Telegram: следующая сборка увидит «состав тот же» и промолчит, а файл уже в промпте.
+    Ровно та тихая утечка, которую B3 объявляет невозможной.
+
+    Пустой состав снимок НЕ затирает: пустой bundle — это деградация (репо контекста не
+    доехал на VPS), а не «состав обнулился».
+    """
+    current = bundle_composition(bundle)
+    if not current:
+        return False
+    key = _composition_key(company)
+    with _composition_lock():
+        state = load_composition_state()
+        if state.get(key) == current:
+            return True  # уже актуален — диск не трогаем
+        state[key] = current
+        return _save_composition_state(state)
+
+
+def _composition_key(company: Optional[str]) -> str:
+    return str(company or "").strip().lower() or "—"
+
+
 def bundle_composition(bundle: KnowledgeBundle) -> dict[str, int]:
     """Состав брифа как `{путь: размер в байтах}` — то, что реально ушло бы в промпт."""
     return {
@@ -1089,7 +1209,7 @@ def diff_knowledge_composition(
     выглядели бы новыми — и уведомление пришло бы на ровном месте.
     """
     current = bundle_composition(bundle)
-    key = str(company or "").strip().lower() or "—"
+    key = _composition_key(company)
     state = load_composition_state()
     previous = state.get(key)
     if not current:
@@ -1104,9 +1224,14 @@ def diff_knowledge_composition(
                 added.append((rel, size))
             elif size >= was * _COMPOSITION_GROWTH_RATIO and size - was >= _COMPOSITION_GROWTH_MIN_BYTES:
                 grown.append((rel, was, size))
+    # `persist=True` — только для вызывателей, которым НЕЧЕГО сообщать владельцу (baseline,
+    # обновление размеров). Когда есть что сообщать, снимок фиксирует `alert_new_knowledge_files`
+    # ПОСЛЕ успешной отправки: иначе сбой Telegram навсегда съедает алерт (Н2).
     if persist and (first_run or added or grown or current != previous):
-        state[key] = current
-        _save_composition_state(state)
+        with _composition_lock():
+            fresh = load_composition_state()
+            fresh[key] = current
+            _save_composition_state(fresh)
     return added, grown, first_run
 
 
@@ -1123,14 +1248,27 @@ def alert_new_knowledge_files(
     встрече). Канал и дисциплина — те же, что у `alert_manifest_problems` (Telegram, дедуп,
     инъекция `pusher`, никогда не бросает).
 
+    СНИМОК ФИКСИРУЕТСЯ ТОЛЬКО ПОСЛЕ УСПЕШНОЙ ОТПРАВКИ (цикл из 5 ходов, Н2). Сбой канала
+    (Telegram лёг, tg-send не найден) → снимок остаётся прежним, и на следующей сборке мы
+    попробуем снова. Записать снимок раньше — значит навсегда потерять алерт о файле,
+    который УЖЕ уехал во внешнюю модель: «состав тот же» → молчим. Повторного спама это не
+    даёт — дедуп `notify.push` по ключу набора глушит повтор на 6 ч; ровно так же (без
+    состояния, с опорой на дедуп) живёт соседний `alert_manifest_problems`.
+
     Опасная тройка: в сообщении только имя файла и размер — ни байта содержимого.
     """
     try:
-        added, grown, first_run = diff_knowledge_composition(company, bundle)
+        added, grown, first_run = diff_knowledge_composition(company, bundle, persist=False)
     except Exception as e:  # noqa: BLE001 — дифф не имеет права уронить сборку протокола
         logger.warning("не сравнить состав знания: %s", type(e).__name__)
         return False
     if first_run or (not added and not grown):
+        # Сообщать нечего (baseline / состав не менялся / файл убрали) — снимок можно
+        # фиксировать сразу: терять нечего.
+        try:
+            persist_knowledge_composition(company, bundle)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("не сохранить снимок состава знания: %s", type(e).__name__)
         return False
     lines: list[str] = []
     for rel, size in added[:_ALERT_MAX_ITEMS]:
@@ -1160,10 +1298,18 @@ def alert_new_knowledge_files(
         except Exception:  # noqa: BLE001
             return False
     try:
-        return bool(pusher(msg, dedupe_key=key))  # type: ignore[operator]
+        sent = bool(pusher(msg, dedupe_key=key))  # type: ignore[operator]
     except Exception as e:  # noqa: BLE001
         logger.warning("не отправить алерт о новых файлах знания: %s", type(e).__name__)
         return False
+    if sent:
+        # Владелец узнал → фиксируем состав как эталон. Не отправилось → снимок НЕ трогаем:
+        # повторим на следующей сборке (Н2).
+        try:
+            persist_knowledge_composition(company, bundle)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("не сохранить снимок состава знания: %s", type(e).__name__)
+    return sent
 
 
 # Внутренняя навигация наружу не уходит (цикл из 5 ходов, Н4). В шапке боевого каталога
