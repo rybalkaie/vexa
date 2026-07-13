@@ -363,21 +363,16 @@ class TestR9ManifestCannotOpenFinances(_ContextRoot, unittest.TestCase):
         self.assertIn("нет", by_path["company/net-takogo-fayla.md"])
 
     def test_translit_fin_neighbour_not_listed_stays_out(self):
-        """РИСК1 наглядно: транслит-финфайл лежит В ТОЙ ЖЕ папке, что разрешённый, и
-        паттернами ПО ИМЕНИ НЕ ловится. Его держат снаружи два независимых слоя: он не вписан
-        в манифест И (с Ф1 плана `knowledge-content-barrier`) его ловит барьер по содержимому.
-        Закон «baza-znaniy — только поимённо, НИКОГДА glob папки» остаётся в силе."""
+        """РИСК1 наглядно: транслит-финфайл лежит В ТОЙ ЖЕ папке, что разрешённый. Его держат
+        снаружи два независимых слоя: он не вписан в манифест И (СМЕНА КУРСА владельца 2026-07-13,
+        план `knowledge-content-barrier`) закрыт ЯВНЫМ denylist поимённо — вписать его в манифест
+        теперь недостаточно. Закон «baza-znaniy — только поимённо, НИКОГДА glob папки» в силе."""
         sp = llm_postprocess._build_protocol_system_prompt("mpfirst", _METHOD)
         self.assertIn(_BAZA_OK, sp)          # сосед из той же папки — вошёл (он в манифесте)
         self.assertNotIn(_TRANSLIT_FIN, sp)  # финфайл — нет (его в манифесте нет)
-        # Слой 1 (имя) на нём по-прежнему МОЛЧИТ — именно поэтому и понадобился слой 2.
-        self.assertIsNone(ck.context_path_block_reason("company/baza-znaniy/924-uchet-dds.md"))
-        # Слой 2 (содержимое) — ловит: вписать такой файл в манифест теперь недостаточно.
-        self.assertIsNotNone(
-            ck.context_path_block_reason(
-                "company/baza-znaniy/924-uchet-dds.md", text="# Учет ДДС\n\nОстаток по кассе.\n"
-            )
-        )
+        # После смены курса известные финфайлы закрыты по ИМЕНИ (denylist), а не только
+        # контент-барьером: вписать такой файл в манифест недостаточно — режется наглухо.
+        self.assertIsNotNone(ck.context_path_block_reason("company/baza-znaniy/924-uchet-dds.md"))
 
     def test_manifest_filter_uses_the_single_backstop(self):
         """Инвариант Ф1: фильтр манифеста ОБЯЗАН звать `context_path_block_reason`, а не

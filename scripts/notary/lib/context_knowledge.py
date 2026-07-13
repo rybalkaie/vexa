@@ -106,6 +106,22 @@ PROTOCOL_CONTEXT_DENYLIST: frozenset[str] = frozenset({
     "o-kompanii-mpervyi.md",  # МПервый: чистая прибыль, маржа, ROIC, налоговый план
     "vision.md",              # Anzhee: антимонопольная механика + указания по формулировкам
     "dry-rental.md",          # Anzhee: дилерские цены, маржа прокатчика, ссылка на закрытый прайс
+    # Смена курса владельца 2026-07-13 (план knowledge-content-barrier): не «распознавать
+    # деньги в тексте» (гонка, грозит прятать открытые данные вроде «3000 пользователей»),
+    # а РАЗДЕЛЬНОЕ ХРАНЕНИЕ — конфиденциальное закрыто структурно, ПОИМЁННО. Эти 9 финфайлов
+    # `baza-znaniy` МПервый названы транслитом (паттерн их не ловит): закрываем точным
+    # именем, даже вписанные в манифест — режутся наглухо. Открытые цифры (метрики,
+    # публичные цены) при этом НЕ трогаем — они допустимы в брифе.
+    "793-kak-uchityvat-reinvestirovanie-protsentov-po-zaymam.md",  # займы, проценты
+    "825-sistema-ucheta-na-google-tablitsakh.md",                  # система учёта
+    "837-planirovanie-oplat-zakazov-tovara.md",                    # планирование оплат
+    "839-kakuyu-tsenu-postavit-unit-ekonomika-prodazh.md",         # unit-экономика продаж
+    "867-nalichnye-kassy-sverka-ostatkov-po-kassam.md",            # наличные кассы, остатки
+    "922-vedenie-ucheta-vneshnikh-reklamnykh-integratsiy.md",      # учёт рекламных трат
+    "924-uchet-dds.md",                                            # ДДС (движение денежных средств)
+    "925-predostavlenie-otcheta-po-sebestoimosti-postavki.md",     # себестоимость поставки
+    "kak-uchityvat-kursy-valyut-pri-zakupkakh.md",                 # курсы валют при закупках
+    "zifriend-vzaimoraschety-itog.md",                             # взаиморасчёты с контрагентом
 })
 
 # Запрет по ПУТИ: имя директории, содержимое которой не читается НИКОГДА, в любом

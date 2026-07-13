@@ -148,6 +148,29 @@ class TestContextPathBlockReason(unittest.TestCase):
         ):
             self.assertIsNotNone(ck.context_path_block_reason(rel), rel)
 
+    def test_baza_znaniy_finfiles_blocked_by_name(self):
+        """Смена курса владельца 2026-07-13 (раздельное хранение вместо распознавания денег):
+        9 конфиденциальных финфайлов baza-znaniy МПервый с транслитными именами закрыты
+        ПОИМЁННО — даже вписанные в манифест, режутся наглухо (паттерны их не ловят)."""
+        for rel in (
+            "company/baza-znaniy/793-kak-uchityvat-reinvestirovanie-protsentov-po-zaymam.md",
+            "company/baza-znaniy/825-sistema-ucheta-na-google-tablitsakh.md",
+            "company/baza-znaniy/837-planirovanie-oplat-zakazov-tovara.md",
+            "company/baza-znaniy/839-kakuyu-tsenu-postavit-unit-ekonomika-prodazh.md",
+            "company/baza-znaniy/867-nalichnye-kassy-sverka-ostatkov-po-kassam.md",
+            "company/baza-znaniy/922-vedenie-ucheta-vneshnikh-reklamnykh-integratsiy.md",
+            "company/baza-znaniy/924-uchet-dds.md",
+            "company/baza-znaniy/925-predostavlenie-otcheta-po-sebestoimosti-postavki.md",
+            "company/baza-znaniy/zifriend-vzaimoraschety-itog.md",
+        ):
+            self.assertIsNotNone(ck.context_path_block_reason(rel), rel)
+
+    def test_open_data_with_numbers_still_passes(self):
+        """Решение владельца: не всякая цифра секрет. Открытые данные (метрики, публичные
+        цены, каталог с артикулами) проходят — их прятать не нужно."""
+        for rel in (_CATALOG, "company/team.md", "company/values.md"):
+            self.assertIsNone(ck.context_path_block_reason(rel), rel)
+
     def test_restricted_dir_anywhere_in_tree(self):
         """R1: всё под `restricted/` закрыто — на любой глубине дерева."""
         for rel in (
@@ -295,19 +318,23 @@ class TestRisk1TranslitNamesSlipPatterns(_FixtureContextMixin, unittest.TestCase
     ловит барьер по СОДЕРЖИМОМУ. Тесты ниже фиксируют оба факта: имя молчит — содержимое
     останавливает."""
 
-    def test_translit_fin_names_are_NOT_caught_by_patterns(self):
-        """Фиксация факта: паттерн-бэкстоп по этим именам молчит."""
+    def test_translit_fin_names_now_blocked_by_denylist(self):
+        """СМЕНА КУРСА владельца 2026-07-13 (раздельное хранение вместо распознавания денег):
+        транслитные финфайлы `baza-znaniy`, которые ПАТТЕРНЫ по имени не ловят, теперь закрыты
+        ЯВНЫМ denylist поимённо — режутся наглухо даже вписанные в манифест. Раньше этот тест
+        фиксировал обратное (что они проходят) как обоснование контент-барьера; после смены
+        курса главная защита известного конфиденциального — точный список имён, не распознавание."""
         for rel in _TRANSLIT_FIN:
-            self.assertIsNone(
+            self.assertIsNotNone(
                 ck.context_path_block_reason(rel),
-                f"паттерн неожиданно поймал {rel} — перечитай РИСК1 перед правкой теста",
+                f"финфайл {rel} должен быть закрыт denylist поимённо (смена курса 2026-07-13)",
             )
         for rel in (
             "company/baza-znaniy/867-nalichnye-kassy-sverka-ostatkov-po-kassam.md",
             "company/baza-znaniy/925-predostavlenie-otcheta-po-sebestoimosti-postavki.md",
             "company/baza-znaniy/kak-uchityvat-kursy-valyut-pri-zakupkakh.md",
         ):
-            self.assertIsNone(ck.context_path_block_reason(rel), rel)
+            self.assertIsNotNone(ck.context_path_block_reason(rel), rel)
 
     def test_glob_style_include_is_stopped_by_content_barrier(self):
         """Симуляция glob'а папки. РАНЬШЕ (до Ф1 плана `knowledge-content-barrier`) финфайлы
