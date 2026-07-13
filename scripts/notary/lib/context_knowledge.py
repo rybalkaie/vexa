@@ -94,6 +94,15 @@ PROTOCOL_CONTEXT_DENYLIST: frozenset[str] = frozenset({
     "finmodel-orgstruktura.md",           # финмодель оргструктуры (финансы + HR)
     "people-confidential.md",             # HR-конфиденшел (люди, зарплаты, оценки)
     "marketplace-affiliation-safety.md",  # аффилированность на маркетплейсах (юр. риск)
+    # Ф2 (цикл из 5 ходов). Про эти три файла ПРОВЕРЕНО, что внутри чувствительное —
+    # и при этом план велел вписать их в бриф (`plans/2026-07-12-…:152`). Из манифеста
+    # их исключили, но в коде не закрывали: файл держался снаружи только тем, что строки
+    # нет в текстовом файле чужого репо, который правит команда без ревью кода. Это
+    # противоречит R9/A3 («бэкстоп живёт в КОДЕ и правкой манифеста не обходится»):
+    # достаточно одной строки — и наружу уезжает то, что уезжать не должно никогда.
+    "o-kompanii-mpervyi.md",  # МПервый: чистая прибыль, маржа, ROIC, налоговый план
+    "vision.md",              # Anzhee: антимонопольная механика + указания по формулировкам
+    "dry-rental.md",          # Anzhee: дилерские цены, маржа прокатчика, ссылка на закрытый прайс
 })
 
 # Запрет по ПУТИ: имя директории, содержимое которой не читается НИКОГДА, в любом
@@ -473,6 +482,15 @@ def apply_total_budget(
 PROTOCOL_KNOWLEDGE_MANIFEST_FILE = "protocol-knowledge-allowlist.txt"
 MANIFEST_CATALOG_PREFIX = "catalog:"
 
+# Сколько проблемных файлов перечислять в Telegram-алерте (у сообщения есть потолок
+# длины; массовая поломка манифеста не должна утопить сам сигнал о поломке).
+_ALERT_MAX_ITEMS = 10
+
+# Порог раннего предупреждения о бюджете. Сигнал «файл выпал» приходит ПОСТФАКТУМ — когда
+# один протокол уже собрался обеднённым. У МПервый занято 75% (38.5 из 50 КБ), запас — 2–3
+# средних файла: команда добавит второй бренд, и хвост вытеснится. Предупреждаем ЗАРАНЕЕ.
+_BUDGET_WARN_RATIO = 0.85
+
 # `\s+#` — комментарий в конце строки (не режем `#` внутри имени файла, хотя таких
 # у нас нет: путь `a#b.md` остался бы целым, а `a.md  # коммент` — обрезался).
 _MANIFEST_INLINE_COMMENT_RE = re.compile(r"\s+#.*$")
@@ -544,7 +562,12 @@ def read_manifest(company: Optional[str]) -> Optional[tuple[list[str], list[str]
     if not mpath or not mpath.is_file():
         return None
     try:
-        text = mpath.read_text(encoding="utf-8", errors="replace")
+        # `utf-8-sig`, а не `utf-8`: манифест по замыслу правит НЕ программист (в этом вся
+        # суть R3/A3), а Блокнот / экспорт из Excel / копипаст из Word сохраняют файл с BOM.
+        # Глазами файл выглядит нормально, но BOM прилипает к первой строке: шапка-комментарий
+        # перестаёт быть комментарием и становится «путём», а если BOM сядет на строку
+        # `catalog:` — префикс не распознается и каталог тихо деградирует в справку.
+        text = mpath.read_text(encoding="utf-8-sig", errors="replace")
     except OSError as e:
         logger.warning("не прочитать манифест знания %s: %s — код-фолбэк", mpath, e)
         return None
@@ -557,33 +580,68 @@ def read_manifest(company: Optional[str]) -> Optional[tuple[list[str], list[str]
     return catalog, brief
 
 
-def resolve_knowledge_manifest(company: Optional[str]) -> tuple[list[str], list[str], str]:
-    """Эффективный СОСТАВ знания компании: `(каталог, бриф, источник)`.
+def resolve_knowledge_manifest(
+    company: Optional[str],
+) -> tuple[list[str], list[str], str, list[tuple[str, str]]]:
+    """Эффективный СОСТАВ знания компании: `(каталог, бриф, источник, потери)`.
 
     Манифест есть → он источник истины («бот читает ИМЕННО их», критерий R3).
     Манифеста нет / он пуст → код-фолбэк `PROTOCOL_CONTEXT_WHITELIST` (РИСК2: канон
     артикулов ISS-21 не должен пропасть только оттого, что манифест не доехал).
+
+    `потери` — [(путь, причина)] того, что команда НЕ вписала, хотя файл лежит в репо:
+    известный каталог товаров пропал из манифеста. Это не «файл отклонён» (его никто
+    не просил) — это ТИХАЯ ПОЛОМКА: канон артикулов молча исчезает из промпта, и бот
+    снова начинает фонетить названия товаров (регресс ISS-21). Возвращаем наверх,
+    чтобы сигнал дошёл до ЧЕЛОВЕКА (Telegram-алерт + CLI), а не только до лога VPS,
+    который никто не читает — иначе «видимый сигнал» слеп ровно в самом дорогом случае.
 
     Здесь НЕТ фильтрации по безопасности — только состав. Фильтр один, и он на
     чтении (`_read_knowledge_file` → `context_path_block_reason`).
     """
     manifest = read_manifest(company)
     if manifest is None:
-        return list(PROTOCOL_CONTEXT_WHITELIST), [], "code-fallback"
-    catalog, brief = manifest
-    # ISS-21-страховка, но НЕ подмена воли команды: если файл код-фолбэка (каталог
-    # товаров) физически есть у компании, а в манифесте его забыли — громко скажем.
-    # Не дописываем его молча: критерий R3 требует «бот читает ИМЕННО их».
+        return list(PROTOCOL_CONTEXT_WHITELIST), [], "code-fallback", []
+    # Копии: ниже мы переставляем файл из брифа в каталог, а вход мутировать нельзя —
+    # сегодня `parse_manifest` отдаёт свежие списки, но стоит кому-то закешировать разбор
+    # манифеста (соблазн есть: диск читается на каждой генерации), и мутация испортит кеш.
+    catalog, brief = list(manifest[0]), list(manifest[1])
+    missing: list[tuple[str, str]] = []
     root = repo_root(company)
     if root:
-        listed = set(catalog) | set(brief)
         for rel in PROTOCOL_CONTEXT_WHITELIST:
-            if rel not in listed and (root / rel).is_file():
+            if rel in catalog:
+                continue
+            if rel in brief:
+                # Каталог вписан, но БЕЗ префикса `catalog:`. Воля команды есть —
+                # ошиблись только в форме записи. Как файл брифа он потерял бы правило
+                # R7 («незнакомый товаро-подобный токен пиши как услышано») и приоритет
+                # в бюджете. Классифицируем правильно и говорим об этом громко: это НЕ
+                # молчаливая дописка (файл в манифесте), а починка формы.
+                brief.remove(rel)
+                # В КОНЕЦ каталогов, не в начало: то, что команда пометила `catalog:`
+                # явно, приоритетнее того, что мы опознали за неё. Главное уже достигнуто —
+                # файл попал в каталог, а значит идёт впереди всего брифа в бюджете и
+                # получает правило подстановки артикулов.
+                catalog.append(rel)
+                logger.warning(
+                    "каталог товаров %s вписан в манифест БЕЗ префикса `catalog:` — "
+                    "читаю его как каталог (иначе пропали бы правило подстановки артикулов "
+                    "и приоритет в бюджете). Поправь строку в манифесте: `catalog: %s`",
+                    rel, rel,
+                )
+                continue
+            if (root / rel).is_file():
+                missing.append((
+                    str(rel),
+                    "каталог товаров ЕСТЬ в репозитории, но НЕ вписан в манифест — "
+                    f"канон названий и артикулов потерян (добавь строку `catalog: {rel}`)",
+                ))
                 logger.warning(
                     "каталог товаров %s ЕСТЬ в репозитории, но НЕ вписан в манифест — "
                     "он НЕ попадёт в промпт (канон артикулов будет потерян, ISS-21)", rel,
                 )
-    return catalog, brief, "manifest"
+    return catalog, brief, "manifest", missing
 
 
 # --- Видимый сигнал: «твой файл не подключён, причина Y» (follow-up 1 из Ф1) ----
@@ -607,11 +665,18 @@ def manifest_report(company: Optional[str], bundle: Optional[KnowledgeBundle] = 
         "code-fallback": "код-фолбэк (манифеста нет — поведение как до Ф2)",
         "none": "репозиторий контекста компании неизвестен",
     }.get(b.source, b.source)
+    pct = int(100 * total / max(1, PROTOCOL_CONTEXT_TOTAL_MAX_BYTES))
     lines.append(f"Компания: {company or '—'} · источник состава: {src}")
     lines.append(
         f"В промпт войдёт: каталог={len(b.catalog)}, бриф={len(b.brief)}, "
-        f"итого {total} Б из бюджета {PROTOCOL_CONTEXT_TOTAL_MAX_BYTES} Б"
+        f"итого {total} Б из бюджета {PROTOCOL_CONTEXT_TOTAL_MAX_BYTES} Б ({pct}%)"
     )
+    # Предупреждаем ДО того, как файл выпал: иначе человек узнаёт о потолке постфактум.
+    if total > PROTOCOL_CONTEXT_TOTAL_MAX_BYTES * _BUDGET_WARN_RATIO:
+        lines.append(
+            f"  ⚠️  бюджет заполнен на {pct}% — следующий крупный файл вытеснит из промпта "
+            "ПОСЛЕДНИЕ строки манифеста. Прежде чем добавлять, реши, что важнее"
+        )
     for rel, text in b.catalog:
         lines.append(f"  ✅ каталог  {rel} ({len(text.encode('utf-8'))} Б)")
     for rel, text in b.brief:
@@ -640,7 +705,16 @@ def alert_manifest_problems(
     if not bundle.rejected:
         return False
     head = f"⚠️ Знание компании «{company}»: {len(bundle.rejected)} файл(ов) НЕ подключены к боту"
-    body = "\n".join(f"• {rel} — {reason}" for rel, reason in bundle.rejected)
+    # Лимит строк: у Telegram потолок сообщения (~4096 знаков), и массовая поломка
+    # манифеста (десятки кривых строк) утопила бы САМ алерт о поломке. Показываем
+    # первые, остальные — счётчиком; полный разбор даёт CLI `check-knowledge-manifest.py`.
+    shown = bundle.rejected[:_ALERT_MAX_ITEMS]
+    body = "\n".join(f"• {rel} — {reason}" for rel, reason in shown)
+    if len(bundle.rejected) > _ALERT_MAX_ITEMS:
+        body += (
+            f"\n• …и ещё {len(bundle.rejected) - _ALERT_MAX_ITEMS}. "
+            "Полный список: `python3 tools/check-knowledge-manifest.py`"
+        )
     tail = (
         f"Протокол соберётся БЕЗ них. Состав правится в "
         f"{KNOWLEDGE_SUBPATH}/{PROTOCOL_KNOWLEDGE_MANIFEST_FILE} репозитория контекста."
@@ -661,6 +735,35 @@ def alert_manifest_problems(
     except Exception as e:  # noqa: BLE001 — алерт не имеет права уронить сборку
         logger.warning("не отправить алерт о манифесте знания: %s", type(e).__name__)
         return False
+
+
+# Внутренняя навигация наружу не уходит (цикл из 5 ходов, Н4). В шапке боевого каталога
+# товаров («где брать живьём») лежат ID трёх ЗАКРЫТЫХ Google-таблиц — людям они там нужны,
+# файл это источник истины команды. Но файл целиком уходит во ВНЕШНИЙ LLM, а политика
+# проекта держит drive-карты в денилисте ровно потому, что внутреннюю навигацию наружу не
+# отдают. Правим не чужие данные, а СВОЁ чтение: идентификатор редактируется на выходе,
+# текст и смысл файла остаются. Барьер общий — он накрывает и каталог, и бриф, и любой
+# файл знания, который команда добавит завтра.
+#
+# Регекс намеренно узкий: Google-ID — длинная строка СМЕШАННОГО регистра с цифрами
+# (`10kEZCmDItFu5yArvxFfRiu9V3lZcCnP4dNCQSwhRup0`). Требование «есть строчная И заглавная
+# И цифра» отсекает ложные срабатывания на ALL_CAPS-константах и артикулах товаров.
+_INTERNAL_ID_RE = re.compile(
+    r"\b(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{25,}\b"
+)
+_INTERNAL_ID_PLACEHOLDER = "‹идентификатор скрыт›"
+
+
+def redact_internal_ids(text: str) -> tuple[str, int]:
+    """Скрыть из текста знания идентификаторы закрытых Google-таблиц/папок. → `(текст, N)`.
+
+    Чистая (без IO) — тестируется инъекцией строки. Возвращает счётчик, а не сам найденный
+    идентификатор: в лог уходит «скрыто 3 шт.», а не то, что именно скрыли (Опасная тройка).
+    """
+    if not text:
+        return "", 0
+    out, n = _INTERNAL_ID_RE.subn(_INTERNAL_ID_PLACEHOLDER, text)
+    return out, n
 
 
 def _read_knowledge_file(root: Path, rel: str) -> tuple[Optional[str], Optional[str]]:
@@ -710,6 +813,13 @@ def _read_knowledge_file(root: Path, rel: str) -> tuple[Optional[str], Optional[
         return None, f"не декодировать файл ({type(e).__name__})"
     if not text:
         return None, "файл пуст"
+    # (5.5) Внутренняя навигация: ID закрытых Google-таблиц из шапок файлов знания наружу
+    # не отдаём. В лог — только СЧЁТЧИК, не то, что скрыли (Опасная тройка).
+    text, hidden = redact_internal_ids(text)
+    if hidden:
+        logger.info(
+            "знание %s: скрыто %d внутренних идентификатор(ов) — во внешний LLM не уйдут", rel, hidden
+        )
     return text, None
 
 
@@ -738,8 +848,13 @@ def load_protocol_knowledge(company: Optional[str]) -> KnowledgeBundle:
     if not root:
         return KnowledgeBundle(catalog=[], brief=[], rejected=[], source="none")
 
-    catalog_rel, brief_rel, source = resolve_knowledge_manifest(company)
-    rejected: list[tuple[str, str]] = []
+    # `missing` — то, что команда забыла вписать (каталог товаров). Кладём его в
+    # `rejected` СРАЗУ: именно `rejected` — единственный канал, по которому проблема
+    # доходит до человека (Telegram-алерт + `manifest_report` + ненулевой код CLI).
+    # Без этого «забытый каталог» виден только в логе VPS, а все три видимые поверхности
+    # рапортуют «всё хорошо» — при том что канон артикулов из промпта пропал.
+    catalog_rel, brief_rel, source, missing = resolve_knowledge_manifest(company)
+    rejected: list[tuple[str, str]] = list(missing)
 
     # Каталог ВСЕГДА впереди брифа: `apply_total_budget` режет хвост, и порядок
     # здесь — единственное, что защищает канон артикулов от переполнения бюджета.
@@ -766,12 +881,22 @@ def load_protocol_knowledge(company: Optional[str]) -> KnowledgeBundle:
     catalog = [(rel, kept_map[rel]) for kind, rel, _t in read if kind == "catalog" and rel in kept_map]
     brief = [(rel, kept_map[rel]) for kind, rel, _t in read if kind == "brief" and rel in kept_map]
 
+    total = sum(len(t.encode("utf-8")) for _, t in catalog + brief)
     if catalog or brief:
         logger.info(
             "знание компании %s (источник: %s): каталог=%d, бриф=%d, байт=%d, не подключено=%d "
             "(текст знания не логируется — Опасная тройка)",
-            company, source, len(catalog), len(brief),
-            sum(len(t.encode("utf-8")) for _, t in catalog + brief), len(rejected),
+            company, source, len(catalog), len(brief), total, len(rejected),
+        )
+    # Ранний сигнал о бюджете: без него человек узнаёт о потолке только когда файл УЖЕ
+    # выпал — то есть один протокол уже собрался обеднённым. Молчим, если выпадение уже
+    # случилось: там свой, более громкий WARNING (не дублируем шум).
+    if not rejected and total > PROTOCOL_CONTEXT_TOTAL_MAX_BYTES * _BUDGET_WARN_RATIO:
+        logger.warning(
+            "бюджет знания %s заполнен на %d%% (%d Б из %d Б) — следующий крупный файл "
+            "вытеснит хвост манифеста из промпта. Проверь состав заранее",
+            company, int(100 * total / max(1, PROTOCOL_CONTEXT_TOTAL_MAX_BYTES)),
+            total, PROTOCOL_CONTEXT_TOTAL_MAX_BYTES,
         )
     return KnowledgeBundle(catalog=catalog, brief=brief, rejected=rejected, source=source)
 

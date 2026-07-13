@@ -510,6 +510,233 @@ class TestIss21CatalogMissingFromManifest(unittest.TestCase):
         self.assertTrue(any("канон артикулов" in m for m in cm.output))
         self.assertEqual(b.catalog, [])  # но волю команды не подменяем
 
+    def test_forgotten_catalog_REACHES_THE_HUMAN_not_just_the_log(self):
+        """Цикл из 5 ходов, Н1. WARNING уходит в лог VPS, которого никто не читает.
+        Забытый каталог обязан дойти до ЧЕЛОВЕКА всеми тремя поверхностями сигнала —
+        иначе канон артикулов (ISS-21) пропадает из промпта, а бот, CLI и Telegram
+        дружно рапортуют «всё хорошо». Это и есть тихая поломка, ради которой сигнал
+        вообще делался."""
+        b = ck.load_protocol_knowledge("mpfirst")
+        # 1. Поверхность «rejected» — единственный канал наружу.
+        by_path = dict(b.rejected)
+        self.assertIn("knowledge/product-catalog-wb.md", by_path)
+        self.assertIn("НЕ вписан в манифест", by_path["knowledge/product-catalog-wb.md"])
+        # 2. Telegram-алерт владельцу РЕАЛЬНО уходит (а не молчит).
+        calls: list[str] = []
+        sent = ck.alert_manifest_problems(
+            "mpfirst", b, pusher=lambda msg, **kw: (calls.append(msg), True)[1]
+        )
+        self.assertTrue(sent, "владелец обязан узнать, что каталог отвалился")
+        self.assertIn("product-catalog-wb.md", calls[0])
+        # 3. CLI-самопроверка обязана ругаться (ненулевой код = ловится в CI/кроне),
+        #    а не печатать «✅ всё, что вписано, реально доезжает».
+        self.assertIn("❌", ck.manifest_report("mpfirst", b))
+
+    def test_catalog_without_prefix_still_gets_the_substitution_rule(self):
+        """Цикл из 5 ходов, Н3. Человек вписал каталог, но забыл префикс `catalog:`.
+        Как файл брифа каталог теряет правило R7 («подставляй ТОЧНО так») и приоритет
+        в бюджете — то есть тихо перестаёт работать как канон. Форму записи чиним,
+        воля команды при этом не подменяется (файл в манифесте есть)."""
+        manifest = (
+            Path(self._tmp) / "mpfirst-context" / "knowledge" / "notary"
+            / ck.PROTOCOL_KNOWLEDGE_MANIFEST_FILE
+        )
+        manifest.write_text(
+            "company/a.md\nknowledge/product-catalog-wb.md\n", encoding="utf-8"  # без префикса
+        )
+        with self.assertLogs("notary.lib.context_knowledge", level=logging.WARNING) as cm:
+            b = ck.load_protocol_knowledge("mpfirst")
+        self.assertTrue(any("БЕЗ префикса" in m for m in cm.output))
+        self.assertEqual([r for r, _ in b.catalog], ["knowledge/product-catalog-wb.md"])
+        # Правило подстановки артикулов на месте, и каталог — первым в бюджете.
+        block = glossary.catalog_prompt_block("mpfirst", bundle=b)
+        self.assertIn(_CATALOG, block)
+        self.assertIn("услышано", block)
+
+
+class TestCodeBackstopCoversKnownFinanceFiles(unittest.TestCase):
+    """Цикл из 5 ходов, Н2. Ф2 установила, что в трёх конкретных файлах лежат финансы
+    (чистая прибыль/маржа/ROIC), дилерские цены и антимонопольная механика — и исключила
+    их из манифеста. Но манифест правит КОМАНДА в чужом репо, без ревью кода, а план
+    (`:152`) прямо велел эти файлы включить. Отсутствие строки в текстовом файле — не
+    барьер. R9/A3 требуют барьер в КОДЕ: вписать можно, прочитать нельзя."""
+
+    _FINANCE_FILES = (
+        "company/o-kompanii-mpervyi.md",   # чистая прибыль, маржа, ROIC, налоговый план
+        "vision.md",                        # антимонопольная механика (Anzhee)
+        "knowledge/dry-rental.md",          # дилерские цены, маржа прокатчика
+    )
+
+    def test_backstop_blocks_them_by_code(self):
+        for rel in self._FINANCE_FILES:
+            self.assertIsNotNone(
+                ck.context_path_block_reason(rel),
+                f"{rel} содержит финансы/чувствительное, но код его не блокирует — "
+                "достаточно одной строки в манифесте, чтобы это уехало в Anthropic",
+            )
+
+    def test_manifest_cannot_reopen_them(self):
+        """Сквозная проверка: вписали в манифест — в промпт всё равно не попало."""
+        tmp = tempfile.mkdtemp()
+        repo = Path(tmp) / "anzhee-context"
+        (repo / "knowledge" / "notary").mkdir(parents=True)
+        (repo / "vision.md").write_text("VISION_SENTINEL_MUST_NOT_LEAK", encoding="utf-8")
+        (repo / "knowledge" / "dry-rental.md").write_text(
+            "DRY_RENTAL_PRICES_SENTINEL_MUST_NOT_LEAK", encoding="utf-8"
+        )
+        (repo / "knowledge" / "notary" / ck.PROTOCOL_KNOWLEDGE_MANIFEST_FILE).write_text(
+            "vision.md\nknowledge/dry-rental.md\n", encoding="utf-8"
+        )
+        saved = os.environ.get("MEETING_NOTARY_CONTEXT_DIR")
+        os.environ["MEETING_NOTARY_CONTEXT_DIR"] = tmp
+        self.addCleanup(
+            lambda: os.environ.__setitem__("MEETING_NOTARY_CONTEXT_DIR", saved)
+            if saved is not None
+            else os.environ.pop("MEETING_NOTARY_CONTEXT_DIR", None)
+        )
+        sp = llm_postprocess._build_protocol_system_prompt("anzhee", _METHOD)
+        self.assertNotIn("VISION_SENTINEL_MUST_NOT_LEAK", sp)
+        self.assertNotIn("DRY_RENTAL_PRICES_SENTINEL_MUST_NOT_LEAK", sp)
+        by_path = dict(ck.load_protocol_knowledge("anzhee").rejected)
+        self.assertIn("денилист", by_path["vision.md"])
+        self.assertIn("денилист", by_path["knowledge/dry-rental.md"])
+
+
+class TestInternalIdsNeverLeaveTheHouse(unittest.TestCase):
+    """Цикл из 5 ходов, Н4 (security). В шапке боевого каталога товаров («где брать живьём»)
+    лежат ID трёх ЗАКРЫТЫХ Google-таблиц, и файл целиком уходит во внешний LLM. Политика
+    проекта держит drive-карты в денилисте ровно потому, что внутреннюю навигацию наружу не
+    отдают — а тут она уходила молча. Чужие данные не правим: редактируем СВОЁ чтение."""
+
+    _REAL_SHAPE = (
+        "> Где брать живьём: ALTRONIX `10kEZCmDItFu5yArvxFfRiu9V3lZcCnP4dNCQSwhRup0`!`Артикулы`,\n"
+        "> ENVONIX `1dZr9L23tlQCE_3T8U6A2KY_kuYcMxmM6Zyc7yMzly54`!`Артикулы`.\n"
+        "\n## Линейки\n- **Pulsar 63ML** — караоке-система, артикул ALT-PLS-63\n"
+    )
+
+    def test_google_ids_are_hidden(self):
+        out, n = ck.redact_internal_ids(self._REAL_SHAPE)
+        self.assertEqual(n, 2)
+        self.assertNotIn("10kEZCmDItFu5yArvxFfRiu9V3lZcCnP4dNCQSwhRup0", out)
+        self.assertNotIn("1dZr9L23tlQCE_3T8U6A2KY_kuYcMxmM6Zyc7yMzly54", out)
+
+    def test_product_names_and_articles_survive(self):
+        """Скраб обязан быть узким: канон артикулов — смысл всего каталога (ISS-21)."""
+        out, _n = ck.redact_internal_ids(self._REAL_SHAPE)
+        for keep in ("Pulsar 63ML", "ALT-PLS-63", "ALTRONIX", "ENVONIX", "Артикулы", "Линейки"):
+            self.assertIn(keep, out, f"скраб съел то, что съедать не должен: {keep}")
+
+    def test_allcaps_constants_are_not_touched(self):
+        """ALL_CAPS-строки (сентинели, константы, заголовки) — не идентификаторы Google."""
+        text = "BRAND_SENTINEL_ALTRONIX_IDENTITY и SENSITIVE_SENTINEL_SALARIES_MUST_NOT_LEAK"
+        out, n = ck.redact_internal_ids(text)
+        self.assertEqual(n, 0)
+        self.assertEqual(out, text)
+
+    def test_redaction_is_on_the_live_read_path(self):
+        """Не «функция написана», а барьер РЕАЛЬНО стоит на пути файла в промпт."""
+        tmp = tempfile.mkdtemp()
+        repo = Path(tmp) / "mpfirst-context"
+        (repo / "knowledge" / "notary").mkdir(parents=True)
+        (repo / "knowledge" / "product-catalog-wb.md").write_text(
+            self._REAL_SHAPE, encoding="utf-8"
+        )
+        (repo / "knowledge" / "notary" / ck.PROTOCOL_KNOWLEDGE_MANIFEST_FILE).write_text(
+            "catalog: knowledge/product-catalog-wb.md\n", encoding="utf-8"
+        )
+        saved = os.environ.get("MEETING_NOTARY_CONTEXT_DIR")
+        os.environ["MEETING_NOTARY_CONTEXT_DIR"] = tmp
+        self.addCleanup(
+            lambda: os.environ.__setitem__("MEETING_NOTARY_CONTEXT_DIR", saved)
+            if saved is not None
+            else os.environ.pop("MEETING_NOTARY_CONTEXT_DIR", None)
+        )
+        sp = llm_postprocess._build_protocol_system_prompt("mpfirst", _METHOD)
+        self.assertNotIn("10kEZCmDItFu5yArvxFfRiu9V3lZcCnP4dNCQSwhRup0", sp)
+        self.assertIn("Pulsar 63ML", sp)  # …при этом канон артикулов на месте
+
+
+class TestManifestSurvivesHumanEditors(unittest.TestCase):
+    """Цикл из 5 ходов, У2. Манифест по замыслу правит НЕ программист (в этом суть R3/A3).
+    Блокнот / экспорт из Excel / копипаст из Word сохраняют файл с BOM — глазами он выглядит
+    нормально, но BOM прилипает к первой строке."""
+
+    def setUp(self):
+        self._saved = os.environ.get("MEETING_NOTARY_CONTEXT_DIR")
+        self._tmp = tempfile.mkdtemp()
+        repo = Path(self._tmp) / "mpfirst-context"
+        (repo / "knowledge" / "notary").mkdir(parents=True)
+        (repo / "knowledge" / "product-catalog-wb.md").write_text(_CATALOG, encoding="utf-8")
+        self._manifest = repo / "knowledge" / "notary" / ck.PROTOCOL_KNOWLEDGE_MANIFEST_FILE
+        os.environ["MEETING_NOTARY_CONTEXT_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("MEETING_NOTARY_CONTEXT_DIR", None)
+        else:
+            os.environ["MEETING_NOTARY_CONTEXT_DIR"] = self._saved
+
+    def test_manifest_saved_with_bom_still_works(self):
+        """BOM не должен превращать шапку-комментарий в «путь», а каталог — в справку."""
+        self._manifest.write_text(
+            "# что бот знает\ncatalog: knowledge/product-catalog-wb.md\n",
+            encoding="utf-8-sig",  # ← именно так сохраняет Блокнот
+        )
+        b = ck.load_protocol_knowledge("mpfirst")
+        self.assertEqual([r for r, _ in b.catalog], ["knowledge/product-catalog-wb.md"])
+        self.assertEqual(b.rejected, [], "комментарий не должен уехать в пути")
+
+
+class TestBudgetWarnsBeforeItHurts(unittest.TestCase):
+    """Цикл из 5 ходов, У4. Сигнал «файл выпал» приходит ПОСТФАКТУМ — когда один протокол
+    уже собрался обеднённым. У МПервый занято 75%, запас 2–3 файла: предупреждаем ЗАРАНЕЕ."""
+
+    def setUp(self):
+        self._saved = os.environ.get("MEETING_NOTARY_CONTEXT_DIR")
+        self._tmp = tempfile.mkdtemp()
+        repo = Path(self._tmp) / "mpfirst-context"
+        (repo / "knowledge" / "notary").mkdir(parents=True)
+        (repo / "company").mkdir(parents=True)
+        (repo / "knowledge" / "product-catalog-wb.md").write_text(_CATALOG, encoding="utf-8")
+        (repo / "company" / "big.md").write_text("Б" * 900, encoding="utf-8")  # ~1800 Б в utf-8
+        (repo / "knowledge" / "notary" / ck.PROTOCOL_KNOWLEDGE_MANIFEST_FILE).write_text(
+            "catalog: knowledge/product-catalog-wb.md\ncompany/big.md\n", encoding="utf-8"
+        )
+        os.environ["MEETING_NOTARY_CONTEXT_DIR"] = self._tmp
+        orig = ck.PROTOCOL_CONTEXT_TOTAL_MAX_BYTES
+        ck.PROTOCOL_CONTEXT_TOTAL_MAX_BYTES = 2000  # всё влезает, но впритык (>85%)
+        self.addCleanup(lambda: setattr(ck, "PROTOCOL_CONTEXT_TOTAL_MAX_BYTES", orig))
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("MEETING_NOTARY_CONTEXT_DIR", None)
+        else:
+            os.environ["MEETING_NOTARY_CONTEXT_DIR"] = self._saved
+
+    def test_warns_while_everything_still_fits(self):
+        """Ничего ещё не выпало — но человека предупреждают, что запас кончается."""
+        with self.assertLogs("notary.lib.context_knowledge", level=logging.WARNING) as cm:
+            b = ck.load_protocol_knowledge("mpfirst")
+        self.assertEqual(b.rejected, [], "на этом бюджете всё ещё влезает")
+        self.assertTrue(any("вытеснит хвост манифеста" in m for m in cm.output))
+        self.assertIn("⚠️", ck.manifest_report("mpfirst", b))
+
+
+class TestAlertStaysDeliverable(unittest.TestCase):
+    """Цикл из 5 ходов, Н5. Массовая поломка манифеста не должна утопить САМ сигнал о
+    поломке: у Telegram-сообщения есть потолок длины."""
+
+    def test_alert_is_capped_and_says_how_many_more(self):
+        many = [(f"company/file-{i}.md", "файла нет в репозитории контекста") for i in range(40)]
+        bundle = ck.KnowledgeBundle(catalog=[], brief=[], rejected=many, source="manifest")
+        calls: list[str] = []
+        ck.alert_manifest_problems(
+            "mpfirst", bundle, pusher=lambda msg, **kw: (calls.append(msg), True)[1]
+        )
+        self.assertLess(len(calls[0]), 4096, "сообщение не должно перерастать лимит Telegram")
+        self.assertIn("и ещё 30", calls[0])
+        self.assertIn("40 файл(ов) НЕ подключены", calls[0])  # полное число — не потеряно
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

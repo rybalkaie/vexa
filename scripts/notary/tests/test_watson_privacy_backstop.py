@@ -122,7 +122,17 @@ class _FixtureContextMixin:
 class TestContextPathBlockReason(unittest.TestCase):
 
     def test_safe_paths_pass(self):
-        for rel in (_CATALOG, "company/about.md", _SAFE_KNOWLEDGE, "knowledge/dry-rental.md"):
+        # ⚠️ `knowledge/dry-rental.md` СТОЯЛ здесь как «безопасный» — и это было ошибкой
+        # посылки, а не кода: план считал файл каталогом оборудования Anzhee, но его никто
+        # не открывал. Ф2 открыла: внутри дилерские цены, маржа прокатчика и ссылка на
+        # закрытый прайс. Файл ушёл в денилист (цикл из 5 ходов, Н2); наружу вместо него
+        # идёт безопасная выжимка `knowledge/notary/dry-rental-brief.md` — она и стоит здесь.
+        for rel in (
+            _CATALOG,
+            "company/about.md",
+            _SAFE_KNOWLEDGE,
+            "knowledge/notary/dry-rental-brief.md",
+        ):
             self.assertIsNone(ck.context_path_block_reason(rel), rel)
 
     def test_denylist_by_basename(self):
