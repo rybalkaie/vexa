@@ -343,6 +343,77 @@ class TestCarryoverRoundTrip(unittest.TestCase):
         self.assertIn("старая задача", carried)
         self.assertTrue(all("висит" not in c for c in carried))
 
+    def test_origin_prefix_stripped_on_carry_key_stable(self):
+        # Цикл5 Н1: origin-префикс «от DD.MM.YYYY» — display-украшение; при переносе
+        # ОБЯЗАН срезаться, иначе запекается в текст, меняет `_status_key` (теряется
+        # sidecar-статус) и на след. встрече навешивается ВТОРОЙ префикс.
+        proto = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "Незакрытые задачи по людям:\n"
+            f"- от 01.07.2026 подготовить расчёт — {sm.STATUS_OPEN_LABEL}\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertEqual(carried, ["подготовить расчёт"])  # префикс срезан, ключ чист
+        self.assertEqual(
+            sm._status_key(carried[0]), sm._status_key("подготовить расчёт")
+        )
+
+    def test_origin_prefix_stripped_owned_before_name(self):
+        # У owned-пункта префикс идёт ПЕРЕД именем: «от 01.07 задача» под «**Имя**» →
+        # срезать надо до восстановления «Имя: задача».
+        proto = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "Незакрытые задачи по людям:\n"
+            "**Иван Петров**\n"
+            f"- от 01.07.2026 сдать отчёт — {sm.STATUS_OPEN_LABEL}\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertEqual(carried, ["Иван Петров: сдать отчёт"])
+
+    def test_origin_prefix_stripped_despite_date_format_drift(self):
+        # Цикл5 У2: модель могла отронить ведущие нули («от 1.7.2026»); срез обязан
+        # терпеть дрейф, иначе префикс запечётся так же, как без среза вовсе.
+        for datestr in ("01.07.2026", "1.7.2026", "1.07.2026"):
+            proto = (
+                f"## {sm.PENDING_SECTION_HEADING}\n"
+                "Незакрытые задачи по людям:\n"
+                f"- от {datestr} подготовить расчёт — {sm.STATUS_OPEN_LABEL}\n"
+            )
+            carried = sm.extract_open_tasks(proto)
+            self.assertEqual(
+                carried, ["подготовить расчёт"], f"дрейф '{datestr}' не срезан"
+            )
+
+    def test_prepositional_ot_not_stripped_as_origin(self):
+        # Предлог «от Ивана …» — НЕ дата, префикс-регэксп его не трогает (за «от» строго
+        # требуется DD.MM.YYYY).
+        proto = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "Незакрытые задачи по людям:\n"
+            f"- от Ивана получить документы — {sm.STATUS_OPEN_LABEL}\n"
+        )
+        carried = sm.extract_open_tasks(proto)
+        self.assertEqual(carried, ["от Ивана получить документы"])
+
+    def test_origin_date_no_drift_across_three_meetings(self):
+        # Сквозной инвариант REQ 34.1: после переноса через встречу 2 origin-дата пункта
+        # на встрече 3 остаётся ПЕРВОЙ встречей (01.07), а не второй, и префикс один.
+        proto_m2 = (
+            f"## {sm.PENDING_SECTION_HEADING}\n"
+            "Незакрытые задачи по людям:\n"
+            f"- от 01.07.2026 подготовить расчёт — {sm.STATUS_OPEN_LABEL}\n"
+        )
+        stored_m2 = sm.extract_open_tasks(proto_m2)
+        digests = [
+            {"date": "2026-07-01", "open_tasks": ["подготовить расчёт"]},
+            {"date": "2026-07-08", "open_tasks": stored_m2},
+        ]
+        origins = sm.origin_dates_for_tasks(digests)
+        hanging = sm._resolve_open_tasks_raw(digests)
+        prefix = sm.origin_prefix_for(hanging[0], origins, "2026-07-15")
+        self.assertEqual(prefix, "от 01.07.2026 ")  # первая встреча, один префикс
+        self.assertNotIn("от 08.07.2026", f"{prefix}{hanging[0]}")  # нет дрейфа/дубля
+
 
 # ==========================================================================
 # Регресс — паритет call-site: clarify тоже передаёт date (origin-даты)
