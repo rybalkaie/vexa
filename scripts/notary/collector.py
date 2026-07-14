@@ -97,10 +97,16 @@ def _env_float(name: str, default: float) -> float:
 # finalize мог напечатать WARNING-и генерации (деградация в Sonnet, «нет шапки»,
 # ретрай Ф2) — раньше stderr читался ТОЛЬКО в ветке rc≠0, и причина «протокол
 # собрался, но со второй попытки / на резервной модели» молча выбрасывалась.
-# Фильтруем по формату логгера finalize (`[WARNING]`/`[ERROR]`) и по маркеру
-# `[protocol]` из llm_postprocess — только метаданные (текст реплик finalize в
-# stderr не печатает; опасная тройка соблюдена на стороне генератора).
-_FINALIZE_WARN_RE = re.compile(r"\[(?:WARNING|ERROR)\]|\[protocol\]")
+# Фильтруем СТРОГО по уровню логгера finalize (`[WARNING]`/`[ERROR]` из формата
+# `%(levelname)s`, см. `finalize-meeting.py:setup_logging`) — только метаданные
+# (текст реплик finalize в stderr не печатает; опасная тройка соблюдена на
+# стороне генератора). Маркер `[protocol]` НЕ добавляем в regex отдельно: его
+# несут и WARNING-строки (уже покрыты уровнем), и INFO-строки об успехе
+# (`llm_postprocess.py` — «[protocol] generated meeting=...» на КАЖДОМ успешном
+# прогоне, «[protocol] FU-12: ... нормализация пропущена») — ловить его сам по
+# себе означало бы репортить «warning» на 100% успешных финализаций (ложный
+# сигнал, противоречит цели REQ 31.4 — видеть именно проблемы, не шум).
+_FINALIZE_WARN_RE = re.compile(r"\[(?:WARNING|ERROR)\]")
 
 
 def _finalize_stderr_warnings(stderr: str, *, limit: int = 40) -> list[str]:

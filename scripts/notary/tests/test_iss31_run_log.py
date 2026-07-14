@@ -11,13 +11,20 @@
   4. Успешный прогон пишет `event=ok`.
   5. Опасная тройка (AST): вызовы run-лога в `llm_postprocess.py` не передают
      переменную с текстом транскрипта/протокола как значение поля.
-  6. `collector._finalize_stderr_warnings`: при rc=0 отбираются WARNING/ERROR/
-     `[protocol]`-строки stderr (метаданные), не весь поток.
+  6. `collector._finalize_stderr_warnings`: при rc=0 отбираются строго WARNING/
+     ERROR-строки stderr (по уровню логгера), не весь поток и не INFO-строки
+     с маркером `[protocol]` (иначе успешная генерация репортилась бы как
+     warning на КАЖДОМ прогоне — цикл5/Ф1, ход1 Н1).
+  7. Контракт между `collector._FINALIZE_WARN_RE` и реальным форматом логгера
+     `finalize-meeting.py:setup_logging()` — тест ловит рассинхрон файлов
+     (цикл5/Ф1, ход2 У2), а не полагается на совпадение по соглашению.
 """
 from __future__ import annotations
 
 import ast
+import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -49,6 +56,7 @@ class RunLogAppendTest(unittest.TestCase):
         self._env.start()
         self.addCleanup(self._env.stop)
         run_log._pruned_this_process = False  # чистый прайм на каждый тест
+        run_log._warned_this_process = False  # ход4 РЕГ1: тот же чистый прайм
 
     def test_writes_metadata_line(self):
         run_log.append_event(
@@ -89,6 +97,21 @@ class RunLogAppendTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MEETING_NOTARY_RUN_LOG_DIR": str(clash)}):
             run_log._pruned_this_process = False
             run_log.append_event("sid3", "ok")  # не бросает
+
+    def test_repeated_failure_warns_once_per_process(self):
+        # Ход4 РЕГ1: одна и та же системная причина сбоя (например, best-of-2
+        # зовёт generate_protocol дважды за один finalize) не должна долбить
+        # warning N раз подряд — второй и далее уходят на debug тем же путём,
+        # что и prune-флаг («раз на процесс»).
+        clash = Path(self._tmp.name) / "afile"
+        clash.write_text("x", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"MEETING_NOTARY_RUN_LOG_DIR": str(clash)}):
+            run_log._pruned_this_process = False
+            with self.assertLogs("lib.run_log", level="DEBUG") as cap:
+                run_log.append_event("sid-a", "ok")
+                run_log.append_event("sid-b", "ok")
+        levels = [rec.levelname for rec in cap.records]
+        self.assertEqual(levels, ["WARNING", "DEBUG"])
 
     def test_retention_prunes_old_logs(self):
         old = Path(self._tmp.name) / "old-sid.log"
@@ -227,6 +250,20 @@ class CollectorStderrWarningsTest(unittest.TestCase):
         self.assertTrue(any("[ERROR]" in ln for ln in out))
         self.assertFalse(any("болтовня" in ln for ln in out))
 
+    def test_info_level_protocol_success_line_not_captured(self):
+        # Регрессия цикла5/Ф1: `[protocol]`-маркер сам по себе не должен ловиться —
+        # его несут и INFO-строки об успехе (`llm_postprocess.generate_protocol`
+        # логирует «[protocol] generated meeting=...» на КАЖДОМ успешном прогоне).
+        # Если бы regex ловил маркер вне уровня, rc=0 стабильно репортил бы
+        # «warning» на 100% успешных финализаций — ложный сигнал.
+        stderr = (
+            "2026-07-14 [INFO] llm_postprocess: [protocol] generated meeting=s1 "
+            "elapsed=12.3s prompt_len=4000 output_len=3000 model=claude-opus-4-8 degraded=no\n"
+            "2026-07-14 [INFO] llm_postprocess: [protocol] FU-12: поле не найдено — "
+            "нормализация пропущена\n"
+        )
+        self.assertEqual(collector._finalize_stderr_warnings(stderr), [])
+
     def test_empty_stderr(self):
         self.assertEqual(collector._finalize_stderr_warnings(""), [])
         self.assertEqual(collector._finalize_stderr_warnings(None), [])
@@ -235,6 +272,42 @@ class CollectorStderrWarningsTest(unittest.TestCase):
         stderr = "\n".join(f"[WARNING] строка {i}" for i in range(100))
         out = collector._finalize_stderr_warnings(stderr, limit=5)
         self.assertEqual(len(out), 5)
+
+
+class FinalizeLogFormatContractTest(unittest.TestCase):
+    """Цикл5/Ф1 (ход2 У2): `collector._FINALIZE_WARN_RE` и формат логгера
+    `finalize-meeting.py:setup_logging()` живут в разных файлах и синхронизированы
+    только соглашением. Тест форматирует НАСТОЯЩИЕ LogRecord через РЕАЛЬНУЮ format-
+    строку finalize (вытащенную из исходника, не переписанную вручную) — если формат
+    когда-нибудь поменяется (например, переход на JSON-логи), тест упадёт, а не
+    молча перестанет ловить warning-и (регресс к поведению до Ф1)."""
+
+    @staticmethod
+    def _finalize_log_format() -> str:
+        src = (_NOTARY / "finalize-meeting.py").read_text(encoding="utf-8")
+        m = re.search(r'logging\.basicConfig\(.*?format=(".*?"|\'.*?\')', src, flags=re.DOTALL)
+        assert m, "не нашёл format= в setup_logging() finalize-meeting.py"
+        return ast.literal_eval(m.group(1))
+
+    def _render(self, level: int, msg: str) -> str:
+        formatter = logging.Formatter(self._finalize_log_format())
+        record = logging.LogRecord(
+            name="lib.llm_postprocess", level=level, pathname=__file__,
+            lineno=1, msg=msg, args=(), exc_info=None,
+        )
+        return formatter.format(record)
+
+    def test_warning_level_matches_collector_regex(self):
+        line = self._render(logging.WARNING, "[protocol] degraded meeting=s reason=timeout")
+        self.assertRegex(line, collector._FINALIZE_WARN_RE)
+
+    def test_error_level_matches_collector_regex(self):
+        line = self._render(logging.ERROR, "что-то упало")
+        self.assertRegex(line, collector._FINALIZE_WARN_RE)
+
+    def test_info_level_does_not_match_collector_regex(self):
+        line = self._render(logging.INFO, "[protocol] generated meeting=s degraded=no")
+        self.assertNotRegex(line, collector._FINALIZE_WARN_RE)
 
 
 if __name__ == "__main__":

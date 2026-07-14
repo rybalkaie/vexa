@@ -51,6 +51,13 @@ _MAX_FIELD_LEN = 200
 # фактически «раз на встречу»). Модульный флаг сбрасывается новым процессом.
 _pruned_this_process = False
 
+# Цикл5/Ф1 (ход4 РЕГ1): та же причина сбоя записи (обычно системная — нет прав /
+# каталог занят) повторяется на КАЖДЫЙ вызов append_event, пока её не починят
+# руками. Warning видим (ход3 У1), но не долбим одним и тем же сообщением N раз
+# за один процесс — первый раз громко, дальше тем же путём, что ретенция (флаг
+# на процесс; в проде процесс = один finalize, повтор means best-of-2 draft A+B).
+_warned_this_process = False
+
 
 def run_log_dir() -> Path:
     """Каталог per-meeting логов. env override → дефолт `/srv/.../logs/runs`."""
@@ -141,6 +148,22 @@ def append_event(sid: str, event: str, **fields: object) -> None:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
     except OSError as e:
-        # На маке `/srv` не писабелен, в тестах env указывает на tmp. Не шумим
-        # ошибкой на каждый вызов — debug-уровень, лог-долг не критичен.
-        logger.debug("run_log append не удался (sid=%s): %s", sid, e)
+        # Цикл5/Ф1 (ход3 У1): `finalize-meeting.py:setup_logging()` дефолтит на
+        # INFO (verbose=False) — `logger.debug(...)` физически НЕ долетал бы до
+        # stderr/collector.log, и единственный deliverable этой фазы (durable
+        # лог причин сбоя) мог бы тихо не существовать НАВСЕГДА, если каталог на
+        # VPS вдруг не writable (ошибка прав / путь занят файлом), а мы бы этого
+        # не узнали никогда. warning — виден и в проде, и (после ход1 Н1) корректно
+        # долетает до `collector.log` через `_finalize_stderr_warnings`, не заваливая
+        # его шумом на успехе. Best-effort остаётся: append не бросает исключение.
+        #
+        # Ход4 РЕГ1: причина обычно системная (нет прав/каталог занят) и повторяется
+        # на каждый вызов, пока её не починят руками — первый раз громко (warning),
+        # дальше в этом же процессе тише (debug), чтобы не заспамить один и тот же
+        # диагноз (напр. best-of-2 зовёт generate_protocol дважды за один finalize).
+        global _warned_this_process
+        if _warned_this_process:
+            logger.debug("run_log append не удался (sid=%s): %s", sid, e)
+        else:
+            _warned_this_process = True
+            logger.warning("run_log append не удался (sid=%s): %s", sid, e)
