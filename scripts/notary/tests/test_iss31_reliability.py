@@ -44,7 +44,7 @@ sys.path.insert(0, str(_NOTARY))
 from lib import run_log  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
 from lib import claude_cli  # noqa: E402
-from lib.claude_cli import ClaudeCliStreamResult, ClaudeCliFailed  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult, ClaudeCliFailed, ClaudeCliTimeout  # noqa: E402
 
 
 _META = {
@@ -140,6 +140,41 @@ class RetryOnTruncationTest(_TmpRunLogMixin, unittest.TestCase):
         self.assertIn("reason=retry-output-without-header", content)
         # Опасная тройка: никакого текста транскрипта/ответа в логе.
         self.assertNotIn("план на неделю", content)
+
+    def test_timeout_degrades_to_fallback_then_retries_on_fallback(self):
+        # Цикл5/Ф2 (У1): путь ТАЙМАУТ основной → деградация на фолбэк → фолбэк
+        # вернул НЕПОЛНЫЙ → ретрай идёт по ФОЛБЭК-модели (той, что дала неполный
+        # ответ), а НЕ по упавшей по таймауту основной. Ретрай — с thinking=0.
+        # Раньше эта комбинация (деградация + ретрай в одной генерации) не была
+        # закрыта ни одним тестом — покрываем несущую опору фазы на её же стыке.
+        if not lp.PROTOCOL_GEN_FALLBACK_MODEL or (
+            lp.PROTOCOL_GEN_FALLBACK_MODEL == lp.PROTOCOL_GEN_MODEL
+        ):
+            self.skipTest("фолбэк-модель не сконфигурирована / совпадает с основной")
+        calls = [
+            ClaudeCliTimeout("основная модель таймаутнула"),  # 1-я попытка (primary)
+            _stream("без шапки"),                              # фолбэк вернул неполный
+            _stream(_FULL_PROTOCOL),                           # ретрай на фолбэке — полный
+        ]
+        with mock.patch.object(
+            lp, "call_claude_print_stream_json", side_effect=calls,
+        ) as mocked:
+            out = lp.generate_protocol(
+                _TRANSCRIPT, _META, method_text="М", meeting_sid="degrade-retry-sid",
+            )
+        self.assertEqual(mocked.call_count, 3, "primary(timeout) + fallback + fallback-retry")
+        primary_call, fallback_call, retry_call = mocked.call_args_list
+        self.assertEqual(primary_call.kwargs["model"], lp.PROTOCOL_GEN_MODEL)
+        self.assertEqual(fallback_call.kwargs["model"], lp.PROTOCOL_GEN_FALLBACK_MODEL)
+        # Ключевой инвариант: ретрай — по ФОЛБЭК-модели (не по упавшей основной).
+        self.assertEqual(retry_call.kwargs["model"], lp.PROTOCOL_GEN_FALLBACK_MODEL)
+        self.assertEqual(retry_call.kwargs["max_thinking_tokens"], 0)
+        self.assertTrue(out.startswith("#протоколвстречи"))
+        content = self._log_content("degrade-retry-sid")
+        self.assertIn("event=degraded", content)       # деградация зафиксирована
+        self.assertIn("reason=primary-timeout", content)
+        self.assertIn("event=retrying", content)        # ретрай зафиксирован
+        self.assertIn("event=ok-after-retry", content)  # ретрай спас встречу
 
 
 # ──────────────────── REQ 31.2 / A9: stop_reason=max_tokens ────────────────────
