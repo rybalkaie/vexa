@@ -302,9 +302,9 @@ class TestFormatAndBuildBlock(unittest.TestCase):
         self.assertIn(f"## {sm.PENDING_SECTION_HEADING}", block)
         self.assertIn("сделать X", block)
         self.assertIn("прислать Y", block)
-        # дисциплина: статус определять по текущему транскрипту
-        self.assertIn("закрыта", block)
-        self.assertIn("висит", block)
+        # Ф4 (ISS-34): статус — каноническим ярлыком по текущему транскрипту
+        self.assertIn(sm.STATUS_DONE_LABEL, block)   # «Закрыто»
+        self.assertIn(sm.STATUS_OPEN_LABEL, block)   # «Статус неизвестен — уточнить»
 
     def test_header_instructs_preserve_owner_prefix(self):
         # У2: промпт явно велит сохранять префикс исполнителя — иначе на round-trip

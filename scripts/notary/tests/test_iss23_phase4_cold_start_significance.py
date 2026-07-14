@@ -347,8 +347,8 @@ class TestCancellationFraming(unittest.TestCase):
         # явное приглашение снять вопрос без выполнения как нормальный исход
         self.assertIn("Снять вопрос", block)
         self.assertIn("нормальн", block.lower())
-        # тон Ф3 сохранён (регресс-якорь существующих тестов)
-        self.assertIn("НЕ контроль", block)
+        # Ф4 (ISS-34/34.3): оправдательный «НЕ контроль» убран; запрет давящих слов остался
+        self.assertNotIn("НЕ контроль", block)
         self.assertIn("просрочк", block.lower())
 
 

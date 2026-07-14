@@ -232,9 +232,13 @@ def _apply_resolution(
                 # Ф3 (R21): mark_shown НЕ передаём (дефолт False) — clarify это реген
                 # уже показанного протокола; помечать закрытые «показано» должен только
                 # канонический finalize, иначе коррекция теряла бы подраздел «закрытые».
+                # Ф4 (ISS-34): `date` ОБЯЗАТЕЛЕН — без него origin-даты висяков «от
+                # DD.MM.YYYY» не проставятся при перевыпуске (паритет с finalize,
+                # память review-checks-two-call-sites).
                 open_tasks_block = series_memory.build_open_tasks_block(
                     _smem, series_dir=transcript_path.parent,
                     meeting_sid=state.get("meeting_id"),
+                    date=meta_block.get("date") or None,
                 )
         except Exception:  # noqa: BLE001
             series_memory_block = ""

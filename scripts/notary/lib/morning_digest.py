@@ -87,11 +87,12 @@ HEADER_INSTRUCTION = (
 )
 
 TITLE = "Открытые вопросы к встрече"
-# Тон союзника (канон мягких формулировок lifecycle Ф3): снять вопрос, не делая, —
-# нормальный исход, а не провал.
+# Ф4 (ISS-34/34.3, A7 — текст утверждён владельцем 14.07): нейтральная строка вместо
+# оправдательной «Это не аудит и не спрос…». Подзаголовок PDF «Сверка перед встречей»
+# (см. render ниже, subtitle) и `HEADER_INSTRUCTION` (слова владельца) — НЕ трогаем.
 _TONE_LINE = (
-    "_Это не аудит и не спрос — просто сверка перед встречей. Снять вопрос, не выполняя "
-    "его (передумали, стало неактуально), — такой же нормальный исход, как и сделать._"
+    "_Список открытых вопросов серии на сегодня. Если вопрос уже неактуален — просто "
+    "напишите, снимем._"
 )
 _NO_OWNER_HEADING = "Без ответственного / неразобрано"
 _MINOR_HEADING = "Просто напоминаю (статус не нужен)"
@@ -256,6 +257,21 @@ def series_display_name(series: str) -> str:
     return s[:1].upper() + s[1:] if s else "Встреча"
 
 
+def _digest_open_bullet(
+    display_text: str, origin_key_text: str, origins: Optional[dict], current_date: str
+) -> str:
+    """Ф4 (ISS-34): буллет ВИСЯЩЕГО пункта дайджеста —
+    «- [от DD.MM.YYYY ]<текст> — Статус неизвестен — уточнить».
+
+    Origin-префикс (A4) считается по ПОЛНОМУ тексту `origin_key_text` («Имя: задача» —
+    ключ `_status_key`, как в sidecar); отображаем `display_text` (у сгруппированных по
+    владельцу имя срезано в подзаголовок). Канонический статус-ярлык (`STATUS_OPEN_LABEL`)
+    красится оранжевым в PDF (`protocol_to_pdf._colorize_status_labels`) — «висяки
+    оранжевые» (REQ 34.2). Мелочь этот ярлык НЕ несёт (по ней статус не нужен, R12)."""
+    prefix = series_memory.origin_prefix_for(origin_key_text, origins, current_date)
+    return f"- {prefix}{display_text} — {series_memory.STATUS_OPEN_LABEL}"
+
+
 def build_digest_markdown(
     series: str,
     date: str,
@@ -263,12 +279,18 @@ def build_digest_markdown(
     minor: list,
     *,
     start_at: Optional[datetime] = None,
+    origins: Optional[dict] = None,
 ) -> str:
     """Markdown дайджеста (его же рендерим в PDF существующим генератором).
 
-    Структура: шапка-инструкция владельца (дословно) → тон союзника → безымянные
-    (УПУ2, ПЕРВЫМИ — их надо разобрать) → секции по ответственным → «просто напоминаю».
-    Пусто в обеих корзинах → "" (caller не шлёт, R13).
+    Структура: шапка-инструкция владельца (дословно) → нейтральная строка (A7) →
+    безымянные (УПУ2, ПЕРВЫМИ — их надо разобрать) → секции по ответственным → «просто
+    напоминаю». Пусто в обеих корзинах → "" (caller не шлёт, R13).
+
+    Ф4 (ISS-34): каждый ПЕРЕНОСИМЫЙ висяк несёт origin-дату «от DD.MM.YYYY» (A4) и
+    канонический статус-ярлык «Статус неизвестен — уточнить» (оранжевый в PDF).
+    `origins` (`series_memory.origin_dates_for_tasks`) не передан → префикса нет
+    (обр. совместимость / прямые вызовы тестов), ярлык статуса ставится всегда.
     """
     hanging = [t for t in (hanging or []) if isinstance(t, str) and t.strip()]
     minor = [t for t in (minor or []) if isinstance(t, str) and t.strip()]
@@ -292,13 +314,13 @@ def build_digest_markdown(
         lines.append(f"## {_NO_OWNER_HEADING}")
         lines.append("")
         for t in nameless:
-            lines.append(f"- {t}")
+            lines.append(_digest_open_bullet(t, t, origins, date))
         lines.append("")
     for owner, items in owned:
         lines.append(f"## {owner}")
         lines.append("")
         for t in items:
-            lines.append(f"- {t}")
+            lines.append(_digest_open_bullet(t, f"{owner}: {t}", origins, date))
         lines.append("")
     if minor:
         lines.append(f"## {_MINOR_HEADING}")
@@ -551,7 +573,17 @@ def send_series_digest(
     if not hanging and not minor:
         res["reason"] = "empty"  # R13: пустой список → дайджест не шлём
         return res
-    md = build_digest_markdown(series, date, hanging, minor, start_at=start_at)
+    # Ф4 (ISS-34, A3): origin-даты висяков сканом ПОЛНОЙ истории серии — «от DD.MM.YYYY»
+    # у переносимых пунктов. Best-effort: сбой чтения → без префиксов (ярлык статуса
+    # всё равно проставится). Текст задач НЕ логируем (опасная тройка).
+    try:
+        origins = series_memory.origin_dates_for_tasks(
+            series_memory.list_series_digests(series_dir)
+        )
+    except Exception as e:  # noqa: BLE001 — origin-даты опциональны
+        logger.warning("[morning-digest] origin-даты не собраны (non-fatal): %s", type(e).__name__)
+        origins = {}
+    md = build_digest_markdown(series, date, hanging, minor, start_at=start_at, origins=origins)
     caption = build_caption(series, date, hanging, minor)
     if dry_run:
         res["status"] = "dry-run"

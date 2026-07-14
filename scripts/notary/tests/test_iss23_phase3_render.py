@@ -57,12 +57,17 @@ class TestSoftToneR3(unittest.TestCase):
         # старого «алармового» 🔻 в заголовке больше нет
         self.assertNotIn("🔻", block)
 
-    def test_helper_framing_not_control(self):
+    def test_neutral_framing_no_defensive_tone(self):
+        # ISS-34/34.3: раздел висяков без оправдательного тона — ни «дружеская/
+        # дружелюбная сверка», ни «НЕ контроль»/«НЕ аудит». Запрет давящих слов остаётся.
         block = sm.format_open_tasks_block(["Илья: добить отчёт"])
-        self.assertIn("помощь", block.lower())
-        self.assertIn("НЕ контроль", block)
+        low = block.lower()
+        self.assertNotIn("не контроль", low)
+        self.assertNotIn("не аудит", low)
+        self.assertNotIn("дружелюб", low)
+        self.assertNotIn("дружеск", low)
         # явный запрет давящих формулировок в инструкции
-        self.assertIn("просрочк", block.lower())   # «БЕЗ … просрочка» — запрет, не маркер
+        self.assertIn("просрочк", low)   # «БЕЗ … просрочка» — запрет, не маркер
 
     def test_empty_is_blank(self):
         self.assertEqual(sm.format_open_tasks_block([]), "")

@@ -94,6 +94,11 @@ blockquote p { margin: 3px 0; }
 code { background: #eef1f5; padding: 1px 5px; border-radius: 3px; font-size: 9.5pt; }
 em { color: #5b6472; }
 a { color: #2563eb; text-decoration: none; }
+/* Ф4 (ISS-34, A5): статус висяка словом+цветом. Оттенки в семье оранжевого
+   blockquote (#ed8936): .status-open — тёмно-оранжевый «уточнить», .status-done —
+   зелёный жирный «Закрыто». Третий цвет НЕ заводим (WAIT/CANCELLED/REOPEN без цвета). */
+.status-open { color: #c05621; font-weight: 600; }
+.status-done { color: #2f855a; font-weight: 700; }
 .footer { margin-top: 22px; padding-top: 8px; border-top: 1px solid #e8ecf1;
           color: #9aa3b0; font-size: 8.5pt; }
 """
@@ -163,7 +168,45 @@ _PDF_ALLOWED_TAGS = [
     "code", "pre", "a",
     "table", "thead", "tbody", "tr", "td", "th",
 ]
-_PDF_ALLOWED_ATTRS = {"a": ["href", "title"]}
+# Ф4 (ISS-34): `span[class]` разрешён для наших статус-span'ов (status-open/status-done),
+# которые вешает `_colorize_status_labels` ДО bleach. ТОЛЬКО `class` (не `style`) —
+# class безвреден (не исполняется, не грузит ресурсы), а `style`/`on*` открыли бы дыру
+# egress/чтения файлов (см. security-комментарий выше). Из недоверенного тела markdown
+# сам `<span>` не порождает, так что реальные span'ы — только наши.
+_PDF_ALLOWED_ATTRS = {"span": ["class"], "a": ["href", "title"]}
+
+
+# Ф4 (ISS-34, A5): канонические статус-ярлыки висяка → цветной span. Красим ТОЛЬКО
+# точную каноническую строку (риск ISS-34: regex по свободному тексту хрупок → ярлык
+# сперва канонизирован в промпте протокола / буллетах дайджеста, потом красим по нему).
+# Отклонился ярлык от каноники → пункт без цвета (мягкая деградация, не поломка).
+# Строки-ярлыки — зеркало `series_memory.STATUS_OPEN_LABEL`/`STATUS_DONE_LABEL` (единый
+# источник там; здесь не импортируем ради лёгкости PDF-модуля, консистентность держит
+# тест `test_iss34_phase4_display`).
+#
+# Оранжевый «Статус неизвестен — уточнить» — матч по всей фразе (уникальна); внутренний
+# em-dash терпим по ширине пробелов (модель/рендер дрейфуют).
+_STATUS_OPEN_RE = re.compile(r"Статус\s+неизвестен\s*—\s*уточнить")
+_STATUS_OPEN_SPAN = '<span class="status-open">Статус неизвестен — уточнить</span>'
+# Зелёное жирное «Закрыто» — ТОЛЬКО как статус после разделителя «— » (так его пишет
+# модель: «- <задача> — Закрыто»). Lookbehind на «— » исключает заголовок Части 2
+# «✅ Закрыто с прошлых встреч» (там «Закрыто» после «✅ ») и слово «закрыто» в тексте
+# задачи (строчное / без разделителя). Правую границу проверяем lookahead'ом.
+_STATUS_DONE_RE = re.compile(r"(—\s*)Закрыто(?=[\s<.,;:!?)]|$)")
+_STATUS_DONE_SPAN = r'\1<span class="status-done">Закрыто</span>'
+
+
+def _colorize_status_labels(html: str) -> str:
+    """Ф4 (ISS-34, A5): оборачивает канонические статус-ярлыки висяка в цветные span'ы.
+
+    Вызывается ПОСЛЕ `markdown.markdown` и ДО `bleach.clean` (bleach пропускает
+    span[class], см. `_PDF_ALLOWED_ATTRS`). Идёт по HTML — статус лежит внутри
+    `<li>`/`<p>`. Оранжевый прогоняем ПЕРВЫМ (в нём свой «—», но нет «Закрыто» — зелёный
+    его не заденет). НЕ трогает WAIT/CANCELLED/REOPEN и заголовки подразделов (НЕС2):
+    красит строго две канонические строки — прочий статус остаётся без цвета."""
+    html = _STATUS_OPEN_RE.sub(_STATUS_OPEN_SPAN, html)
+    html = _STATUS_DONE_RE.sub(_STATUS_DONE_SPAN, html)
+    return html
 
 
 def markdown_to_html(md_text: str, title: str, subtitle: str) -> str:
@@ -184,6 +227,9 @@ def markdown_to_html(md_text: str, title: str, subtitle: str) -> str:
     body_html = markdown.markdown(
         body_md, extensions=["tables", "sane_lists", "fenced_code"]
     )
+    # Ф4 (ISS-34): красим канонические статус-ярлыки висяка ДО bleach (он пропускает
+    # наши span[class]). После markdown, чтобы работать по готовому HTML тела.
+    body_html = _colorize_status_labels(body_html)
     # FU-4 (security): вырезаем сырой HTML из тела (см. _PDF_ALLOWED_TAGS выше).
     # title/subtitle экранируются htmllib.escape отдельно (это не markdown).
     try:
