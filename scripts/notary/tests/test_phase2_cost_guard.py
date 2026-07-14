@@ -150,6 +150,44 @@ class TestCG1CollectorFlock(unittest.TestCase):
         finally:
             collector._do_finalize_and_collect = orig
 
+    def test_retry_lengthened_finalize_still_blocks_concurrent_tick(self):
+        """РИСК3 (план `2026-07-14-reliability-and-open-tasks-ux.md`, Ф2):
+        Ф2 добавила ретрай ВНУТРИ `generate_protocol` (ISS-31 REQ 31.1) —
+        finalize теперь может идти дольше (первый прогон ~14 мин → с повтором
+        до 25-30 мин), а collector тикает каждые 5 мин. Опасение: второй тик
+        мог бы застать «ещё идущий» finalize и запустить параллельный Opus по
+        той же встрече (двойные деньги/гонка).
+
+        Разведка Ф2 показала: механизм-страховка УЖЕ существует — CG1
+        (`_session_finalize_lock`/`_finalize_and_collect`, заведён раньше для
+        другого риска — двойная оплата Speechmatics) держит лок на ВСЁ время
+        `_do_finalize_and_collect` целиком, независимо от того, что происходит
+        ВНУТРИ этого времени (обычный прогон или прогон с ретраем на VPS —
+        для мак-стороны collector'а это один и тот же непрерывный blocking-вызов
+        через SSH). Новый лок заводить не нужно — этот тест лишь ЗАКРЕПЛЯЕТ,
+        что удлинение finalize ретраем не открывает щель: пока «долгий» finalize
+        (смоделирован как ещё не отпустивший лок процесс) не завершился, второй
+        тик по тому же sid не вызывает `_do_finalize_and_collect` ни разу — то
+        есть НЕ мог бы запустить второй Opus-вызов."""
+        calls = []
+        orig = collector._do_finalize_and_collect
+        collector._do_finalize_and_collect = lambda sid: calls.append(sid)
+        try:
+            with collector._session_finalize_lock("tm-retry") as held:
+                self.assertTrue(held, "первый тик держит лок — «идёт finalize с ретраем»")
+                # Несколько тиков собрались за время удлинённого (ретраем) finalize.
+                for _ in range(3):
+                    collector._finalize_and_collect("tm-retry")
+                self.assertEqual(
+                    calls, [],
+                    "ни один из пересёкшихся тиков не запустил finalize (0 Opus-вызовов)",
+                )
+            # Долгий finalize наконец отпустил лок — следующий тик отрабатывает штатно.
+            collector._finalize_and_collect("tm-retry")
+            self.assertEqual(calls, ["tm-retry"], "ровно один finalize после освобождения лока")
+        finally:
+            collector._do_finalize_and_collect = orig
+
     def test_lock_path_sanitizes_session_uid(self):
         p = collector._finalize_lock_path("a/b\\c")
         self.assertNotIn("/", p.name)

@@ -214,3 +214,151 @@ def call_claude_print_json(
         model or "(default)", len(full_prompt), len(text), cost_usd, in_tok, out_tok, elapsed,
     )
     return ClaudeCliResult(text.strip(), cost_usd, in_tok, out_tok, envelope)
+
+
+class ClaudeCliStreamResult:
+    """Результат `claude --print --output-format stream-json --verbose`.
+
+    Поля:
+      text        — ответ ассистента (как у `ClaudeCliResult`).
+      stop_reason — `stop_reason` терминальной строки CLI (`end_turn`,
+                    `max_tokens`, …), `None` если CLI его не прислал.
+                    НЕДОСТУПНО в плоском `--output-format json` (проверено
+                    Ф2 ISS-31 РИСК1: `grep stop_reason` по кодовой базе = 0) —
+                    единственный способ его получить — этот режим.
+      cost_usd / input_tokens / output_tokens — как у `ClaudeCliResult`.
+      raw — терминальная JSON-строка (`type=="result"`) целиком, для аудита.
+    """
+
+    __slots__ = ("text", "stop_reason", "cost_usd", "input_tokens", "output_tokens", "raw")
+
+    def __init__(
+        self, text: str, stop_reason: Optional[str], cost_usd: float,
+        input_tokens: int, output_tokens: int, raw: dict,
+    ):
+        self.text = text
+        self.stop_reason = stop_reason
+        self.cost_usd = cost_usd
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.raw = raw
+
+
+def call_claude_print_stream_json(
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    timeout: int = 60,
+    model: Optional[str] = None,
+    max_thinking_tokens: Optional[int] = None,
+) -> "ClaudeCliStreamResult":
+    """Как `call_claude_print`, но через `--output-format stream-json --verbose`.
+
+    Зачем отдельный режим (Ф2 ISS-31, РИСК1): это единственный вывод CLI, где
+    приходит `stop_reason` — нужен, чтобы отличить усечение по лимиту вывода
+    (`stop_reason == "max_tokens"`) от нормального завершения, даже если шапка
+    протокола формально успела попасть в текст (детект «нет шапки» такое не
+    ловит). `--verbose` ОБЯЗАТЕЛЕН вместе с `--output-format stream-json` в
+    `--print`-режиме — без него CLI падает мгновенно с понятной ошибкой ДО
+    обращения к API (проверено спайком Ф2, cli exit=1 "requires --verbose").
+
+    max_thinking_tokens: если задан — пробрасывается в subprocess как env
+    `MAX_THINKING_TOKENS` (тот же механизм, что у интерактивного Claude Code).
+    `0` — принудительно выключает thinking (`type: "disabled"` в теле запроса
+    к API — подтверждено статическим разбором CLI, ветка `qe===0`).
+    `>0` — запрошенный бюджет; спайк Ф2 (реальные вызовы на `claude-sonnet-5`
+    + справочные строки самого CLI-бинаря про `budget_tokens`) показал: рычаг
+    реально переключает наличие thinking (on/off), но как ЧИСЛЕННЫЙ потолок
+    надёжно работает только на моделях, где API ещё принимает явный
+    `budget_tokens` (Sonnet 4.6 и старше — deprecated, но не отклоняется).
+    На новых моделях (Opus 4.8/4.7, Fable 5 — семейство `PROTOCOL_GEN_MODEL`)
+    `budget_tokens` вовсе убран из API (сам CLI шлёт `type:"adaptive"` вместо
+    него, минуя число) — численный потолок там реализовать нечем через этот
+    транспорт; `None` → рычаг не трогаем (текущее поведение CLI/модели).
+
+    Разбирает ТОЛЬКО последнюю непустую строку stdout (`type == "result"` —
+    несёт `result`/`usage`/`total_cost_usd`, как у `ClaudeCliResult`, ПЛЮС
+    `stop_reason`); промежуточные события потока (system/assistant/…) не
+    парсятся — вызывающему коду они не нужны.
+
+    На любую ошибку (бинарник, timeout, ненулевой exit, невалидный JSON,
+    `is_error`) — ClaudeCliError-подкласс, как у остальных вариантов.
+    """
+    import json as _json  # локально, как у call_claude_print_json
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise ClaudeCliNotInstalled("`claude` не найден в PATH")
+
+    try:
+        _floor = int(os.environ.get("CLAUDE_MIN_TIMEOUT", "0") or "0")
+    except ValueError:
+        _floor = 0
+    if _floor > timeout:
+        timeout = _floor
+
+    full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
+    cmd = [claude_bin, "--print", "--output-format", "stream-json", "--verbose"]
+    if model:
+        cmd += ["--model", model]
+
+    # env копируем целиком (subprocess.run(env=...) ЗАМЕНЯЕТ окружение, не
+    # мёржит) — иначе claude потеряет PATH/авторизацию/остальной контекст.
+    run_env = os.environ.copy()
+    if max_thinking_tokens is not None:
+        run_env["MAX_THINKING_TOKENS"] = str(max_thinking_tokens)
+
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd, input=full_prompt, capture_output=True, text=True,
+            timeout=timeout, env=run_env,
+        )
+    except subprocess.TimeoutExpired as e:
+        elapsed = time.monotonic() - started
+        raise ClaudeCliTimeout(
+            f"claude --print (stream-json) timeout {timeout}s (elapsed={elapsed:.1f}s)"
+        ) from e
+    elapsed = time.monotonic() - started
+
+    if result.returncode != 0:
+        stderr_snippet = (result.stderr or "").strip()[:200]
+        raise ClaudeCliFailed(
+            f"claude --print (stream-json) exit={result.returncode}, stderr={stderr_snippet!r}"
+        )
+    lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        raise ClaudeCliFailed(
+            f"claude --print (stream-json) пустой stdout (elapsed={elapsed:.1f}s)"
+        )
+    try:
+        final = _json.loads(lines[-1])
+    except _json.JSONDecodeError as e:
+        raise ClaudeCliFailed(
+            f"claude --print (stream-json) невалидная терминальная строка: {e}"
+        ) from e
+    if not isinstance(final, dict) or final.get("type") != "result":
+        got = final.get("type") if isinstance(final, dict) else type(final).__name__
+        raise ClaudeCliFailed(
+            f"claude --print (stream-json) терминальная строка не result (type={got})"
+        )
+    if final.get("is_error"):
+        raise ClaudeCliFailed(
+            f"claude --print (stream-json) is_error: {str(final.get('result'))[:200]!r}"
+        )
+    text = final.get("result") or ""
+    if not isinstance(text, str) or not text.strip():
+        raise ClaudeCliFailed("claude --print (stream-json) пустое поле result")
+    stop_reason = final.get("stop_reason")
+    usage = final.get("usage") or {}
+    cost = final.get("total_cost_usd")
+    cost_usd = float(cost) if isinstance(cost, (int, float)) else 0.0
+    in_tok = int(usage.get("input_tokens", 0) or 0)
+    out_tok = int(usage.get("output_tokens", 0) or 0)
+    logger.debug(
+        "claude --print(stream-json) ok: model=%s prompt_len=%d out_len=%d "
+        "stop_reason=%s cost=$%.4f in=%d out=%d elapsed=%.1fs",
+        model or "(default)", len(full_prompt), len(text), stop_reason,
+        cost_usd, in_tok, out_tok, elapsed,
+    )
+    return ClaudeCliStreamResult(text.strip(), stop_reason, cost_usd, in_tok, out_tok, final)

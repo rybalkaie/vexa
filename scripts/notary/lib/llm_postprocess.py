@@ -58,6 +58,7 @@ from .claude_cli import (
     ClaudeCliNotInstalled,
     ClaudeCliTimeout,
     call_claude_print,
+    call_claude_print_stream_json,
 )
 from . import clarify_state
 from . import context_knowledge
@@ -1176,8 +1177,10 @@ def clarify_speakers_via_telegram(
 # связки «кто за что / что решили / что висит» и смешивал данные; Opus умнее на
 # синтезе (план `2026-06-13-umnyi-protokol-assemblyai.md`, REQ G1). Env
 # `PROTOCOL_GEN_MODEL` переопределяет — откат на Sonnet без передеплоя кода.
-# Передаётся в `call_claude_print(model=...)` → `--model <value>` в subprocess.
-# Opus медленнее Sonnet → см. таймаут/деградацию ниже (РИСК1).
+# Передаётся в `call_claude_print_stream_json(model=...)` (Ф2: `call_claude_print`
+# заменён на stream-json вариант ради `stop_reason`, см. `generate_protocol`) →
+# `--model <value>` в subprocess. Opus медленнее Sonnet → см. таймаут/деградацию
+# ниже (РИСК1).
 PROTOCOL_GEN_MODEL = (os.environ.get("PROTOCOL_GEN_MODEL") or "claude-opus-4-8").strip()
 
 # Ф3 (РИСК1): резервная модель генерации на случай ТАЙМАУТА основной (Opus) на
@@ -1198,6 +1201,21 @@ try:
     PROTOCOL_GEN_TIMEOUT = int(os.environ.get("PROTOCOL_GEN_TIMEOUT", "600") or "600")
 except ValueError:
     PROTOCOL_GEN_TIMEOUT = 600
+
+# Ф2 (ISS-31 REQ 31.3): дефолт thinking-бюджета генерации протокола. Спайк Ф2
+# (реальные вызовы `claude --print --output-format stream-json` + справочные
+# строки самого CLI-бинаря про `budget_tokens`) подтвердил рычаг РАБОЧИЙ как
+# on/off-переключатель thinking на всех моделях; как ТОЧНЫЙ численный потолок
+# он действует только там, где API ещё принимает явный `budget_tokens`
+# (Sonnet 4.6 и старше — фолбэк-модель ниже). На новых моделях (Opus 4.8/4.7,
+# Fable 5 — сюда попадает дефолтный `PROTOCOL_GEN_MODEL`) API убрал этот
+# параметр вовсе — CLI сам уходит на `type:"adaptive"`, число значения не
+# имеет. Оставляем рычаг включённым везде (не роняет Opus-вызов, реально
+# работает на фолбэке) — см. `_protocol_thinking_budget()`, читает env
+# `NOTARY_PROTOCOL_MAX_THINKING_TOKENS` ДИНАМИЧЕСКИ (не в модульную константу —
+# как `_is_finalize_best_of_2_enabled()` ниже, а не как `PROTOCOL_GEN_TIMEOUT`
+# выше: тестам не нужен `importlib.reload`, чтобы проверить override).
+_PROTOCOL_THINKING_TOKENS_DEFAULT = 6000
 
 # Имя файла метода на диске (общий для мака и VPS). На маке живёт в
 # `~/Projects/me/methods/`, на VPS — копируется через cron rsync (см.
@@ -1688,6 +1706,67 @@ def _build_protocol_system_prompt(
     return system_prompt
 
 
+def _protocol_thinking_budget() -> int:
+    """Значение для `MAX_THINKING_TOKENS` при генерации протокола (Ф2 REQ 31.3).
+
+    `NOTARY_PROTOCOL_MAX_THINKING_TOKENS` из env, читается на КАЖДЫЙ вызов
+    (дефолт `_PROTOCOL_THINKING_TOKENS_DEFAULT` = 6000). `0` → thinking
+    выключен. `>0` → API требует минимум 1024 (подтверждено спайком Ф2 по
+    справочным строкам CLI: "budget_tokens... min 1024" — errors otherwise на
+    моделях, где параметр ещё принимается); значения 1..1023 клампятся вверх
+    до 1024, а не отклоняются — оператор мог ошибиться в `.env.notary`, но это
+    не повод ронять генерацию протокола.
+    """
+    raw = (os.environ.get("NOTARY_PROTOCOL_MAX_THINKING_TOKENS") or "").strip()
+    try:
+        v = int(raw) if raw else _PROTOCOL_THINKING_TOKENS_DEFAULT
+    except ValueError:
+        v = _PROTOCOL_THINKING_TOKENS_DEFAULT
+    if v <= 0:
+        return 0
+    return max(v, 1024)
+
+
+class _IncompleteProtocolOutput(Exception):
+    """Внутренний сигнал ретрая (Ф2 REQ 31.1/31.2), НЕ `ProtocolGenerationError`.
+
+    Ловится внутри `generate_protocol` — наружу уходит, только если и ретрай
+    закончился тем же самым (см. `generate_protocol`)."""
+
+    def __init__(self, reason: str, output_len: int):
+        self.reason = reason
+        self.output_len = output_len
+        super().__init__(reason)
+
+
+def _extract_protocol_text(raw: str, stop_reason: Optional[str]) -> str:
+    """Срезает markdown-fence, находит шапку `#протоколвстречи`.
+
+    Бросает `_IncompleteProtocolOutput`, если:
+      - шапки нет вообще (`output-without-header` — детект ДО Ф2, был
+        единственным сигналом обрыва);
+      - ИЛИ `stop_reason == "max_tokens"` (Ф2 REQ 31.2, A9): модель могла
+        успеть напечатать шапку и часть тела и оборваться ПОСЛЕ неё — старый
+        детект такое пропускал молча, `stop_reason` из `stream-json` ловит
+        точно (см. `call_claude_print_stream_json`). Проверяем ПОСЛЕ детекта
+        шапки, а не вместо — `max-tokens-truncated` информативнее, чем
+        `output-without-header`, когда шапка всё же есть.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:markdown|md)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    if not text.startswith("#протоколвстречи"):
+        m = re.search(r"^#протоколвстречи\b", text, flags=re.MULTILINE)
+        if m:
+            text = text[m.start():]
+        else:
+            raise _IncompleteProtocolOutput("output-without-header", len(text))
+    if stop_reason == "max_tokens":
+        raise _IncompleteProtocolOutput("max-tokens-truncated", len(text))
+    return text
+
+
 def generate_protocol(
     transcript_md: str,
     meeting_meta: dict,
@@ -1794,12 +1873,19 @@ def generate_protocol(
     _segments = len(re.findall(r"^\*\*\[", transcript_md, flags=re.MULTILINE))
 
     def _emit_run_log(event: str, *, model: str, reason: str = "",
-                      output_len: int = 0) -> None:
+                      output_len: int = 0, stop_reason: Optional[str] = None) -> None:
         """Пишет метаданные прогона генерации в per-meeting durable-лог VPS.
 
         Причина сбоя/деградации переживает удаление контейнера и чистку `_tmp`.
         В лог уходят ТОЛЬКО счётчики/класс — текст транскрипта/протокола НЕ
         передаётся (опасная тройка). Best-effort внутри `run_log`.
+
+        `stop_reason` (Ф2 ISS-31): поле было зарезервировано в схеме с Ф1,
+        всегда `None`/пропускалось — теперь пробрасывается реальным значением
+        из `ClaudeCliStreamResult.stop_reason`, когда есть живой stream-результат
+        (транспортные сбои до/без ответа CLI — `cli-not-installed`/`timeout`/
+        `cli-error`/`fallback-failed`/`retry-cli-error` — его не несут, `None`
+        молча пропускается `run_log._coerce_field`, см. `test_iss31_run_log.py`).
         """
         run_log.append_event(
             meeting_sid or "unknown",
@@ -1809,16 +1895,25 @@ def generate_protocol(
             prompt_len=_prompt_len,
             segments=_segments,
             output_len=output_len,
+            stop_reason=stop_reason,
         )
 
     started = time.monotonic()
-    try:
-        raw = call_claude_print(
+    # Ф2 (ISS-31 REQ 31.3): бюджет thinking из конфигурации, см.
+    # `_protocol_thinking_budget()`/`NOTARY_PROTOCOL_MAX_THINKING_TOKENS`.
+    thinking_budget = _protocol_thinking_budget()
+
+    def _call(model: str, *, budget: Optional[int]):
+        return call_claude_print_stream_json(
             user_prompt,
             system=system_prompt,
             timeout=timeout,
-            model=primary_model,
+            model=model,
+            max_thinking_tokens=budget,
         )
+
+    try:
+        stream = _call(primary_model, budget=thinking_budget)
     except ClaudeCliNotInstalled as e:
         _emit_run_log("failed", model=primary_model, reason="cli-not-installed")
         raise ProtocolGenerationError(
@@ -1844,12 +1939,7 @@ def generate_protocol(
         # Деградация: основная модель таймаутнула, идём на резервную (Sonnet).
         _emit_run_log("degraded", model=fallback, reason="primary-timeout")
         try:
-            raw = call_claude_print(
-                user_prompt,
-                system=system_prompt,
-                timeout=timeout,
-                model=fallback,
-            )
+            stream = _call(fallback, budget=thinking_budget)
         except ClaudeCliError as e2:
             logger.warning(
                 "[protocol] fallback failed meeting=%s model=%s error=%s",
@@ -1871,32 +1961,64 @@ def generate_protocol(
         )
         _emit_run_log("failed", model=primary_model, reason="cli-error")
         raise ProtocolGenerationError(f"claude --print: {e}") from e
-    elapsed = time.monotonic() - started
 
-    text = raw.strip()
-    # Срезаем markdown-fence на случай если модель всё-таки обернула ответ.
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:markdown|md)?\s*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-    if not text.startswith("#протоколвстречи"):
-        # Терпимо: модель могла начать с «Вот протокол:» — обрезаем всё до
-        # шапки. Якорь — `#протоколвстречи` (точное соответствие методичке),
-        # НЕ просто `^#` (иначе «# Здравствуйте! ...» в начале попадёт в файл).
-        m = re.search(r"^#протоколвстречи\b", text, flags=re.MULTILINE)
-        if m:
-            text = text[m.start():]
-        else:
+    # Ф2 (ISS-31 REQ 31.1/31.2, A6/A9): усечение ПОСЛЕ шапки
+    # (`stop_reason == "max_tokens"`) или отсутствие шапки вовсе — оба «неполный
+    # ответ», один ретрай ВНУТРИ этой же финализации (не полагаясь на то, что
+    # следующий 5-минутный тик collector'а пересоберёт протокол сам). Ретрай —
+    # на ТОЙ ЖЕ модели, что дала неполный ответ (`model_used`: primary или уже
+    # фолбэк после таймаута выше), с thinking ПРИНУДИТЕЛЬНО выключенным
+    # (`budget=0` — самый урезанный вариант, A6 «урезанным thinking-бюджетом»),
+    # чтобы весь потолок вывода на второй попытке ушёл под текст протокола.
+    try:
+        text = _extract_protocol_text(stream.text, stream.stop_reason)
+    except _IncompleteProtocolOutput as incomplete:
+        logger.warning(
+            "[protocol] incomplete meeting=%s model=%s reason=%s stop_reason=%s "
+            "output_len=%d — ретрай (Ф2 A6)",
+            meeting_sid or "?", model_used, incomplete.reason, stream.stop_reason,
+            incomplete.output_len,
+        )
+        _emit_run_log(
+            "retrying", model=model_used, reason=incomplete.reason,
+            output_len=incomplete.output_len, stop_reason=stream.stop_reason,
+        )
+        try:
+            stream = _call(model_used, budget=0)
+        except ClaudeCliError as e2:
             logger.warning(
-                "[protocol] failed meeting=%s error=output-without-header retry=0",
-                meeting_sid or "?",
+                "[protocol] retry transport-сбой meeting=%s model=%s error=%s",
+                meeting_sid or "?", model_used, str(e2)[:200],
+            )
+            _emit_run_log("failed", model=model_used, reason="retry-cli-error")
+            raise ProtocolGenerationError(
+                f"claude --print (ретрай Ф2): {e2}"
+            ) from e2
+        try:
+            text = _extract_protocol_text(stream.text, stream.stop_reason)
+        except _IncompleteProtocolOutput as still_incomplete:
+            logger.warning(
+                "[protocol] retry ТОЖЕ неполный meeting=%s model=%s reason=%s",
+                meeting_sid or "?", model_used, still_incomplete.reason,
             )
             _emit_run_log(
-                "failed", model=model_used, reason="output-without-header",
-                output_len=len(text),
+                "failed", model=model_used,
+                reason=f"retry-{still_incomplete.reason}",
+                output_len=still_incomplete.output_len, stop_reason=stream.stop_reason,
             )
             raise ProtocolGenerationError(
-                "модель вернула ответ без шапки протокола (`#протоколвстречи`)"
+                "модель вернула неполный ответ дважды подряд "
+                f"({still_incomplete.reason})"
             )
+        # Ретрай спас встречу — отдельное событие в run_log (сумма ok/failed +
+        # retrying + ok-after-retry даёт полную картину прогона на VPS).
+        degraded_reason = "retried" if degraded_reason == "no" else degraded_reason
+        _emit_run_log(
+            "ok-after-retry", model=model_used, reason=incomplete.reason,
+            output_len=len(text), stop_reason=stream.stop_reason,
+        )
+
+    elapsed = time.monotonic() - started
 
     # FU-11 / Ф5: детерминированный пост-проход доменных терминов (остаточные
     # перевирания мимо STT-словаря и подсказки), company-scoped — тот же источник
@@ -1927,6 +2049,7 @@ def generate_protocol(
         model=model_used,
         reason="" if degraded_reason == "no" else degraded_reason,
         output_len=len(text),
+        stop_reason=stream.stop_reason,
     )
     return text
 

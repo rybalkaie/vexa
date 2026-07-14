@@ -38,6 +38,7 @@ sys.path.insert(0, str(_NOTARY))
 
 from lib import run_log  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 import collector  # noqa: E402
 
 
@@ -146,17 +147,29 @@ class GenerateProtocolRunLogTest(unittest.TestCase):
         run_log._pruned_this_process = False
 
     def test_output_without_header_logs_reason_and_no_transcript_leak(self):
+        # Ф2: generate_protocol теперь зовёт call_claude_print_stream_json (не
+        # call_claude_print) и ретраит один раз (A6) — мок отдаёт headerless
+        # НА ОБЕИХ попытках, поэтому итог всё равно ProtocolGenerationError,
+        # но по пути пишется event=retrying, а финальный event=failed несёт
+        # reason=retry-output-without-header (см. test_iss31_reliability.py
+        # для прицельных тестов самого ретрая).
         headerless = "Тут нет шапки протокола, просто текст ответа модели."
-        with mock.patch.object(lp, "call_claude_print", return_value=headerless):
+        stream_result = ClaudeCliStreamResult(headerless, "end_turn", 0.0, 0, 0, {})
+        with mock.patch.object(
+            lp, "call_claude_print_stream_json", return_value=stream_result,
+        ) as mocked:
             with self.assertRaises(lp.ProtocolGenerationError):
                 lp.generate_protocol(
                     _TRANSCRIPT, self._META, method_text="М", meeting_sid="fail-sid",
                 )
+            self.assertEqual(mocked.call_count, 2, "1 попытка + 1 ретрай (A6)")
         log = Path(self._tmp.name) / "fail-sid.log"
         self.assertTrue(log.exists(), "per-meeting лог должен появиться при сбое")
         content = log.read_text(encoding="utf-8")
+        self.assertIn("event=retrying", content)
         self.assertIn("event=failed", content)
         self.assertIn("reason=output-without-header", content)
+        self.assertIn("reason=retry-output-without-header", content)
         self.assertIn("segments=1", content)  # одна реплика в транскрипте
         # ОПАСНАЯ ТРОЙКА: текст реплики НЕ утёк в лог.
         self.assertNotIn(_SECRET, content)
@@ -172,13 +185,18 @@ class GenerateProtocolRunLogTest(unittest.TestCase):
             "---\n\n"
             "## 1) Тема\n\n▪️ Что-то произошло.\n"
         )
-        with mock.patch.object(lp, "call_claude_print", return_value=protocol):
+        stream_result = ClaudeCliStreamResult(protocol, "end_turn", 0.01, 100, 200, {})
+        with mock.patch.object(
+            lp, "call_claude_print_stream_json", return_value=stream_result,
+        ) as mocked:
             out = lp.generate_protocol(
                 _TRANSCRIPT, self._META, method_text="М", meeting_sid="ok-sid",
             )
+            self.assertEqual(mocked.call_count, 1, "полный ответ с 1-й попытки — ретрай не нужен")
         self.assertTrue(out.startswith("#протоколвстречи"))
         content = (Path(self._tmp.name) / "ok-sid.log").read_text(encoding="utf-8")
         self.assertIn("event=ok", content)
+        self.assertIn("stop_reason=end_turn", content)  # Ф2: поле больше не пропускается
         self.assertNotIn(_SECRET, content)
 
 

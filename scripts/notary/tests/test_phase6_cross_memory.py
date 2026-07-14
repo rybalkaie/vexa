@@ -570,19 +570,20 @@ class TestCrossBlockReachesPrompt(unittest.TestCase):
         (тот же канал, что блок памяти серии — уже доказан в Ф7-сьюте)."""
         captured = {}
 
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             captured["user"] = user_prompt
-            return ("#протоколвстречи 13.06.2026\n\n**Встреча:** Тест.\n\n"
+            text = ("#протоколвстречи 13.06.2026\n\n**Встреча:** Тест.\n\n"
                     "**Длительность:** 10 мин\n\n**Участники:** Михаил Саргин\n\n"
                     "**Транскрипт:** [2026-06-13.md](2026-06-13.md)\n\n---\n\n"
                     "## 1) Тема\n\n▪️ Пункт.\n")
+            return claude_cli.ClaudeCliStreamResult(text, "end_turn", 0.0, 0, 0, {})
 
         cross = sm.format_cross_memory_block([{
             "series": "anzhee-logi", "date": "2026-06-10",
             "themes": ["Поставки маркетплейс"], "key_points": ["Контейнер"]}])
         combined = "\n\n".join(p for p in ("", cross.strip()) if p)
         meta = {"series": "anzhee-coord", "date": "2026-06-13"}
-        with mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             lp.generate_protocol("транскрипт", meta, method_text="М",
                                  series_memory=combined, meeting_sid="cross1")
         self.assertIn("ФОН — связанные встречи", captured["user"])

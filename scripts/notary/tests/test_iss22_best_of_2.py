@@ -46,6 +46,7 @@ for _mod in ("requests", "httpx", "numpy", "torch"):
 
 from lib import llm_postprocess as lp  # noqa: E402
 from lib import series_memory as sm  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 _DISCLAIMER = "> _Авторство реплик распознано автоматически, возможны неточности._"
 _METHOD = "МЕТОДИЧКА (тест): пиши протокол по структуре."
@@ -203,7 +204,8 @@ class TestSecondDraftGeneration(unittest.TestCase):
         """🔴 Опасная тройка: лог второго черновика несёт ЧИСЛА (out_len), но НЕ
         текст транскрипта/протокола."""
         secret = "урезаем на пятнадцать процентов"  # фраза из транскрипта
-        with mock.patch.object(lp, "call_claude_print", return_value=DRAFT_B_RAW):
+        stream_result = ClaudeCliStreamResult(DRAFT_B_RAW, "end_turn", 0.0, 0, 0, {})
+        with mock.patch.object(lp, "call_claude_print_stream_json", return_value=stream_result):
             with self.assertLogs("lib.llm_postprocess", level="INFO") as cm:
                 out = lp.generate_alt_draft_for_best_of_2(
                     self.transcript, META, meeting_sid="sid", method_text=_METHOD)
@@ -240,7 +242,8 @@ class TestBestOf2Merge(unittest.TestCase):
     def test_draft_b_extractable(self):
         """Линк best-of-2: задача Y из (реально сгенерённого) черновика B извлекается
         детерминированно (series_memory) → дойдёт до инварианта склейки."""
-        with mock.patch.object(lp, "call_claude_print", return_value=DRAFT_B_RAW):
+        stream_result = ClaudeCliStreamResult(DRAFT_B_RAW, "end_turn", 0.0, 0, 0, {})
+        with mock.patch.object(lp, "call_claude_print_stream_json", return_value=stream_result):
             draft_b = lp.generate_alt_draft_for_best_of_2(
                 self.transcript, META, meeting_sid="sid", method_text=_METHOD)
         self.assertIsNotNone(draft_b)
@@ -263,7 +266,16 @@ class TestBestOf2Merge(unittest.TestCase):
             calls["gen"] += 1                            # генерация черновика B
             return DRAFT_B_RAW
 
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake_claude):
+        def fake_claude_stream(user, system="", **kw):
+            # Ф2: generate_protocol (внутри generate_alt_draft_for_best_of_2)
+            # зовёт call_claude_print_stream_json, а не call_claude_print —
+            # склейка-критик (review_and_flag_protocol_file) ниже осталась на
+            # старом транспорте. Одна и та же ветвящаяся fake_claude решает,
+            # чья это реплика; здесь только заворачиваем результат генерации.
+            return ClaudeCliStreamResult(fake_claude(user, system=system, **kw), "end_turn", 0.0, 0, 0, {})
+
+        with mock.patch.object(lp, "call_claude_print", side_effect=fake_claude), \
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake_claude_stream):
             draft_b = lp.generate_alt_draft_for_best_of_2(
                 self.transcript, META, meeting_sid="sid", method_text=_METHOD)
             self.assertIsNotNone(draft_b)
@@ -292,11 +304,15 @@ class TestBestOf2Merge(unittest.TestCase):
                 return _envelope(IMPROVED_WITH_Y)
             return DRAFT_B_RAW
 
+        def fake_claude_stream(user, system="", **kw):
+            return ClaudeCliStreamResult(fake_claude(user, system=system, **kw), "end_turn", 0.0, 0, 0, {})
+
         prior_version = (
             "#протоколвстречи 24.06.2026\n\n## 1) Задачи\n\n**Татьяна**\n"
             "▪️ Выслать расчёт по аренде.\n"
         )
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake_claude):
+        with mock.patch.object(lp, "call_claude_print", side_effect=fake_claude), \
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake_claude_stream):
             draft_b = lp.generate_alt_draft_for_best_of_2(
                 self.transcript, META, meeting_sid="sid", method_text=_METHOD)
             merge_sources = [s for s in (prior_version, draft_b) if s]

@@ -39,6 +39,7 @@ sys.path.insert(0, str(_NOTARY))
 
 from lib import series_memory as sm  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 
 # Протокол встречи M1: только что назначенные задачи (блок «Задачи»), без хвоста.
@@ -108,14 +109,15 @@ _META = {"series": "koordinaciya", "date": "2026-06-15",
 
 
 def _capture_call():
-    """side_effect для call_claude_print: пишет аргументы и отдаёт протокол."""
+    """side_effect для call_claude_print_stream_json (Ф2): пишет аргументы и
+    отдаёт протокол."""
     cap: dict = {}
 
-    def _fake(user_prompt, *, system, timeout, model):
+    def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
         cap["user"] = user_prompt
         cap["system"] = system
         cap["model"] = model
-        return _PROTO_M1  # любой валидный протокол (с шапкой)
+        return ClaudeCliStreamResult(_PROTO_M1, "end_turn", 0.0, 0, 0, {})  # любой валидный протокол (с шапкой)
 
     return _fake, cap
 
@@ -374,11 +376,11 @@ class TestOpenTasksReachesGeneration(unittest.TestCase):
         block = sm.format_open_tasks_block(["Илья: добить отчёт по складу"])
         calls = []
 
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             calls.append(user_prompt)
-            return _PROTO_M1
+            return ClaudeCliStreamResult(_PROTO_M1, "end_turn", 0.0, 0, 0, {})
 
-        with mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             lp.generate_protocol("транскрипт", _META, method_text="М",
                                  meeting_sid="ph8", open_tasks=block)
         self.assertEqual(len(calls), 1)
@@ -389,7 +391,7 @@ class TestOpenTasksReachesGeneration(unittest.TestCase):
         secret = "СЕКРЕТ-ЗАДАЧА-LOG"
         block = sm.format_open_tasks_block([f"Илья: {secret}"])
         fake, _cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake), \
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake), \
                 self.assertLogs(lp.logger, level="DEBUG") as logctx:
             lp.generate_protocol("транскрипт", _META, method_text="М",
                                  meeting_sid="ph8b", open_tasks=block)

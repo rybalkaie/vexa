@@ -24,6 +24,7 @@ _NOTARY = _HERE.parent
 sys.path.insert(0, str(_NOTARY))
 
 from lib import llm_postprocess as lp  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +192,11 @@ class TestGenerateProtocolStabilizes(unittest.TestCase):
             + _svc("Решения", _DECISIONS)
             + _svc("Задачи", _TASKS)
         )
-        with mock.patch.object(lp, "call_claude_print", side_effect=[run_a, run_b]):
+        stream_results = [
+            ClaudeCliStreamResult(run_a, "end_turn", 0.0, 0, 0, {}),
+            ClaudeCliStreamResult(run_b, "end_turn", 0.0, 0, 0, {}),
+        ]
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=stream_results):
             out1 = lp.generate_protocol("т", _META, method_text="М", meeting_sid="s1")
             out2 = lp.generate_protocol("т", _META, method_text="М", meeting_sid="s2")
         # Бинарный критерий R13: два прогона → идентичный список участников и

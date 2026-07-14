@@ -28,7 +28,9 @@ sys.path.insert(0, str(_NOTARY))
 
 from lib import llm_postprocess as lp  # noqa: E402
 from lib import series_roster as sr  # noqa: E402
-from lib.claude_cli import ClaudeCliTimeout, ClaudeCliFailed  # noqa: E402
+from lib.claude_cli import (  # noqa: E402
+    ClaudeCliTimeout, ClaudeCliFailed, ClaudeCliStreamResult,
+)
 
 
 # Минимальный валидный протокол (должен начинаться с `#протоколвстречи`).
@@ -56,15 +58,18 @@ _META = {
 
 
 def _capture_call():
-    """side_effect для `call_claude_print`: пишет аргументы вызова и отдаёт протокол."""
+    """side_effect для `call_claude_print_stream_json` (Ф2): пишет аргументы
+    вызова и отдаёт готовый протокол (валидная шапка → ретрай Ф2 не триггерится,
+    остальные тесты этого файла остаются однопроходными, как до Ф2)."""
     captured: dict = {}
 
-    def _fake(user_prompt, *, system, timeout, model):
+    def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
         captured["user"] = user_prompt
         captured["system"] = system
         captured["timeout"] = timeout
         captured["model"] = model
-        return _FAKE_PROTOCOL
+        captured["max_thinking_tokens"] = max_thinking_tokens
+        return ClaudeCliStreamResult(_FAKE_PROTOCOL, "end_turn", 0.0, 0, 0, {})
 
     return _fake, captured
 
@@ -83,7 +88,7 @@ class TestGenModelOpus(unittest.TestCase):
 
     def test_model_passed_to_cli(self):
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("транскрипт", _META, method_text="МЕТОД", meeting_sid="g1")
         self.assertEqual(cap["model"], lp.PROTOCOL_GEN_MODEL)
 
@@ -98,13 +103,13 @@ class TestTimeoutAndDegradation(unittest.TestCase):
 
     def test_timeout_passed_to_cli_at_least_600(self):
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("т", _META, method_text="МЕТОД", meeting_sid="r1")
         self.assertGreaterEqual(cap["timeout"], 600)
 
     def test_explicit_timeout_respected(self):
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("т", _META, method_text="М", timeout=120, meeting_sid="r1b")
         self.assertEqual(cap["timeout"], 120)
 
@@ -112,14 +117,14 @@ class TestTimeoutAndDegradation(unittest.TestCase):
         """Opus упал по таймауту → один проход на резервной модели, встреча НЕ потеряна."""
         calls = []
 
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             calls.append(model)
             if model == lp.PROTOCOL_GEN_MODEL:
                 raise ClaudeCliTimeout("timeout 600s")
-            return _FAKE_PROTOCOL
+            return ClaudeCliStreamResult(_FAKE_PROTOCOL, "end_turn", 0.0, 0, 0, {})
 
         with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6"), \
-                mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             out = lp.generate_protocol("т", _META, method_text="М", meeting_sid="r2")
         self.assertTrue(out.startswith("#протоколвстречи"))
         # Первая попытка — основная модель, вторая — фолбэк.
@@ -128,13 +133,13 @@ class TestTimeoutAndDegradation(unittest.TestCase):
 
     def test_degradation_logged_with_marker(self):
         """Деградация видна в structured-логе (`degraded`), без текста транскрипта."""
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             if model == lp.PROTOCOL_GEN_MODEL:
                 raise ClaudeCliTimeout("timeout")
-            return _FAKE_PROTOCOL
+            return ClaudeCliStreamResult(_FAKE_PROTOCOL, "end_turn", 0.0, 0, 0, {})
 
         with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6"), \
-                mock.patch.object(lp, "call_claude_print", side_effect=_fake), \
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake), \
                 self.assertLogs(lp.logger, level="WARNING") as logctx:
             lp.generate_protocol("т", _META, method_text="М", meeting_sid="r3")
         blob = "\n".join(logctx.output)
@@ -143,33 +148,33 @@ class TestTimeoutAndDegradation(unittest.TestCase):
 
     def test_timeout_without_fallback_raises(self):
         """Фолбэк выключен → понятный отказ (не тихий None), встреча перегенерится позже."""
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             raise ClaudeCliTimeout("timeout")
 
         with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", ""), \
-                mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             with self.assertRaises(lp.ProtocolGenerationError):
                 lp.generate_protocol("т", _META, method_text="М", meeting_sid="r4")
 
     def test_fallback_failure_raises_not_silent(self):
         """Если и фолбэк упал — ProtocolGenerationError, не тихий None."""
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             if model == lp.PROTOCOL_GEN_MODEL:
                 raise ClaudeCliTimeout("timeout")
             raise ClaudeCliFailed("fallback boom")
 
         with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6"), \
-                mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             with self.assertRaises(lp.ProtocolGenerationError):
                 lp.generate_protocol("т", _META, method_text="М", meeting_sid="r5")
 
     def test_non_timeout_error_unchanged(self):
         """Не-таймаут-ошибка ведёт себя как до Ф3: отказ без фолбэка."""
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             raise ClaudeCliFailed("exit 1")
 
         with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6"), \
-                mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             with self.assertRaises(lp.ProtocolGenerationError):
                 lp.generate_protocol("т", _META, method_text="М", meeting_sid="r6")
 
@@ -206,7 +211,7 @@ class TestRolesBlock(unittest.TestCase):
     def test_roles_block_reaches_generate_protocol(self):
         """End-to-end: блок ролей доходит до user-промпта генерации."""
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("транскрипт", _META, method_text="М", meeting_sid="g2")
         self.assertIn("Роли участников этой серии", cap["user"])
         self.assertIn("Мария Михина — поставки", cap["user"])
@@ -243,7 +248,7 @@ class TestMethodTextFull(unittest.TestCase):
             + "\nКОНЕЦ-МЕТОДИЧКИ-уникальный-маркер"
         )
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("т", _META, method_text=method, meeting_sid="g3")
         # Целиком: и начало, и конец, и полная подстрока.
         self.assertIn("НАЧАЛО-МЕТОДИЧКИ-уникальный-маркер", cap["system"])
@@ -258,7 +263,7 @@ class TestMethodTextFull(unittest.TestCase):
             self.skipTest("метод-файл не найден на этой машине (headless/VPS без rsync)")
         self.assertGreater(len(text), 200)
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("т", _META, method_text=text, meeting_sid="g3b")
         self.assertIn(text, cap["system"])
 
@@ -271,7 +276,7 @@ class TestPrivacyNoLeak(unittest.TestCase):
     def test_transcript_and_roles_not_logged(self):
         secret_transcript = "СЕКРЕТ-РЕПЛИКА-не-должна-утечь-в-лог"
         fake, _cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake), \
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake), \
                 self.assertLogs(lp.logger, level="DEBUG") as logctx:
             lp.generate_protocol(secret_transcript, _META, method_text="М", meeting_sid="g10")
         blob = "\n".join(logctx.output)
@@ -287,13 +292,13 @@ class TestPrivacyNoLeak(unittest.TestCase):
         """Путь деградации тоже не логирует транскрипт/имена ролей."""
         secret = "СЕКРЕТ-РЕПЛИКА-деградация"
 
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             if model == lp.PROTOCOL_GEN_MODEL:
                 raise ClaudeCliTimeout("timeout")
-            return _FAKE_PROTOCOL
+            return ClaudeCliStreamResult(_FAKE_PROTOCOL, "end_turn", 0.0, 0, 0, {})
 
         with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6"), \
-                mock.patch.object(lp, "call_claude_print", side_effect=_fake), \
+                mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake), \
                 self.assertLogs(lp.logger, level="DEBUG") as logctx:
             lp.generate_protocol(secret, _META, method_text="М", meeting_sid="g10b")
         blob = "\n".join(logctx.output)

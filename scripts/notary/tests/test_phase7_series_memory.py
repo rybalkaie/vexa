@@ -32,6 +32,7 @@ sys.path.insert(0, str(_NOTARY))
 
 from lib import series_memory as sm  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 
 # Реалистичный протокол (структура из методички + реального примера).
@@ -340,13 +341,14 @@ class TestMemoryBlock(unittest.TestCase):
 
         def _fake(user_prompt, **kwargs):
             captured["user"] = user_prompt
-            return "#протоколвстречи 03.06.2026\n\nтело\n"
+            return ClaudeCliStreamResult(
+                "#протоколвстречи 03.06.2026\n\nтело\n", "end_turn", 0.0, 0, 0, {})
 
         with tempfile.TemporaryDirectory() as td:
             tpath = Path(td) / "2026-06-03.md"
             tpath.write_text("**[00:00:01] Илья:** привет\n", encoding="utf-8")
             ppath = Path(td) / "2026-06-03-protokol.md"
-            with mock.patch.object(lp, "call_claude_print", side_effect=_fake), \
+            with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake), \
                  mock.patch.object(lp, "_load_method_text", return_value="МЕТОД"):
                 lp.regenerate_protocol_for_meeting(
                     transcript_path=tpath, protocol_path=ppath,

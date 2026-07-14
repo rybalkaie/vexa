@@ -41,6 +41,7 @@ from lib import protocol_to_tg as ptg  # noqa: E402
 from lib import series_memory as sm  # noqa: E402
 from lib import protocol_to_pdf as ppdf  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 
 def _turn(speaker: str, text: str) -> AlignedTurn:
@@ -222,7 +223,8 @@ class TestDisclaimerInMarkdown(unittest.TestCase):
             "---\n\n"
             "## 1) Тема\n\n▪️ пункт\n"
         )
-        with mock.patch.object(lp, "call_claude_print", return_value=fake):
+        stream_result = ClaudeCliStreamResult(fake, "end_turn", 0.0, 0, 0, {})
+        with mock.patch.object(lp, "call_claude_print_stream_json", return_value=stream_result):
             out = lp.generate_protocol(
                 "**[00:01] Илья:** привет",
                 {"date": "2026-06-03", "participants": ["Илья Рыбалка"],

@@ -34,6 +34,7 @@ from cli import registry  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
 from lib import series_markup  # noqa: E402  (тот же объект, что использует lp)
 from lib import series_roster as sr  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 SLUG = sr.ANZHEE_COORDINATION_SLUG
 # Один источник истины — реестр (цикл5/ход3, У4): параметрические тесты ниже
@@ -76,15 +77,16 @@ def _rec(series, **fields):
 
 
 def _capture_call():
-    """side_effect для `call_claude_print`: пишет аргументы вызова и отдаёт протокол."""
+    """side_effect для `call_claude_print_stream_json` (Ф2): пишет аргументы
+    вызова и отдаёт готовый протокол."""
     captured: dict = {}
 
-    def _fake(user_prompt, *, system, timeout, model):
+    def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
         captured["user"] = user_prompt
         captured["system"] = system
         captured["timeout"] = timeout
         captured["model"] = model
-        return _FAKE_PROTOCOL
+        return ClaudeCliStreamResult(_FAKE_PROTOCOL, "end_turn", 0.0, 0, 0, {})
 
     return _fake, captured
 
@@ -237,7 +239,7 @@ class TestGenreBlockInPrompt(unittest.TestCase):
     def test_genre_block_reaches_generate_protocol(self):
         """End-to-end: блок жанра доходит до user-промпта генерации (один вызов)."""
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("транскрипт", _META, method_text="М", meeting_sid="g4")
         self.assertIn("Тип (повестка) этой встречи", cap["user"])
 
@@ -245,11 +247,11 @@ class TestGenreBlockInPrompt(unittest.TestCase):
         """ГРАН1/НЕС1: жанр НЕ плодит отдельный Opus-вызов — генерация это один вызов."""
         calls = []
 
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             calls.append(model)
-            return _FAKE_PROTOCOL
+            return ClaudeCliStreamResult(_FAKE_PROTOCOL, "end_turn", 0.0, 0, 0, {})
 
-        with mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             lp.generate_protocol("транскрипт", _META, method_text="М", meeting_sid="g4b")
         self.assertEqual(len(calls), 1)
 
@@ -264,7 +266,7 @@ class TestGenreBlockInPrompt(unittest.TestCase):
         """G10/опасная тройка: ни транскрипт, ни блок жанра не утекают в лог."""
         secret = "СЕКРЕТ-РЕПЛИКА-Ф5"
         fake, _cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake), \
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake), \
                 self.assertLogs(lp.logger, level="DEBUG") as logctx:
             lp.generate_protocol(secret, _META, method_text="М", meeting_sid="g4c")
         blob = "\n".join(logctx.output)
@@ -319,7 +321,7 @@ class TestMethodichkaReinforced(unittest.TestCase):
         text = self._load()
         self.assertGreater(len(text), 200)
         fake, cap = _capture_call()
-        with mock.patch.object(lp, "call_claude_print", side_effect=fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=fake):
             lp.generate_protocol("т", _META, method_text=text, meeting_sid="g5")
         # Методичка целиком — подстрока system-промпта (без среза).
         self.assertIn(text, cap["system"])

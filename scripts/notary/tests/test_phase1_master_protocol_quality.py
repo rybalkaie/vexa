@@ -27,6 +27,7 @@ sys.path.insert(0, str(_NOTARY))
 from lib import glossary  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
 from lib import protocol_to_tg as ptg  # noqa: E402
+from lib.claude_cli import ClaudeCliStreamResult  # noqa: E402
 
 
 # ===========================================================================
@@ -167,7 +168,8 @@ class TestGenerateProtocolPostProcessing(unittest.TestCase):
 
     def test_generate_applies_glossary_and_duration(self):
         """generate_protocol прогоняет глоссарий + нормализацию длительности."""
-        with mock.patch.object(lp, "call_claude_print", return_value=_PROTOCOL_62):
+        stream_result = ClaudeCliStreamResult(_PROTOCOL_62, "end_turn", 0.0, 0, 0, {})
+        with mock.patch.object(lp, "call_claude_print_stream_json", return_value=stream_result):
             out = lp.generate_protocol(
                 "транскрипт", _META_42, method_text="МЕТОД", meeting_sid="t1",
             )
@@ -184,11 +186,11 @@ class TestGenerateProtocolPostProcessing(unittest.TestCase):
         """Глоссарий действительно подмешан в system-prompt генерации."""
         captured = {}
 
-        def _fake(user_prompt, *, system, timeout, model):
+        def _fake(user_prompt, *, system, timeout, model, max_thinking_tokens=None):
             captured["system"] = system
-            return _PROTOCOL_62
+            return ClaudeCliStreamResult(_PROTOCOL_62, "end_turn", 0.0, 0, 0, {})
 
-        with mock.patch.object(lp, "call_claude_print", side_effect=_fake):
+        with mock.patch.object(lp, "call_claude_print_stream_json", side_effect=_fake):
             lp.generate_protocol("т", _META_42, method_text="МЕТОД", meeting_sid="t2")
         self.assertIn("Глоссарий проекта", captured["system"])
         self.assertIn("РСЯ", captured["system"])
