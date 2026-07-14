@@ -1273,6 +1273,122 @@ def maybe_route_to_pending_status_reply(
     return True
 
 
+def maybe_route_to_mixed_reply(
+    token: str, chat_id: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """Ф5 (ISS-33): расщепление СМЕШАННОГО reply (статусы + правки) на части.
+
+    Стоит ДО статус-роута и шлюза правок. Корень: reply Ольги Новиковой (4 правки +
+    2 статуса одним сообщением) — статус-роут распознал ОДИН статус, вернул True и
+    прожевал всё, 4 правки и второй статус молча пропали. Тихая потеря — худший режим.
+
+    Гейт `ENABLE_MIXED_REPLY_SPLIT` ДЕФОЛТ-OFF (A1): при OFF — сразу False, поведение
+    = ТЕКУЩЕЕ (один reply — один роут, обратная совместимость). При ON и СМЕШАННОМ
+    reply (≥2 статуса, ИЛИ статус+правки, ИЛИ статус+непонятое) — обрабатываем ОБЕ
+    части и шлём ОДИН объединённый ack → True. Чистый одиночный статус / чистая
+    правка / мусор → False → обычные роуты ниже (РИСК5: чистый статус в reissue НЕ
+    уходит — шлюз правок при пустом правочном остатке не зовём вовсе).
+
+    Опасная тройка: НЕ логируем текст reply/сегментов — только счётчики.
+    """
+    if chat_id is None:
+        return False
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text or msg.get("voice") or msg.get("audio"):
+        return False  # текст-only (голос/аудио — как раньше, в шлюз правок)
+    try:
+        from notary.lib import mixed_reply_split  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модуль не грузится → фича просто выключена
+        logger.debug("[mixed-reply] import failed (feature off?): %s", e)
+        return False
+    if not mixed_reply_split.is_enabled():
+        return False  # A1: дефолт-OFF → текущее поведение
+    try:
+        from notary.lib import pending_status_reply  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модуль не грузится → фича выключена
+        logger.debug("[mixed-reply] import pending_status_reply failed: %s", e)
+        return False
+    # Дешёвый регекс-предчек ДО платного LLM-сплита: смешанный reply ВСЕГДА несёт
+    # статус-маркер (статус-часть). Нет маркера → это чистая правка/переписка →
+    # не наш путь (в шлюз правок), сплиттер не дёргаем (зеркалит статус-роут :1253).
+    if pending_status_reply.detect_status_intent(text) is None:
+        return False
+    series = _reply_context_series(chat_id, msg)
+    if not series:
+        return False  # не reply на доставленный протокол серии (дайджест — свой роут)
+    series_dir = _protokol_root() / series
+    try:
+        items = pending_status_reply.load_series_pending(series_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[mixed-reply] резолв висяков не удался (feature off?): %s", e)
+        return False
+    try:
+        split = mixed_reply_split.split_reply(text, items)
+    except Exception as e:  # noqa: BLE001 — сплит не должен валить listener
+        logger.exception("[mixed-reply] сплит упал (non-fatal): %s", e)
+        return False
+    if not mixed_reply_split.should_engage(split):
+        return False  # не смешанный → обычные роуты (чистый статус/правка) — РИСК5
+    status_segments = split["status_segments"]
+    edit_remainder = "\n".join(split["edits"])
+    n_edits = len(split["edits"])
+    unclear = split["unclear"]
+
+    # 1) Статусы — apply_status_reply В ЦИКЛЕ по КАЖДОМУ сегменту (РИСК4): один
+    #    вызов резолвит ОДИН висяк, поэтому сегмент-на-статус + цикл = все статусы.
+    n_status_ok = 0
+    n_status_unresolved = 0
+    for seg in status_segments:
+        try:
+            res = pending_status_reply.apply_status_reply(
+                seg, series_dir, date=_reply_date_str(msg), source="mixed-reply",
+            )
+        except Exception as e:  # noqa: BLE001 — сбой одного статуса не роняет остальные
+            logger.warning("[mixed-reply] статус-сегмент упал (non-fatal): %s", type(e).__name__)
+            res = None
+        if res:
+            n_status_ok += 1
+        else:
+            n_status_unresolved += 1  # интент есть, но висяк не привязался — не молчим
+
+    # 2) Правки — шлюз правок с ПОДАВЛЕННЫМ ack (РИСК5: только при непустом остатке).
+    edit_queued = False
+    if edit_remainder.strip():
+        acked = {"v": False}
+
+        def _capture_send(*_a, **_k):
+            acked["v"] = True  # ack правок подавлен, факт приёма зафиксирован
+
+        edit_msg = {**msg, "text": edit_remainder}
+        edit_msg.pop("voice", None)
+        edit_msg.pop("audio", None)
+        try:
+            from notary.lib import feedback_worker  # noqa: PLC0415
+            feedback_worker.route_feedback_reply(
+                token, chat_id, edit_msg, allowed_chat=allowed_chat, send=_capture_send,
+            )
+        except Exception as e:  # noqa: BLE001 — сбой правок не роняет обработку статусов
+            logger.exception("[mixed-reply] шлюз правок упал (non-fatal): %s", e)
+        edit_queued = acked["v"]
+
+    # 3) Объединённый ack (REQ 33.3/33.4/33.5) — ОДИН ответ на весь reply.
+    ack = mixed_reply_split.build_mixed_ack(
+        n_status_ok=n_status_ok, n_status_unresolved=n_status_unresolved,
+        n_edits=n_edits, edit_queued=edit_queued, unclear=unclear,
+    )
+    send_message(token, chat_id, ack, reply_to=msg.get("message_id"))
+    logger.info(
+        "[mixed-reply] chat=%s series=%s статусов=%d(ok=%d,unresolved=%d) правок=%d "
+        "queued=%s непонятое=%s",
+        chat_id, series, len(status_segments), n_status_ok, n_status_unresolved,
+        n_edits, edit_queued, bool(unclear),
+    )
+    return True
+
+
 def _learning_digest_prefix() -> str:
     """Префикс 🧠 дайджеста самообучения — из `feedback_learning.DIGEST_PREFIX`
     (один источник истины). Fallback на литерал, если модуль не импортируется."""
@@ -1795,6 +1911,15 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # приходит) он молча дропнул бы ответ участника. Статус → в тот же sidecar Ф2;
     # голос / нераспознанное → подсказка, но НЕ молчание: канал сам просил ответить.
     if maybe_route_to_digest_reply(token, cid, msg):
+        return
+
+    # Ф5 (ISS-33): СМЕШАННЫЙ reply «правки текста + статусы задач» одним сообщением.
+    # ДО статус-роута и шлюза правок — иначе статус-роут распознал бы ОДИН статус,
+    # вернул True и прожевал бы всё сообщение (правки и второй статус молча пропали
+    # бы — корень ISS-33, кейс Ольги). Гейт `ENABLE_MIXED_REPLY_SPLIT` дефолт-OFF:
+    # OFF → сразу False (текущее поведение); ON и reply смешанный → обрабатывает обе
+    # части + один объединённый ack → True. Чистый статус/правка → False → роуты ниже.
+    if maybe_route_to_mixed_reply(token, cid, allowed_chat, msg):
         return
 
     # Ф5 (REQ R9/R5/A10): reply со СТАТУСОМ висяка («этот закрыт» / «снимаем» /

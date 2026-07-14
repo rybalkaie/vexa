@@ -843,10 +843,17 @@ def route_feedback_reply(
     allowed_chat: Optional[int],
     root: Optional[Path] = None,
     now: Optional[datetime] = None,
+    send=None,
 ) -> bool:
     """FB1-шлюз. Возвращает True если сообщение «прожёвано» фичей правок
     (приложили правку ИЛИ осознанно дропнули в групповом чате), иначе False —
     caller продолжает свой dispatch (DM-flow).
+
+    `send` (по умолчанию `telegram_api.send_message` внутри `handle_feedback_reply`)
+    инъектируется смешанным роутом ISS-33 (`mixed_reply_split`), чтобы ПОДАВИТЬ
+    отдельный ack правок: там правочная часть — лишь один из сегментов, и ack на неё
+    сливается в ОДИН объединённый ответ (не плодим второй). Вызывающий по факту
+    вызова `send` понимает, что правка принята.
 
     Решение:
       • reply на доставленный протокол + есть текст → правка (ack + state) → True.
@@ -917,7 +924,7 @@ def route_feedback_reply(
                     voice_msg.pop("voice", None)
                     voice_msg.pop("audio", None)
                     try:
-                        handle_feedback_reply(token, chat_id, voice_msg, meeting=meeting, root=root, now=now)
+                        handle_feedback_reply(token, chat_id, voice_msg, meeting=meeting, root=root, now=now, send=send)
                     except Exception as e:  # noqa: BLE001
                         logger.exception("[feedback] handle_feedback_reply (голос) упал: %s", e)
                     return True
@@ -929,7 +936,7 @@ def route_feedback_reply(
             logger.info("[feedback] правка без текста (не голос) — пропуск chat=%s", chat_id)
             return True
         try:
-            handle_feedback_reply(token, chat_id, msg, meeting=meeting, root=root, now=now)
+            handle_feedback_reply(token, chat_id, msg, meeting=meeting, root=root, now=now, send=send)
         except Exception as e:  # noqa: BLE001
             logger.exception("[feedback] handle_feedback_reply упал: %s", e)
         return True
