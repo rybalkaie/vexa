@@ -171,11 +171,20 @@ def _target_md_for_session(series: str, date_str: str, session_uid: str) -> Path
             return MEETINGS_DIR / "_one-off" / f"{date_str}-{safe_sid}" / f"{date_str}.md"
         return MEETINGS_DIR / series / f"{date_str}.md"
 
-# Где собирать готовый .md. На маке — тащим scp с VPS в ~/Projects/me/встречи/.
-# На VPS (LOCAL_FINALIZE=1) — кладём в /srv/meeting-notary/protocols/<series>/,
+# Куда collector кладёт ДОЛГОВЕЧНУЮ копию (архив). На маке — scp с VPS в
+# ~/Projects/me/встречи/. На VPS (LOCAL_FINALIZE=1) — /srv/meeting-notary/protocols/,
 # mirror-агент мака притащит позже.
+#
+# ISS-32 (Ф3, 2026-07-14): источник — `MEETING_NOTARY_ARCHIVE_DIR` (долговечный
+# архив), с фолбэком на рабочую `MEETING_NOTARY_PROTOCOLS_DIR`. Раньше читалась
+# ТОЛЬКО рабочая переменная — когда её перевели на `_tmp` (для listener/reissue),
+# долговечная копия стала in-place no-op и `/srv`/мак-архив замерли на месяц.
+# Разведение: finalize пишет в PROTOCOLS_DIR (`_tmp`), collector копирует в
+# ARCHIVE_DIR (`/srv`). Дефолт ARCHIVE_DIR = PROTOCOLS_DIR → архив == рабочая →
+# копия in-place, поведение как до Ф3 (обратная совместимость).
 MEETINGS_DIR = Path(os.path.expanduser(
-    os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR")
+    os.environ.get("MEETING_NOTARY_ARCHIVE_DIR")
+    or os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR")
     or ("/srv/meeting-notary/protocols" if LOCAL_FINALIZE else "~/Projects/me/встречи")
 ))
 
@@ -885,93 +894,124 @@ def _finalize_and_collect(session_uid: str) -> None:
         _do_finalize_and_collect(session_uid)
 
 
+def _sync_sidecar_to_archive(
+    src_dir: Path, dst_dir: Path, filename: str, session_uid: str, *, label: str,
+) -> None:
+    """Донести sidecar-файл `filename` (память серии / протокол-сводка) с рабочей
+    стороны (output-dir finalize) в долговечный архив рядом с транскриптом.
+
+    Тем же транспортом, что и протокол:
+      • LOCAL_FINALIZE (коллектор на VPS): локальная copy2 `src_dir → dst_dir`;
+      • мак (коллектор на маке): scp с VPS.
+
+    Имя файла на обеих сторонах одинаковое (`filename`) — date-ключ совпадает с тем,
+    что писал finalize (кладётся по date-ключу даже при коллизии имени транскрипта).
+
+    Защитно к топологии: `src == dst` (output-dir == долговечный корень, архив не
+    разведён с рабочей папкой) → no-op, как и копирование `.md`.
+
+    Best-effort и ТИХО: sidecar — вторичный артефакт; нет файла-источника (артефакт
+    выключен / пустой протокол) или сбой транспорта → INFO/WARN без алерта — доставка
+    протокола уже состоялась. Содержимое файла НЕ читаем и НЕ логируем (опасная тройка).
+    """
+    dst = Path(dst_dir) / filename
+    tmp = dst.with_suffix(dst.suffix + ".part")
+
+    if LOCAL_FINALIZE:
+        src = Path(src_dir) / filename
+        if not src.exists():
+            logger.info(
+                "%s: файла-источника %s нет — синк не нужен (артефакт выключен / "
+                "пустой протокол; sid=%s)", label, src.name, session_uid,
+            )
+            return
+        try:
+            if src.resolve() == dst.resolve():
+                logger.info("✓ %s уже на месте (in-place от finalize): %s", label, dst)
+                return
+        except OSError:
+            pass
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+            logger.info("✓ %s (архив, local): %s", label, dst)
+        except OSError as e:
+            logger.warning(
+                "%s: local copy %s → %s не удался (не критично): %s", label, src, dst, e,
+            )
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+        return
+
+    # Мак-путь: scp `filename` с VPS (рядом с транскриптом-источником на VPS).
+    vps_src = f"{Path(src_dir).as_posix()}/{filename}"
+    scp_cmd = ["scp", f"{SSH_HOST}:{vps_src}", str(tmp)]
+    try:
+        scp = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "%s: scp timeout (sid=%s) — пропуск, протокол уже доставлен", label, session_uid,
+        )
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        return
+    if scp.returncode != 0:
+        # Норма, когда артефакта нет (выключен / пустой протокол): файла нет → rc != 0.
+        logger.info(
+            "%s: нет на VPS или scp rc=%d (sid=%s) — синк пропущен (не критично)",
+            label, scp.returncode, session_uid,
+        )
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        return
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(tmp, dst)
+        logger.info("✓ %s (архив, scp): %s", label, dst)
+    except OSError as e:
+        logger.warning(
+            "%s: os.replace %s → %s не удался (не критично): %s", label, tmp, dst, e,
+        )
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
 def _sync_series_memory(finalize_protocol_path: str, target_md: Path, session_uid: str) -> None:
     """Ф4 (task 5): доставить выжимку памяти серии на долговечную сторону рядом с протоколом.
 
     finalize (`series_memory.save_meeting_digest`) кладёт `<date>-memory.json` рядом с
     протоколом в свой output-dir. Долговечный архив (MEETINGS_DIR) до Ф4 получал ТОЛЬКО
-    `.md` — память серии на бою не доезжала в архив владельца (наследие Ф2 §5). Здесь —
-    синк sidecar-файла памяти тем же транспортом, что и протокол:
-      • LOCAL_FINALIZE (коллектор на VPS): локальная копия output-dir → MEETINGS_DIR;
-      • мак (коллектор на маке): scp с VPS рядом с протоколом.
-
-    Имя файла памяти выводим из имени протокола-источника (`<date>.md` → `<date>-memory.json`,
-    см. `series_memory.MEMORY_FILE_SUFFIX`) — date-ключ совпадает с тем, что писал finalize.
-    Кладём по date-ключу даже при коллизии имени протокола (`<date>-<sid>.md`): одна выжимка
-    на дату серии, перефинализация перетирает свою же выжимку.
-
-    Защитно к топологии: если output-dir finalize совпадает с долговечным корнем (память
-    уже на месте) — видим `src == dst` и пропускаем (no-op), как делает и копирование `.md`.
-
-    Best-effort и ТИХО: память — вторичный артефакт; нет файла-источника (память выключена /
-    пустой протокол) или сбой транспорта → INFO/WARN без алерта владельцу — доставка
-    протокола уже состоялась. Содержимое файла НЕ читаем и НЕ логируем (РИСК4 / опасная тройка).
+    `.md` — память серии на бою не доезжала в архив владельца (наследие Ф2 §5). Имя файла
+    памяти выводим из имени транскрипта-источника (`<date>.md` → `<date>-memory.json`, см.
+    `series_memory.MEMORY_FILE_SUFFIX`) — date-ключ совпадает с тем, что писал finalize.
+    Кладём по date-ключу даже при коллизии имени транскрипта (`<date>-<sid>.md`): одна
+    выжимка на дату серии, перефинализация перетирает свою же выжимку.
     """
     src_protocol = Path(finalize_protocol_path)
     mem_name = src_protocol.stem + series_memory.MEMORY_FILE_SUFFIX  # `<date>.md` → `<date>-memory.json`
-    dst_mem = target_md.parent / mem_name
-    tmp_mem = dst_mem.with_suffix(dst_mem.suffix + ".part")
+    _sync_sidecar_to_archive(
+        src_protocol.parent, target_md.parent, mem_name, session_uid, label="Память серии",
+    )
 
-    if LOCAL_FINALIZE:
-        src_mem = src_protocol.parent / mem_name
-        if not src_mem.exists():
-            logger.info(
-                "Память серии: файла-источника %s нет — синк не нужен (память выключена / "
-                "пустой протокол; sid=%s)", src_mem.name, session_uid,
-            )
-            return
-        try:
-            if src_mem.resolve() == dst_mem.resolve():
-                logger.info("✓ Память серии уже на месте (in-place от finalize): %s", dst_mem)
-                return
-        except OSError:
-            pass
-        try:
-            dst_mem.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_mem, tmp_mem)
-            os.replace(tmp_mem, dst_mem)
-            logger.info("✓ Память серии (local): %s", dst_mem)
-        except OSError as e:
-            logger.warning(
-                "Память серии: local copy %s → %s не удался (не критично): %s",
-                src_mem, dst_mem, e,
-            )
-            with contextlib.suppress(FileNotFoundError):
-                tmp_mem.unlink()
-        return
 
-    # Мак-путь: scp `<date>-memory.json` с VPS (рядом с протоколом-источником на VPS).
-    vps_mem = f"{src_protocol.parent.as_posix()}/{mem_name}"
-    scp_cmd = ["scp", f"{SSH_HOST}:{vps_mem}", str(tmp_mem)]
-    try:
-        scp = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=120)
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "Память серии: scp timeout (sid=%s) — пропуск, протокол уже доставлен", session_uid,
-        )
-        with contextlib.suppress(FileNotFoundError):
-            tmp_mem.unlink()
-        return
-    if scp.returncode != 0:
-        # Норма для встреч без памяти (выключена / пустой протокол): файла нет → rc != 0.
-        logger.info(
-            "Память серии: нет на VPS или scp rc=%d (sid=%s) — синк пропущен (не критично)",
-            scp.returncode, session_uid,
-        )
-        with contextlib.suppress(FileNotFoundError):
-            tmp_mem.unlink()
-        return
-    try:
-        dst_mem.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(tmp_mem, dst_mem)
-        logger.info("✓ Память серии (scp): %s", dst_mem)
-    except OSError as e:
-        logger.warning(
-            "Память серии: os.replace %s → %s не удался (не критично): %s",
-            tmp_mem, dst_mem, e,
-        )
-        with contextlib.suppress(FileNotFoundError):
-            tmp_mem.unlink()
+def _sync_protocol_summary(
+    finalize_protocol_path: str, target_md: Path, date_str: str, session_uid: str,
+) -> None:
+    """ISS-32 (Ф3): доставить LLM-протокол `<date>-protokol.md` в долговечный архив.
+
+    finalize пишет протокол-сводку рядом с транскриптом (`finalize-meeting.py:1283`,
+    `<date>-protokol.md` по date-ключу), а collector до Ф3 копировал в архив ТОЛЬКО
+    транскрипт (`<date>.md`) + память — сама сводка (то, что читает владелец) в архив
+    не доезжала. Имя — по date-ключу (как пишет finalize для series И one-off), а не
+    из stem транскрипта (у one-off транскрипт `<date>-<sid>.md`, а протокол всё равно
+    `<date>-protokol.md`). Best-effort: нет файла (генерация выключена/упала) → no-op.
+    """
+    proto_name = f"{date_str}-protokol.md"
+    _sync_sidecar_to_archive(
+        Path(finalize_protocol_path).parent, target_md.parent, proto_name, session_uid,
+        label="Протокол-сводка",
+    )
 
 
 def _do_finalize_and_collect(session_uid: str) -> None:
@@ -1124,7 +1164,9 @@ def _do_finalize_and_collect(session_uid: str) -> None:
             # finalize уже положил файл в финальное место — копировать нечего.
             md_placed = target_md.exists()
             if md_placed:
-                logger.info("✓ Протокол (in-place от finalize): %s", target_md)
+                # ISS-32: src==dst → архив НЕ разведён с рабочей (ARCHIVE_DIR пуст/
+                # ==PROTOCOLS_DIR). Копировать нечего, finalize уже на месте.
+                logger.info("✓ Протокол (архив == рабочая, in-place): %s", target_md)
         else:
             try:
                 shutil.copy2(src_md, tmp_md)
@@ -1138,7 +1180,7 @@ def _do_finalize_and_collect(session_uid: str) -> None:
                 except FileNotFoundError:
                     pass
             if md_placed:
-                logger.info("✓ Протокол (local): %s", target_md)
+                logger.info("✓ Протокол (архив, local): %s", target_md)
     else:
         # Мак-путь: scp с VPS через tmp + rename.
         scp_cmd = [
@@ -1171,16 +1213,20 @@ def _do_finalize_and_collect(session_uid: str) -> None:
             logger.error("os.replace %s → %s упал: %s", tmp_md, target_md, e)
             push(f"Не смог переименовать .md «{session_uid}»: {e}")
             return
-        logger.info("✓ Протокол: %s", target_md)
+        logger.info("✓ Протокол (архив, scp): %s", target_md)
 
-    # 2.5. Ф4 (task 5): синк памяти серии (<date>-memory.json) рядом с протоколом на
-    # долговечную сторону. finalize пишет выжимку в свой output-dir рядом с протоколом;
-    # коллектор раньше тащил только .md → на бою память серии не доезжала в архив
-    # (наследие Ф2 §5). Гейт: протокол реально размещён (md_placed) + finalize вернул
-    # series-протокол (только у series-встреч пишется память). Best-effort внутри —
-    # сбой синка памяти не влияет на доставку протокола и не алертит владельца.
-    if md_placed and finalize_protocol_path and series_from_finalize:
-        _sync_series_memory(finalize_protocol_path, target_md, session_uid)
+    # 2.5. Синк sidecar-артефактов рядом с транскриптом на долговечную сторону.
+    # finalize пишет их в свой output-dir; collector раньше тащил в архив только
+    # транскрипт `.md`. Best-effort внутри — сбой синка не влияет на доставку и не
+    # алертит владельца. Гейт по `md_placed` + известному источнику.
+    if md_placed and finalize_protocol_path:
+        # ISS-32 (Ф3): протокол-сводка `<date>-protokol.md` — то, что читает владелец;
+        # до Ф3 в архив не доезжала. Пишется и у series, и у one-off (генерация не
+        # завязана на серию) → синкаем без гейта series_from_finalize.
+        _sync_protocol_summary(finalize_protocol_path, target_md, date_str, session_uid)
+        # Ф4 (task 5): память серии `<date>-memory.json` — только у series-встреч.
+        if series_from_finalize:
+            _sync_series_memory(finalize_protocol_path, target_md, session_uid)
 
     # 3. WAV cleanup (Ф1-доработки 29.05). Удаляем WAV ТОЛЬКО когда оба
     # условия выполнены:

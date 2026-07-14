@@ -201,3 +201,63 @@ def _target_path(meta, *, root=None, kind: str = "transcript"):
     _validate_path_component(one_off_id, field="oneOffId/sessionUid-derived")
     folder = f"{date_str}-{one_off_id}"
     return base / ONE_OFF_DIR / folder / filename
+
+
+# ---- ISS-32 (Ф3, 2026-07-14): развести рабочую папку и долговечный архив ----
+#
+# КОРЕНЬ БАГА ISS-32: `MEETING_NOTARY_PROTOCOLS_DIR` — рабочая папка finalize
+# (`_tmp`), её же читают listener/reissue/morning_digest. Collector использовал ЕЁ
+# ЖЕ как цель долговечной копии → копия стала in-place no-op → `/srv` архив замер,
+# мак-зеркало молчало месяц (тихая потеря). Фикс: отдельная `MEETING_NOTARY_ARCHIVE_DIR`
+# для ЗАПИСИ долговечной копии. Дефолт = рабочая папка (обратная совместимость:
+# архив не задан → архив == рабочая → поведение как до Ф3).
+
+
+def protocols_root() -> Path:
+    """Рабочая папка протоколов/транскриптов (= `--output-dir` finalize).
+
+    `MEETING_NOTARY_PROTOCOLS_DIR` или `DEFAULT_ROOT`. Сюда пишет finalize, отсюда
+    ЧИТАЮТ listener/reissue/morning_digest — рабочая сторона, НЕ архив.
+    """
+    raw = os.environ.get("MEETING_NOTARY_PROTOCOLS_DIR")
+    return Path(os.path.expanduser(raw)) if raw else Path(DEFAULT_ROOT)
+
+
+def archive_root() -> Path:
+    """Корень долговечного архива (ISS-32/Ф3): куда collector/reissue кладут
+    долговечную копию.
+
+    `MEETING_NOTARY_ARCHIVE_DIR`, дефолт = рабочая папка `protocols_root()`
+    (архив не задан → пишем туда же, где и раньше — обратная совместимость).
+    """
+    raw = os.environ.get("MEETING_NOTARY_ARCHIVE_DIR")
+    return Path(os.path.expanduser(raw)) if raw else protocols_root()
+
+
+def archive_dest_for(working_path) -> Path | None:
+    """ISS-32 (Ф3): куда в долговечном архиве положить рабочий файл `working_path`.
+
+    Возвращает `None` (== копировать НЕ нужно), когда:
+      • `MEETING_NOTARY_ARCHIVE_DIR` не задан ИЛИ совпадает с рабочей папкой
+        `MEETING_NOTARY_PROTOCOLS_DIR` — архив == рабочая (обратная совместимость,
+        finalize уже пишет прямо туда, дублировать нечего);
+      • `working_path` лежит ВНЕ рабочей папки — безопасно смапить в архив нечем
+        (co-located тест / нестандартный путь), молча пропускаем, не пишем мусор.
+
+    Иначе — тот же относительный путь под архивным корнем
+    (`<archive>/<series>/<date>-protokol.md`). Маппинг лексический (по префиксу),
+    симлинки НЕ резолвим — на VPS путь чистый (`_tmp/protocols/...` → `/srv/...`).
+    """
+    arch_raw = os.environ.get("MEETING_NOTARY_ARCHIVE_DIR")
+    if not arch_raw:
+        return None
+    prot_root = protocols_root()
+    arch = Path(os.path.expanduser(arch_raw))
+    if arch == prot_root:
+        return None
+    try:
+        rel = Path(working_path).relative_to(prot_root)
+    except ValueError:
+        # working_path вне рабочей папки — не мапим (не гадаем, куда класть).
+        return None
+    return arch / rel

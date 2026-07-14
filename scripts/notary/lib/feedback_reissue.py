@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -604,6 +605,45 @@ def _protocol_for(transcript_path: Path, meta: Optional[dict], date: str) -> Pat
     return transcript_path.parent / f"{date}-protokol.md"
 
 
+def _sync_reissue_to_archive(protocol_path: Path, transcript_path: Path, date: str) -> None:
+    """ISS-32 (Ф3): донести перевыпущенную версию в долговечный архив.
+
+    reissue правит протокол/транскрипт/память в РАБОЧЕЙ папке (`MEETING_NOTARY_
+    PROTOCOLS_DIR`, `_tmp`). Без этого синка долговечный архив (`/srv` → мак) отстаёт
+    после КАЖДОГО перевыпуска (ISS-32.3): участники видят новую версию в Telegram, а
+    в архиве владельца — старая. Копируем ровно то, что reissue переписал на диск:
+    протокол `<date>-protokol.md`, remapped транскрипт `<date>*.md`, выжимку памяти
+    `<date>-memory.json`.
+
+    additive (без удалений), атомарно (tmp + os.replace), best-effort. Когда архив НЕ
+    разведён с рабочей папкой (`MEETING_NOTARY_ARCHIVE_DIR` пуст или == рабочей, либо
+    файл вне рабочей папки) — `paths.archive_dest_for` вернёт None → no-op (обратная
+    совместимость, как до Ф3). Опасная тройка: содержимое файлов НЕ читаем/НЕ логируем.
+    """
+    # Ленивый импорт series_memory (тот импортируется в reissue_one тоже лениво —
+    # держим единый паттерн, MEMORY_FILE_SUFFIX = единый источник имени sidecar'а).
+    from . import series_memory  # noqa: PLC0415
+    memory_path = transcript_path.parent / f"{date}{series_memory.MEMORY_FILE_SUFFIX}"
+    for src in (protocol_path, transcript_path, memory_path):
+        if not src.is_file():
+            continue
+        dst = paths.archive_dest_for(src)
+        if dst is None:
+            continue
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+            logger.info("[reissue] ✓ архив-синк: %s", dst)
+        except OSError as e:
+            logger.warning("[reissue] архив-синк %s не удался (non-fatal): %s", src.name, e)
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _resolve_paths(
     state: dict, meta_path: Path, meta: Optional[dict] = None,
 ) -> tuple[Optional[Path], Optional[Path]]:
@@ -1055,6 +1095,13 @@ def reissue_one(
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] digest speaker_mapping update упал (non-fatal): %s", e)
+            # ISS-32 (Ф3): донести доставленную версию в долговечный архив (протокол +
+            # remapped транскрипт + <date>-memory.json). Все три файла уже в финальном
+            # виде на диске рабочей папки. Best-effort, no-op когда архив не разведён.
+            try:
+                _sync_reissue_to_archive(protocol_path, transcript_path, date)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[reissue] синк в архив упал (non-fatal): %s", e)
             # Ф6 задел: learning-лог + самообучение — ТОЛЬКО по реально применённым
             # КОНТЕНТНЫМ правкам (авторские учтены детерминированным remap'ом; в
             # term/meaning-лог их НЕ пускаем, иначе «не Илья, а Михаил» отравит
