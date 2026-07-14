@@ -93,6 +93,30 @@ def _env_float(name: str, default: float) -> float:
     return v if v > 0 else default
 
 
+# ISS-31/Ф1: строки-предупреждения из stderr finalize-подпроцесса. При rc=0
+# finalize мог напечатать WARNING-и генерации (деградация в Sonnet, «нет шапки»,
+# ретрай Ф2) — раньше stderr читался ТОЛЬКО в ветке rc≠0, и причина «протокол
+# собрался, но со второй попытки / на резервной модели» молча выбрасывалась.
+# Фильтруем по формату логгера finalize (`[WARNING]`/`[ERROR]`) и по маркеру
+# `[protocol]` из llm_postprocess — только метаданные (текст реплик finalize в
+# stderr не печатает; опасная тройка соблюдена на стороне генератора).
+_FINALIZE_WARN_RE = re.compile(r"\[(?:WARNING|ERROR)\]|\[protocol\]")
+
+
+def _finalize_stderr_warnings(stderr: str, *, limit: int = 40) -> list[str]:
+    """WARNING/ERROR-строки из stderr finalize (метаданные, без текста реплик)."""
+    if not stderr:
+        return []
+    out: list[str] = []
+    for line in stderr.splitlines():
+        s = line.strip()
+        if s and _FINALIZE_WARN_RE.search(s):
+            out.append(s[:300])
+            if len(out) >= limit:
+                break
+    return out
+
+
 # Ф3 (2026-06-03): watchdog зависшего bot-контейнера. Зависшим считаем контейнер,
 # который (а) живёт дольше любой реальной встречи — наблюдаемый максимум ~122 мин
 # (Татьяна); бот сам уходит после 20 мин тишины (`endReason=silence_20min`),
@@ -1031,6 +1055,18 @@ def _do_finalize_and_collect(session_uid: str) -> None:
             dedupe_key=f"finalize-fail:{session_uid}",
         )
         return
+
+    # ISS-31/Ф1: rc=0 НЕ значит «всё гладко». finalize мог собрать протокол со
+    # второй попытки / на резервной модели / с warning-ами генерации — раньше эти
+    # строки stderr выбрасывались молча (читались только в ветке rc≠0 выше).
+    # Логируем их в общий collector.log, чтобы причина «тихой» деградации не
+    # терялась. Сам per-meeting лог причин пишет finalize на VPS (lib/run_log.py).
+    warn_lines = _finalize_stderr_warnings(proc.stderr or "")
+    if warn_lines:
+        logger.warning(
+            "finalize %s rc=0, но stderr нёс %d warning-строк(и):\n%s",
+            session_uid, len(warn_lines), "\n".join(warn_lines),
+        )
 
     # 2. Парсим результат finalize'а (один блок JSON с series + delivery + paths).
     finalize_result = _parse_finalize_result(proc.stdout) or {}

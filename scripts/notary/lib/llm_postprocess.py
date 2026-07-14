@@ -67,6 +67,7 @@ from . import series_markup
 from . import series_memory
 from . import series_roster
 from . import protocol_to_pdf
+from . import run_log  # ISS-31/Ф1: per-meeting durable-лог причин сбоя генерации
 from . import telegram_api
 
 
@@ -1784,6 +1785,32 @@ def generate_protocol(
     primary_model = PROTOCOL_GEN_MODEL
     model_used = primary_model
     degraded_reason = "no"
+
+    # ISS-31/Ф1: метаданные прогона для per-meeting durable-лога. ТОЛЬКО счётчики
+    # (опасная тройка): длина промпта и число реплик-сегментов транскрипта — по
+    # ним видно масштаб встречи без текста. `segments` = число строк-реплик
+    # `**[ts] Имя:**` в транскрипте (метаданный счётчик, не содержимое).
+    _prompt_len = len(system_prompt) + len(user_prompt)
+    _segments = len(re.findall(r"^\*\*\[", transcript_md, flags=re.MULTILINE))
+
+    def _emit_run_log(event: str, *, model: str, reason: str = "",
+                      output_len: int = 0) -> None:
+        """Пишет метаданные прогона генерации в per-meeting durable-лог VPS.
+
+        Причина сбоя/деградации переживает удаление контейнера и чистку `_tmp`.
+        В лог уходят ТОЛЬКО счётчики/класс — текст транскрипта/протокола НЕ
+        передаётся (опасная тройка). Best-effort внутри `run_log`.
+        """
+        run_log.append_event(
+            meeting_sid or "unknown",
+            event,
+            reason=reason,
+            model=model,
+            prompt_len=_prompt_len,
+            segments=_segments,
+            output_len=output_len,
+        )
+
     started = time.monotonic()
     try:
         raw = call_claude_print(
@@ -1793,6 +1820,7 @@ def generate_protocol(
             model=primary_model,
         )
     except ClaudeCliNotInstalled as e:
+        _emit_run_log("failed", model=primary_model, reason="cli-not-installed")
         raise ProtocolGenerationError(
             "`claude` CLI не найден в PATH — генерация протокола невозможна"
         ) from e
@@ -1805,6 +1833,7 @@ def generate_protocol(
                 "[protocol] timeout meeting=%s model=%s timeout=%ds (фолбэка нет)",
                 meeting_sid or "?", primary_model, timeout,
             )
+            _emit_run_log("failed", model=primary_model, reason="timeout")
             raise ProtocolGenerationError(
                 f"claude --print timeout (модель {primary_model}, {timeout}s): {e}"
             ) from e
@@ -1812,6 +1841,8 @@ def generate_protocol(
             "[protocol] degraded meeting=%s reason=timeout primary=%s fallback=%s timeout=%ds",
             meeting_sid or "?", primary_model, fallback, timeout,
         )
+        # Деградация: основная модель таймаутнула, идём на резервную (Sonnet).
+        _emit_run_log("degraded", model=fallback, reason="primary-timeout")
         try:
             raw = call_claude_print(
                 user_prompt,
@@ -1824,6 +1855,7 @@ def generate_protocol(
                 "[protocol] fallback failed meeting=%s model=%s error=%s",
                 meeting_sid or "?", fallback, str(e2)[:200],
             )
+            _emit_run_log("failed", model=fallback, reason="fallback-failed")
             raise ProtocolGenerationError(
                 f"claude --print (фолбэк {fallback}): {e2}"
             ) from e2
@@ -1837,6 +1869,7 @@ def generate_protocol(
             "[protocol] failed meeting=%s error=%s retry=0",
             meeting_sid or "?", str(e)[:200],
         )
+        _emit_run_log("failed", model=primary_model, reason="cli-error")
         raise ProtocolGenerationError(f"claude --print: {e}") from e
     elapsed = time.monotonic() - started
 
@@ -1856,6 +1889,10 @@ def generate_protocol(
             logger.warning(
                 "[protocol] failed meeting=%s error=output-without-header retry=0",
                 meeting_sid or "?",
+            )
+            _emit_run_log(
+                "failed", model=model_used, reason="output-without-header",
+                output_len=len(text),
             )
             raise ProtocolGenerationError(
                 "модель вернула ответ без шапки протокола (`#протоколвстречи`)"
@@ -1881,6 +1918,15 @@ def generate_protocol(
         "[protocol] generated meeting=%s elapsed=%.1fs prompt_len=%d output_len=%d model=%s degraded=%s",
         meeting_sid or "?", elapsed, len(system_prompt) + len(user_prompt),
         len(text), model_used, degraded_reason,
+    )
+    # ISS-31/Ф1: успешный прогон тоже фиксируется — по нему видно, что генерация
+    # состоялась (и на какой модели), а Ф2 в этот же файл допишет причину
+    # обрыва/ретрая. `degraded` несёт «primary-timeout», если собрали на резервной.
+    _emit_run_log(
+        "ok" if degraded_reason == "no" else "degraded",
+        model=model_used,
+        reason="" if degraded_reason == "no" else degraded_reason,
+        output_len=len(text),
     )
     return text
 
