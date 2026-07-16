@@ -1199,7 +1199,10 @@ def _apply_digest_status_batch(
     try:
         split = mixed_reply_split.split_reply(text, items)
     except Exception as e:  # noqa: BLE001 — сплит не должен валить listener
-        logger.exception("[morning-digest] сплит пачки упал (non-fatal): %s", e)
+        # Опасная тройка: логируем только ТИП сбоя, без текста reply и без traceback
+        # (как run_status_loop и сам split_reply). split_reply глотает свои исключения —
+        # этот catch защитный, тип класса достаточен для диагностики границы сплита.
+        logger.warning("[morning-digest] сплит пачки упал (non-fatal): %s", type(e).__name__)
         split = None
     if split is None:
         # UPU1: reply похож на пачку, но сплит не удался → честная подсказка (не молча-один).
