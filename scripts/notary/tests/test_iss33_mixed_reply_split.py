@@ -184,8 +184,12 @@ class TestSplitModule(unittest.TestCase):
         # Опасная тройка: _request_split логирует только форму, без текста reply.
         secret = "СЕКРЕТНАЯ_РЕПЛИКА_ПРО_МАРЖУ"
         raw = '{"statuses":["a"],"edits":[],"unclear":[]}'
-        # call_claude_print импортируется лениво из claude_cli — мокаем там.
-        with mock.patch("lib.claude_cli.call_claude_print", return_value=raw), \
+        # call_claude_print импортируется лениво `from .claude_cli import` внутри
+        # _request_split → при `mrs = notary.lib.mixed_reply_split` резолвится в
+        # notary.lib.claude_cli (двойной sys.path: lib.* ≠ notary.lib.* — FU-5).
+        # Мокаем ИМЕННО notary.lib.claude_cli, иначе мок промахивается и тест
+        # дёргает реальный claude (анти-паттерн reissue-llm-tier-gate-default-off).
+        with mock.patch("notary.lib.claude_cli.call_claude_print", return_value=raw), \
              self.assertLogs("notary.mixed_reply_split", level="INFO") as cm:
             mrs._request_split(secret, _ITEMS)
         blob = "\n".join(cm.output)
