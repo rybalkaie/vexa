@@ -141,8 +141,9 @@ class TestDigestMarkdown(unittest.TestCase):
         )
         self.assertIn("## Илья", out)
         self.assertIn("## Татьяна", out)
-        self.assertIn("- подготовить расчёт", out)
-        self.assertIn("- решить по найму", out)
+        # Ф3: сквозная нумерация (Илья: подготовить=1, решить по найму=2; Татьяна=3)
+        self.assertIn("1. подготовить расчёт", out)
+        self.assertIn("2. решить по найму", out)
 
     def test_nameless_bucket_not_swallowed(self):
         # УПУ2: висяк без ответственного не теряется — отдельный бакет.
@@ -151,7 +152,8 @@ class TestDigestMarkdown(unittest.TestCase):
             ["определиться со сроком запуска", "Илья: подготовить расчёт"], [],
         )
         self.assertIn("Без ответственного", out)
-        self.assertIn("- определиться со сроком запуска", out)
+        # Ф3: безымянный висяк идёт ПЕРВЫМ → номер 1
+        self.assertIn("1. определиться со сроком запуска", out)
 
     def test_minor_block_present_and_separate(self):
         # R12: мелочь — отдельным блоком «просто напоминаю», без запроса статуса.

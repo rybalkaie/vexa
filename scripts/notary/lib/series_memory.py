@@ -1533,6 +1533,76 @@ def group_open_tasks_by_owner(tasks: list[str]) -> tuple[list[str], list[tuple[s
     return _group_open_by_owner(tasks)
 
 
+# ---------------------------------------------------------------------------
+# Ф3 (open-questions-reply-fix, A9/RISK2/RISK3) — единый канонический порядок
+# висяков: один источник и для НУМЕРАЦИИ показа (дайджест/протокол), и для
+# ординал-матчинга Ф4. Номер — display-only, в текст задачи/`_status_key` НЕ входит.
+# ---------------------------------------------------------------------------
+def ordered_open_task_positions(hanging: list[str]) -> list[dict]:
+    """Плоский канонический порядок висяков в порядке ПОКАЗА (безымянные → по людям).
+
+    `hanging` — уже собранные ВИСЯЩИЕ (после наложения sidecar-статусов Ф2 + cap), в
+    том же виде, что идут в дайджест/протокол. Порядок ТОЧНО совпадает с обходом
+    `build_digest_markdown` (morning_digest) и Части 1 `format_open_tasks_block` — оба
+    идут `_group_open_by_owner`: сперва безымянные, затем по владельцам в порядке
+    первого появления. Номер позиции = индекс+1 (сквозной 1..N, REQ 5.1), строго
+    display-only. Каждая позиция:
+      • `key_text`     — ПОЛНЫЙ текст, по которому ключует `_status_key`/`set_task_status`
+                         (безымянный → сам текст; с владельцем → `f"{owner}: {task}"`).
+                         НЕ обрезан (RISK2): иначе ординальная запись статуса владельца
+                         уедет под чужой/фантомный ключ (тихая потеря);
+      • `display_text` — текст показа (у сгруппированных по владельцу имя срезано в
+                         подзаголовок — как в дайджесте/протоколе);
+      • `owner`        — ответственный (str) или None (безымянный).
+    Чистая функция. Пусто → [].
+    """
+    # Фильтр не-строк/пустых — ТОЧНО как `build_digest_markdown` (morning_digest) на
+    # входе: иначе слепок разошёлся бы с показом при странном хвосте (тихая потеря).
+    clean = [t for t in (hanging or []) if isinstance(t, str) and t.strip()]
+    nameless, owned = _group_open_by_owner(clean)
+    positions: list[dict] = []
+    for t in nameless:
+        positions.append({"key_text": t, "display_text": t, "owner": None})
+    for owner, items in owned:
+        for it in items:
+            positions.append(
+                {"key_text": f"{owner}: {it}", "display_text": it, "owner": owner}
+            )
+    return positions
+
+
+def _collect_hanging_open_tasks(series_dir: Optional[Path]) -> list[str]:
+    """Ф3 (RISK3): ВИСЯЩИЕ серии ТЕМ ЖЕ пайплайном, что дайджест (`morning_digest.
+    collect_items`, строки 241-246): свежий хвост → наложение sidecar-статусов Ф2 →
+    cap. НЕ сырой `resolve_open_tasks` (он БЕЗ merge — в нумерацию попали бы sidecar-
+    закрытые, и номер человека ≠ order матчера). Мелочь (minor) НЕ включаем (A8 — по
+    ней статус не нужен, номер не даём). Сбой/нет каталога/пусто → []."""
+    if series_dir is None:
+        return []
+    try:
+        digests = list_series_digests(Path(series_dir))
+        if not digests:
+            return []
+        store = load_task_status(Path(series_dir))
+        cap = open_tasks_max()
+        fresh = _resolve_open_tasks_raw(digests)
+        hanging = merge_open_tasks_with_status(fresh, store).get("open") or []
+        if cap > 0:
+            hanging = hanging[:cap]
+        return list(hanging)
+    except Exception as e:  # noqa: BLE001 — порядок best-effort, ничего не валим
+        logger.warning("[open-tasks] ordered collect failed (non-fatal): %s", type(e).__name__)
+        return []
+
+
+def ordered_open_tasks(series_dir: Optional[Path]) -> list[dict]:
+    """Ф3 (A9/RISK3): единый канонический порядок висяков серии для нумерации показа и
+    ординал-матчинга Ф4. Собирается ТЕМ ЖЕ пайплайном, что дайджест, поэтому
+    `ordered_open_tasks(series_dir)` == порядок показа дайджеста И по ПОРЯДКУ, И по
+    key-тексту. Каждая позиция — см. `ordered_open_task_positions`. Пусто/сбой → []."""
+    return ordered_open_task_positions(_collect_hanging_open_tasks(series_dir))
+
+
 def _group_closed_by_label(closed: list[dict]) -> list[tuple[str, list[str]]]:
     """Ф3 (R21): закрытые сгруппированы по человекочитаемому ярлыку (статус+причина).
 
@@ -1689,33 +1759,38 @@ def format_open_tasks_block(
         lines += [
             "",
             "ЧАСТЬ 1 — НЕзакрытые, сгруппируй по ответственному (НЕ плоским списком). "
-            "Для каждого человека — подзаголовок жирным `**Имя**`, под ним его задачи "
-            "строкой «- <текст задачи дословно> — <статус>». Если в задаче есть префикс "
-            "исполнителя «Имя: …» — это и есть ответственный (вынеси имя в подзаголовок; "
-            "в строке имя можно не повторять). Задачи без явного исполнителя выведи "
-            "первыми, без подзаголовка. Статус пиши ТОЛЬКО одним из двух канонических "
-            f"ярлыков ДОСЛОВНО (важно для окраски): решена/выполнена на этой встрече → "
-            f"«{STATUS_DONE_LABEL}»; в транскрипте не всплыла или упомянута, но неясно → "
-            f"«{STATUS_OPEN_LABEL}» (НЕ угадывай «{STATUS_DONE_LABEL}» — лучше показать "
-            "неизвестной лишний раз). Если у пункта в начале уже стоит пометка «от "
-            "DD.MM.YYYY» (дата, когда вопрос впервые подняли) — СОХРАНИ её дословно в "
-            "начале строки. Срок показывай ТОЛЬКО если он уже есть в тексте задачи (в "
-            "скобках «(срок: …)»); не добавляй сроков и НЕ помечай просрочку — этого в "
-            "данных нет.",
+            "Ниже задачи УЖЕ пронумерованы сквозным номером «N.» в начале строки. "
+            "СОХРАНИ номер и ПОРЯДОК задач ДОСЛОВНО (не перенумеровывай, не переставляй, "
+            "не пропускай) — номер служит ссылкой («первая», «задача 3»), он обязан "
+            "совпадать между встречами. Для каждого человека — подзаголовок жирным "
+            "`**Имя**`, под ним его задачи строкой «N. <текст задачи дословно> — "
+            "<статус>». Если в задаче есть префикс исполнителя «Имя: …» — это и есть "
+            "ответственный (вынеси имя в подзаголовок; в строке имя можно не повторять). "
+            "Задачи без явного исполнителя выведи первыми, без подзаголовка. Статус пиши "
+            f"ТОЛЬКО одним из двух канонических ярлыков ДОСЛОВНО (важно для окраски): "
+            f"решена/выполнена на этой встрече → «{STATUS_DONE_LABEL}»; в транскрипте не "
+            f"всплыла или упомянута, но неясно → «{STATUS_OPEN_LABEL}» (НЕ угадывай "
+            f"«{STATUS_DONE_LABEL}» — лучше показать неизвестной лишний раз). Если у "
+            "пункта после номера стоит пометка «от DD.MM.YYYY» (дата, когда вопрос "
+            "впервые подняли) — СОХРАНИ её дословно. Срок показывай ТОЛЬКО если он уже "
+            "есть в тексте задачи (в скобках «(срок: …)»); не добавляй сроков и НЕ помечай "
+            "просрочку — этого в данных нет.",
             "",
             "Незакрытые задачи по людям:",
         ]
-        nameless, owned = _group_open_by_owner(open_tasks)
-        for t in nameless:
-            lines.append(f"- {origin_prefix_for(t, origins, current_date)}{t}")
-        for owner, items in owned:
-            lines.append(f"**{owner}**")
-            for it in items:
-                # Origin-ключ — по ПОЛНОМУ тексту «Имя: задача» (как хранится в
-                # open_tasks и в sidecar); группировка срезала имя в подзаголовок,
-                # восстанавливаем его для матча `_status_key`.
-                prefix = origin_prefix_for(f"{owner}: {it}", origins, current_date)
-                lines.append(f"- {prefix}{it}")
+        # Ф3 (A9/A10): нумеруем ДЕТЕРМИНИРОВАННО из `ordered_open_task_positions` — тот
+        # же плоский порядок (безымянные → по людям) и те же номера, что снапшотит
+        # точка отправки протокола. Нумерацию/порядок НЕ отдаём на откуп LLM, иначе
+        # показ разойдётся со слепком (риск «показ ≠ слепок»). Origin-ключ — по ПОЛНОМУ
+        # key-тексту позиции («Имя: задача»), чтобы «от DD.MM» матчил `_status_key`.
+        last_owner = None
+        for i, p in enumerate(ordered_open_task_positions(open_tasks), start=1):
+            owner = p["owner"]
+            if owner is not None and owner != last_owner:
+                lines.append(f"**{owner}**")
+            last_owner = owner
+            prefix = origin_prefix_for(p["key_text"], origins, current_date)
+            lines.append(f"{i}. {prefix}{p['display_text']}")
     subsections = _render_pending_subsections(doubt, closed)
     if subsections:
         lines += [
@@ -1743,6 +1818,7 @@ def build_open_tasks_block(
     mark_shown: bool = False,
     date: Optional[str] = None,
     shown_sink: Optional[list] = None,
+    open_sink: Optional[list] = None,
 ) -> str:
     """Ф8 (G9): единая точка сборки блока открытых задач для ОБОИХ триггеров
     (finalize И clarify) — как `build_cross_memory_block` для кросс-фона.
@@ -1806,6 +1882,16 @@ def build_open_tasks_block(
         block = format_open_tasks_block(
             hanging, doubt=doubt, closed=closed, origins=origins, current_date=date,
         )
+        # Ф3 (A14/A10, Гейт 2 Q1): слепок нумерованного списка висяков ИМЕННО ЭТОЙ
+        # версии протокола — полные key-тексты по позициям, в том же порядке и с той же
+        # нумерацией, что показ (`format_open_tasks_block` строит показ из того же
+        # `hanging` тем же `ordered_open_task_positions` → номер показа == позиция
+        # слепка). Caller (finalize) снапшотит его ПОСЛЕ подтверждённой доставки, keyed
+        # by message_id протокола, чтобы ординал Ф4 резолвился против слепка отвечаемой
+        # версии, а не live-пересчёта. Только если раздел реально попал в протокол.
+        if open_sink is not None and hanging and block:
+            for p in ordered_open_task_positions(hanging):
+                open_sink.append(p["key_text"])
         # FU-7: отложенный режим — закрытые НЕ помечаем здесь, складываем их ключи в
         # sink; caller закоммитит «показано»+онбординг ПОСЛЕ подтверждённой доставки.
         if shown_sink is not None:
@@ -2163,6 +2249,123 @@ def merge_open_tasks_with_status(fresh_tail: list[str], status_store: dict) -> d
         # нет записи / open / переоткрытая → висит
         open_tasks.append(text)
     return {"open": open_tasks, "doubt": doubt, "closed": closed}
+
+
+# ---------------------------------------------------------------------------
+# Ф3 (open-questions-reply-fix, A14/Гейт 2 Q1) — снапшот нумерованного списка
+# висяков ОТПРАВЛЕННОГО документа (дайджест И каждая версия протокола) по его
+# message_id. Фундамент под ординал-матчинг Ф4: «первая»/«задача 3» резолвятся
+# против слепка ИМЕННО отвечаемого документа, не против live-пересчёта (иначе дрейф
+# номера за утро / между перевыпусками протокола → тихое снятие чужой задачи).
+# Обратная совместимость без миграции (A14): нет записи/поля (документ отправлен ДО
+# Ф3) → «ординал недоступен», honest-остаток.
+# ---------------------------------------------------------------------------
+OPEN_TASKS_SNAPSHOT_FILE = "open-tasks-snapshots.json"
+OPEN_TASKS_SNAPSHOT_SCHEMA = 1
+# Слепки живут недолго (reply приходит по горячим следам). Ограничивает рост файла.
+_KEEP_SNAPSHOT_DAYS = 45
+
+
+def open_tasks_snapshot_path(series_dir: Path) -> Path:
+    """Путь sidecar-слепков нумерации серии: `<series_dir>/open-tasks-snapshots.json`."""
+    return Path(series_dir) / OPEN_TASKS_SNAPSHOT_FILE
+
+
+def _load_open_tasks_snapshots(series_dir: Optional[Path]) -> dict:
+    """`{str(message_id): {positions:[key_text,...], surface, date, chat_id, at}}`.
+    Нет файла/мусор → {} (миграции не нужны, A14)."""
+    if series_dir is None:
+        return {}
+    p = open_tasks_snapshot_path(series_dir)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    snaps = data.get("snapshots") if isinstance(data, dict) else None
+    return snaps if isinstance(snaps, dict) else {}
+
+
+def record_open_tasks_snapshot(
+    series_dir: Optional[Path],
+    message_id,
+    positions: list,
+    *,
+    surface: str,
+    date: Optional[str] = None,
+    chat_id=None,
+    at: Optional[str] = None,
+) -> Optional[Path]:
+    """Ф3 (A14, Гейт 2 Q1): записать слепок нумерованного списка висяков отправленного
+    документа, keyed by его `message_id`. `positions` — ПОЛНЫЕ key-тексты по позициям
+    (индекс i → номер показа i+1). `surface` = «digest»/«protocol» (диагностика).
+
+    Пишем ПОСЛЕ подтверждённой отправки (message_id пришёл от Telegram). Best-effort:
+    сбой → None (ординал по этому message окажется недоступен → honest-остаток).
+    Прунит записи старше `_KEEP_SNAPSHOT_DAYS` по `date`. Read-modify-write под тем же
+    серийным locks'ом, что sidecar статусов (FU-2): снапшот-запись не теряет чужой
+    message_id при гонке writer'ов (finalize/дайджест-тик). Опасная тройка: НЕ логирует
+    тексты — только счётчик позиций.
+    """
+    if series_dir is None or message_id is None:
+        return None
+    try:
+        mid = str(int(message_id))
+    except (TypeError, ValueError):
+        return None
+    from datetime import datetime as _dt, timezone as _tz, date as _date, timedelta as _td
+    clean = [t for t in (positions or []) if isinstance(t, str) and t.strip()]
+    rec: dict = {
+        "positions": clean,
+        "surface": surface,
+        "at": at or _dt.now(_tz.utc).isoformat(),
+    }
+    if date is not None:
+        rec["date"] = date
+    if chat_id is not None:
+        try:
+            rec["chat_id"] = int(chat_id)
+        except (TypeError, ValueError):
+            pass
+    with _status_store_lock(series_dir):  # FU-2: read-modify-write под серийным locks'ом
+        snaps = dict(_load_open_tasks_snapshots(series_dir))
+        snaps[mid] = rec
+        cutoff = (_date.today() - _td(days=_KEEP_SNAPSHOT_DAYS)).isoformat()
+        snaps = {
+            k: v for k, v in snaps.items()
+            if not (isinstance(v, dict) and isinstance(v.get("date"), str)
+                    and len(v["date"]) == 10 and v["date"] < cutoff)
+        }
+        payload = {"schema": OPEN_TASKS_SNAPSHOT_SCHEMA, "snapshots": snaps}
+        try:
+            _atomic_write_text(
+                open_tasks_snapshot_path(series_dir),
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except (OSError, TypeError, ValueError) as e:
+            logger.warning("[open-tasks] snapshot save failed (non-fatal): %s", type(e).__name__)
+            return None
+    logger.info("[open-tasks] snapshot saved surface=%s positions=%d", surface, len(clean))
+    return open_tasks_snapshot_path(series_dir)
+
+
+def open_tasks_snapshot_for_message(series_dir: Optional[Path], message_id) -> Optional[list]:
+    """Ф3→Ф4: нумерованный слепок висяков документа по его `message_id` (позиция N →
+    результат[N-1], полный key-текст). Нет записи/поля (документ отправлен ДО Ф3, или
+    reissue-версия без снапшота) → None (ординал недоступен, honest-остаток; A14 —
+    миграции нет)."""
+    if series_dir is None or message_id is None:
+        return None
+    try:
+        mid = str(int(message_id))
+    except (TypeError, ValueError):
+        return None
+    rec = _load_open_tasks_snapshots(series_dir).get(mid)
+    if not isinstance(rec, dict):
+        return None
+    pos = rec.get("positions")
+    return list(pos) if isinstance(pos, list) else None
 
 
 # ---------------------------------------------------------------------------

@@ -84,10 +84,11 @@ class TestGroupByOwnerR7(unittest.TestCase):
             ["Татьяна: A-задача", "Илья: B-задача", "Татьяна: C-задача"])
         self.assertIn("**Татьяна**", block)
         self.assertIn("**Илья**", block)
+        # Ф3: висяки пронумерованы сквозным «N.» (Татьяна: A=1, C=2; Илья: B=3);
         # имя в строке не повторяется (срезано в подзаголовок)
-        self.assertIn("- A-задача", block)
-        self.assertIn("- C-задача", block)
-        self.assertNotIn("- Татьяна: A-задача", block)
+        self.assertIn("1. A-задача", block)
+        self.assertIn("2. C-задача", block)
+        self.assertNotIn("Татьяна: A-задача", block)
 
     def test_owner_grouping_collapses_same_person(self):
         nameless, owned = sm._group_open_by_owner(

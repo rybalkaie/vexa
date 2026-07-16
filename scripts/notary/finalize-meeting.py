@@ -804,6 +804,12 @@ def main() -> int:
     # онбординг коммитим ПОСЛЕ подтверждённой доставки (см. ниже), не при сборке —
     # иначе при сбое генерации/постинга подраздел R21 потерялся бы в ретрае.
     pending_shown_keys: list[str] = []
+    # Ф3 (A14, Гейт 2 Q1): нумерованный слепок висяков ЭТОЙ версии протокола (полные
+    # key-тексты по позициям, в порядке и с нумерацией показа). Заполняется
+    # build_open_tasks_block через open_sink; снапшотим по message_id ПОСЛЕ
+    # подтверждённой доставки — фундамент под ординал-матчинг Ф4 против слепка именно
+    # отвечаемой версии протокола (не live-пересчёта).
+    pending_open_positions: list[str] = []
     # Ф4б (REQ 1.2): закреплённое человеком сопоставление спикер→имя из памяти серии
     # (правка авторства реплаем на прошлой встрече). Подаётся якорем в map_all ДО
     # догадки Ф4а. {} если нет/старые файлы без ключа (ленивое поле, УПУ3).
@@ -846,6 +852,7 @@ def main() -> int:
             open_tasks_block = series_memory.build_open_tasks_block(
                 series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
                 date=date_part, shown_sink=pending_shown_keys,
+                open_sink=pending_open_positions,
             )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
@@ -1760,6 +1767,23 @@ def main() -> int:
                 series_dir, pending_shown_keys, date=date_part)
         except Exception as e:  # noqa: BLE001 — пометка best-effort, протокол доставлен
             log.warning("[open-tasks] commit shown failed (non-fatal): %s", type(e).__name__)
+        # Ф3 (A14, Гейт 2 Q1): слепок нумерации ЭТОЙ версии протокола по message_id
+        # отправленного сообщения — ординал Ф4 резолвится против слепка отвечаемой
+        # версии, не live. Только если раздел висяков реально попал в протокол
+        # (pending_open_positions заполнен). Best-effort: протокол уже доставлен.
+        if pending_open_positions:
+            try:
+                for _mid in (delivery_result.get("message_ids") or []):
+                    if not _mid:
+                        continue
+                    series_memory.record_open_tasks_snapshot(
+                        series_dir, _mid, pending_open_positions,
+                        surface="protocol", date=date_part,
+                        chat_id=delivery_result.get("chat_id"),
+                    )
+            except Exception as e:  # noqa: BLE001 — снапшот best-effort, протокол доставлен
+                log.warning("[open-tasks] snapshot нумерации не записан (non-fatal): %s",
+                            type(e).__name__)
 
     # 4.0.3b. Ф8 LLM-proposer: кандидаты в Speechmatics vocab по стенограмме.
     # Зовём ТОЛЬКО после успешной TG-доставки протокола (status in {sent,

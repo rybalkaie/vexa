@@ -79,6 +79,10 @@ h2 { font-size: 13pt; color: #2c5282; margin: 20px 0 7px; padding: 0 0 4px;
 h3 { font-size: 11.5pt; color: #2d3748; margin: 14px 0 5px; }
 p { margin: 6px 0; }
 ul { margin: 6px 0; padding-left: 20px; }
+/* Ф3 (open-questions-reply-fix): нумерованные висяки (дайджест/протокол) — `<ol>` с тем
+   же отступом, что буллеты `<ul>`, иначе номера ушли бы на дефолтный отступ браузера
+   (рассинхрон с буллетами мелочи/прочих списков). */
+ol { margin: 6px 0; padding-left: 20px; }
 li { margin: 4px 0; }
 li::marker { color: #94a3b8; }
 strong { color: #111827; font-weight: 650; }
@@ -173,7 +177,13 @@ _PDF_ALLOWED_TAGS = [
 # class безвреден (не исполняется, не грузит ресурсы), а `style`/`on*` открыли бы дыру
 # egress/чтения файлов (см. security-комментарий выше). Из недоверенного тела markdown
 # сам `<span>` не порождает, так что реальные span'ы — только наши.
-_PDF_ALLOWED_ATTRS = {"span": ["class"], "a": ["href", "title"]}
+_PDF_ALLOWED_ATTRS = {"span": ["class"], "a": ["href", "title"], "ol": ["start"]}
+# Ф3 (open-questions-reply-fix): `ol[start]` — чтобы СКВОЗНАЯ нумерация висяков не
+# рестартилась. Каждая секция дайджеста/протокола (безымянные, затем по людям) —
+# отдельный `<ol>`; markdown ставит `start="N"` (2-я секция начинается не с 1). Без
+# `start` в allowlist bleach его срезал бы → браузер отрисовал бы каждую секцию с «1.»
+# (показ разошёлся бы со слепком нумерации). `start` — числовой атрибут показа, без
+# XSS/egress-вектора (в отличие от `style`/`on*`), пускать безопасно.
 
 
 # Ф4 (ISS-34, A5): канонические статус-ярлыки висяка → цветной span. Красим ТОЛЬКО

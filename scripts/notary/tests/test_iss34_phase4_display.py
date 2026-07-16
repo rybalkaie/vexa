@@ -103,15 +103,17 @@ class TestOriginInProtocolBlock(unittest.TestCase):
             ["Илья: подготовить расчёт", "новая на 15-е"],
             origins=origins, current_date="2026-07-15",
         )
-        self.assertIn("- от 01.07.2026 подготовить расчёт", block)  # переносимый под owner
-        self.assertIn("- новая на 15-е", block)                    # свежий безымянный
-        self.assertNotIn("от 15.07.2026", block)                   # ОЖИД1 — без префикса
+        # Ф3: безымянная «новая на 15-е» = позиция 1, «Илья: подготовить расчёт» = 2
+        self.assertIn("2. от 01.07.2026 подготовить расчёт", block)  # переносимый под owner
+        self.assertIn("1. новая на 15-е", block)                    # свежий безымянный
+        self.assertNotIn("от 15.07.2026", block)                    # ОЖИД1 — без префикса
 
     def test_no_origins_no_prefix_backcompat(self):
         # Прямой вызов без origins (обр. совместимость) — префиксов нет, блок валиден.
         block = sm.format_open_tasks_block(["Илья: добить отчёт"])
-        self.assertIn("- добить отчёт", block)
-        self.assertNotIn("от ", block.split("Незакрытые задачи")[-1].split("- добить")[0][-6:])
+        # Ф3: единственный висяк = позиция 1; отсутствие «от …» между номером и текстом
+        # подтверждает, что origin-префикса нет (иначе было бы «1. от … добить отчёт»).
+        self.assertIn("1. добить отчёт", block)
 
     def test_build_open_tasks_block_wires_origins_end_to_end(self):
         # Полный путь: 2 выжимки на диске → блок несёт origin-дату переносимого пункта.
@@ -135,9 +137,9 @@ class TestOriginInDigest(unittest.TestCase):
             "koordinatsiya", "2026-07-15",
             ["Илья: подготовить расчёт"], [], origins=origins,
         )
-        # переносимый висяк: origin-префикс + канонический ярлык (оранжевый в PDF)
+        # переносимый висяк: номер (Ф3) + origin-префикс + канонический ярлык
         self.assertIn(
-            "- от 01.07.2026 подготовить расчёт — Статус неизвестен — уточнить", out
+            "1. от 01.07.2026 подготовить расчёт — Статус неизвестен — уточнить", out
         )
 
     def test_digest_fresh_no_prefix_ozhid1(self):
@@ -145,7 +147,7 @@ class TestOriginInDigest(unittest.TestCase):
         out = md.build_digest_markdown(
             "koordinatsiya", "2026-07-15", ["свежая на сегодня"], [], origins=origins,
         )
-        self.assertIn("- свежая на сегодня — Статус неизвестен — уточнить", out)
+        self.assertIn("1. свежая на сегодня — Статус неизвестен — уточнить", out)
         self.assertNotIn("от 15.07.2026", out)
 
     def test_digest_minor_no_status_label(self):

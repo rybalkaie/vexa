@@ -258,10 +258,16 @@ def series_display_name(series: str) -> str:
 
 
 def _digest_open_bullet(
-    display_text: str, origin_key_text: str, origins: Optional[dict], current_date: str
+    number: int, display_text: str, origin_key_text: str,
+    origins: Optional[dict], current_date: str,
 ) -> str:
-    """Ф4 (ISS-34): буллет ВИСЯЩЕГО пункта дайджеста —
-    «- [от DD.MM.YYYY ]<текст> — Статус неизвестен — уточнить».
+    """Ф4 (ISS-34) + Ф3 (REQ 5.1): пункт ВИСЯКА дайджеста нумерованным списком —
+    «N. [от DD.MM.YYYY ]<текст> — Статус неизвестен — уточнить».
+
+    `number` — сквозной 1..N по ВСЕМ секциям висяков (REQ 5.1), СТРОГО display-only: в
+    текст задачи и `_status_key` не входит (REQ 5.3), это префикс показа. Строка —
+    элемент нумерованного списка (`N. …`, рендерится `<ol>`), а НЕ `- `-буллета: под
+    `sane_lists` «- N. …» дало бы вложенный `<ol>` внутри `<li>`.
 
     Origin-префикс (A4) считается по ПОЛНОМУ тексту `origin_key_text` («Имя: задача» —
     ключ `_status_key`, как в sidecar); отображаем `display_text` (у сгруппированных по
@@ -269,7 +275,7 @@ def _digest_open_bullet(
     красится оранжевым в PDF (`protocol_to_pdf._colorize_status_labels`) — «висяки
     оранжевые» (REQ 34.2). Мелочь этот ярлык НЕ несёт (по ней статус не нужен, R12)."""
     prefix = series_memory.origin_prefix_for(origin_key_text, origins, current_date)
-    return f"- {prefix}{display_text} — {series_memory.STATUS_OPEN_LABEL}"
+    return f"{number}. {prefix}{display_text} — {series_memory.STATUS_OPEN_LABEL}"
 
 
 def build_digest_markdown(
@@ -310,17 +316,25 @@ def build_digest_markdown(
         "",
     ]
     nameless, owned = series_memory.group_open_tasks_by_owner(hanging)
+    # Ф3 (REQ 5.1): СКВОЗНОЙ номер висяка 1..N по всем секциям (безымянные → по людям),
+    # не рестартится в секции владельца. Порядок обхода ТОЧНО совпадает с
+    # `series_memory.ordered_open_task_positions(hanging)` (оба — `_group_open_by_owner`),
+    # поэтому номер показа == позиция снапшота (см. send_series_digest). Мелочь НЕ
+    # нумеруем (A8 — по ней статус не нужен).
+    n = 0
     if nameless:
         lines.append(f"## {_NO_OWNER_HEADING}")
         lines.append("")
         for t in nameless:
-            lines.append(_digest_open_bullet(t, t, origins, date))
+            n += 1
+            lines.append(_digest_open_bullet(n, t, t, origins, date))
         lines.append("")
     for owner, items in owned:
         lines.append(f"## {owner}")
         lines.append("")
         for t in items:
-            lines.append(_digest_open_bullet(t, f"{owner}: {t}", origins, date))
+            n += 1
+            lines.append(_digest_open_bullet(n, t, f"{owner}: {t}", origins, date))
         lines.append("")
     if minor:
         lines.append(f"## {_MINOR_HEADING}")
@@ -601,6 +615,19 @@ def send_series_digest(
     saved = record_sent(series_dir, date, chat_id=chat_id, message_id=mid)
     res["status"] = "sent"
     res["message_id"] = mid
+    # Ф3 (A14, Гейт 2 Q1): слепок нумерованного списка висяков ЭТОГО дайджеста, keyed by
+    # его message_id. Тот же `hanging` и порядок, что в `build_digest_markdown` выше →
+    # номер показа == позиция слепка. Фундамент под ординал-матчинг Ф4 (резолв «первая»
+    # против слепка ИМЕННО отвечаемого документа, не live-пересчёта). Best-effort:
+    # дайджест уже ушёл, сбой снапшота его не отменяет. НЕ логируем тексты.
+    try:
+        snapshot = [p["key_text"] for p in series_memory.ordered_open_task_positions(hanging)]
+        series_memory.record_open_tasks_snapshot(
+            series_dir, mid, snapshot, surface="digest", date=date, chat_id=chat_id,
+        )
+    except Exception as e:  # noqa: BLE001 — снапшот опционален, доставка уже прошла
+        logger.warning("[morning-digest] снапшот нумерации не записан (non-fatal): %s",
+                       type(e).__name__)
     if saved is None:
         # Дайджест УЖЕ ушёл, а идемпотентность не записалась → следующий тик (через
         # 15 мин) отправит его повторно, и так до начала встречи. Отменить отправку
