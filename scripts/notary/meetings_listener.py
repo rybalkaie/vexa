@@ -1153,6 +1153,86 @@ DIGEST_UNPARSED_HINT = (
     "статус — например: «отчёт по марже — сделано» или «презентация — снимаем, неактуально». "
     "Если вопрос будете обсуждать на встрече — отвечать не нужно, бот услышит и пометит сам."
 )
+# Ф2 (UPU1): reply ПОХОЖ на пачку статусов, но сплиттер её не разобрал (LLM икнул/
+# таймаут/мусор). Молча взять один статус и потерять остальные нельзя — честно просим
+# прислать по-другому, чтобы ни один статус не пропал в тишине.
+DIGEST_BATCH_UNPARSED_HINT = (
+    "Похоже, тут несколько задач сразу, но я не смог их надёжно разобрать 🙏 Пришлите, "
+    "пожалуйста, вторым сообщением — по одной задаче на строку, с задачей и статусом "
+    "(«медиаплан — сделано», «расчёт склада — снимаем»)."
+)
+
+
+def _apply_digest_status_batch(
+    token: str, chat_id: int, series: str, text: str, msg: dict[str, Any]
+) -> bool:
+    """Ф2 (ISS-36 случай А): ПАЧКА статусов ответом на дайджест — применяет ВСЕ,
+    честно перечисляет остаток кратким структурным ack. Общий status-loop
+    `mixed_reply_split.run_status_loop` — тот же, что у mixed-роута протокола (KODE1,
+    [[review-checks-two-call-sites]]).
+
+    Возврат True = пачка обработана (ack отправлен) → caller выходит. False = это НЕ
+    пачка (флаг OFF / одиночный статус — REQ 2.3 fast-path / сплит оказался не
+    смешанным) → caller идёт обычным одиночным `apply`.
+
+    A3: на дайджесте протокола НЕТ → сегменты-«правки» уходят в ПОДСКАЗКУ (edit_as_hint),
+    НЕ в шлюз правок. UPU1: сплит икнул на явной пачке → честная подсказка, не молча-один.
+
+    Опасная тройка: в лог только счётчики (сегментов/ok/unresolved/правок), не тексты.
+    """
+    try:
+        from notary.lib import mixed_reply_split  # noqa: PLC0415
+        from notary.lib import pending_status_reply  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модуль не грузится → фича просто выключена
+        logger.debug("[morning-digest] mixed-split import failed (feature off?): %s", e)
+        return False
+    if not mixed_reply_split.is_enabled():
+        return False  # A1: дефолт-OFF → одиночный путь как раньше (совместимость)
+    if not mixed_reply_split.looks_like_multi_status(text):
+        return False  # REQ 2.3: одиночный статус → fast-path, платный сплиттер не зовём
+    series_dir = _protokol_root() / series
+    try:
+        items = pending_status_reply.load_series_pending(series_dir)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[morning-digest] резолв висяков не удался (feature off?): %s", e)
+        return False
+    try:
+        split = mixed_reply_split.split_reply(text, items)
+    except Exception as e:  # noqa: BLE001 — сплит не должен валить listener
+        logger.exception("[morning-digest] сплит пачки упал (non-fatal): %s", e)
+        split = None
+    if split is None:
+        # UPU1: reply похож на пачку, но сплит не удался → честная подсказка (не молча-один).
+        send_message(token, chat_id, DIGEST_BATCH_UNPARSED_HINT, reply_to=msg.get("message_id"))
+        logger.info("[morning-digest] пачка не разобрана (UPU1) series=%s → подсказка", series)
+        return True
+    if not mixed_reply_split.should_engage(split):
+        return False  # оказался одиночный/чистый статус → обычный одиночный apply
+    status_segments = split["status_segments"]
+    n_status_raw = split.get("n_status_raw") or len(status_segments)
+
+    def _apply_one(seg):
+        return pending_status_reply.apply_status_reply(
+            seg, series_dir, date=_reply_date_str(msg), source="digest-reply",
+        )
+
+    loop = mixed_reply_split.run_status_loop(status_segments, _apply_one)
+    n_edits = len(split.get("edits") or [])
+    # REQ 3.2: объём превышен (сплиттер вернул больше статусов, чем cap) → «N из M».
+    overflow = (len(status_segments), n_status_raw) if n_status_raw > len(status_segments) else None
+    ack = mixed_reply_split.build_mixed_ack(
+        status_groups=loop["groups"],
+        n_status_unresolved=loop["n_unresolved"],
+        n_edits=n_edits, edit_queued=False, edit_as_hint=True,
+        unclear=split.get("unclear") or "", overflow=overflow,
+    )
+    send_message(token, chat_id, ack, reply_to=msg.get("message_id"))
+    logger.info(
+        "[morning-digest] пачка статусов series=%s сегментов=%d ok=%d unresolved=%d "
+        "правок=%d overflow=%s",
+        series, len(status_segments), loop["n_ok"], loop["n_unresolved"], n_edits, bool(overflow),
+    )
+    return True
 
 
 def maybe_route_to_digest_reply(
@@ -1196,6 +1276,12 @@ def maybe_route_to_digest_reply(
         # ничего не теряет — терялся бы только НЕПОНЯТЫЙ статус, а его мы ловим ниже.
         if pending_status_reply.detect_status_intent(text) is None:
             logger.info("[morning-digest] reply без статус-маркера series=%s → молчим", series)
+            return True
+        # Ф2 (ISS-36 случай А): ПАЧКА статусов одним reply под флагом
+        # ENABLE_MIXED_REPLY_SPLIT. Одиночный статус сюда НЕ заходит (fast-path
+        # внутри, REQ 2.3) → идём обычным одиночным apply ниже. Пачку — обработали и
+        # вышли (True). OFF → тоже вниз, одиночным (обратная совместимость).
+        if _apply_digest_status_batch(token, chat_id, series, text, msg):
             return True
         result = pending_status_reply.apply_status_reply(
             text, _protokol_root() / series, date=_reply_date_str(msg), source="digest-reply",
@@ -1333,26 +1419,21 @@ def maybe_route_to_mixed_reply(
     if not mixed_reply_split.should_engage(split):
         return False  # не смешанный → обычные роуты (чистый статус/правка) — РИСК5
     status_segments = split["status_segments"]
+    n_status_raw = split.get("n_status_raw") or len(status_segments)
     edit_remainder = "\n".join(split["edits"])
     n_edits = len(split["edits"])
     unclear = split["unclear"]
 
-    # 1) Статусы — apply_status_reply В ЦИКЛЕ по КАЖДОМУ сегменту (РИСК4): один
-    #    вызов резолвит ОДИН висяк, поэтому сегмент-на-статус + цикл = все статусы.
-    n_status_ok = 0
-    n_status_unresolved = 0
-    for seg in status_segments:
-        try:
-            res = pending_status_reply.apply_status_reply(
-                seg, series_dir, date=_reply_date_str(msg), source="mixed-reply",
-            )
-        except Exception as e:  # noqa: BLE001 — сбой одного статуса не роняет остальные
-            logger.warning("[mixed-reply] статус-сегмент упал (non-fatal): %s", type(e).__name__)
-            res = None
-        if res:
-            n_status_ok += 1
-        else:
-            n_status_unresolved += 1  # интент есть, но висяк не привязался — не молчим
+    # 1) Статусы — общий status-loop (РИСК4): один вызов резолвит ОДИН висяк, поэтому
+    #    сегмент-на-статус + цикл = все статусы. Тот же хелпер, что у digest-роута (KODE1).
+    def _apply_one(seg):
+        return pending_status_reply.apply_status_reply(
+            seg, series_dir, date=_reply_date_str(msg), source="mixed-reply",
+        )
+
+    loop = mixed_reply_split.run_status_loop(status_segments, _apply_one)
+    n_status_ok = loop["n_ok"]
+    n_status_unresolved = loop["n_unresolved"]
 
     # 2) Правки — шлюз правок с ПОДАВЛЕННЫМ ack (РИСК5: только при непустом остатке).
     edit_queued = False
@@ -1374,17 +1455,19 @@ def maybe_route_to_mixed_reply(
             logger.exception("[mixed-reply] шлюз правок упал (non-fatal): %s", e)
         edit_queued = acked["v"]
 
-    # 3) Объединённый ack (REQ 33.3/33.4/33.5) — ОДИН ответ на весь reply.
+    # 3) Объединённый ack — ОДИН ответ на весь reply. Краткий СТРУКТУРНЫЙ по статус-
+    #    группам (REQ 2.4/OZHID2). REQ 3.2: cap статусов превышен → «N из M» (не тихо).
+    overflow = (len(status_segments), n_status_raw) if n_status_raw > len(status_segments) else None
     ack = mixed_reply_split.build_mixed_ack(
-        n_status_ok=n_status_ok, n_status_unresolved=n_status_unresolved,
-        n_edits=n_edits, edit_queued=edit_queued, unclear=unclear,
+        status_groups=loop["groups"], n_status_unresolved=n_status_unresolved,
+        n_edits=n_edits, edit_queued=edit_queued, unclear=unclear, overflow=overflow,
     )
     send_message(token, chat_id, ack, reply_to=msg.get("message_id"))
     logger.info(
         "[mixed-reply] chat=%s series=%s статусов=%d(ok=%d,unresolved=%d) правок=%d "
-        "queued=%s непонятое=%s",
+        "queued=%s непонятое=%s overflow=%s",
         chat_id, series, len(status_segments), n_status_ok, n_status_unresolved,
-        n_edits, edit_queued, bool(unclear),
+        n_edits, edit_queued, bool(unclear), bool(overflow),
     )
     return True
 

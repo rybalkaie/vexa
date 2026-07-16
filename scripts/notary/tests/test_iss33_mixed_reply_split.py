@@ -329,7 +329,9 @@ class TestMixedRoute(_SeriesBase):
         self.assertTrue(claimed)
         self.assertEqual(len(sent), 1)                        # один объединённый ack
         ack = sent[0][0][2]
-        self.assertIn("татус", ack)
+        # Ф2/RISK8: ack протокола теперь СТРУКТУРНЫЙ — статус-часть по РАСПОЗНАННОМУ
+        # ярлыку («Закрыто»), правочная часть — «Правки текста».
+        self.assertIn("Закрыто", ack)
         self.assertIn("равки", ack)
         self.assertEqual(len(edit_calls), 1)                  # шлюз правок вызван
         self.assertIn("23МПКТК", edit_calls[0])
@@ -347,7 +349,9 @@ class TestMixedRoute(_SeriesBase):
         store = sm.load_task_status(self.sd)
         self.assertEqual(store[sm._status_key(_ITEMS[0])]["status"], sm.STATUS_CANCELLED)
         self.assertEqual(store[sm._status_key(_ITEMS[1])]["status"], sm.STATUS_DONE)
-        self.assertIn("2", sent[0][0][2])                     # «статусы: принял 2»
+        ack = sent[0][0][2]                                   # Ф2: структурный ack по группам
+        self.assertIn("Снято", ack)                          # медиаплан → cancelled
+        self.assertIn("Закрыто", ack)                        # склад → done
 
     def test_status_plus_garbage(self):
         # REQ 33.4: статус + мусор → ack содержит и статус, и «эту часть не понял».
@@ -357,7 +361,7 @@ class TestMixedRoute(_SeriesBase):
         self.assertTrue(claimed)
         self.assertEqual(edit_calls, [])
         ack = sent[0][0][2]
-        self.assertIn("татус", ack)
+        self.assertIn("Закрыто", ack)                        # Ф2: статус-часть по ярлыку
         self.assertIn("не понял", ack.lower())
         self.assertIn("абырвалг", ack)
 
@@ -385,7 +389,8 @@ class TestMixedRoute(_SeriesBase):
         self.assertEqual(store[sm._status_key(_ITEMS[1])]["status"], sm.STATUS_DONE)
         self.assertEqual(len(edit_calls), 1)                  # 4 правки одним блобом
         ack = sent[0][0][2]
-        self.assertIn("2", ack)                               # статусы: 2
+        self.assertIn("Снято", ack)                           # статусы: медиаплан снят
+        self.assertIn("Закрыто", ack)                         # склад закрыт
         self.assertIn("4", ack)                               # правки: 4
 
     def test_flag_off_is_current_behavior(self):

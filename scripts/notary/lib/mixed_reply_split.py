@@ -53,12 +53,25 @@ from . import feedback_reissue  # sanitize_edit_text (как feedback_classify_l
 logger = logging.getLogger("notary.mixed_reply_split")
 
 # ── Лимиты входа/выхода (graceful degrade + защита от мусора/гигантских полей) ──
-_MAX_REPLY_LEN = int(os.environ.get("MIXED_REPLY_SPLIT_MAX_LEN", "1200") or "1200")
+# Ф2 (ISS-36 случай А, UPU2): лимиты подняты и вынесены в env, чтобы ПАЧКА статусов
+# (реальный кейс — ~25 задач ответом на дайджест, ~2-3К символов) доезжала до
+# сегментации, а не срезалась молча на 12/12/1200. `_MAX_REPLY_LEN` держим ≥4000 —
+# иначе `_looks_splittable` отрезал бы длинный reply ДО сплиттера (UPU2). Дедуп+кап
+# считают ПРЕ-cap объём (`_norm_segment_list_counted`), чтобы честно сказать «обработал
+# N из M» (REQ 3.2), а не потерять хвост в тишине.
+_MAX_REPLY_LEN = int(os.environ.get("MIXED_REPLY_SPLIT_MAX_LEN", "4000") or "4000")
 _MAX_SEGMENT_LEN = 300          # потолок длины одного сегмента (статус/правка)
-_MAX_STATUS_SEGMENTS = 12       # разумный потолок числа статус-сегментов в одном reply
-_MAX_EDIT_SEGMENTS = 12         # то же для правок
-_MAX_ITEMS_IN_PROMPT = 12       # висяков в промпт (как pending_status_reply LLM-ярус)
+_MAX_STATUS_SEGMENTS = int(os.environ.get("MIXED_REPLY_SPLIT_MAX_SEGMENTS", "40") or "40")
+_MAX_EDIT_SEGMENTS = int(os.environ.get("MIXED_REPLY_SPLIT_MAX_EDITS", "40") or "40")
+# Кап КОНТЕКСТА для LLM-сплиттера (NES2): режет лишь число висяков-ПОДСКАЗОК в промпт,
+# НЕ детерминированный матч — тот идёт по полному `load_series_pending` без капа. Поднят,
+# чтобы у сплиттера в промпте были ВСЕ висяки серии (иначе он не привяжет хвост пачки).
+_MAX_ITEMS_IN_PROMPT = int(os.environ.get("MIXED_REPLY_SPLIT_MAX_ITEMS", "60") or "60")
 _MAX_UNCLEAR_LEN = 400          # потолок склеенного непонятого остатка
+# Групповой ack (REQ 2.4): при ≥ этого порога статусов ack сворачивается в строку-НА-
+# ГРУППУ со счётчиком; ниже — по строке на задачу. Имён на группу — не больше _MAX_NAMES.
+_GROUP_ACK_THRESHOLD = int(os.environ.get("MIXED_REPLY_ACK_GROUP_THRESHOLD", "4") or "4")
+_MAX_NAMES_PER_GROUP = int(os.environ.get("MIXED_REPLY_ACK_NAMES_PER_GROUP", "6") or "6")
 
 # Модель — Haiku (A2), как маппинг имён / классификаторы. Дешёвая, задача структурная.
 _SPLIT_MODEL = (os.environ.get("MIXED_REPLY_SPLIT_MODEL") or "").strip() \
@@ -145,12 +158,19 @@ def build_split_user_prompt(reply_text: str, items: Optional[list]) -> str:
     )
 
 
-def _norm_segment_list(raw, *, cap: int) -> list:
-    """Список сегментов → санитизированные, непустые, уникальные, ≤ cap штук."""
+def _norm_segment_list_counted(raw, *, cap: int) -> tuple:
+    """Список сегментов → (санитизированные непустые уникальные ≤cap штук, СКОЛЬКО
+    всего валидных было ДО обрезки cap).
+
+    Второе число нужно для честного «обработал N из M» (REQ 3.2): без него хвост,
+    срезанный cap'ом, потерялся бы в тишине. Считаем ВСЕ уникальные непустые, но в
+    список кладём только первые cap — так и защита от гигантских полей, и правда о
+    том, сколько реально пришло."""
     if not isinstance(raw, list):
-        return []
+        return [], 0
     out: list = []
     seen: set = set()
+    n_valid = 0
     for s in raw:
         t = feedback_reissue.sanitize_edit_text(str(s or ""), max_len=_MAX_SEGMENT_LEN)
         t = t.strip()
@@ -160,9 +180,15 @@ def _norm_segment_list(raw, *, cap: int) -> list:
         if key in seen:
             continue
         seen.add(key)
-        out.append(t)
-        if len(out) >= cap:
-            break
+        n_valid += 1
+        if len(out) < cap:
+            out.append(t)
+    return out, n_valid
+
+
+def _norm_segment_list(raw, *, cap: int) -> list:
+    """Список сегментов → санитизированные, непустые, уникальные, ≤ cap штук."""
+    out, _n = _norm_segment_list_counted(raw, cap=cap)
     return out
 
 
@@ -189,13 +215,16 @@ def parse_split_response(raw: str) -> Optional[dict]:
         return None
     if not isinstance(parsed, dict):
         return None
-    status_segments = _norm_segment_list(parsed.get("statuses"), cap=_MAX_STATUS_SEGMENTS)
+    status_segments, n_status_raw = _norm_segment_list_counted(
+        parsed.get("statuses"), cap=_MAX_STATUS_SEGMENTS)
     edits = _norm_segment_list(parsed.get("edits"), cap=_MAX_EDIT_SEGMENTS)
     unclear_list = _norm_segment_list(parsed.get("unclear"), cap=_MAX_EDIT_SEGMENTS)
     unclear = "; ".join(unclear_list)
     if len(unclear) > _MAX_UNCLEAR_LEN:
         unclear = unclear[:_MAX_UNCLEAR_LEN - 1].rstrip() + "…"
-    return {"status_segments": status_segments, "edits": edits, "unclear": unclear}
+    # n_status_raw — сколько статусов реально пришло ДО cap (REQ 3.2 «N из M»).
+    return {"status_segments": status_segments, "edits": edits, "unclear": unclear,
+            "n_status_raw": n_status_raw}
 
 
 def _request_split(
@@ -268,10 +297,17 @@ def split_reply(
     if not isinstance(res, dict):
         return None
     # Страховка: даже если split_fn вернул сырой dict — нормализуем поля.
-    status_segments = res.get("status_segments")
-    if status_segments is None:
-        status_segments = res.get("statuses")
-    status_segments = _norm_segment_list(status_segments, cap=_MAX_STATUS_SEGMENTS)
+    status_src = res.get("status_segments")
+    if status_src is None:
+        status_src = res.get("statuses")
+    status_segments, computed_raw = _norm_segment_list_counted(
+        status_src, cap=_MAX_STATUS_SEGMENTS)
+    # Пре-cap объём: из res (реальный путь через parse_split_response уже посчитал до
+    # своего cap) либо из локального пересчёта (путь стаба). Берём больший — так cap
+    # parse-шага не «съест» правду о том, сколько статусов реально было (REQ 3.2).
+    n_status_raw = res.get("n_status_raw")
+    if not isinstance(n_status_raw, int) or n_status_raw < computed_raw:
+        n_status_raw = computed_raw
     edits = _norm_segment_list(res.get("edits"), cap=_MAX_EDIT_SEGMENTS)
     unclear = res.get("unclear")
     if isinstance(unclear, list):
@@ -279,7 +315,8 @@ def split_reply(
     unclear = (unclear or "").strip()
     if len(unclear) > _MAX_UNCLEAR_LEN:
         unclear = unclear[:_MAX_UNCLEAR_LEN - 1].rstrip() + "…"
-    return {"status_segments": status_segments, "edits": edits, "unclear": unclear}
+    return {"status_segments": status_segments, "edits": edits, "unclear": unclear,
+            "n_status_raw": n_status_raw}
 
 
 def should_engage(split: Optional[dict]) -> bool:
@@ -303,37 +340,178 @@ def should_engage(split: Optional[dict]) -> bool:
     return len(st) >= 2 or bool(edits) or bool(unclear)
 
 
+_MULTI_LINE_RE = re.compile(r"[;]")
+_MULTI_NUM_RE = re.compile(r"(?:^|\s)\d+[.)]\s")
+
+
+def looks_like_multi_status(reply_text) -> bool:
+    """Дешёвый пред-чек «похоже на ПАЧКУ статусов» — БЕЗ LLM, детерминированно.
+
+    Две роли (Ф2):
+      • REQ 2.3 fast-path: одиночный статус НЕ похож на пачку → digest-роут НЕ дёргает
+        платный сплиттер зря, идёт коротким одиночным `apply` (совместимость).
+      • UPU1: если reply ПОХОЖ на пачку, а `split_reply` вернул None (LLM икнул/таймаут/
+        мусор) — caller не откатывается молча к одиночному `apply` (резолвит 1, теряет
+        24), а честно просит прислать вторым сообщением.
+
+    Признаки пачки: несколько непустых строк / нумерация «1) …» / несколько «;» /
+    длинный однострочник с перечислением через запятые."""
+    t = str(reply_text or "").strip()
+    if not t:
+        return False
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        return True                              # «задача — статус» по строке — типовая пачка
+    if len(_MULTI_NUM_RE.findall(t)) >= 2:
+        return True                              # нумерованный список
+    if len(_MULTI_LINE_RE.findall(t)) >= 2:
+        return True                              # перечисление через «;»
+    if len(t) >= 400 and t.count(",") >= 3:
+        return True                              # длинный однострочник-перечисление
+    return False
+
+
+def run_status_loop(status_segments, apply_one):
+    """Прогон КАЖДОГО статус-сегмента через `apply_one(seg)` → сбор результата с
+    разбивкой по статус-ГРУППАМ. Общий хелпер digest-роута И mixed-роута протокола
+    (KODE1, [[review-checks-two-call-sites]]) — один код, две точки вызова.
+
+    `apply_one(seg)` возвращает dict `{label, status, matched, ack}` (успех) или None
+    (интент есть, но висяк не привязался — не молчим, считаем в unresolved). Сбой ОДНОГО
+    сегмента не роняет пачку (best-effort, non-fatal).
+
+    Возврат:
+      • `n_ok` / `n_unresolved` — счётчики;
+      • `groups` — список `(label, [matched_name, …])` в порядке первого появления
+        группы (для группового/потаск ack; имена = РАСПОЗНАННЫЕ ботом, OZHID2);
+      • `results` — сырые результаты по сегментам (на случай per-task рендера).
+
+    Опасная тройка: НЕ логируем тексты сегментов — только тип сбоя (без содержимого)."""
+    grouped: dict = {}          # label → [matched, …]; dict сохраняет порядок вставки (3.7+)
+    results: list = []
+    n_ok = 0
+    n_unresolved = 0
+    for seg in (status_segments or []):
+        try:
+            res = apply_one(seg)
+        except Exception as e:  # noqa: BLE001 — сбой одного сегмента не роняет остальные
+            logger.warning("[status-loop] сегмент упал (non-fatal): %s", type(e).__name__)
+            res = None
+        results.append(res)
+        if res:
+            n_ok += 1
+            label = res.get("label") or "other"
+            grouped.setdefault(label, []).append(res.get("matched") or "")
+        else:
+            n_unresolved += 1  # интент есть, висяк не привязался — честно в остаток
+    groups = [(lbl, names) for lbl, names in grouped.items()]
+    return {"n_ok": n_ok, "n_unresolved": n_unresolved, "groups": groups, "results": results}
+
+
+# ── Групповой ack (REQ 2.4 + OZHID2): эмодзи + человекочитаемый ярлык по статусу ──
+_GROUP_META = {
+    "done":      ("✅", "Закрыто"),
+    "cancelled": ("🚫", "Снято"),
+    "doubt":     ("🟡", "Под вопросом"),
+    "wait":      ("👌", "В работе"),
+    "reopen":    ("↩️", "Вернул в работу"),
+    "other":     ("•", "Отметил"),
+}
+
+
+def _short_task_name(matched: str, *, limit: int = 48) -> str:
+    """Короткое РАСПОЗНАННОЕ имя задачи для ack (OZHID2): что бот сматчил в каноническом
+    списке. Срезаем префикс исполнителя «Имя Фамилия: » (оставляем саму задачу) и режем
+    по длине. Пусто → «(без названия)» (не молчим)."""
+    s = (matched or "").strip()
+    if ": " in s:
+        _head, tail = s.split(": ", 1)
+        if tail.strip():
+            s = tail.strip()
+    if not s:
+        return "(без названия)"
+    if len(s) > limit:
+        s = s[:limit - 1].rstrip() + "…"
+    return s
+
+
+def _render_status_section(status_groups: list, n_status_ok: Optional[int]) -> list:
+    """Статус-часть ack. При `status_groups` — по РАСПОЗНАННЫМ именам (OZHID2):
+      • ≥ `_GROUP_ACK_THRESHOLD` статусов → РОВНО по строке на статус-группу со
+        счётчиком + ≤ `_MAX_NAMES_PER_GROUP` коротких имён (RAZM1, не дамп);
+      • 1..threshold-1 → по строке на задачу.
+    Без `status_groups` (легаси-вызов только по счётчику) — одна строка «принял N»."""
+    if status_groups is None:
+        return [f"✅ Статусы: принял {n_status_ok}."] if n_status_ok else []
+    total = sum(len(names) for _lbl, names in status_groups)
+    if total <= 0:
+        return []
+    lines: list = []
+    if total >= _GROUP_ACK_THRESHOLD:
+        for label, names in status_groups:
+            emoji, human = _GROUP_META.get(label, _GROUP_META["other"])
+            shown = [_short_task_name(n) for n in names[:_MAX_NAMES_PER_GROUP]]
+            rest = len(names) - len(shown)
+            tail = f", +ещё {rest}" if rest > 0 else ""
+            lines.append(f"{emoji} {human} ({len(names)}): {', '.join(shown)}{tail}")
+    else:
+        for label, names in status_groups:
+            emoji, human = _GROUP_META.get(label, _GROUP_META["other"])
+            for n in names:
+                lines.append(f"{emoji} {human}: «{_short_task_name(n)}»")
+    return lines
+
+
 def build_mixed_ack(
     *,
-    n_status_ok: int,
-    n_status_unresolved: int,
-    n_edits: int,
-    edit_queued: bool,
-    unclear: str,
+    n_status_ok: Optional[int] = None,
+    n_status_unresolved: int = 0,
+    n_edits: int = 0,
+    edit_queued: bool = False,
+    unclear: str = "",
+    status_groups: Optional[list] = None,
+    edit_as_hint: bool = False,
+    overflow: Optional[tuple] = None,
 ) -> str:
-    """Объединённый ack (REQ 33.3/33.4/33.5) — ОДИН ответ на весь смешанный reply:
-    «статусы: принял N; правки текста: принял M, перевыпущу; не понял: …».
+    """Объединённый ack — ОДИН ответ на весь reply. Инвариант «ничего молча»: каждая
+    распознанная часть перечислена, непривязанное/непонятое/срезанное честно помечено.
 
-    Инвариант «ничего молча»: каждая распознанная часть перечислена; непонятый
-    остаток честно помечен «эту часть не понял». Текст `unclear` эхом уходит в ТОТ
-    ЖЕ чат, где reply и пришёл (не новый egress, не лог) — чтобы автор увидел, что
-    именно не разобрано, и уточнил."""
-    parts: list = []
-    if n_status_ok:
-        parts.append(f"✅ Статусы: принял {n_status_ok}.")
+    Ф2:
+      • `status_groups` (REQ 2.4/OZHID2) — краткий СТРУКТУРНЫЙ ack по статус-группам со
+        счётчиками и распознанными именами задач (см. `_render_status_section`). Без
+        него — легаси-строка по счётчику `n_status_ok` (обратная совместимость).
+      • `edit_as_hint` (A3) — на дайджесте протокола нет: правки НЕ уходят в шлюз, а
+        честной подсказкой «вносите ответом на сам протокол».
+      • `overflow=(n, m)` (REQ 3.2) — объём превышен: «обработал N из M, остальное
+        пришлите вторым сообщением» (не тихо).
+
+    Текст `unclear` эхом уходит в ТОТ ЖЕ чат, где reply и пришёл (не новый egress, не
+    лог) — чтобы автор увидел, что именно не разобрано, и уточнил."""
+    parts: list = _render_status_section(status_groups, n_status_ok)
     if n_status_unresolved:
         parts.append(
-            f"⚠️ Статусы: {n_status_unresolved} не смог привязать к вопросу — "
+            f"⚠️ Ещё {n_status_unresolved} не смог привязать к вопросу — "
             "уточните, по какому именно."
         )
     if n_edits:
-        if edit_queued:
+        if edit_as_hint:
+            parts.append(
+                f"✏️ Заметил правки текста ({n_edits}) — их вносите ответом на сам "
+                "протокол встречи, не на дайджест."
+            )
+        elif edit_queued:
             parts.append(f"✏️ Правки текста: принял {n_edits}, перевыпущу протокол.")
         else:
             parts.append(
                 f"⚠️ Правки текста: {n_edits} не смог применить — ответьте на протокол "
                 "с правкой ещё раз."
             )
+    if overflow:
+        n_done, n_total = overflow
+        parts.append(
+            f"📦 Обработал {n_done} из {n_total} — остальное пришлите, пожалуйста, "
+            "вторым сообщением."
+        )
     snippet = (unclear or "").strip()
     if snippet:
         if len(snippet) > 120:
