@@ -393,5 +393,80 @@ class TestCycle5Regressions(_SeriesBase):
         self.assertIn("медиаплан", r["ack"].lower())
 
 
+# ==========================================================================
+# ISS-36 случай Б (Ф1): статус по ФИНАЛЬНОЙ клаузе, а не по первому статус-слову
+# эхо-текста задачи. Развёрнутый ответ «задача — <эхо-статус>, статус? — <вердикт>»
+# теперь помечается вердиктом из ПОСЛЕДНЕЙ клаузы.
+# ==========================================================================
+class TestFinalClauseIntent(unittest.TestCase):
+
+    def test_echo_wait_then_final_done(self):
+        # RISK1: реальный WAIT-токен («в работе») в ЭХО-тексте задачи ПЕРЕД финальным
+        # «сделано». Старый фикс-приоритет WAIT>DONE дал бы wait (корень кейса Б);
+        # предпочтение финальной клаузы даёт done. Пример несёт НАСТОЯЩИЙ WAIT-паттерн
+        # («в работе» матчит `\bв\s+работ`) — не плоское «висит», которое ни один
+        # WAIT-регекс не ловит (иначе на старом коде уже был бы done → ложно-зелёный).
+        self.assertEqual(
+            p.detect_status_intent("Отслушать сэмплы — в работе, статус? — сделано"),
+            p.LABEL_DONE,
+        )
+
+    def test_multi_intent_last_clause_wins(self):
+        # RISK5 (СОЗНАТЕЛЬНАЯ смена приоритета, A4): «жду…, но…сделал» → done —
+        # побеждает ПОСЛЕДНЯЯ клауза, а не фикс-приоритет WAIT>DONE, как было.
+        self.assertEqual(
+            p.detect_status_intent("жду расчёт, но задачу сделал"), p.LABEL_DONE)
+
+    def test_status_not_in_final_clause_falls_back(self):
+        # Статус в ПЕРВОЙ клаузе, финальная — без статуса (приписка/ссылка): идём с
+        # конца и находим done в более ранней клаузе → распознавание НЕ теряется.
+        self.assertEqual(
+            p.detect_status_intent("медиаплан сделал — вот ссылка на файл"),
+            p.LABEL_DONE,
+        )
+
+    def test_no_status_anywhere_is_none(self):
+        # Ни в одной клаузе статуса нет → None (предпочтение финальной клаузы не
+        # расширяет распознаваемость ложно — правки текста остаются не нашим путём).
+        self.assertIsNone(
+            p.detect_status_intent("в пункте 3 не Озон — а Wildberries, посмотрите"))
+
+    def test_single_intents_regress_with_separator(self):
+        # Критерий Ф1: одиночные интенты не сломаны, в т.ч. с разделителем «—».
+        cases = {
+            "не закрыто": p.LABEL_REOPEN,
+            "почти готово": p.LABEL_WAIT,
+            "задача — снимаем": p.LABEL_CANCELLED,
+            "задача — сделано": p.LABEL_DONE,
+        }
+        for text, want in cases.items():
+            self.assertEqual(p.detect_status_intent(text), want, text)
+
+
+class TestFinalClauseApply(_SeriesBase):
+    """Кейс Б и мульти-интент ДОХОДЯТ до sidecar на протокольном пути (source=reply/
+    mixed-reply) — фикс единый, зовётся из `apply_status_reply` (общий вход)."""
+
+    def test_case_b_echo_wait_then_done_writes_done(self):
+        # Кейс Б целиком: эхо «в работе» + финальное «сделано» → sidecar DONE, НЕ OPEN.
+        r = p.apply_status_reply(
+            "Прислать расчёт по складу — в работе, статус? — сделано", self.sd,
+            date="2026-06-10", source="reply")
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], sm.STATUS_DONE)
+        key = sm._status_key("Татьяна Филиппова: Прислать расчёт по складу Ozon")
+        self.assertEqual(sm.load_task_status(self.sd)[key]["status"], sm.STATUS_DONE)
+
+    def test_multi_intent_apply_writes_done(self):
+        # RISK5 на протокольном пути (source=mixed-reply): «жду… но задачу сделал» → DONE.
+        r = p.apply_status_reply(
+            "жду расчёт по складу, но задачу сделал", self.sd,
+            date="2026-06-10", source="mixed-reply")
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], sm.STATUS_DONE)
+        key = sm._status_key("Татьяна Филиппова: Прислать расчёт по складу Ozon")
+        self.assertEqual(sm.load_task_status(self.sd)[key]["status"], sm.STATUS_DONE)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
