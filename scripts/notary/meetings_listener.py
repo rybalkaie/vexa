@@ -1148,6 +1148,15 @@ DIGEST_VOICE_HINT = (
     "Голосом статус по дайджесту пока не понимаю 🙏 Напишите ответом на это сообщение "
     "текстом — например: «сделано», «не успел, жду расчёт» или «снимаем, неактуально»."
 )
+# Ф5 (REQ 6.2): голос НА дайджест под ON-флагом, но STT недоступен/вернул пусто —
+# не молчим и не теряем: честно просим прислать статус текстом. ОТДЕЛЬНО от
+# DIGEST_VOICE_HINT (та — для OFF-флага, «голос пока не понимаю»); здесь голос мы
+# понимаем, но конкретно эту запись расшифровать не удалось (сеть/тишина/шум).
+DIGEST_VOICE_STT_HINT = (
+    "Не смог расшифровать голосовое 🙏 Пришлите, пожалуйста, статус ответом на это "
+    "сообщение текстом — например: «сделано», «не успел, жду расчёт» или «снимаем, "
+    "неактуально»."
+)
 DIGEST_UNPARSED_HINT = (
     "Не понял, по какому вопросу статус 🙏 Ответьте на это сообщение, назвав задачу и "
     "статус — например: «отчёт по марже — сделано» или «презентация — снимаем, неактуально». "
@@ -1262,6 +1271,54 @@ def _apply_digest_status_batch(
     return True
 
 
+def _digest_voice_reply_enabled() -> bool:
+    """Ф5-гейт `ENABLE_DIGEST_VOICE_REPLY` — ДЕФОЛТ OFF. ON ← `1/true/yes/on`.
+
+    Дефолт-OFF В КОДЕ — ПО ПРИЧИНЕ ТЕСТОВ (A11, память
+    [[reissue-llm-tier-gate-default-off]]): без флага голос-ветка на дайджесте НЕ зовёт
+    реальный Groq STT → офлайн-тесты остаются зелёными и квоту не жгут. На боевом деплое
+    флаг ВЫСТАВЛЯЕТСЯ В 1 СРАЗУ (как `ENABLE_MIXED_REPLY_SPLIT`, Гейт 2 Q2) — это защита
+    тестов + аварийный kill-switch, НЕ «ждём smoke». При OFF голос-reply на дайджест ведёт
+    себя как сегодня — отбивка `DIGEST_VOICE_HINT` «напишите текстом».
+    """
+    raw = (os.environ.get("ENABLE_DIGEST_VOICE_REPLY") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _digest_voice_to_text_or_hint(
+    token: str, chat_id: int, series: str, msg: dict[str, Any]
+) -> Optional[str]:
+    """Ф5 (REQ 6.1-6.3): голосовой reply на дайджест → РАСШИФРОВАННЫЙ текст для того же
+    статус-парсера, что и текст (мульти-статус Ф2 + ординал Ф4). НЕ переписываем парсер —
+    только подаём распознанный текст в существующий вход.
+
+    Возврат:
+      • str — расшифровка (caller гонит её общим путём вместе с текстовыми reply);
+      • None — подсказка УЖЕ отправлена (флаг OFF ИЛИ STT пусто/недоступен), caller выходит
+        (`return True`): ни одного статуса молча не теряем (6.2 «не молчим»).
+
+    Транскрипция — существующий Groq-путь `transcribe_voice_or_none` → `voice_input.
+    voice_to_text` (тот же daemon/Groq-стек, что «в других местах», A11).
+
+    Опасная тройка: расшифровку и ключ Groq/токен НЕ логируем — только длину/исход.
+    """
+    if not _digest_voice_reply_enabled():
+        # OFF (тестовый дефолт): текущая отбивка «голос пока не понимаю, напишите текстом».
+        send_message(token, chat_id, DIGEST_VOICE_HINT, reply_to=msg.get("message_id"))
+        logger.info("[morning-digest] голос-reply series=%s (флаг OFF) → подсказка", series)
+        return None
+    voice_text = transcribe_voice_or_none(token, msg)
+    if not voice_text or not voice_text.strip():
+        # 6.2: STT недоступен/пусто → честная подсказка (не молчим, не теряем).
+        send_message(token, chat_id, DIGEST_VOICE_STT_HINT, reply_to=msg.get("message_id"))
+        logger.info("[morning-digest] голос-reply series=%s STT пусто → фолбэк", series)
+        return None
+    text = voice_text.strip()
+    # Опасная тройка: только ДЛИНА расшифровки, НЕ сам текст.
+    logger.info("[morning-digest] голос-reply series=%s расшифрован chars=%d", series, len(text))
+    return text
+
+
 def maybe_route_to_digest_reply(
     token: str, chat_id: Optional[int], msg: dict[str, Any]
 ) -> bool:
@@ -1276,8 +1333,9 @@ def maybe_route_to_digest_reply(
     Разбор:
       • текст с однозначным статусом → `pending_status_reply` (тот же sidecar Ф2, второго
         канала статусов нет) → ack;
-      • голос/аудио → подсказка «напишите текстом» (статус-канал текст-only, Ф5; голос
-        транскрибируется в listener НИЖЕ по потоку, уже после роутов — сюда не доедет);
+      • голос/аудио под флагом `ENABLE_DIGEST_VOICE_REPLY` (Ф5) → транскрибируем и гоним
+        расшифровку тем же путём, что текст (мульти-статус Ф2 + ординал Ф4); OFF / STT
+        пусто → подсказка (не молчим — 6.2);
       • текст без статуса / не резолвится конкретный висяк → подсказка, как ответить.
 
     Опасная тройка: НЕ логируем текст reply/висяков — только серию, код статуса, исход.
@@ -1288,12 +1346,17 @@ def maybe_route_to_digest_reply(
     if not series:
         return False  # не reply на дайджест — не наш путь
     if msg.get("voice") or msg.get("audio"):
-        send_message(token, chat_id, DIGEST_VOICE_HINT, reply_to=msg.get("message_id"))
-        logger.info("[morning-digest] голос-reply на дайджест series=%s → подсказка", series)
-        return True
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return True  # стикер/фото на дайджест — молча жуём, отвечать не на что
+        # Ф5 (REQ 6.1-6.3): под флагом ENABLE_DIGEST_VOICE_REPLY (дефолт-OFF ради
+        # офлайн-тестов, на проде =1 сразу — Гейт 2 Q2) голос ТРАНСКРИБИРУЕТСЯ и идёт
+        # ДАЛЬШЕ тем же путём, что текст (мульти-статус Ф2 + ординал Ф4). OFF / STT
+        # пусто → подсказка уже отправлена внутри, выходим (не молчим — 6.2).
+        text = _digest_voice_to_text_or_hint(token, chat_id, series, msg)
+        if text is None:
+            return True
+    else:
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return True  # стикер/фото на дайджест — молча жуём, отвечать не на что
     try:
         from notary.lib import pending_status_reply  # noqa: PLC0415
         # Подсказку даём, только если человек ПЫТАЛСЯ дать статус (есть статус-маркер).
