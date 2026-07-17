@@ -368,6 +368,16 @@ def looks_like_multi_status(reply_text) -> bool:
         return True                              # перечисление через «;»
     if len(t) >= 400 and t.count(",") >= 3:
         return True                              # длинный однострочник-перечисление
+    # Ф4: ≥2 РАЗНЫХ ординала в одной строке («первая — сделана, вторая — в работе») —
+    # тоже пачка. Без сплиттера `detect_status_intent` взял бы ОДИН финальный статус, а
+    # `detect_ordinals` увидел бы конфликт чисел → оба потерялись бы. Детерминированно,
+    # БЕЗ сети (lazy-import, без цикла: pending_status_reply нас не импортирует).
+    try:
+        from . import pending_status_reply  # noqa: PLC0415
+        if len(pending_status_reply.detect_ordinals(t)) >= 2:
+            return True
+    except Exception:  # noqa: BLE001 — детект ординалов best-effort, гейт не валим
+        pass
     return False
 
 

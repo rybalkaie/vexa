@@ -1163,8 +1163,31 @@ DIGEST_BATCH_UNPARSED_HINT = (
 )
 
 
+def _reply_open_tasks_snapshot(series_dir, msg: dict[str, Any]) -> Optional[list]:
+    """Ф4 (RISK4/A15): нумерованный СЛЕПОК висяков ОТВЕЧАЕМОГО документа по его
+    message_id (`reply_to`). Ординал резолвится против слепка ИМЕННО того сообщения, на
+    которое reply (дайджест ИЛИ конкретная версия протокола) — читатель
+    `series_memory.open_tasks_snapshot_for_message`. Нет слепка (сообщение до Ф3 /
+    reissue-версия без снапшота, FU-4) → None: ординал недоступен, матчинг идёт overlap'ом
+    как до Ф4 (honest-остаток). Best-effort — любой сбой → None (ординал просто не активен).
+    """
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return None
+    mid = reply_to.get("message_id")
+    if mid is None:
+        return None
+    try:
+        from notary.lib import series_memory  # noqa: PLC0415
+        return series_memory.open_tasks_snapshot_for_message(series_dir, mid)
+    except Exception as e:  # noqa: BLE001 — резолв слепка best-effort, ординал не активен
+        logger.debug("[ordinal] snapshot lookup failed (non-fatal): %s", type(e).__name__)
+        return None
+
+
 def _apply_digest_status_batch(
-    token: str, chat_id: int, series: str, text: str, msg: dict[str, Any]
+    token: str, chat_id: int, series: str, text: str, msg: dict[str, Any],
+    *, snapshot: Optional[list] = None,
 ) -> bool:
     """Ф2 (ISS-36 случай А): ПАЧКА статусов ответом на дайджест — применяет ВСЕ,
     честно перечисляет остаток кратким структурным ack. Общий status-loop
@@ -1217,6 +1240,7 @@ def _apply_digest_status_batch(
     def _apply_one(seg):
         return pending_status_reply.apply_status_reply(
             seg, series_dir, date=_reply_date_str(msg), source="digest-reply",
+            snapshot=snapshot,
         )
 
     loop = mixed_reply_split.run_status_loop(status_segments, _apply_one)
@@ -1280,14 +1304,19 @@ def maybe_route_to_digest_reply(
         if pending_status_reply.detect_status_intent(text) is None:
             logger.info("[morning-digest] reply без статус-маркера series=%s → молчим", series)
             return True
+        # Ф4: слепок нумерации ОТВЕЧАЕМОГО дайджеста (по reply_to message_id) — против
+        # него резолвится ординал («первая», «задача 3»). Нет слепка → None (overlap).
+        series_dir = _protokol_root() / series
+        snapshot = _reply_open_tasks_snapshot(series_dir, msg)
         # Ф2 (ISS-36 случай А): ПАЧКА статусов одним reply под флагом
         # ENABLE_MIXED_REPLY_SPLIT. Одиночный статус сюда НЕ заходит (fast-path
         # внутри, REQ 2.3) → идём обычным одиночным apply ниже. Пачку — обработали и
         # вышли (True). OFF → тоже вниз, одиночным (обратная совместимость).
-        if _apply_digest_status_batch(token, chat_id, series, text, msg):
+        if _apply_digest_status_batch(token, chat_id, series, text, msg, snapshot=snapshot):
             return True
         result = pending_status_reply.apply_status_reply(
-            text, _protokol_root() / series, date=_reply_date_str(msg), source="digest-reply",
+            text, series_dir, date=_reply_date_str(msg), source="digest-reply",
+            snapshot=snapshot,
         )
     except Exception as e:  # noqa: BLE001 — обработка статуса не должна валить listener
         logger.exception("[morning-digest] обработка reply на дайджест упала: %s", e)
@@ -1345,9 +1374,13 @@ def maybe_route_to_pending_status_reply(
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
     series_dir = _protokol_root() / series
+    # Ф4: слепок нумерации ИМЕННО той версии протокола, на которую reply (по message_id) —
+    # ординал резолвится против него (Гейт 2 Q1). Нет слепка → None (overlap как до Ф4).
+    snapshot = _reply_open_tasks_snapshot(series_dir, msg)
     try:
         result = pending_status_reply.apply_status_reply(
             text, series_dir, date=_reply_date_str(msg), source="reply",
+            snapshot=snapshot,
         )
     except Exception as e:  # noqa: BLE001 — обработка статуса не должна валить listener
         logger.exception("[pending-status] обработка reply упала: %s", e)
@@ -1427,11 +1460,16 @@ def maybe_route_to_mixed_reply(
     n_edits = len(split["edits"])
     unclear = split["unclear"]
 
+    # Ф4: слепок нумерации отвечаемой версии протокола (по message_id) — ординал резолвится
+    # против него на mixed-пути тоже (A15). Нет слепка → None (overlap как до Ф4).
+    snapshot = _reply_open_tasks_snapshot(series_dir, msg)
+
     # 1) Статусы — общий status-loop (РИСК4): один вызов резолвит ОДИН висяк, поэтому
     #    сегмент-на-статус + цикл = все статусы. Тот же хелпер, что у digest-роута (KODE1).
     def _apply_one(seg):
         return pending_status_reply.apply_status_reply(
             seg, series_dir, date=_reply_date_str(msg), source="mixed-reply",
+            snapshot=snapshot,
         )
 
     loop = mixed_reply_split.run_status_loop(status_segments, _apply_one)

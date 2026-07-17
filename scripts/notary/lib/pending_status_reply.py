@@ -349,6 +349,128 @@ def match_pending_item(reply_text: str, items: list) -> Optional[str]:
     return winners[0] if len(winners) == 1 else None
 
 
+# ── Ординал-матчинг (Ф4, ISS-36 REQ 7.1/7.3): ссылка на висяк по НОМЕРУ/ПОРЯДКУ ─
+# «первая — сделана», «задача 3 — снимаем», «п.1», «закрой третью». Резолвится ПРОТИВ
+# СЛЕПКА нумерованного списка ИМЕННО отвечаемого документа (дайджест ИЛИ конкретная
+# версия протокола — по `reply_to` message_id; снимок пишет Ф3), НЕ против live-порядка:
+# так «первая» = пункт №1 в ТОМ сообщении, на которое отвечают, без дрейфа за утро/между
+# перевыпусками (A14/A15). Детерминированно, БЕЗ сети (A12/RISK7 — не только именительный).
+
+# Порядковые слова 1..10 в РАЗНЫХ падежах/родах (после ё→е). Единственное число —
+# множественные («первые/первых») НАМЕРЕННО не включены: «в первых числах» — идиома, не
+# ссылка на пункт (ложный ординал = ложное закрытие чужой задачи, R16). Whole-word lookup.
+_ORDINAL_WORD_FORMS = {
+    1:  ("первая", "первый", "первое", "первую", "первым", "первом", "первого", "первой"),
+    2:  ("вторая", "второй", "второе", "вторую", "вторым", "втором", "второго"),
+    3:  ("третья", "третий", "третье", "третью", "третьим", "третьем", "третьего", "третьей"),
+    4:  ("четвертая", "четвертый", "четвертое", "четвертую", "четвертым",
+         "четвертом", "четвертого", "четвертой"),
+    5:  ("пятая", "пятый", "пятое", "пятую", "пятым", "пятом", "пятого", "пятой"),
+    6:  ("шестая", "шестой", "шестое", "шестую", "шестым", "шестом", "шестого"),
+    7:  ("седьмая", "седьмой", "седьмое", "седьмую", "седьмым", "седьмом", "седьмого"),
+    8:  ("восьмая", "восьмой", "восьмое", "восьмую", "восьмым", "восьмом", "восьмого"),
+    9:  ("девятая", "девятый", "девятое", "девятую", "девятым", "девятом", "девятого", "девятой"),
+    10: ("десятая", "десятый", "десятое", "десятую", "десятым", "десятом", "десятого", "десятой"),
+}
+_ORDINAL_WORD_TO_POS = {w: n for n, forms in _ORDINAL_WORD_FORMS.items() for w in forms}
+
+# Числительные словом 1..10 (для «задачу три» — число словом, RISK7; нормализация
+# «3»↔«три» = одна и та же позиция). Матчатся ТОЛЬКО после ключа (задача/пункт/вопрос/
+# номер) — «на три дня» ординалом не станет.
+_CARDINAL_WORD_TO_NUM = {
+    "один": 1, "одна": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+    "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10,
+}
+_CARD_ALT = "|".join(sorted(_CARDINAL_WORD_TO_NUM, key=len, reverse=True))
+
+# Ключ-слово перед НОМЕРОМ цифрой: «задача 3» / «пункт 3» / «вопрос 3» / «п.1» / «№3».
+# Захватываем и перечисление после ключа («задачи 3 и 5», «пункты 1, 2») — оно
+# keyword-anchored, поэтому «с 3 и 5 числа» (без ключа) ординалом НЕ станет (защита от дат/
+# кварталов). Несколько чисел → у caller'а неоднозначность (A13).
+_NUM_KEYWORD = r"(?:\bзадач\w*|\bпункт\w*|\bвопрос\w*|\bномер\w*|\bп\.?|№)"
+_KEYWORD_DIGIT_RE = re.compile(
+    _NUM_KEYWORD + r"\s*№?\s*(\d+(?:\s*(?:,|\bи\b|;)\s*\d+)*)", re.IGNORECASE)
+_DIGIT_RE = re.compile(r"\d+")
+# Ключ-слово + число СЛОВОМ: «задачу три». Требует ключ+пробел (не «п»/«№»: «п три» — шум).
+_KEYWORD_CARD_RE = re.compile(
+    r"(?:\bзадач\w*|\bпункт\w*|\bвопрос\w*|\bномер\w*)\s+(" + _CARD_ALT + r")\b",
+    re.IGNORECASE,
+)
+# Лидирующий номер сегмента: «3. …» / «1) …». Дата НЕ ловится: после точки/скобки не
+# цифра (иначе «15.07 …» дало бы ложный ординал 15).
+_LEADING_NUM_RE = re.compile(r"^\s*(\d+)\s*[.)](?!\d)")
+_ORDINAL_TOKEN_RE = re.compile(r"[a-zа-я0-9]+")
+
+
+def detect_ordinals(text: str) -> set:
+    """Множество РАЗЛИЧНЫХ позиций (1-based), на которые сегмент ссылается по номеру/
+    порядку. Пусто = явного ординала нет. ДЕТЕРМИНИРОВАННО, БЕЗ сети (A12/RISK7):
+      • порядковые слова «первая…десятая» в любом падеже/роде (косвенные тоже);
+      • «задача N» / «пункт N» / «вопрос N» / «п.N» / «№N» (цифра);
+      • «задачу три» и т.п. (число словом, только после ключа) — нормализация «3»↔«три»;
+      • лидирующий «N.» / «N)» сегмента (не дата).
+    Несколько РАЗНЫХ чисел (напр. «задачи 3 и 5») → множество размера ≥2 → у caller'а
+    это неоднозначность (A13). Опасная тройка: текст не логируем."""
+    if not text:
+        return set()
+    t = _norm(text)  # lower, ё→е (тот же _norm, что matcher)
+    found: set = set()
+    for tok in _ORDINAL_TOKEN_RE.findall(t):
+        pos = _ORDINAL_WORD_TO_POS.get(tok)
+        if pos is not None:
+            found.add(pos)
+    for m in _KEYWORD_DIGIT_RE.finditer(t):
+        for num in _DIGIT_RE.findall(m.group(1)):
+            try:
+                n = int(num)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                found.add(n)
+    for m in _KEYWORD_CARD_RE.finditer(t):
+        n = _CARDINAL_WORD_TO_NUM.get(m.group(1))
+        if n:
+            found.add(n)
+    lead = _LEADING_NUM_RE.match(t)
+    if lead:
+        try:
+            n = int(lead.group(1))
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            found.add(n)
+    return found
+
+
+def _resolve_ordinal_target(reply_text: str, snapshot) -> tuple:
+    """Ф4: резолв ординала сегмента ПРОТИВ СЛЕПКА отвечаемого документа. Кортеж
+    `(verdict, key_text)`:
+      • ('none', None)       — ординала нет ИЛИ слепка нет → идём overlap-путём как до
+                               Ф4 (нет слепка = ординал НЕДОСТУПЕН, поведение прежнее;
+                               honest-остаток даст overlap, A14 — миграции нет);
+      • ('unresolved', None) — ординал+слепок есть, но несколько РАЗНЫХ чисел (A13) ИЛИ
+                               номер ВНЕ диапазона слепка (A13) → честный остаток, НЕ
+                               угадываем overlap'ом (явная ссылка сильнее размытого имени);
+      • ('match', key_text)  — однозначный ординал N → ПОЛНЫЙ key-текст `snapshot[N-1]`
+                               (по нему сразу ключует `set_task_status`, RISK2 закрыт на
+                               записи Ф3 — обратная сборка не нужна).
+    """
+    ords = detect_ordinals(reply_text)
+    if not ords:
+        return ("none", None)                # ординала нет → overlap
+    if not isinstance(snapshot, list):
+        return ("none", None)                # слепка нет (старое сообщение / reissue) → overlap
+    if len(ords) > 1:
+        return ("unresolved", None)          # несколько разных чисел → неоднозначно (A13)
+    n = next(iter(ords))
+    if not (1 <= n <= len(snapshot)):
+        return ("unresolved", None)          # вне диапазона слепка (A13)
+    key_text = snapshot[n - 1]
+    if not isinstance(key_text, str) or not key_text.strip():
+        return ("unresolved", None)          # позиция пуста/битая → честный остаток
+    return ("match", key_text)
+
+
 # ── Опциональный LLM-ярус подтверждения интента (A9) — ДЕФОЛТ-OFF ────────────
 # Детерминированный детектор уже консервативен; LLM-ярус — ДОПОЛНИТЕЛЬНЫЙ предохра-
 # нитель, который может ТОЛЬКО отозвать кандидата обратно в правки (veto), но НИКОГДА
@@ -502,14 +624,22 @@ def apply_status_reply(
     source: str = "reply",
     participants: Optional[list] = None,
     classify_fn=None,
+    snapshot: Optional[list] = None,
 ) -> Optional[dict]:
     """Распознать статус-reply и проставить статус висяка в sidecar Ф2. Возвращает
     `{label, status, matched, ack}` при успехе или None, если это не однозначный
     статус-reply (→ listener отдаёт шлюзу правок, не перехватываем — A9).
 
-    Шаги: детект интента → резолв ОДНОГО висяка по тексту → (опц. LLM-vetо) →
-    `set_task_status`. Опасная тройка: НЕ логируем тексты — только коды/счётчики.
-    `classify_fn(reply, items, participants)` инъектируется тестами вместо LLM.
+    Шаги: детект интента → резолв ОДНОГО висяка (ординал ПРИОРИТЕТНЕЕ overlap) →
+    (опц. LLM-vetо) → `set_task_status`. Опасная тройка: НЕ логируем тексты — только
+    коды/счётчики. `classify_fn(reply, items, participants)` инъектируется тестами.
+
+    Ф4 (REQ 7.1/7.3): `snapshot` — нумерованный слепок висяков ОТВЕЧАЕМОГО документа
+    (позиция N → полный key-текст `snapshot[N-1]`; читатель
+    `series_memory.open_tasks_snapshot_for_message`). Явная ссылка по номеру/порядку
+    («первая», «задача 3») резолвится ПРОТИВ него и приоритетнее overlap. `snapshot=None`
+    (сообщение до Ф3 / reissue-версия) → ординал недоступен, матчинг идёт overlap'ом как
+    до Ф4 — фаза чисто аддитивна.
     """
     if not reply_text or not reply_text.strip():
         return None
@@ -518,19 +648,34 @@ def apply_status_reply(
     label = detect_status_intent(reply_text)
     if label is None:
         return None  # нет статус-маркера → это не наш путь (правки/уточнения)
-    items = load_series_pending(series_dir)
-    if not items:
-        logger.info("[pending-status] статус-маркер есть, но висяков серии нет → пропуск")
-        return None
-    matched = match_pending_item(reply_text, items)
-    if matched is None:
+    # Ф4: явная ссылка по номеру/порядку ПРИОРИТЕТНЕЕ overlap и резолвится ПРОТИВ СЛЕПКА
+    # отвечаемого документа (RISK4/A15). Слепка нет → ординал недоступен, идём overlap.
+    ord_verdict, ord_matched = _resolve_ordinal_target(reply_text, snapshot)
+    if ord_verdict == "unresolved":
         logger.info(
-            "[pending-status] не резолвится конкретный висяк (label=%s items=%d) → отдаём правкам",
-            label, len(items),
+            "[pending-status] ординал есть, но не резолвится (label=%s) → честный остаток",
+            label,
         )
         return None
+    items = None
+    if ord_verdict == "match":
+        matched = ord_matched  # ординал сильнее overlap (A13); key-текст готов к записи
+    else:  # 'none' → overlap-путь как до Ф4
+        items = load_series_pending(series_dir)
+        if not items:
+            logger.info("[pending-status] статус-маркер есть, но висяков серии нет → пропуск")
+            return None
+        matched = match_pending_item(reply_text, items)
+        if matched is None:
+            logger.info(
+                "[pending-status] не резолвится конкретный висяк (label=%s items=%d) → отдаём правкам",
+                label, len(items),
+            )
+            return None
     # Опциональный LLM-предохранитель (дефолт-OFF): может ТОЛЬКО отозвать в правки.
     if is_intent_llm_enabled():
+        if items is None:  # ординал-путь: список висяков для vetо ещё не грузили
+            items = load_series_pending(series_dir)
         verdict = (classify_fn or classify_reply_intent_llm)(reply_text, items, participants)
         if verdict == "edit":
             logger.info("[pending-status] LLM-vetо: интент=edit → отдаём правкам (label=%s)", label)
@@ -547,8 +692,9 @@ def apply_status_reply(
     if rec is None:
         return None
     logger.info(
-        "[pending-status] статус проставлен label=%s status=%s items=%d llm=%s",
-        label, sm_status, len(items), "on" if is_intent_llm_enabled() else "off",
+        "[pending-status] статус проставлен label=%s status=%s via=%s llm=%s",
+        label, sm_status, "ordinal" if ord_verdict == "match" else "overlap",
+        "on" if is_intent_llm_enabled() else "off",
     )
     return {"label": label, "status": sm_status, "matched": matched,
             "ack": _ack_with_item(label, matched)}
