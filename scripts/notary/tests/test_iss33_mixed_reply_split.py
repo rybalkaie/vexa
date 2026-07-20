@@ -434,5 +434,44 @@ class TestMixedRoute(_SeriesBase):
             self.assertFalse(ml.maybe_route_to_mixed_reply("tok", self.GROUP, self.OWNER, msg))
 
 
+class TestSplitTimeoutConfig(unittest.TestCase):
+    """R3/FU-8: таймаут сплиттера настраивается env `MIXED_REPLY_SPLIT_TIMEOUT`, прод ≥120с.
+    Реальный сплит пачки ~25 задач ≈57с; прежние 30с ловили ClaudeCliTimeout → пачка не
+    разбиралась. Чтение динамическое — `mock.patch.dict` без `importlib.reload`."""
+
+    def _clean_env(self):
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        os.environ.pop("MIXED_REPLY_SPLIT_TIMEOUT", None)
+        self.addCleanup(env.stop)
+
+    def test_default_is_120_prod_floor(self):
+        self._clean_env()
+        self.assertEqual(mrs._split_timeout(), 120)
+        self.assertGreaterEqual(mrs._split_timeout(), 120)  # прод ≥120с
+
+    def test_env_override_respected(self):
+        with mock.patch.dict(os.environ, {"MIXED_REPLY_SPLIT_TIMEOUT": "200"}):
+            self.assertEqual(mrs._split_timeout(), 200)
+
+    def test_garbage_env_falls_back_to_default(self):
+        for bad in ("", "abc", "0", "-5"):
+            with mock.patch.dict(os.environ, {"MIXED_REPLY_SPLIT_TIMEOUT": bad}):
+                self.assertEqual(mrs._split_timeout(), 120, bad)
+
+    def test_request_split_passes_dynamic_timeout_to_cli(self):
+        # Интеграция: env → фактический timeout, переданный в claude_cli (offline, стаб CLI).
+        captured = {}
+
+        def _fake_call(user_prompt, *, system, timeout, model):
+            captured["timeout"] = timeout
+            return '{"statuses": [], "edits": [], "unclear": []}'
+
+        with mock.patch.dict(os.environ, {"MIXED_REPLY_SPLIT_TIMEOUT": "175"}), \
+             mock.patch("notary.lib.claude_cli.call_claude_print", side_effect=_fake_call):
+            mrs._request_split("любой reply", ["висяк"])
+        self.assertEqual(captured["timeout"], 175)
+
+
 if __name__ == "__main__":
     unittest.main()

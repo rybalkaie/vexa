@@ -86,10 +86,11 @@ NOTARY_DIR = THIS_DIR.parent
 SCRIPTS_DIR = NOTARY_DIR.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-# Таймаут LLM-сплиттера читается на ИМПОРТЕ mixed_reply_split (`_SPLIT_TIMEOUT`, дефолт
-# 30с). Реальная пачка ~25 задач расщепляется дольше (замер — ~57с), поэтому для процесса
-# ИНСТРУМЕНТА поднимаем дефолт ДО импорта (setdefault — владелец может переопределить
-# своим env). Иначе владелец на большой пачке словил бы ClaudeCliTimeout → «не разобрал».
+# Таймаут LLM-сплиттера читается ДИНАМИЧЕСКИ (`mixed_reply_split._split_timeout()`, дефолт
+# 120с, R3/FU-8). Реальная пачка ~25 задач расщепляется дольше (замер — ~57с) и инструмент
+# гоняют вручную на самых больших пачках, поэтому для процесса ИНСТРУМЕНТА поднимаем ещё
+# выше — 240с (setdefault — владелец может переопределить своим env). Динамическое чтение
+# делает `setdefault` независимым от порядка импорта.
 os.environ.setdefault("MIXED_REPLY_SPLIT_TIMEOUT", "240")
 
 from notary.lib import mixed_reply_split as _mrs  # noqa: E402

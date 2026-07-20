@@ -1202,6 +1202,25 @@ try:
 except ValueError:
     PROTOCOL_GEN_TIMEOUT = 600
 
+
+def _protocol_retry_timeout(base_timeout: int) -> int:
+    """R25/ISS-42: ЯВНО увеличенный лимит для ОДНОГО авто-ретрая генерации протокола
+    после ТАЙМАУТА. ISS-42: модель на VPS упёрлась в 600с (Opus и Sonnet оба), а ручной
+    перезапуск с 30-мин лимитом собрал протокол — значит нужен просто запас по времени,
+    не другой класс ошибки. Дефолт ретрая = 1.5× базового (30 мин → 45 мин, как в REQ);
+    пол — базовый лимит (ретрай не короче исходной попытки). Env
+    `PROTOCOL_GEN_RETRY_TIMEOUT` задаёт абсолютное значение в секундах. Читается
+    ДИНАМИЧЕСКИ (тесту не нужен `importlib.reload`)."""
+    raw = (os.environ.get("PROTOCOL_GEN_RETRY_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return max(v, base_timeout)
+        except ValueError:
+            pass
+    return max(int(base_timeout * 1.5), base_timeout)
+
 # Ф2 (ISS-31 REQ 31.3): дефолт thinking-бюджета генерации протокола. Спайк Ф2
 # (реальные вызовы `claude --print --output-format stream-json` + справочные
 # строки самого CLI-бинаря про `budget_tokens`) подтвердил рычаг РАБОЧИЙ как
@@ -1903,11 +1922,11 @@ def generate_protocol(
     # `_protocol_thinking_budget()`/`NOTARY_PROTOCOL_MAX_THINKING_TOKENS`.
     thinking_budget = _protocol_thinking_budget()
 
-    def _call(model: str, *, budget: Optional[int]):
+    def _call(model: str, *, budget: Optional[int], call_timeout: Optional[int] = None):
         return call_claude_print_stream_json(
             user_prompt,
             system=system_prompt,
-            timeout=timeout,
+            timeout=call_timeout if call_timeout is not None else timeout,
             model=model,
             max_thinking_tokens=budget,
         )
@@ -1920,39 +1939,41 @@ def generate_protocol(
             "`claude` CLI не найден в PATH — генерация протокола невозможна"
         ) from e
     except ClaudeCliTimeout as e:
+        # R25/ISS-42: таймаут генерации НЕ роняет протокол «в один заход». ОДИН авто-ретрай
+        # с ЯВНО увеличенным лимитом (`_protocol_retry_timeout`, дефолт 1.5× → 45 мин от
+        # базовых 30) ДО того как ошибка дойдёт до caller'а — finalize шлёт алерт владельцу
+        # ТОЛЬКО на проброшенный `ProtocolGenerationError`, значит алерт уходит лишь ПОСЛЕ
+        # повторного провала. Ретрай — по резервной модели (Sonnet, быстрее); фолбэк
+        # выключен/совпадает с основной → по ТОЙ ЖЕ модели с бОльшим лимитом (ISS-42:
+        # обе модели упёрлись в 600с, а ручной перезапуск с 30-мин лимитом собрал — проблема
+        # во ВРЕМЕНИ, не в модели). ЕДИНЫЙ ВЛАДЕЛЕЦ РЕТРАЯ (РАЗМ5): делиберат-ретрай живёт
+        # ЗДЕСЬ, в generate_protocol; collector-тик (перепрогон finalize раз в 5 мин, пока WAV
+        # жив) — грубая страховка от падения процесса, а НЕ второй авто-ретрай (ретрай в
+        # collector/finalize НЕ добавляем) → двойного авто-повтора/алерта нет.
         fallback = PROTOCOL_GEN_FALLBACK_MODEL
-        if not fallback or fallback == primary_model:
-            # Фолбэк выключен/совпадает с основной → не тихий None, а понятный
-            # отказ (caller перегенерирует позже). Лог — только метаданные.
-            logger.warning(
-                "[protocol] timeout meeting=%s model=%s timeout=%ds (фолбэка нет)",
-                meeting_sid or "?", primary_model, timeout,
-            )
-            _emit_run_log("failed", model=primary_model, reason="timeout")
-            raise ProtocolGenerationError(
-                f"claude --print timeout (модель {primary_model}, {timeout}s): {e}"
-            ) from e
+        retry_timeout = _protocol_retry_timeout(timeout)
+        retry_model = fallback if (fallback and fallback != primary_model) else primary_model
         logger.warning(
-            "[protocol] degraded meeting=%s reason=timeout primary=%s fallback=%s timeout=%ds",
-            meeting_sid or "?", primary_model, fallback, timeout,
+            "[protocol] degraded meeting=%s reason=timeout primary=%s timeout=%ds "
+            "→ авто-ретрай model=%s timeout=%ds (R25)",
+            meeting_sid or "?", primary_model, timeout, retry_model, retry_timeout,
         )
-        # Деградация: основная модель таймаутнула, идём на резервную (Sonnet).
-        _emit_run_log("degraded", model=fallback, reason="primary-timeout")
+        # Модель-нейтральный маркер деградации (primary мог быть переопределён env).
+        _emit_run_log("degraded", model=retry_model, reason="primary-timeout")
         try:
-            stream = _call(fallback, budget=thinking_budget)
+            stream = _call(retry_model, budget=thinking_budget, call_timeout=retry_timeout)
         except ClaudeCliError as e2:
             logger.warning(
-                "[protocol] fallback failed meeting=%s model=%s error=%s",
-                meeting_sid or "?", fallback, str(e2)[:200],
+                "[protocol] авто-ретрай после таймаута тоже упал meeting=%s model=%s "
+                "timeout=%ds error=%s",
+                meeting_sid or "?", retry_model, retry_timeout, str(e2)[:200],
             )
-            _emit_run_log("failed", model=fallback, reason="fallback-failed")
+            _emit_run_log("failed", model=retry_model, reason="timeout-retry-failed")
             raise ProtocolGenerationError(
-                f"claude --print (фолбэк {fallback}): {e2}"
+                f"claude --print таймаут ({primary_model}, {timeout}s) + авто-ретрай "
+                f"({retry_model}, {retry_timeout}s): {e2}"
             ) from e2
-        model_used = fallback
-        # Модель-нейтральный маркер: primary мог быть переопределён через env
-        # (PROTOCOL_GEN_MODEL) — «opus» в значении лога ввёл бы в заблуждение.
-        # Сама модель, что таймаутнула, логируется рядом (primary=%s выше).
+        model_used = retry_model
         degraded_reason = "primary-timeout"
     except ClaudeCliError as e:
         logger.warning(

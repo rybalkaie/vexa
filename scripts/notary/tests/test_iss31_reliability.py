@@ -177,6 +177,85 @@ class RetryOnTruncationTest(_TmpRunLogMixin, unittest.TestCase):
         self.assertIn("event=ok-after-retry", content)  # ретрай спас встречу
 
 
+# ───────────── R25 / ISS-42: авто-ретрай генерации при ТАЙМАУТЕ с бОльшим лимитом ─────────────
+
+
+class TimeoutRetryBiggerLimitTest(_TmpRunLogMixin, unittest.TestCase):
+    """R25 (ISS-42): таймаут сборки протокола НЕ роняет протокол целиком. ОДИН авто-ретрай
+    с ЯВНО увеличенным лимитом ДО алерта владельцу; алерт (проброс ProtocolGenerationError
+    в finalize) — только после ПОВТОРНОГО провала. Единый владелец ретрая — generate_protocol
+    (РАЗМ5): collector/finalize второй авто-ретрай не добавляют."""
+
+    def test_retry_timeout_default_is_one_and_half_x(self):
+        # REQ: «45 мин от базовых 30» = 1.5×.
+        self.assertEqual(lp._protocol_retry_timeout(1800), 2700)
+        self.assertEqual(lp._protocol_retry_timeout(600), 900)
+
+    def test_retry_timeout_env_override_absolute(self):
+        with mock.patch.dict(os.environ, {"PROTOCOL_GEN_RETRY_TIMEOUT": "3600"}):
+            self.assertEqual(lp._protocol_retry_timeout(1800), 3600)
+
+    def test_retry_timeout_floor_is_base_and_garbage_defaults(self):
+        # Ретрай не короче исходной попытки даже при заниженном env.
+        with mock.patch.dict(os.environ, {"PROTOCOL_GEN_RETRY_TIMEOUT": "100"}):
+            self.assertEqual(lp._protocol_retry_timeout(600), 600)
+        for bad in ("", "abc", "0", "-5"):
+            with mock.patch.dict(os.environ, {"PROTOCOL_GEN_RETRY_TIMEOUT": bad}):
+                self.assertEqual(lp._protocol_retry_timeout(600), 900, bad)
+
+    def test_timeout_retries_with_bigger_limit_and_recovers(self):
+        # 1-я попытка таймаутит → авто-ретрай с УВЕЛИЧЕННЫМ лимитом собирает протокол.
+        # Алерта нет (не бросили), встреча спасена.
+        calls = [ClaudeCliTimeout("основная упёрлась в лимит"), _stream(_FULL_PROTOCOL)]
+        with mock.patch.object(
+            lp, "call_claude_print_stream_json", side_effect=calls,
+        ) as mocked:
+            out = lp.generate_protocol(
+                _TRANSCRIPT, _META, method_text="М", meeting_sid="r25-ok-sid",
+            )
+        self.assertEqual(mocked.call_count, 2, "таймаут + РОВНО один авто-ретрай")
+        first_call, retry_call = mocked.call_args_list
+        base_timeout = first_call.kwargs["timeout"]
+        self.assertEqual(
+            retry_call.kwargs["timeout"], lp._protocol_retry_timeout(base_timeout),
+            "ретрай идёт с ЯВНО увеличенным лимитом",
+        )
+        self.assertGreater(retry_call.kwargs["timeout"], base_timeout)
+        self.assertTrue(out.startswith("#протоколвстречи"))
+        content = self._log_content("r25-ok-sid")
+        self.assertIn("reason=primary-timeout", content)
+
+    def test_timeout_retry_also_fails_raises_for_alert(self):
+        # И ретрай упёрся в (больший) лимит → проброс ошибки → finalize шлёт алерт.
+        calls = [ClaudeCliTimeout("основная"), ClaudeCliTimeout("и ретрай тоже")]
+        with mock.patch.object(
+            lp, "call_claude_print_stream_json", side_effect=calls,
+        ) as mocked:
+            with self.assertRaises(lp.ProtocolGenerationError):
+                lp.generate_protocol(
+                    _TRANSCRIPT, _META, method_text="М", meeting_sid="r25-fail-sid",
+                )
+        self.assertEqual(mocked.call_count, 2, "ровно один авто-ретрай, затем честный отказ")
+        content = self._log_content("r25-fail-sid")
+        self.assertIn("reason=timeout-retry-failed", content)
+
+    def test_retry_holds_even_without_fallback_model(self):
+        # Фолбэк выключен → авто-ретрай всё равно есть (та же модель, бОльший лимит):
+        # ISS-42 — проблема во ВРЕМЕНИ, не в модели. R25 держится независимо от фолбэка.
+        calls = [ClaudeCliTimeout("primary"), _stream(_FULL_PROTOCOL)]
+        with mock.patch.object(lp, "PROTOCOL_GEN_FALLBACK_MODEL", ""), \
+             mock.patch.object(
+                 lp, "call_claude_print_stream_json", side_effect=calls) as mocked:
+            out = lp.generate_protocol(
+                _TRANSCRIPT, _META, method_text="М", meeting_sid="r25-nofb-sid",
+            )
+        self.assertEqual(mocked.call_count, 2)
+        first_call, retry_call = mocked.call_args_list
+        self.assertEqual(first_call.kwargs["model"], retry_call.kwargs["model"])  # та же модель
+        self.assertGreater(retry_call.kwargs["timeout"], first_call.kwargs["timeout"])
+        self.assertTrue(out.startswith("#протоколвстречи"))
+
+
 # ──────────────────── REQ 31.2 / A9: stop_reason=max_tokens ────────────────────
 
 

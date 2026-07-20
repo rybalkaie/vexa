@@ -76,7 +76,28 @@ _MAX_NAMES_PER_GROUP = int(os.environ.get("MIXED_REPLY_ACK_NAMES_PER_GROUP", "6"
 # Модель — Haiku (A2), как маппинг имён / классификаторы. Дешёвая, задача структурная.
 _SPLIT_MODEL = (os.environ.get("MIXED_REPLY_SPLIT_MODEL") or "").strip() \
     or "claude-haiku-4-5-20251001"
-_SPLIT_TIMEOUT = int(os.environ.get("MIXED_REPLY_SPLIT_TIMEOUT", "30") or "30")
+
+# Таймаут LLM-сплиттера (R3/FU-8). Дефолт поднят 30→120с: реальный сплит большой пачки
+# (~25 задач у Михаила) занимает ~57с (замер Ф6), а прежние 30с ловили `ClaudeCliTimeout`
+# → пачка не разбиралась (честная деградация, но не автомат). 120с даёт запас и на протокол-,
+# и на digest-роут. Читается ДИНАМИЧЕСКИ (не модульной константой), чтобы (1) тесту хватало
+# `mock.patch.dict(os.environ,…)` без `importlib.reload`, (2) `setdefault` из reapply-инструмента
+# (240с) применялся независимо от порядка импорта. Env `MIXED_REPLY_SPLIT_TIMEOUT` переопределяет.
+_SPLIT_TIMEOUT_DEFAULT = 120
+
+
+def _split_timeout() -> int:
+    """Таймаут (сек) LLM-сплиттера из env `MIXED_REPLY_SPLIT_TIMEOUT`, дефолт 120
+    (прод ≥120с, R3/FU-8). Кривое значение → дефолт."""
+    raw = (os.environ.get("MIXED_REPLY_SPLIT_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _SPLIT_TIMEOUT_DEFAULT
 
 
 def is_enabled() -> bool:
@@ -245,7 +266,7 @@ def _request_split(
     try:
         raw = call_claude_print(
             user_prompt, system=SPLIT_SYSTEM_PROMPT,
-            timeout=timeout or _SPLIT_TIMEOUT, model=model or _SPLIT_MODEL,
+            timeout=timeout or _split_timeout(), model=model or _SPLIT_MODEL,
         )
     except ClaudeCliNotInstalled:
         logger.warning("[mixed-split] `claude` не в PATH — сплиттер пропущен")

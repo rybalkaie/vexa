@@ -326,6 +326,21 @@ class TestDigestRouteGuard(_Base):
         self.assertFalse(psr.looks_edit_heavy("юани закупили, вопрос закрыт"))
         self.assertFalse(psr.looks_edit_heavy("заменили поставщика, задача выполнена"))
 
+    def test_guard_recognises_past_tense_edit_markers(self):
+        """R2: маркеры правок в ПРОШЕДШЕМ времени («поправили/исправили/заменили»)
+        тоже собираются в edit-heavy (≥2 маркеров). Раньше ловилось только повелит./
+        инфинитив, а прошедшее проваливалось → пачка правок «мы уже поправили» не
+        распознавалась как правки и могла закрыть случайный висяк."""
+        from notary.lib import pending_status_reply as psr
+        # ≥2 маркеров в прошедшем времени → edit-heavy.
+        self.assertTrue(psr.looks_edit_heavy("поправили название, заменили сумму"))
+        self.assertTrue(psr.looks_edit_heavy("исправили дату и поправили имя спикера"))
+        self.assertTrue(psr.looks_edit_heavy("заменили Zil на Zeal, исправили цифру в п.3"))
+        self.assertTrue(psr.looks_edit_heavy("мы поправили абзац, а строку выше исправили"))
+        # Один маркер (даже прошедшего времени) — законный статус, НЕ перехватываем.
+        self.assertFalse(psr.looks_edit_heavy("поправил одно слово, задача закрыта"))
+        self.assertFalse(psr.looks_edit_heavy("исправили дату, вопрос отработан"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
