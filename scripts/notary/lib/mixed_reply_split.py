@@ -315,8 +315,83 @@ def split_reply(
     unclear = (unclear or "").strip()
     if len(unclear) > _MAX_UNCLEAR_LEN:
         unclear = unclear[:_MAX_UNCLEAR_LEN - 1].rstrip() + "…"
-    return {"status_segments": status_segments, "edits": edits, "unclear": unclear,
-            "n_status_raw": n_status_raw}
+    out = {"status_segments": status_segments, "edits": edits, "unclear": unclear,
+           "n_status_raw": n_status_raw}
+    # ISS-37: последний детерминированный фильтр — «статус», собранный из строки-правки,
+    # статусом не является (сплиттер недетерминирован, изредка выдаёт такой сегмент).
+    return reclassify_edit_origin_statuses(reply_text, out)
+
+
+def _best_origin_line(segment: str, lines: list) -> Optional[str]:
+    """Строка ИСХОДНОГО reply, из которой вероятнее всего собран сегмент.
+
+    Сплиттер сегменты ПЕРЕПИСЫВАЕТ, поэтому ищем по пересечению содержательных
+    токенов (тот же токенайзер, что у матчинга висяков — без служебных слов)."""
+    try:
+        from . import pending_status_reply as psr  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — модуль не грузится → происхождение не проверяем
+        return None
+    seg_tokens = psr._content_tokens(segment)
+    if not seg_tokens:
+        return None
+    best, best_score = None, 0
+    for ln in lines:
+        score = psr._overlap(seg_tokens, psr._content_tokens(ln))
+        if score > best_score:
+            best, best_score = ln, score
+    return best
+
+
+def reclassify_edit_origin_statuses(reply_text: str, split: dict) -> dict:
+    """ISS-37: статус-сегмент, ПОРОЖДЁННЫЙ строкой-правкой, — это правка, не статус.
+
+    Зачем. Сплиттер недетерминирован: на одном и том же сообщении Марии он то
+    возвращает `statuses=0` (верно), то выдаёт «статус» из строки
+    «Поправить — проекторы и клавиатуры приехали на склад в Москве, готовы к продаже».
+    Дальше `detect_status_intent` видит в сегменте «готовы» → LABEL_DONE, матчер
+    цепляет по словам «склад/проекторы» живую задачу и закрывает её. Именно так на
+    повторном прогоне закрылись две задачи, хотя в бою тот же текст дал 0 статусов.
+
+    Правило детерминированное и узкое: если сам сегмент ЛИБО породившая его строка
+    исходного reply несёт маркер правки («вместо», «правильно», «заменить»,
+    «поправить»), сегмент переезжает в `edits`. Так он не закроет задачу и при этом
+    не потеряется — уйдёт в петлю правок, чем он и является.
+
+    ISS-33 не регрессирует: законный статус («по задачам Новиковой: … закрыта,
+    отработана») маркеров правки не несёт и остаётся статусом.
+    """
+    st = split.get("status_segments") or []
+    if not st:
+        return split
+    try:
+        from . import pending_status_reply as psr  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return split
+    lines = [ln.strip() for ln in str(reply_text or "").splitlines() if ln.strip()]
+    # Происхождение проверяем ТОЛЬКО у многострочных reply, где строка — осмысленная
+    # единица. В однострочном «юани закупили, закрыто; и замените Zil на Zeal» вся
+    # реплика — одна строка, и маркер правки из её второй половины съел бы законный
+    # статус из первой (поймано регресс-тестом). Там судим лишь по самому сегменту.
+    check_origin = len(lines) >= 2
+    kept, moved = [], []
+    for seg in st:
+        seg_is_edit = bool(psr._EDIT_MARKER_RE.search(seg))
+        origin = _best_origin_line(seg, lines) if check_origin else None
+        origin_is_edit = bool(origin and psr._EDIT_MARKER_RE.search(origin))
+        (moved if (seg_is_edit or origin_is_edit) else kept).append(seg)
+    if not moved:
+        return split
+    logger.info(
+        "[mixed-split] статус-сегментов переведено в правки: %d из %d "
+        "(порождены строкой-правкой)", len(moved), len(st),
+    )
+    out = dict(split)
+    out["status_segments"] = kept
+    out["edits"] = list(split.get("edits") or []) + moved
+    # n_status_raw пересчитываем: переехавшие в правки статусами не были, иначе ack
+    # соврал бы «обработал N из M».
+    out["n_status_raw"] = max(0, int(split.get("n_status_raw") or len(st)) - len(moved))
+    return out
 
 
 def should_engage(split: Optional[dict]) -> bool:
@@ -324,11 +399,24 @@ def should_engage(split: Optional[dict]) -> bool:
 
     Беремся ТОЛЬКО когда одиночный статус-роут промахнётся — иначе откат к обычным
     роутам (обратная совместимость + РИСК5 «чистый статус в reissue не уходит»):
-      - нет статус-сегментов → False (чистая правка/мусор → шлюз правок как сегодня);
+      - нет статус-сегментов, но есть правки/непонятое → True (ISS-37, см. ниже);
+      - совсем пусто → False (сплиттер не нашёл ничего → обычные роуты);
       - ровно один статус-сегмент, без правок и без непонятого → False (чистый
         одиночный статус → статус-роут как сегодня, шлюз правок не зовём — РИСК5);
       - ≥2 статуса, ИЛИ статус+правки, ИЛИ статус+непонятое → True (смешанный: один
         роут потерял бы часть).
+
+    ISS-37 (инцидент 20.07.2026, серия `mpervyi-pn-koord-finplan`): раньше пустой
+    `status_segments` давал False БЕЗУСЛОВНО — «чистая правка, пусть её берёт шлюз
+    правок». Но шлюз стоит ТРЕТЬИМ, а вторым — одиночный статус-роут, и до него
+    reply доходил живым. Причём в mixed мы попадаем только когда
+    `detect_status_intent` уже дал не-None (`meetings_listener` :1502), то есть
+    статус-роут гарантированно возьмётся за тот же текст, сматчит его по
+    пересечению слов ЦЕЛИКОМ и закроет висяк словами из ПРАВОК. В бою так закрылись
+    две живые задачи («Zifriend/1С», «контейнер/Bolong»), а 12 и 5 правок молча
+    пропали. Поэтому: сплиттер авторитетно сказал «статусов нет» — reply забирает
+    смешанный роут (правки → в шлюз, непонятое → честно в ack), а не отпускает его
+    под ложное закрытие.
     """
     if not split:
         return False
@@ -336,7 +424,7 @@ def should_engage(split: Optional[dict]) -> bool:
     edits = split.get("edits") or []
     unclear = (split.get("unclear") or "").strip()
     if not st:
-        return False
+        return bool(edits) or bool(unclear)
     return len(st) >= 2 or bool(edits) or bool(unclear)
 
 

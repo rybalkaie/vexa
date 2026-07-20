@@ -138,10 +138,19 @@ class TestSplitModule(unittest.TestCase):
     def test_engage_none(self):
         self.assertFalse(mrs.should_engage(None))
 
-    def test_engage_no_status_false(self):
-        # чистая правка/мусор без статусов → обычный шлюз правок (не наш путь)
-        self.assertFalse(mrs.should_engage(
+    def test_engage_no_status_but_edits_true(self):
+        # ISS-37 (было False до 20.07.2026): сплиттер сказал «статусов нет», а правки
+        # есть → берём reply СЕБЕ. Отпустить нельзя: следом стоит одиночный статус-роут,
+        # он сматчит текст целиком и закроет висяк словами из правок (боевой инцидент
+        # 20.07 — закрылись две живые задачи, 12+5 правок потерялись).
+        self.assertTrue(mrs.should_engage(
             {"status_segments": [], "edits": ["x"], "unclear": "y"}))
+
+    def test_engage_nothing_at_all_false(self):
+        # Сплиттер не нашёл вообще ничего → mixed не берётся (дыру закрывает роут
+        # в listener: отдаёт такой reply шлюзу правок, минуя статус-роут).
+        self.assertFalse(mrs.should_engage(
+            {"status_segments": [], "edits": [], "unclear": ""}))
 
     def test_engage_single_clean_status_false(self):
         # РИСК5: чистый одиночный статус → статус-роут, шлюз правок не зовём

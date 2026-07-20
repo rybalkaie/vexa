@@ -1433,6 +1433,18 @@ def maybe_route_to_pending_status_reply(
     # delivered-index lookup, отдаём их шлюзу правок без накладных.
     if pending_status_reply.detect_status_intent(text) is None:
         return False
+    # ISS-37: reply — ПАЧКА ПРАВОК («вместо … правильно …», «заменить», «поправить»).
+    # Матч висяка идёт по пересечению слов со ВСЕМ текстом, поэтому слова из правок
+    # закрывают случайную живую задачу (боевой инцидент 20.07). Смешанный роут выше
+    # это ловит, но он СЕТЕВОЙ (Haiku) — при таймауте/выключенном флаге reply доходит
+    # сюда живым. Детерминированный чек — последний рубеж: отдаём такой reply шлюзу
+    # правок (он ниже по dispatch), статус НЕ трогаем.
+    if pending_status_reply.looks_edit_heavy(text):
+        logger.info(
+            "[pending-status] reply похож на пачку правок → статус не трогаем, "
+            "отдаём шлюзу правок chat=%s", chat_id,
+        )
+        return False
     series = _reply_context_series(chat_id, msg)
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
@@ -1516,6 +1528,26 @@ def maybe_route_to_mixed_reply(
         logger.exception("[mixed-reply] сплит упал (non-fatal): %s", e)
         return False
     if not mixed_reply_split.should_engage(split):
+        # ISS-37: сплиттер ОТРАБОТАЛ и не нашёл ни одного статус-сегмента — значит это
+        # не статус-reply, чем бы он ни был. Отпустить его нельзя: следующим стоит
+        # одиночный статус-роут (:2117), а мы сюда попали только потому, что
+        # `detect_status_intent` дал не-None → он возьмётся за тот же текст и закроет
+        # висяк по случайному пересечению слов. Поэтому отдаём reply СРАЗУ шлюзу
+        # правок, минуя статус-роут (ack шлюза — обычный, это штатный путь правки).
+        if split is not None and not (split.get("status_segments") or []):
+            try:
+                from notary.lib import feedback_worker  # noqa: PLC0415
+                handled = feedback_worker.route_feedback_reply(
+                    token, chat_id, msg, allowed_chat=allowed_chat,
+                )
+            except Exception as e:  # noqa: BLE001 — сбой шлюза не валит listener
+                logger.exception("[mixed-reply] шлюз правок упал (non-fatal): %s", e)
+                return False
+            logger.info(
+                "[mixed-reply] статус-сегментов нет → отдал шлюзу правок "
+                "chat=%s series=%s handled=%s", chat_id, series, bool(handled),
+            )
+            return bool(handled)
         return False  # не смешанный → обычные роуты (чистый статус/правка) — РИСК5
     status_segments = split["status_segments"]
     n_status_raw = split.get("n_status_raw") or len(status_segments)
