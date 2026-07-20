@@ -339,6 +339,11 @@ def _best_origin_line(segment: str, lines: list) -> Optional[str]:
         score = psr._overlap(seg_tokens, psr._content_tokens(ln))
         if score > best_score:
             best, best_score = ln, score
+    # Слабое совпадение источником НЕ считаем (сверка ISS-37): иначе законный статус,
+    # у которого случайно нашлось одно общее слово со строкой-правкой, уехал бы в
+    # правки и статус молча не проставился бы. Порог — тот же, что у матчинга висяков.
+    if best_score < psr._min_overlap_required(len(seg_tokens)):
+        return None
     return best
 
 

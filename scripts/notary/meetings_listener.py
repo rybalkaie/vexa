@@ -1377,6 +1377,24 @@ def maybe_route_to_digest_reply(
         # вышли (True). OFF → тоже вниз, одиночным (обратная совместимость).
         if _apply_digest_status_batch(token, chat_id, series, text, msg, snapshot=snapshot):
             return True
+        # ISS-37, ВТОРАЯ точка вызова ([[review-checks-two-call-sites]]): пачка правок
+        # («вместо … правильно …», «заменить», «поправить») не должна закрывать висяк по
+        # случайному пересечению слов — здесь `apply_status_reply` идёт по ЦЕЛОМУ тексту,
+        # как в протокольном роуте. Правки на дайджест и так не применяются (их место —
+        # ответ на сам протокол), поэтому честно подсказываем, а не молчим и не гадаем.
+        if pending_status_reply.looks_edit_heavy(text):
+            send_message(
+                token, chat_id,
+                "✏️ Похоже на правки текста протокола, а не на статусы вопросов. "
+                "Их вносите, пожалуйста, ответом на сам протокол встречи — "
+                "тогда перевыпущу его с исправлениями.",
+                reply_to=msg.get("message_id"),
+            )
+            logger.info(
+                "[morning-digest] reply похож на пачку правок series=%s → статус не "
+                "трогаем, дана подсказка", series,
+            )
+            return True
         result = pending_status_reply.apply_status_reply(
             text, series_dir, date=_reply_date_str(msg), source="digest-reply",
             snapshot=snapshot,

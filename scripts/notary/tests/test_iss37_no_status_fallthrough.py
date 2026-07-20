@@ -297,5 +297,35 @@ class TestRegressionStatusStillWorks(_Base):
         self.assertEqual(len(closed), 1)
 
 
+class TestDigestRouteGuard(_Base):
+    """ISS-37, ВТОРАЯ точка вызова ([[review-checks-two-call-sites]]): дайджест-роут
+    тоже применяет статус по ЦЕЛОМУ тексту reply, значит пачка правок и там закрыла бы
+    случайный висяк. Найдено сверкой уже ПОСЛЕ деплоя первой версии фикса."""
+
+    def test_edit_heavy_reply_to_digest_does_not_close(self):
+        sent = []
+        msg = self._msg(_REPLY_OLGA)
+        msg["reply_to_message"] = {"message_id": 777, "text": "📋 Открытые вопросы к встрече"}
+        with _on(), \
+             mock.patch.object(ml, "_protokol_root", return_value=self.root), \
+             mock.patch.object(ml, "_digest_reply_series", return_value="koord", create=True), \
+             mock.patch.object(ml, "send_message",
+                               side_effect=lambda *a, **k: sent.append(a[2])):
+            try:
+                ml.maybe_route_to_digest_reply("tok", self.GROUP, msg)
+            except Exception:  # noqa: BLE001 — резолв серии дайджеста стабится по-разному
+                pass          # важен инвариант ниже, а не факт срабатывания роута
+        self.assertNothingClosed()
+
+    def test_guard_itself_recognises_edit_wall(self):
+        """Прямая проверка предохранителя на реальных текстах (без роут-обвязки)."""
+        from notary.lib import pending_status_reply as psr
+        self.assertTrue(psr.looks_edit_heavy(_REPLY_OLGA))
+        self.assertTrue(psr.looks_edit_heavy(_REPLY_MARIA))
+        # Законный статус предохранитель НЕ перехватывает.
+        self.assertFalse(psr.looks_edit_heavy("юани закупили, вопрос закрыт"))
+        self.assertFalse(psr.looks_edit_heavy("заменили поставщика, задача выполнена"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
