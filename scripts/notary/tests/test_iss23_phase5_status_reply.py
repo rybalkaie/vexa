@@ -149,6 +149,43 @@ class TestFU1NegationReopen(unittest.TestCase):
             self.assertEqual(p.detect_status_intent(t), p.LABEL_DONE, t)
 
 
+class TestSplitNegationReopen(unittest.TestCase):
+    """ход3/У1 (разорванное отрицание): «не» + идиома НЕуспеха, когда done-слово стоит НЕ
+    вплотную к «не» («не получилось закрыть», «не удалось решить», «не было сделано»).
+    Раньше проваливались в done → ЛОЖНОЕ закрытие. Теперь → reopen (R16). Регресс: позитив
+    остаётся done, «ещё/пока не …» — wait, команда «не удаляй» НЕ уходит в reopen."""
+
+    _REOPEN = (
+        "не было сделано", "не было закрыто", "не было решено", "не было выполнено",
+        "не получилось закрыть", "не получается сделать", "не получилось решить",
+        "не удалось решить", "не удалось закрыть вопрос", "не удалась задача",
+        "не смогли выполнить", "не смог закрыть", "не смогла сделать",
+        "не вышло закрыть",
+    )
+
+    def test_split_negations_map_to_reopen(self):
+        for t in self._REOPEN:
+            self.assertEqual(p.detect_status_intent(t), p.LABEL_REOPEN, t)
+
+    def test_still_trying_stays_wait(self):
+        # «ещё/пока не получилось/удалось» — всё ещё в работе (wait), не reopen: _WAIT_FIRST.
+        for t in ("ещё не получилось закрыть", "пока не удалось решить", "ещё не смогли"):
+            self.assertEqual(p.detect_status_intent(t), p.LABEL_WAIT, t)
+
+    def test_positive_completion_not_reopened(self):
+        # Ключевой инвариант фикса: расширение — СТРОГО под префиксом «не», поэтому идиома
+        # успеха без «не» НЕ уходит в reopen. (done vs None зависит от инфинитивности глагола —
+        # «удалось решить»/«смогли выполнить» дают None: «решить»/«выполнить» инфинитивы, не
+        # `_DONE_RE`; это pre-existing и вне scope фикса. Проверяем именно «не reopen».)
+        for t in ("получилось закрыть", "удалось решить", "смогли выполнить", "всё сделали"):
+            self.assertNotEqual(p.detect_status_intent(t), p.LABEL_REOPEN, t)
+        self.assertEqual(p.detect_status_intent("всё сделали"), p.LABEL_DONE)
+
+    def test_delete_command_not_reopen(self):
+        # «не удаляй» — команда удаления, НЕ статус-переоткрытие: анкор `удал[оаи]сь` не задет.
+        self.assertNotEqual(p.detect_status_intent("не удаляй задачу"), p.LABEL_REOPEN)
+
+
 # ==========================================================================
 # Матчинг «о каком висяке reply»
 # ==========================================================================
