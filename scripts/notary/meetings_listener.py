@@ -178,7 +178,12 @@ def telegram_request(token: str, method: str, params: dict[str, Any], *, timeout
         return json.load(r)
 
 
-def send_message(token: str, chat_id: int, text: str, *, reply_to: int | None = None, html: bool = False) -> None:
+def send_message(
+    token: str, chat_id: int, text: str, *, reply_to: int | None = None, html: bool = False
+) -> int | None:
+    """Отправить сообщение. Возвращает `message_id` отправленного (нужен Ф4 для state
+    ack по message_id — R15/R26) или None при сбое. Прежние вызывающие возврат
+    игнорируют — обратной несовместимости нет."""
     params: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_to:
         params["reply_to_message_id"] = reply_to
@@ -188,8 +193,11 @@ def send_message(token: str, chat_id: int, text: str, *, reply_to: int | None = 
         resp = telegram_request(token, "sendMessage", params, timeout=15)
         if not resp.get("ok"):
             logger.warning("sendMessage: %s", resp.get("description", "?"))
+            return None
+        return (resp.get("result") or {}).get("message_id")
     except Exception as e:  # noqa: BLE001
         logger.warning("sendMessage упал: %s", e)
+        return None
 
 
 def get_updates(token: str, offset: int) -> list[dict[str, Any]]:
@@ -1292,9 +1300,14 @@ def _apply_digest_understand(
     series_dir = _protokol_root() / series
     if snapshot is None:
         snapshot = _reply_open_tasks_snapshot(series_dir, msg)
+    replier = _msg_display_name(msg)
+    # ОЖИД1: пачка → лёгкая реакция ДО долгого ИИ-разбора, чтобы тишина не читалась плохо.
+    from notary.lib import mixed_reply_split  # noqa: PLC0415
+    if mixed_reply_split.looks_like_multi_status(text):
+        send_message(token, chat_id, UNDERSTAND_PROGRESS_HINT, reply_to=msg.get("message_id"))
     try:
         result = reply_understand.understand_reply(
-            text, series_dir=series_dir, replier=_msg_display_name(msg),
+            text, series_dir=series_dir, replier=replier,
             snapshot=snapshot, orig_ts=msg.get("date"), date=_reply_date_str(msg),
             source="understand-digest", msg_id=msg.get("message_id"), chat_id=chat_id,
         )
@@ -1303,17 +1316,18 @@ def _apply_digest_understand(
         return False
     if not result.get("engaged"):
         return False
+    # Настройка серии (R12): владельцу форвард; ответ сотруднику схлопнут в ЕДИНЫЙ ack.
     if result.get("config_requests"):
         _forward_config_to_owner(series, result["config_requests"])
-        send_message(token, chat_id, CONFIG_FORWARDED_REPLY, reply_to=msg.get("message_id"))
     if result.get("deferred"):
         if result.get("status_groups"):
-            _send_understand_ack(token, chat_id, msg, result, edit_as_hint=True)
+            _send_understand_ack(token, chat_id, msg, result, series_dir=series_dir,
+                                 snapshot=snapshot, replier=replier, edit_as_hint=True)
         send_message(token, chat_id, UNDERSTAND_DEFERRED_HINT, reply_to=msg.get("message_id"))
         return True
-    if (result.get("applied") or result.get("questions") or result.get("edits")
-            or (result.get("unclear") or "").strip()):
-        _send_understand_ack(token, chat_id, msg, result, edit_as_hint=True)
+    # Ф4 (R13-R16/R26): ЕДИНЫЙ ack (на дайджесте правки — подсказкой, `edit_as_hint=True`).
+    _send_understand_ack(token, chat_id, msg, result, series_dir=series_dir,
+                         snapshot=snapshot, replier=replier, edit_as_hint=True)
     logger.info(
         "[understand-digest] reply разобран series=%s applied=%d questions=%d config=%d",
         series, len(result.get("applied") or []), len(result.get("questions") or []),
@@ -1694,6 +1708,9 @@ UNDERSTAND_DEFERRED_HINT = (
     "⏳ Сейчас не смог разобрать сообщение (техническая заминка). Ничего не потерял — "
     "разберу и отвечу позже."
 )
+# Ф4 (ОЖИД1): при уходе в длинный сплит/ИИ-разбор ПАЧКИ (десятки секунд) — сразу лёгкая
+# реакция, чтобы минута тишины не читалась как «опять не работает» (требование «не бесил»).
+UNDERSTAND_PROGRESS_HINT = "⏳ Получил, разбираю…"
 
 
 def _msg_display_name(msg: dict[str, Any]) -> Optional[str]:
@@ -1792,21 +1809,27 @@ def _forward_understand_edits(
 
 
 def _send_understand_ack(
-    token: str, chat_id: int, msg: dict[str, Any], result: dict, *, edit_as_hint: bool
+    token: str, chat_id: int, msg: dict[str, Any], result: dict, *,
+    series_dir, snapshot, replier: Optional[str], edit_as_hint: bool
 ) -> None:
-    """ВРЕМЕННЫЙ ack understand-слоя (ЗАВ1: единый рендер — Ф4). Переиспользует
-    СУЩЕСТВУЮЩИЙ `build_mixed_ack` Ф2 для применённых статусов; вопросы ступени-3 пока
-    сворачиваются в «не смог привязать/уточните» (полноценный закрытый переспрос
-    цифрой — Ф4). Ничего молча: каждая часть отражена."""
-    from notary.lib import mixed_reply_split  # noqa: PLC0415
-    n_edits = len(result.get("edits") or [])
-    ack = mixed_reply_split.build_mixed_ack(
-        status_groups=result.get("status_groups") or [],
-        n_status_unresolved=len(result.get("questions") or []),
-        n_edits=n_edits, edit_queued=bool(result.get("_edit_queued")),
-        edit_as_hint=edit_as_hint, unclear=result.get("unclear") or "",
-    )
-    send_message(token, chat_id, ack, reply_to=msg.get("message_id"))
+    """Ф4 (R13-R16/R26): ЕДИНЫЙ сборщик ack — «применил / не понял / не привязал» +
+    нумерованный переспрос + канал несогласия. Заменяет временный ack Ф3 и схлопывает
+    бывший двойной ack config+status в ОДНО сообщение.
+
+    После отправки персистит контекст ack по его `message_id` ([[reply_ack_state]],
+    RAZM6: переживает рестарт) — по нему reply человека «не так/верни» (R26) или ответ
+    цифрой на переспрос (R15) находит исходное решение. Персист только когда есть что
+    откатывать/уточнять (applied/question)."""
+    from notary.lib import reply_ack, reply_ack_state  # noqa: PLC0415
+    built = reply_ack.build_ack(
+        result, series_dir=series_dir, snapshot=snapshot, replier=replier,
+        edit_as_hint=edit_as_hint)
+    mid = send_message(token, chat_id, built["text"], reply_to=msg.get("message_id"))
+    if mid is not None and (built.get("applied") or built.get("question")):
+        reply_ack_state.record(
+            mid, series_dir=series_dir, chat_id=chat_id, replier=replier,
+            applied=built.get("applied"), has_tier2=built.get("has_tier2"),
+            question=built.get("question"), date=_reply_date_str(msg))
 
 
 def maybe_route_to_reply_understand(
@@ -1845,9 +1868,14 @@ def maybe_route_to_reply_understand(
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
     series_dir = _protokol_root() / series
     snapshot = _reply_open_tasks_snapshot(series_dir, msg)
+    replier = _msg_display_name(msg)
+    # ОЖИД1: пачка → лёгкая реакция ДО долгого ИИ-разбора (десятки секунд), не молчим.
+    from notary.lib import mixed_reply_split  # noqa: PLC0415
+    if mixed_reply_split.looks_like_multi_status(text):
+        send_message(token, chat_id, UNDERSTAND_PROGRESS_HINT, reply_to=msg.get("message_id"))
     try:
         result = reply_understand.understand_reply(
-            text, series_dir=series_dir, replier=_msg_display_name(msg),
+            text, series_dir=series_dir, replier=replier,
             snapshot=snapshot, orig_ts=msg.get("date"), date=_reply_date_str(msg),
             source="understand", msg_id=msg.get("message_id"), chat_id=chat_id,
         )
@@ -1856,31 +1884,83 @@ def maybe_route_to_reply_understand(
         return False
     if not result.get("engaged"):
         return False  # understand ничего не нашёл → обычные роуты ниже
-    # 1) Настройка серии (R12/И2): владельцу + сотруднику явный не-канцелярит (не молчим).
+    # 1) Настройка серии (R12/И2): владельцу форвард; ответ сотруднику схлопнут в ЕДИНЫЙ
+    #    ack ниже (Ф4: больше не второе сообщение CONFIG_FORWARDED_REPLY).
     if result.get("config_requests"):
         _forward_config_to_owner(series, result["config_requests"])
-        send_message(token, chat_id, CONFIG_FORWARDED_REPLY, reply_to=msg.get("message_id"))
     # 2) Правки (РИСК1): в существующую петлю правок с подавленным ack.
     result["_edit_queued"] = _forward_understand_edits(
         token, chat_id, allowed_chat, msg, result.get("edits") or [])
     # 3) ИИ недоступен (R9): очевидное уже применено, остальное в очереди — честная отбивка.
     if result.get("deferred"):
         if result.get("status_groups"):
-            _send_understand_ack(token, chat_id, msg, result, edit_as_hint=False)
+            _send_understand_ack(token, chat_id, msg, result, series_dir=series_dir,
+                                 snapshot=snapshot, replier=replier, edit_as_hint=False)
         send_message(token, chat_id, UNDERSTAND_DEFERRED_HINT, reply_to=msg.get("message_id"))
         logger.info("[understand] reply отложен (ИИ недоступен) series=%s", series)
         return True
-    # 4) Применённое/вопросы/непонятое → временный ack (Ф4 заменит единым рендером).
-    if (result.get("applied") or result.get("questions") or result.get("edits")
-            or (result.get("unclear") or "").strip() or result.get("config_requests")):
-        if not result.get("config_requests") or result.get("applied") or result.get("questions") \
-                or result.get("edits"):
-            _send_understand_ack(token, chat_id, msg, result, edit_as_hint=False)
+    # 4) Ф4 (R13-R16/R26): ЕДИНЫЙ ack — «применил / не понял / не привязал» + переспрос +
+    #    канал несогласия. engaged=True гарантирует ≥1 часть, ничего молча.
+    _send_understand_ack(token, chat_id, msg, result, series_dir=series_dir,
+                         snapshot=snapshot, replier=replier, edit_as_hint=False)
     logger.info(
         "[understand] reply разобран series=%s applied=%d questions=%d edits=%d config=%d",
         series, len(result.get("applied") or []), len(result.get("questions") or []),
         len(result.get("edits") or []), len(result.get("config_requests") or []),
     )
+    return True
+
+
+def maybe_route_to_ack_reply(
+    token: str, chat_id: Optional[int], msg: dict[str, Any]
+) -> bool:
+    """Ф4 (R26/УПУ1 + R15): reply человека НА ack/переспрос бота.
+
+    Раньше reply на бот-сообщение с неизвестным префиксом уходил в игнор
+    (`process_message`) — обещание ступени-2 «поправьте, если не так» было ЛОЖНЫМ (некуда
+    поправить). Теперь по `message_id` бот-сообщения ищем персистентный контекст
+    ([[reply_ack_state]], переживает рестарт — RAZM6):
+      • «не так / верни» на применённое ступени-2 → РЕАЛЬНЫЙ reopen (R26);
+      • ответ цифрой / «да, кроме 3» / класс словом на переспрос → применяется (R15);
+      • подтверждённый класс слова → память `remember_word_class` (R24-триггер).
+
+    Стоит ПЕРВЫМ из reply-роутов (до дайджеста/understand): ack бота — не протокол и не
+    дайджест, те роуты его серию не нашли бы, а fallthrough увёл бы «верни» в игнор. Гейт
+    `ENABLE_REPLY_UNDERSTAND` дефолт-OFF: OFF → False (state и не пишется). Нет записи по
+    этому message_id → False → обычные роуты (не наш ack). Опасная тройка: текст не логируем."""
+    if chat_id is None:
+        return False
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return False
+    mid = reply_to.get("message_id")
+    if mid is None:
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False  # голос/стикер на ack — не канал закрытого ответа (не наш случай)
+    try:
+        from notary.lib import reply_understand, reply_ack, reply_ack_state  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модули не грузятся → фича выключена
+        logger.debug("[ack-reply] import failed (feature off?): %s", e)
+        return False
+    if not reply_understand.is_enabled():
+        return False  # R10: дефолт-OFF → state не пишется, обычные роуты
+    state = reply_ack_state.get(mid)
+    if not state:
+        return False  # не reply на НАШ ack → обычные роуты (не перехватываем чужое)
+    try:
+        res = reply_ack.handle_ack_reply(state, text)
+    except Exception as e:  # noqa: BLE001 — обработка ответа не должна валить listener
+        logger.exception("[ack-reply] обработка ответа упала: %s", e)
+        return False
+    if res.get("consume"):
+        reply_ack_state.consume(mid)
+    out = res.get("text") or ""
+    if out:
+        send_message(token, chat_id, out, reply_to=msg.get("message_id"))
+    logger.info("[ack-reply] обработан ответ на ack mid=%s consume=%s learned=%s",
+                mid, res.get("consume"), res.get("learned"))
     return True
 
 
@@ -2398,6 +2478,13 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # сообщение в группе. Owner-гейт и узкий триггер — внутри (обычную переписку и
     # команды коррекции не перехватывает).
     if maybe_route_to_set_chat_command(token, cid, allowed_chat, msg):
+        return
+
+    # Ф4 (watson, R26/R15): reply человека НА ack/переспрос бота. ПЕРВЫМ из reply-роутов —
+    # ack бота не протокол и не дайджест, иначе «не так/верни»/«ответ цифрой» утекли бы в
+    # игнор. Ищет контекст ack по message_id (переживает рестарт). Гейт ENABLE_REPLY_UNDERSTAND
+    # дефолт-OFF: OFF / не наш ack → False → обычные роуты ниже (обратная совместимость).
+    if maybe_route_to_ack_reply(token, cid, msg):
         return
 
     # Ф4 (watson, R11): reply на УТРЕННИЙ ДАЙДЖЕСТ «Открытые вопросы к встрече».
