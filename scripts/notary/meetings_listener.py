@@ -1224,7 +1224,10 @@ def _apply_digest_status_batch(
         return False  # REQ 2.3: одиночный статус → fast-path, платный сплиттер не зовём
     series_dir = _protokol_root() / series
     try:
-        items = pending_status_reply.load_series_pending(series_dir)
+        # ISS-39/РИСК2: универсум сплиттера = снапшот отвечаемого дайджеста (что видел
+        # человек), тот же, что кормит одиночный apply ниже — консистентно по всем
+        # потребителям. Нет снапшота → live-хвост (A14).
+        items = pending_status_reply.load_series_pending(series_dir, snapshot=snapshot)
     except Exception as e:  # noqa: BLE001
         logger.debug("[morning-digest] резолв висяков не удался (feature off?): %s", e)
         return False
@@ -1535,8 +1538,13 @@ def maybe_route_to_mixed_reply(
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
     series_dir = _protokol_root() / series
+    # Ф4/ISS-39: слепок нумерации отвечаемой версии протокола (по message_id) — ординал
+    # резолвится против него (A15), И универсум сплиттера/overlap ограничен им (РИСК2:
+    # что человек видел в ТОМ протоколе, а не вся глубина хвоста). Нет слепка → None
+    # (overlap/live как до Ф4).
+    snapshot = _reply_open_tasks_snapshot(series_dir, msg)
     try:
-        items = pending_status_reply.load_series_pending(series_dir)
+        items = pending_status_reply.load_series_pending(series_dir, snapshot=snapshot)
     except Exception as e:  # noqa: BLE001
         logger.debug("[mixed-reply] резолв висяков не удался (feature off?): %s", e)
         return False
@@ -1572,10 +1580,6 @@ def maybe_route_to_mixed_reply(
     edit_remainder = "\n".join(split["edits"])
     n_edits = len(split["edits"])
     unclear = split["unclear"]
-
-    # Ф4: слепок нумерации отвечаемой версии протокола (по message_id) — ординал резолвится
-    # против него на mixed-пути тоже (A15). Нет слепка → None (overlap как до Ф4).
-    snapshot = _reply_open_tasks_snapshot(series_dir, msg)
 
     # 1) Статусы — общий status-loop (РИСК4): один вызов резолвит ОДИН висяк, поэтому
     #    сегмент-на-статус + цикл = все статусы. Тот же хелпер, что у digest-роута (KODE1).

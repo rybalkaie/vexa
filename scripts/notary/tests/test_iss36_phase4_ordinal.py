@@ -39,6 +39,15 @@ from notary.lib import pending_status_reply as p  # noqa: E402
 from notary.lib import mixed_reply_split as mrs  # noqa: E402
 import notary.meetings_listener as ml  # noqa: E402
 
+from datetime import date as _date  # noqa: E402
+
+# Ф2/ISS-39 (fix follow-up Ф1): дата слепка нумерации должна быть СВЕЖЕЙ — иначе
+# `record_open_tasks_snapshot` прунит запись старше `_KEEP_SNAPSHOT_DAYS` (=45) прямо на
+# записи (cutoff = сегодня−45), слепок исчезает и ординал недоступен. Жёсткая «2026-06-03»
+# протухла с 2026-07-19. Берём «сегодня» (relative), как и пишет прод по горячим следам
+# (A14) → тест снова защитный и immune к ходу календаря.
+_RECENT_SNAP_DATE = _date.today().isoformat()
+
 
 _PROTO5 = """#протоколвстречи 03.06.2026
 
@@ -303,7 +312,7 @@ class _DigestRouteBase(_SeriesFx):
         super().setUp()
         # Слепок ДАЙДЖЕСТА по его message_id (как пишет send_series_digest в Ф3).
         sm.record_open_tasks_snapshot(self.sd, self.DIGEST_MID, self.kt,
-                                      surface="digest", date="2026-06-03")
+                                      surface="digest", date=_RECENT_SNAP_DATE)
 
     def _msg(self, text, reply_mid=None):
         return {
@@ -377,7 +386,7 @@ class TestProtocolRouteOrdinal(_SeriesFx):
         super().setUp()
         # Слепок ПРОТОКОЛА по его message_id (как пишет finalize-meeting в Ф3).
         sm.record_open_tasks_snapshot(self.sd, self.PROTO_MID, self.kt,
-                                      surface="protocol", date="2026-06-03")
+                                      surface="protocol", date=_RECENT_SNAP_DATE)
 
     def _msg(self, text, reply_mid=None):
         return {

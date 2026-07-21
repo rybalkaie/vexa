@@ -709,35 +709,67 @@ def classify_reply_intent_llm(reply_text: str, items: list, participants=None) -
 
 
 # ── Резолв висяков серии (универсум для матчинга) ────────────────────────────
-def load_series_pending(series_dir: Optional[Path]) -> list:
-    """Тексты висяков серии, на которые мог сослаться reply: свежий хвост
-    (`resolve_open_tasks`) ∪ МЕЛОЧЬ утреннего дайджеста (`resolve_minor_open_tasks`)
-    ∪ тексты из sidecar (для переоткрытия закрытого, A10 — закрытый пункт уже мог
-    выпасть из хвоста, но ещё показан в «✅ Закрыто» того же протокола). Дедуп по
-    `_status_key`, порядок: хвост → мелочь → только-в-sidecar. Сбой/нет каталога → [].
+def load_series_pending(series_dir: Optional[Path], *, snapshot: Optional[list] = None) -> list:
+    """Универсум висяков серии, на которые мог сослаться reply. ИНВАРИАНТ Ф2 (ISS-39/R4):
+    универсум = ровно то, что участник ВИДИТ в блоке «с прошлых встреч» — «напечатано ⇒
+    находится среди кандидатов». Поэтому источник ТОТ ЖЕ, что у показа
+    (`series_memory.build_open_tasks_block` / `morning_digest.build_digest_markdown`):
 
-    Ф4 (watson, R12): мелочь в универсуме нужна, потому что она ВИДНА участнику — в
-    дайджесте, блоком «просто напоминаю». Статуса по ней не просят, но если человек
-    всё же ответит «сделал» — ответ обязан попасть В ЭТОТ пункт, а не сматчиться на
-    похожий значимый висяк (ложное закрытие чужой задачи). На протокол мелочь при этом
-    не влияет: путь протокола её не тянет (`_resolve_open_tasks_raw`)."""
+      • ВИСЯЩИЕ — сырой хвост → наложение sidecar-статусов (`merge_open_tasks_with_status`)
+        → cap ВИСЯЩИХ. НЕ прежний `resolve_open_tasks` (он капил хвост ДО merge): при
+        терминально закрытых впереди капа реально показанный висяк выпал бы из кандидатов
+        (ложное «не смог привязать» на том, что человек видит, — ядро ISS-39, R4);
+      • МЕЛОЧЬ (`resolve_minor_open_tasks`) — видна в дайджесте блоком «просто напоминаю»
+        (R12): статуса по ней не просят, но ответ «сделал» обязан попасть В НЕЁ, а не
+        сматчиться на похожий значимый висяк (ложное закрытие чужой задачи);
+      • «под сомнением» + «закрытые» (`doubt`/`closed` из merge) — видны в Части 2 показа
+        (🟡/✅), человек может ответить по ним (переоткрыть/подтвердить);
+      • sidecar-тексты — переоткрытие закрытого (A10): закрытый пункт мог выпасть из
+        хвоста, но ещё показан в «✅ Закрыто» того же протокола.
+
+    Дедуп по `_status_key`, порядок: висящие → мелочь → doubt/closed → только-в-sidecar.
+    Сбой/нет каталога → [].
+
+    РИСК2 (Ф2): расширение универсума до ВСЕЙ глубины хвоста растит пространство ложных
+    overlap-матчей. Митигация — `snapshot`: нумерованный слепок висяков ИМЕННО отвечаемого
+    документа (`open_tasks_snapshot_for_message` по reply_to message_id). Передан
+    (документ отправлен в Ф3+) → корзину ВИСЯЩИХ берём ИЗ НЕГО (что человек видел в ТОМ
+    сообщении), а не из live-хвоста: универсум ограничен одним документом, а не растёт
+    бесконечно за серию. Не передан / пуст (сообщение до Ф3 / reissue-версия без слепка,
+    A14) → live-хвост как раньше (обратная совместимость). Мелочь/doubt/closed/sidecar
+    слепок НЕ несёт (он только про нумерованные висяки) → они всегда live: это малые
+    корзины, страхуются адаптивным порогом `_min_overlap_required` (хотфикс 20.07).
+    """
     if series_dir is None:
         return []
-    fresh: list = []
+    sd = Path(series_dir)
     try:
-        digests = series_memory.list_series_digests(Path(series_dir))
-        fresh = list(series_memory.resolve_open_tasks(digests))
-        fresh += list(series_memory.resolve_minor_open_tasks(digests))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[pending-status] резолв хвоста серии не удался (non-fatal): %s", type(e).__name__)
-        fresh = []
-    try:
-        store = series_memory.load_task_status(Path(series_dir))
+        store = series_memory.load_task_status(sd)
     except Exception:  # noqa: BLE001
         store = {}
+    hanging: list = []
+    aux: list = []
+    try:
+        digests = series_memory.list_series_digests(sd)
+        raw = series_memory._resolve_open_tasks_raw(digests)
+        merged = series_memory.merge_open_tasks_with_status(raw, store)
+        cap = series_memory.open_tasks_max()
+        live_hanging = merged["open"][:cap] if cap > 0 else merged["open"]
+        # РИСК2: снапшот отвечаемого документа ограничивает корзину висящих одним
+        # сообщением; нет снапшота → live-хвост (обратная совместимость, A14).
+        hanging = (
+            [t for t in snapshot if isinstance(t, str) and t.strip()]
+            if snapshot else list(live_hanging)
+        )
+        aux = list(series_memory.resolve_minor_open_tasks(digests))
+        aux += [d.get("text") for d in merged["doubt"] if isinstance(d, dict)]
+        aux += [c.get("text") for c in merged["closed"] if isinstance(c, dict)]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[pending-status] резолв хвоста серии не удался (non-fatal): %s", type(e).__name__)
+        hanging, aux = [], []
     out: list = []
     seen: set = set()
-    for t in fresh:
+    for t in [*hanging, *aux]:
         if not isinstance(t, str) or not t.strip():
             continue
         k = series_memory._status_key(t)
@@ -801,7 +833,9 @@ def apply_status_reply(
     if ord_verdict == "match":
         matched = ord_matched  # ординал сильнее overlap (A13); key-текст готов к записи
     else:  # 'none' → overlap-путь как до Ф4
-        items = load_series_pending(series_dir)
+        # РИСК2: overlap ищет по универсуму отвечаемого документа (снапшот), не по всей
+        # глубине хвоста; нет снапшота → live (A14). Тот же снапшот, что кормит ординал.
+        items = load_series_pending(series_dir, snapshot=snapshot)
         if not items:
             logger.info("[pending-status] статус-маркер есть, но висяков серии нет → пропуск")
             return None
@@ -815,7 +849,7 @@ def apply_status_reply(
     # Опциональный LLM-предохранитель (дефолт-OFF): может ТОЛЬКО отозвать в правки.
     if is_intent_llm_enabled():
         if items is None:  # ординал-путь: список висяков для vetо ещё не грузили
-            items = load_series_pending(series_dir)
+            items = load_series_pending(series_dir, snapshot=snapshot)
         verdict = (classify_fn or classify_reply_intent_llm)(reply_text, items, participants)
         if verdict == "edit":
             logger.info("[pending-status] LLM-vetо: интент=edit → отдаём правкам (label=%s)", label)

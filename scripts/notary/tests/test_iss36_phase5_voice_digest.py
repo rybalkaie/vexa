@@ -39,6 +39,13 @@ from notary.lib import pending_status_reply as p  # noqa: E402
 from notary.lib import mixed_reply_split as mrs  # noqa: E402
 import notary.meetings_listener as ml  # noqa: E402
 
+from datetime import date as _date  # noqa: E402
+
+# Ф2/ISS-39 (fix follow-up Ф1): дата слепка — СВЕЖАЯ, иначе `record_open_tasks_snapshot`
+# прунит её (старше `_KEEP_SNAPSHOT_DAYS`=45, cutoff=сегодня−45) и ординал недоступен.
+# Жёсткая «2026-06-03» протухла с 2026-07-19; «сегодня» (как пишет прод, A14) — immune.
+_RECENT_SNAP_DATE = _date.today().isoformat()
+
 
 # Протокол серии с 5 висяками под одним исполнителем (как в Ф2/Ф4).
 _PROTO5 = """#протоколвстречи 03.06.2026
@@ -112,7 +119,7 @@ class _VoiceDigestBase(unittest.TestCase):
         # Слепок ДАЙДЖЕСТА по его message_id (как send_series_digest пишет в Ф3) —
         # против него резолвится ординал по голосу (Ф4, тот же читатель).
         sm.record_open_tasks_snapshot(self.sd, self.DIGEST_MID, self.kt,
-                                      surface="digest", date="2026-06-03")
+                                      surface="digest", date=_RECENT_SNAP_DATE)
 
     def tearDown(self):
         self._tmp.cleanup()

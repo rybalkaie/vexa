@@ -51,6 +51,15 @@ _spec = importlib.util.spec_from_file_location("reapply_digest_reply", str(_TOOL
 rdr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rdr)
 
+from datetime import date as _date  # noqa: E402
+
+# Ф2/ISS-39 (fix follow-up Ф1): дата слепка — СВЕЖАЯ, иначе `record_open_tasks_snapshot`
+# прунит её (старше `_KEEP_SNAPSHOT_DAYS`=45, cutoff=сегодня−45) и ординал недоступен.
+# Жёсткая «2026-06-03» протухла с 2026-07-19; «сегодня» (как пишет прод, A14) — immune.
+# (Дата ОТВЕТА в reply остаётся «2026-06-03» — на неё прун не действует, это sidecar
+# `updated`, не слепок.)
+_RECENT_SNAP_DATE = _date.today().isoformat()
+
 
 # Синтетический протокол серии с 5 висяками (те же безопасные фикстуры, что в Ф2/Ф4/Ф5 —
 # НЕ реальные задачи/цифры участников).
@@ -102,7 +111,7 @@ class _ReapplyBase(unittest.TestCase):
         # Слепок ДАЙДЖЕСТА по message_id (как send_series_digest пишет в Ф3) — против него
         # резолвится ординал (Ф4, тот же читатель open_tasks_snapshot_for_message).
         sm.record_open_tasks_snapshot(self.sd, self.DIGEST_MID, self.kt,
-                                      surface="digest", date="2026-06-03")
+                                      surface="digest", date=_RECENT_SNAP_DATE)
 
     def tearDown(self):
         self._tmp.cleanup()

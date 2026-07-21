@@ -155,7 +155,9 @@ def _run_digest_path(
     # Ф2 (батч, _apply_digest_status_batch): пачка статусов под флагом
     # ENABLE_MIXED_REPLY_SPLIT. Одиночный статус сюда не заходит (fast-path).
     if _mrs.is_enabled() and _mrs.looks_like_multi_status(text):
-        items = _psr.load_series_pending(series_dir)
+        # ISS-39/РИСК2: универсум сплиттера = снапшот отвечаемого документа (как в
+        # listener), тот же, что кормит одиночный apply. Нет снапшота → live (A14).
+        items = _psr.load_series_pending(series_dir, snapshot=snapshot)
         try:
             split = _mrs.split_reply(text, items)
         except Exception as e:  # noqa: BLE001 — сбой границы LLM не роняет прогон
