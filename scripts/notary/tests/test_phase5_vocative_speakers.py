@@ -196,6 +196,46 @@ class TestR18CrossCheck(unittest.TestCase):
         self.assertEqual({conflicts[0].name_a, conflicts[0].name_b}, {"Михаил", "Ольга"})
 
 
+class TestR18CommonWordHomographs(unittest.TestCase):
+    """Ход1 цикла5: усечённые формы, совпадающие с частыми словами («тема»→Артём,
+    «серый»→Сергей), НЕ дают ложное само-обращение на нарративе, но в звательной
+    позиции («Тёма, глянь») по-прежнему ловятся."""
+
+    def test_topic_word_not_false_self_address(self):
+        md = _transcript(
+            "**[00:01] Артём:** Такая тема уже закрыта, движемся дальше.",
+            "**[00:02] Ольга:** Хорошо.",
+        )
+        self.assertEqual(vc.find_conflicts(md), [])
+
+    def test_tem_bole_not_false(self):
+        md = _transcript(
+            "**[00:01] Артём:** Тем более что бюджет уже согласован.",
+            "**[00:02] Мария:** Согласна.",
+        )
+        self.assertEqual(vc.find_conflicts(md), [])
+
+    def test_grey_word_not_false_for_sergey(self):
+        md = _transcript(
+            "**[00:01] Сергей:** Серый фон на слайде совсем не читается.",
+            "**[00:02] Ольга:** Поправим.",
+        )
+        self.assertEqual(vc.find_conflicts(md), [])
+
+    def test_vocative_tyoma_still_caught(self):
+        """Реальное обращение в звательной позиции — сигнал НЕ теряется."""
+        md = _transcript(
+            "**[00:01] Артём:** Тёма, глянь отчёт по продажам.",
+            "**[00:02] Ольга:** Ок.",
+        )
+        conflicts = vc.find_conflicts(md)
+        self.assertTrue(conflicts, "звательное само-обращение должно ловиться")
+        names = set()
+        for c in conflicts:
+            names |= {c.name_a, c.name_b}
+        self.assertIn("Артём", names)
+
+
 class TestR18Findings(unittest.TestCase):
     def test_findings_carry_pair_and_notes(self):
         md = _transcript(
@@ -285,6 +325,35 @@ class TestR19PlaqueAndInline(unittest.TestCase):
         out = self.lp.apply_review_flags(_PROTOCOL, findings)
         self.assertIn(self.lp.SPEAKER_PLAQUE_SENTINEL, out)
         self.assertIn("⚠️ проверь: проверь срок", out)  # старый контур values жив
+
+
+class TestR19MultiTokenLabels(unittest.TestCase):
+    """Ход3 цикла5: метки спикеров в транскрипте часто двухсловные («Илья Рыбалка»),
+    а тело протокола подписано короткими именами («Илья»). Врезка (место №2) обязана
+    вставать по ПЕРВОМУ имени, иначе теряется на большинстве реальных встреч."""
+
+    def test_inline_note_matches_short_body_name(self):
+        from lib import llm_postprocess as lp
+        protocol = (
+            "#протоколвстречи 21.07.2026\n"
+            "**Участники:** Илья Рыбалка, Мария Иванова\n"
+            "\n---\n\n"
+            "## Задачи\n"
+            "**Илья:** подготовить смету\n"
+            "**Мария:** обновить прайс\n"
+        )
+        transcript = _transcript(
+            "**[00:01] Илья Рыбалка:** Илюш, глянь смету.",   # само-обращение
+            "**[00:02] Мария Иванова:** Машунь, привет.",
+        )
+        findings = vc.find_vocative_findings(transcript)
+        self.assertTrue(findings, "своп по полным меткам должен дать конфликт")
+        out = lp.apply_review_flags(protocol, findings)
+        # Плашка называет полные имена…
+        self.assertIn(lp.SPEAKER_PLAQUE_SENTINEL, out)
+        # …а врезка встала в теле у КОРОТКИХ подписей (по первому имени).
+        body = out.split("## Задачи", 1)[1]
+        self.assertGreaterEqual(body.count("проверьте: тут мог быть"), 2)
 
 
 # ==========================================================================

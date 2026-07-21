@@ -114,6 +114,16 @@ _ALL_FORMS: frozenset[str] = frozenset(_FORM_INDEX.keys())
 # не бывают подлежащим — по ним детект точнее.
 _CANON_LOWER: frozenset[str] = frozenset(_norm(c) for c in _CANON_TO_FORMS)
 
+# Усечённые формы, СОВПАДАЮЩИЕ (после ё→е) с частыми обычными словами: «Тёма/Тём»→
+# «тема»/«тем» (тема разговора / «тем более»), «Серый»→серый цвет, «Петь»→петь,
+# «Мила»→мила, «Вить»→вить, «Мишка»→мишка (игрушка). На нарративе они дали бы ложное
+# само-обращение (спикер «Артём», сказавший «тема закрыта», выглядел бы как «зовёт
+# сам себя»). Поэтому их берём в обращения ТОЛЬКО в звательной позиции (приветствие/
+# имя+запятая), как полные номинативы, а не «везде» (ход1 цикла5).
+_COMMON_WORD_FORMS: frozenset[str] = frozenset(
+    {"тема", "тем", "серый", "петь", "мила", "вить", "мишка"}
+)
+
 _SPEAKER_PLACEHOLDER_RE = re.compile(r"^спикер\s*\d+$", re.IGNORECASE)
 
 # Строка транскрипта: `**[HH:MM] Имя:**  текст` (совместимо с
@@ -207,9 +217,12 @@ def _iter_vocative_tokens(text: str):
     if not text:
         return
     # (1) любые слова, чья нормаль — известная УСЕЧЁННАЯ форма (не полный канон).
+    #     Формы-гомографы частых слов (`_COMMON_WORD_FORMS`) тут НЕ берём — только
+    #     в звательной позиции ниже (иначе «тема закрыта» = ложное само-обращение).
     for m in _WORD_RE.finditer(text):
         w = _norm(m.group(0))
-        if w and w in _ALL_FORMS and w not in _CANON_LOWER:
+        if (w and w in _ALL_FORMS and w not in _CANON_LOWER
+                and w not in _COMMON_WORD_FORMS):
             yield m.group(0)
 
     # (2) полное имя (номинатив) в звательной позиции.
@@ -220,13 +233,13 @@ def _iter_vocative_tokens(text: str):
         rf"(?:{_GREETING_RE})[\s,]+({_WORD_RE.pattern})\s*(?=[,.!?…]|$)", re.IGNORECASE)
     for m in greet.finditer(text):
         w = _norm(m.group(1))
-        if w in _CANON_LOWER:
+        if w in _CANON_LOWER or w in _COMMON_WORD_FORMS:
             yield m.group(1)
     # 2b. имя + запятая в НАЧАЛЕ реплики/предложения: «Михаил, посмотри…».
     head = re.compile(rf"(?:^|[.!?…]\s+)({_WORD_RE.pattern})\s*,", re.IGNORECASE)
     for m in head.finditer(text):
         w = _norm(m.group(1))
-        if w in _CANON_LOWER:
+        if w in _CANON_LOWER or w in _COMMON_WORD_FORMS:
             yield m.group(1)
 
 

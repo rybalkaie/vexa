@@ -5441,8 +5441,15 @@ def _apply_vocative_flags(protocol_text: str, vocative_findings: list[dict]) -> 
         note = (f.get("note") or "").strip()
         if not name or not note:
             continue
+        # Тело протокола почти всегда подписано КОРОТКИМ именем («Илья»), а метка
+        # спикера в транскрипте — часто полная двухсловная («Илья Рыбалка»). Привязка
+        # по первому токену покрывает оба варианта; иначе врезка (место №2, RAZM2) не
+        # встала бы на большинстве реальных встреч (≈60% меток двухсловные — замер
+        # ход3 цикла5). Over-match тёзок невозможен: при неоднозначном первом имени
+        # конфликт вообще не рождается (`vocative_check.addressed_names` → ambiguous).
+        match_name = vocative_check._first_name_token(name) or name
         name_re = re.compile(
-            r"(?<![а-яёА-ЯЁ])" + re.escape(name) + r"(?![а-яёА-ЯЁ])", re.IGNORECASE
+            r"(?<![а-яёА-ЯЁ])" + re.escape(match_name) + r"(?![а-яёА-ЯЁ])", re.IGNORECASE
         )
         flag = f"{REVIEW_FLAG_MARKER} проверьте: {note}"
         for i in range(body_start, len(lines)):
