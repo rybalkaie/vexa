@@ -67,6 +67,7 @@ from . import protocol_to_tg
 from . import series_markup
 from . import series_memory
 from . import series_roster
+from . import vocative_check  # Ф5 (R18): кросс-проверка вокативов в разметке спикеров
 from . import protocol_to_pdf
 from . import run_log  # ISS-31/Ф1: per-meeting durable-лог причин сбоя генерации
 from . import telegram_api
@@ -86,6 +87,12 @@ MAP_SPEAKER_NAMES_SYSTEM_PROMPT = """Ты помогаешь определит�
 - Один кластер — одно имя. Одно имя — один кластер.
 - Если по конкретному кластеру ты не уверен — поставь "name": null. Лучше пропустить, чем угадать неверно.
 
+ГЛАВНОЕ про обращения по имени (вокатив) — направление сигнала:
+- Тот, кто ПРОИЗНОСИТ обращение по имени, — это НЕ тот человек, к кому он обращается. Реплику «Привет, Тань» или «Тань, глянь» говорит НЕ Татьяна: он ЗОВЁТ Татьяну, значит сам он кто-то другой (Татьяна — это ДРУГОЙ кластер, тот, к кому обращаются).
+- Имя кластера бери из двух источников: (1) самопредставление в его же репликах («я — Илья», «меня зовут …»); (2) обращения ДРУГИХ кластеров к нему по имени («Илья, расскажи…» в репликах СОСЕДА → значит соседа зовут не Илья, а вот ЭТОТ кластер — Илья, если он отвечает).
+- Учитывай уменьшительные формы: «Тань» = Татьяна, «Машунь» = Мария, «Оль» = Ольга, «Миш» = Михаил, «Саш» = Александр или Александра. Если по обращению нельзя однозначно понять полное имя из списка — не подставляй, ставь null.
+- НИКОГДА не подставляй кластеру имя, к которому он САМ обращается в своих репликах, — это верный признак путаницы (человек не зовёт сам себя по имени).
+
 Калибровка confidence (важно):
 - 0.95–1.00 — есть прямое самопредставление («я — Илья», «меня зовут …») или vocative-обращение к этому спикеру от другого («Илья, расскажи…»).
 - 0.85–0.95 — есть несколько сильных сходящихся сигналов: явная роль (владелец / менеджер / технический эксперт), упоминания «я», «мы» с привязкой к контексту имени, манера, предмет речи. Это уровень «уверен почти точно».
@@ -95,7 +102,7 @@ MAP_SPEAKER_NAMES_SYSTEM_PROMPT = """Ты помогаешь определит�
 
 Не занижай confidence от страха ошибиться: если на репликах кластера есть 2+ согласованных сигнала про конкретного человека из списка — это уже 0.85+. 0.80 — это сигнал «я не уверен», который запустит ручной clarify; используй его только когда правда не уверен.
 
-Vocative-обращения («Михаил, посмотри…»), упоминания «я …» с проверяемой ролью и предметная специфика (кто про что говорит как профессионал) — самые надёжные сигналы.
+Vocative-обращения — надёжный сигнал, но ПОМНИ про направление: «Михаил, посмотри…» в репликах кластера означает, что Михаил — это ДРУГОЙ кластер (тот, к кому обращаются), а НЕ говорящий. Упоминания «я …» с проверяемой ролью и предметная специфика (кто про что говорит как профессионал) — тоже сильные сигналы про самого говорящего.
 
 Ответь СТРОГО валидным JSON-массивом в формате:
 [
@@ -5336,6 +5343,122 @@ def build_authorship_uncertainty_findings(names: list[str]) -> list[dict]:
     return out
 
 
+# Ф5 (R19): при неуверенной разметке спикеров — плашка в ШАПКЕ протокола, которая
+# НАЗЫВАЕТ спорные имена, + врезка в ТЕЛЕ у пунктов с этими именами. Источник —
+# детерминированная кросс-проверка вокативов (`vocative_check`, section="vocative"),
+# приходит тем же контуром `review_and_flag_protocol_file`, что и authorship (значит
+# из ОБОИХ call-site: finalize + clarify_worker). Владелец УТР1: помечать, не спрашивать.
+SPEAKER_PLAQUE_SENTINEL = "Разметка спикеров под вопросом"
+# Маркер inline-врезки (для идемпотентности повторного прохода).
+_VOCATIVE_INLINE_MARKER = "проверьте: тут мог быть"
+
+
+def _first_body_section_idx(lines: list[str]) -> Optional[int]:
+    """Индекс первой строки-секции `## ` (граница шапка↔тело). None — секций нет."""
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("## "):
+            return i
+    return None
+
+
+def _format_plaque_pairs(pairs: list[tuple]) -> str:
+    """(X,Y) пары → «X и Y; A и B» для текста плашки."""
+    return "; ".join(f"{a} и {b}" for a, b in pairs)
+
+
+def _insert_speaker_plaque(protocol_text: str, pairs: list[tuple]) -> str:
+    """Ф5 (R19, место №1): плашка «мог перепутать X и Y — проверьте» в ШАПКЕ протокола.
+
+    Ставится строго ДО первой `## `-секции — как постоянный дисклеймер Ф4а (иначе
+    утекла бы в series_memory-дайджест, который собирает только тело `## `-секций).
+    Идемпотентно по `SPEAKER_PLAQUE_SENTINEL`: повторный проход дубль не плодит,
+    а список пар обновляет (снимаем старую строку и ставим новую с актуальными
+    именами). Markdown-цитата курсивом — как дисклеймер (служебная заметка, не контент).
+    """
+    if not pairs:
+        return protocol_text
+    text = protocol_text or ""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    # Снять прежнюю плашку (если имена изменились между перевыпусками).
+    lines = [ln for ln in lines if SPEAKER_PLAQUE_SENTINEL not in ln]
+    plaque = (
+        f"> ⚠️ _{SPEAKER_PLAQUE_SENTINEL}: мог перепутать "
+        f"{_format_plaque_pairs(pairs)} — проверьте, кто где._"
+    )
+    insert_at = _first_body_section_idx(lines)
+    if insert_at is None:
+        # Нет секций → после шапки (первый `---`), иначе после первой строки.
+        insert_at = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "---"), 1)
+    block = ["", plaque, ""]
+    new_lines = lines[:insert_at] + block + lines[insert_at:]
+    # Схлопываем прогоны пустых строк в одну — иначе снятие/повторная вставка плашки
+    # копит осиротевшие пустые строки (нарушая идемпотентность повторного прохода).
+    collapsed: list[str] = []
+    for ln in new_lines:
+        if ln.strip() == "" and collapsed and collapsed[-1].strip() == "":
+            continue
+        collapsed.append(ln)
+    result = "\n".join(collapsed)
+    if text.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _apply_vocative_flags(protocol_text: str, vocative_findings: list[dict]) -> str:
+    """Ф5 (R19): рендер findings section="vocative" в ДВУХ местах.
+
+    Место №1 — плашка в шапке (называет спорные имена X/Y).
+    Место №2 (RAZM2) — врезка «⚠️ проверьте: тут мог быть Y, а не X» у пунктов/задач
+    ТЕЛА протокола, где фигурирует спорное имя (дословных реплик в саммари нет, поэтому
+    привязываемся к именам). Только тело (после первой `## `-секции): в шапке имена
+    участников — там врезка не нужна (её несёт плашка). Идемпотентно.
+
+    Чистая функция (без IO/claude). PII: имена — уже в протоколе, ничего нового наружу.
+    """
+    if not vocative_findings:
+        return protocol_text
+    # Пары для плашки (дедуп, стабильный порядок).
+    pairs: list[tuple] = []
+    seen_pairs: set[tuple] = set()
+    for f in vocative_findings:
+        pr = f.get("pair") or []
+        if len(pr) == 2:
+            key = tuple(sorted(pr))
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                pairs.append(key)
+    text = _insert_speaker_plaque(protocol_text, pairs)
+
+    # Врезки в теле. Перечень (имя → note) для inline.
+    lines = text.split("\n")
+    body_start = _first_body_section_idx(lines)
+    if body_start is None:
+        return text
+    for f in vocative_findings:
+        name = (f.get("quote") or "").strip()
+        note = (f.get("note") or "").strip()
+        if not name or not note:
+            continue
+        name_re = re.compile(
+            r"(?<![а-яёА-ЯЁ])" + re.escape(name) + r"(?![а-яёА-ЯЁ])", re.IGNORECASE
+        )
+        flag = f"{REVIEW_FLAG_MARKER} проверьте: {note}"
+        for i in range(body_start, len(lines)):
+            ln = lines[i]
+            stripped = ln.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith(">"):
+                continue
+            if not name_re.search(ln):
+                continue
+            # Идемпотентность: на строке уже стоит вокатив-врезка — не дублируем.
+            if _VOCATIVE_INLINE_MARKER in ln:
+                continue
+            lines[i] = ln.rstrip() + f"  {flag}"
+    return "\n".join(lines)
+
+
 class ProtocolReviewError(RuntimeError):
     """Сбой ревью-прохода (CLI/claude/parse)."""
 
@@ -5345,6 +5468,15 @@ def _is_protocol_review_enabled() -> bool:
     `0/false/no` → OFF). Нужен, чтобы при сбое в проде отключить лишний
     claude-вызов в hot-path без передеплоя кода."""
     raw = (os.environ.get("ENABLE_PROTOCOL_REVIEW") or "").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
+def _is_vocative_check_enabled() -> bool:
+    """Ф5 (R18/R19): kill-switch кросс-проверки вокативов `ENABLE_VOCATIVE_CHECK`
+    (дефолт ON; `0/false/no` → OFF). Проверка детерминированная (без claude), но
+    если на реальных встречах она зашумит ложными парами — гасим ЕЁ в проде без
+    передеплоя, оставив весь остальной ревью-контур живым."""
+    raw = (os.environ.get("ENABLE_VOCATIVE_CHECK") or "").strip().lower()
     return raw not in ("0", "false", "no")
 
 
@@ -5885,9 +6017,24 @@ def apply_review_flags(protocol_text: str, findings: list[dict]) -> str:
     Идемпотентно: если в строке уже есть ⚠️ с этим note — не дублирует;
     хвостовой блок не плодится при повторном проходе. Чистая функция
     (без IO/claude) — основной объект unit-тестов 5.2/6.2.
+
+    Ф5 (R19): findings section="vocative" (кросс-проверка вокативов) рендерятся
+    ОСОБО — плашка в шапке + врезка в теле у пунктов со спорными именами
+    (`_apply_vocative_flags`), не общим построчным контуром.
     """
     if not findings:
         return protocol_text
+    # Ф5 (R19): вокатив-находки — плашка/врезка, отдельно от построчного контура.
+    vocative_findings = [
+        f for f in findings if f.get("section") == vocative_check.VOCATIVE_SECTION
+    ]
+    if vocative_findings:
+        protocol_text = _apply_vocative_flags(protocol_text, vocative_findings)
+        findings = [
+            f for f in findings if f.get("section") != vocative_check.VOCATIVE_SECTION
+        ]
+        if not findings:
+            return protocol_text
     lines = protocol_text.split("\n")
     norm_lines = [_normalize_for_match(ln) for ln in lines]
     unmatched: list[dict] = []
@@ -6323,6 +6470,25 @@ def review_and_flag_protocol_file(
         return 0
 
     extra = [f for f in (extra_findings or []) if f.get("quote") and f.get("note")]
+
+    # Ф5 (R18/R19): детерминированная кросс-проверка вокативов по ТРАНСКРИПТУ. Тут —
+    # ЕДИНАЯ точка на ОБА call-site (finalize + clarify_worker; + команда/CLI) и оба
+    # режима (rewrite/flag-only): findings section="vocative" уезжают тем же `extra`,
+    # что и authorship, и рендерятся `apply_review_flags` (плашка в шапке + врезка в
+    # теле). Best-effort: сбой страховки НЕ роняет встречу. Опасная тройка: логируем
+    # ЧИСЛО спорных пар, без имён/текста реплик.
+    if _is_vocative_check_enabled():
+        try:
+            voc = vocative_check.find_vocative_findings(transcript_md)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[vocative] check failed (non-fatal): %s", type(e).__name__)
+            voc = []
+        if voc:
+            extra = extra + voc
+            logger.info(
+                "[vocative] meeting=%s спорных пар разметки спикеров: %d",
+                meeting_sid or "?", len(voc) // 2,
+            )
 
     # Ф7 (G8): второй проход «редактор-критик» — переписывает черновик ТЕМ ЖЕ
     # единственным вызовом, что несёт ревизию диаризации (Ф4). 2 тяжёлых вызова
