@@ -51,6 +51,7 @@ _WRITE_LOCK = threading.Lock()
 
 _MAX_KEY_LEN = 48          # длина ключа-слова (защита от гигантских полей)
 _MIN_KEY_LEN = 4           # короче — не идентифицирующее слово (как токенайзер матчинга)
+_MIN_NAME_LEN = 2          # имя короче — не идентифицирующее (У4: журнал вокатив-пар; Оля/Ян)
 
 # Прямое отрицание «не <слово>» — зеркало dict `pending_status_reply._REOPEN_RE`
 # (`\bне\s+<verb>`). Класс выученного слова относится к УТВЕРДИТЕЛЬНОЙ форме: «не разрулили»
@@ -253,7 +254,37 @@ def record_unknown_word(
     })
 
 
+def _name_key(name: str) -> Optional[str]:
+    """Ключ ИМЕНИ для журнала вокатив-пар (У4). Мягче `_word_key`: имена бывают короткими
+    (Оля, Ян). lower, ё→е, срез пунктуации по краям, потолок длины. Пусто/<`_MIN_NAME_LEN`
+    → None (не журналим)."""
+    n = _norm(name).strip().strip(".,;:!?«»\"'()[]")
+    n = re.sub(r"\s+", " ", n).strip()
+    if len(n) < _MIN_NAME_LEN:
+        return None
+    return n[:_MAX_KEY_LEN]
+
+
+def record_vocative_flag(
+    name_a: str, name_b: str, *, store_path: Optional[Path] = None,
+) -> bool:
+    """У4 (Ф6, follow-ups Ф5): журнал того, что пометила вокатив-проверка Ф5 —
+    «vocative-пара помечена». В файл — ТОЛЬКО имена пары (нормализованные, отсортированы для
+    стабильного ключа) + дата, БЕЗ текста реплик/транскрипта (опасная тройка; У4 разрешает
+    имена, но НЕ реплики). То же хранилище, что R20/R24 (одно, не два). Событие `vocative`
+    на активную карту слов НЕ влияет (аудит, как `journal` R20 — `_fold` его игнорирует).
+    Пустое/короткое имя любой стороны → False."""
+    a = _name_key(name_a)
+    b = _name_key(name_b)
+    if not a or not b:
+        return False
+    pair = sorted((a, b))
+    return _append_event(_store_path(store_path), {
+        "ev": "vocative", "pair": pair, "date": _today(),
+    })
+
+
 def journal_entries(*, store_path: Optional[Path] = None) -> list:
-    """Все события журнала (learn/rollback/journal) в порядке записи — для аудита R20
-    (Ф6). Возвращает список dict'ов как записаны."""
+    """Все события журнала (learn/rollback/journal/vocative) в порядке записи — для аудита
+    R20+У4 (Ф6). Возвращает список dict'ов как записаны."""
     return _read_events(_store_path(store_path))

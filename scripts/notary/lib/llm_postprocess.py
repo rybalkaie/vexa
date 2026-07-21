@@ -5487,6 +5487,17 @@ def _is_vocative_check_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def _is_vocative_journal_enabled() -> bool:
+    """Ф6 (У4): журнал помеченных вокатив-пар `ENABLE_VOCATIVE_JOURNAL` — ДЕФОЛТ OFF в
+    коде ([[reissue-llm-tier-gate-default-off]]). Дефолт-OFF ради тестов: полный ревью-контур
+    в офлайн-тестах пишет в реальный `decision-memory.jsonl` (общий с продом), поэтому
+    журналим ТОЛЬКО когда флаг явно включён (на проде — в деплой-чек-листе Ф6, рядом с
+    `ENABLE_REPLY_UNDERSTAND`). Сама плашка/врезка вокатива при этом работает всегда
+    (гейтится отдельным `ENABLE_VOCATIVE_CHECK`, дефолт-ON) — журнал лишь аудитная надстройка."""
+    raw = (os.environ.get("ENABLE_VOCATIVE_JOURNAL") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 # === Ф7 (G8): второй проход «редактор-критик» (двухпроходная генерация) =======
 # Существующий ревью-проход только ФЛАЖИТ (⚠️). Ф7 добавляет РЕЖИМ «переписать
 # черновик по чек-листу» — модель сама вычитывает черновик (пропущенные
@@ -6496,6 +6507,26 @@ def review_and_flag_protocol_file(
                 "[vocative] meeting=%s спорных пар разметки спикеров: %d",
                 meeting_sid or "?", len(voc) // 2,
             )
+            # У4 (Ф6): журнал помеченных вокатив-пар — ИМЕНА пары + дата, БЕЗ реплик/текста
+            # (опасная тройка). Гейт `ENABLE_VOCATIVE_JOURNAL` дефолт-OFF (тесты не пишут в
+            # реальный decision-memory). По одной записи на УНИКАЛЬНУЮ пару (voc несёт 2
+            # finding на пару). Best-effort: сбой журнала не роняет встречу.
+            if _is_vocative_journal_enabled():
+                try:
+                    from . import decision_memory as _dm  # noqa: PLC0415
+                    seen_pairs = set()
+                    for f in voc:
+                        pair = tuple(f.get("pair") or [])
+                        if len(pair) != 2:
+                            continue
+                        canon = tuple(sorted(pair))
+                        if canon in seen_pairs:
+                            continue
+                        seen_pairs.add(canon)
+                        _dm.record_vocative_flag(pair[0], pair[1])
+                except Exception as e:  # noqa: BLE001 — журнал best-effort
+                    logger.warning("[vocative] журнал пометок не удался (non-fatal): %s",
+                                   type(e).__name__)
 
     # Ф7 (G8): второй проход «редактор-критик» — переписывает черновик ТЕМ ЖЕ
     # единственным вызовом, что несёт ревизию диаризации (Ф4). 2 тяжёлых вызова
