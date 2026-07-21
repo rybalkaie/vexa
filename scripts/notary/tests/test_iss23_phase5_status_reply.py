@@ -130,6 +130,7 @@ class TestFU1NegationReopen(unittest.TestCase):
         "не закрыл", "не закрыто", "не закрыт",
         "не готов", "не готово",
         "не отработано", "не отработал",       # зеркало _DONE_RE «отработано»
+        "не done", "не DONE",                   # зеркало _DONE_RE токена «done» (двуязычные reply)
         "так и не сделал",                      # длинная форма
         "не выполнил план до конца",            # длинная форма — не ловит done по «выполн»
     )
@@ -145,7 +146,7 @@ class TestFU1NegationReopen(unittest.TestCase):
 
     def test_positive_without_negation_unbroken(self):
         # Расширение — только под префиксом «не …»; позитив по-прежнему done.
-        for t in ("сделал", "сделали", "выполнил", "выполнено", "решил", "отработано"):
+        for t in ("сделал", "сделали", "выполнил", "выполнено", "решил", "отработано", "done"):
             self.assertEqual(p.detect_status_intent(t), p.LABEL_DONE, t)
 
 
