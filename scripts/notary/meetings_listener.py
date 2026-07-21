@@ -1949,6 +1949,13 @@ def maybe_route_to_ack_reply(
     state = reply_ack_state.get(mid)
     if not state:
         return False  # не reply на НАШ ack → обычные роуты (не перехватываем чужое)
+    # Кросс-чатовая защита: Telegram нумерует message_id ПО-ЧАТНО, а state глобальный.
+    # Бот живёт в личке владельца + группах серий (cid ≠ allowed_chat), их message_id
+    # свободно совпадают. Без сверки chat_id reply в чате B на сообщение с тем же id, что
+    # у нашего ack в чате A, увёл бы «верни»/«да» в ЧУЖУЮ серию (порча статусов). Сверяем.
+    st_chat = state.get("chat_id")
+    if st_chat is not None and st_chat != chat_id:
+        return False  # тот же message_id, но другой чат → не наш ack → обычные роуты
     try:
         res = reply_ack.handle_ack_reply(state, text)
     except Exception as e:  # noqa: BLE001 — обработка ответа не должна валить listener

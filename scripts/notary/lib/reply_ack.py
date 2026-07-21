@@ -134,7 +134,9 @@ def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
     if block is not None:
         options = _replier_tasks(_load_items(series_dir, snapshot), replier)
         if not options:
-            return None, [], None
+            # У2 (цикл5): «закрой всё» при нуле висящих — не молчим и не врём «не нашёл
+            # статусов»: честно говорим, что закрывать нечего (block_close «съеден»).
+            return None, ["Сейчас у вас нет открытых вопросов — закрывать нечего."], block
         lines = ["Закрыть все ваши вопросы?", *_numbered(options),
                  "Ответьте «да», «нет» или «да, кроме 3» (номер)."]
         return ({"mode": "confirm_close", "label": "done", "options": options, "word": None},
@@ -343,7 +345,13 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
     ans = parse_answer(text)
 
     # 1) Несогласие (R26): «не так / верни» на ступени-2 → РЕАЛЬНЫЙ reopen применённого.
-    if ans["rollback"] and applied:
+    #    НО: слова отмены — омонимы. «отмени/отменили» = и «откати», и класс «снято»
+    #    (cancelled). Если ждём ответ на clarify_class и человек НАЗВАЛ класс словом — это
+    #    ОТВЕТ НА ПЕРЕСПРОС (снять эту задачу), а не откат применённого. Не крадём его в
+    #    reopen, иначе вернули бы в работу уже применённое и не сняли спрошенное.
+    answering_clarify = bool(
+        question and question.get("mode") == "clarify_class" and ans["cls"])
+    if ans["rollback"] and applied and not answering_clarify:
         reopened = [a["text"] for a in applied
                     if a.get("text") and _reopen(series_dir, a["text"], date=date)]
         if reopened:
@@ -417,6 +425,10 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
     if applied:
         if ans["yes"] or not text.strip():
             return {"text": "", "consume": True, "learned": False}
-        return {"text": "Если что-то не так — ответьте «не так» или «верни», поправлю.",
+        # У1 (цикл5): reply на ack, не «да» и не откат — вероятно, добивка нового статуса.
+        # Ре-роут в understand вне скоупа Ф4; честно подсказываем оба канала, не молчим.
+        return {"text": "Если что-то не так — ответьте «не так» или «верни», поправлю. "
+                        "А новый статус по другому вопросу лучше отправить ответом на сам "
+                        "протокол встречи.",
                 "consume": False, "learned": False}
     return {"text": "", "consume": True, "learned": False}

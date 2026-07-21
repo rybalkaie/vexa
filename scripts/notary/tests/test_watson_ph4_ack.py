@@ -195,6 +195,17 @@ class TestBuildAck(_Base):
         self.assertTrue(built["has_tier2"])
         self.assertIn("не так", built["text"].lower())
 
+    def test_block_close_no_pending_says_nothing_to_close(self):
+        # У2 (цикл5): «закрой всё» при нуле висящих — честная строка, не молчание и не
+        # вводящее «Не нашёл статусов»; block_close не теряется.
+        empty = self.root / "empty-series"
+        empty.mkdir()
+        res = self._blank(questions=[_question("block_close")])
+        built = ra.build_ack(res, series_dir=empty, replier="Татьяна")
+        self.assertIn("закрывать нечего", built["text"])
+        self.assertNotIn("Не нашёл", built["text"])
+        self.assertIsNone(built["question"])
+
 
 # ==========================================================================
 # parse_answer — цифры / «да, кроме третьей» (И1) / «верни» / класс словом
@@ -284,6 +295,29 @@ class TestHandleAckReply(_Base):
         self.assertFalse(res["consume"])
         self.assertEqual(self._status(), {})
 
+    def test_rollback_word_answers_clarify_not_reopen(self):
+        # Цикл5 Н2: слово отмены — омоним. При clarify_class + УЖЕ применённом «отменили»
+        # = ответ на переспрос (снять спрошенную задачу), НЕ откат применённого. Иначе
+        # вернули бы в работу применённое и не сняли спрошенное.
+        sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_DONE, source="x", date="2026-06-10")
+        st = self._state(
+            applied=[{"text": _ITEM_RASCH, "label": "done"}],
+            question={"mode": "clarify_class", "label": None,
+                      "matched": _ITEM_MEDIA, "word": "разрулили"})
+        res = ra.handle_ack_reply(st, "отменили")
+        s = self._status()
+        self.assertEqual(s.get(sm._status_key(_ITEM_RASCH)), sm.STATUS_DONE)       # не откатили
+        self.assertEqual(s.get(sm._status_key(_ITEM_MEDIA)), sm.STATUS_CANCELLED)  # сняли спрошенное
+        self.assertTrue(res["consume"])
+
+    def test_reply_to_ack_new_update_guides_to_protocol(self):
+        # У1 (цикл5): reply на ack не-«да»/не-откат (добивка нового статуса) → подсказка
+        # про канал протокола, контекст НЕ гасим (вдруг всё же захочет «верни»).
+        st = self._state(applied=[{"text": _ITEM_RASCH, "label": "done"}])
+        res = ra.handle_ack_reply(st, "а медиаплан тоже готов")
+        self.assertFalse(res["consume"])
+        self.assertIn("протокол", res["text"].lower())
+
 
 # ==========================================================================
 # Проводка в listener — роут ответа на ack (R26/R15) + persist + ОЖИД1
@@ -318,6 +352,19 @@ class TestAckReplyRoute(_Base):
         with mock.patch.object(ml, "send_message"):
             claimed = ml.maybe_route_to_ack_reply("tok", self.GROUP, self._reply_msg("верни", 777))
         self.assertFalse(claimed)
+
+    def test_route_cross_chat_collision_ignored(self):
+        # Цикл5 Н1: message_id уникален ПО-ЧАТНО. Ack записан для ДРУГОГО чата (999), reply
+        # с тем же mid пришёл в наш GROUP → chat_id не совпал → не наш ack (False), чужую
+        # серию не трогаем и её контекст не гасим.
+        sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_DONE, source="x", date="2026-06-10")
+        ras.record(700, series_dir=self.sd, chat_id=999,
+                   applied=[{"text": _ITEM_RASCH, "label": "done"}], has_tier2=True)
+        with mock.patch.object(ml, "send_message"):
+            claimed = ml.maybe_route_to_ack_reply("tok", self.GROUP, self._reply_msg("верни", 700))
+        self.assertFalse(claimed)
+        self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_DONE)  # не откатили
+        self.assertIsNotNone(ras.get(700))                              # контекст не погашен
 
     def test_route_off_flag_returns_false(self):
         ras.record(890, series_dir=self.sd, applied=[{"text": _ITEM_RASCH, "label": "done"}])
