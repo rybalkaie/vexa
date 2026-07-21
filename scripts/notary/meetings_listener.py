@@ -1760,7 +1760,7 @@ def _forward_config_to_owner(series: str, requests: list) -> None:
         notify.push(
             f"🔧 Просьба про формат серии «{series}» ({n}) — участник просит поменять "
             f"вид протокола/дайджеста. Формат решаешь ты. Первая: {requests[0][:160]}",
-            identity=f"series-config:{series}",
+            dedupe_key=f"series-config:{series}",
         )
     except Exception as e:  # noqa: BLE001 — форвард best-effort, listener не валим
         logger.warning("[understand] форвард настройки владельцу упал (non-fatal): %s", type(e).__name__)

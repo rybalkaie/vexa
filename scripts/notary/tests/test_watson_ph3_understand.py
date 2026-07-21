@@ -479,10 +479,13 @@ class TestUnderstandListenerRoute(_SeriesBase):
         pushed = []
         stub = lambda rt, it: _canned(config=["не включай блок задач в протокол"])
         from notary.lib import notify
+        # autospec=True → мок ЭНФОРСИТ реальную сигнатуру push (ловит неверный kwarg типа
+        # `identity=` — в проде он бы уронил форвард в try/except молча).
         with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
              mock.patch.object(ml, "_protokol_root", return_value=self.root), \
              mock.patch.object(ru, "_request_understand", stub), \
-             mock.patch.object(notify, "push", side_effect=lambda *a, **k: pushed.append(a) or True), \
+             mock.patch.object(notify, "push", autospec=True,
+                               side_effect=lambda *a, **k: pushed.append((a, k)) or True), \
              mock.patch.object(ml, "send_message", side_effect=lambda *a, **k: sent.append(a[2])):
             claimed = ml.maybe_route_to_reply_understand(
                 "tok", self.GROUP, self.OWNER, self._msg("не включай блок задач в протокол"))
@@ -508,6 +511,17 @@ class TestUnderstandListenerRoute(_SeriesBase):
             out = ml._maybe_transcribe_protocol_voice("tok", self.GROUP, m)
         self.assertIn("voice", out)
         self.assertNotIn("text", out)
+
+    def test_process_message_dispatches_to_understand(self):
+        # Достижимость из РЕАЛЬНОГО триггера: process_message → maybe_route_to_reply_understand
+        # (не изолированный вызов роута). Статус реально проставлен через полный dispatch.
+        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
+             mock.patch.object(ml, "_protokol_root", return_value=self.root), \
+             mock.patch.object(ru, "_request_understand", stub), \
+             mock.patch.object(ml, "send_message"):
+            ml.process_message("tok", self.OWNER, self._msg("по складу склад разрулили"))
+        self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_DONE)
 
     def test_digest_route_understand_reachable(self):
         # НЕС2: understand достижим и на дайджест-роуте (_apply_digest_understand).
