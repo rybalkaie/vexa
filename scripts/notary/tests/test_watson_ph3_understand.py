@@ -298,6 +298,15 @@ class TestUnderstandCore(_SeriesBase):
         self.assertTrue(r["edits"])
         self.assertEqual(self._status(), {})
 
+    def test_pure_edit_does_not_engage(self):
+        # РИСК1: чистая правка (без статуса) — работа петли правок, understand НЕ вовлекается
+        # (не крадёт правку и её дебаунс-ack), чтобы reply ушёл в шлюз правок как раньше.
+        stub = lambda rt, it: _canned(edits=["не Дрим Стори, а 23МПКТК"])
+        r = ru.understand_reply("не Дрим Стори, а 23МПКТК", series_dir=self.sd,
+                                replier="Татьяна", understand_fn=stub, date="2026-06-10")
+        self.assertFalse(r["engaged"])
+        self.assertEqual(len(r["applied"]), 0)
+
     def test_opasnaya_troika_no_reply_text_in_logs(self):
         # Текст reply в лог understand-слоя не уходит (только счётчики/классы).
         secret = "СЕКРЕТ_ПРО_МАРЖУ_И_ЗАКУПКУ"
@@ -331,6 +340,16 @@ class TestUnderstandFallbackR9(_SeriesBase):
         self.assertTrue(r["deferred"])
         self.assertEqual(self._status(), {})              # ложных закрытий 0
         self.assertEqual(len(ru.ruq.list_pending(self.sd)), 1)
+
+    def test_ai_down_pure_edit_steps_aside(self):
+        # ИИ-down + чистая пачка правок (нет статус-маркера) → understand НЕ берёт
+        # (engaged=False), НЕ копит: обычный шлюз правок отработает как сегодня.
+        r = ru.understand_reply("вместо Zil правильно Zeal, замените склад на склад-2",
+                                series_dir=self.sd, replier="Татьяна",
+                                understand_fn=lambda rt, it: None, date="2026-06-10", orig_ts=1000.0)
+        self.assertFalse(r["engaged"])
+        self.assertEqual(ru.ruq.list_pending(self.sd), [])
+        self.assertEqual(self._status(), {})
 
     def test_out_of_order_deferred_does_not_overwrite(self):
         # Поздний живой ответ закрыл задачу (ts=2000); ранний отложенный (ts=1000) при

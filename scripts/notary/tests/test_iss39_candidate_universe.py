@@ -233,9 +233,18 @@ class TestRisk2SnapshotBounding(_SeriesFx):
         for t in (_NAMELESS, _SONA_1, _SONA_2, _MIKH_1, _MIKH_2, _MINOR_1):
             self.assertIn(sm._status_key(t), cand_keys)
 
-    def test_empty_snapshot_falls_back_to_live(self):
-        # Пустой слепок (документ без нумерованных висяков) → live-хвост, не пустой универсум.
-        self.assertTrue(p.load_series_pending(self.sd, snapshot=[]))
+    def test_empty_snapshot_means_empty_hanging_basket(self):
+        # Ф3 форвард-долг (Ф2-1): пустой слепок (документ показал 0 нумерованных висяков) —
+        # это «0 висящих», НЕ live-хвост (иначе overlap мог бы закрыть задачу, которой в
+        # отвечаемом документе не было — РИСК2). `snapshot is None` по-прежнему = live.
+        # Правка ОСОЗНАННО пересматривает прежнее поведение (было: `[]`→live).
+        empty = _candidate_keys(self.sd, snapshot=[])
+        live = _candidate_keys(self.sd, snapshot=None)
+        # висящая задача БЕЗ слепка — кандидат; с ПУСТЫМ слепком — уже нет:
+        self.assertIn(sm._status_key(_SONA_1), live)
+        self.assertNotIn(sm._status_key(_SONA_1), empty)
+        # мелочь слепок не несёт — она всегда live (остаётся кандидатом и при пустом слепке):
+        self.assertIn(sm._status_key(_MINOR_1), empty)
 
 
 _DISTINCT = [

@@ -394,6 +394,8 @@ def understand_reply(
     understand_fn=None,
     store_path=None,
     apply: bool = True,
+    msg_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
 ) -> dict:
     """Полный разбор reply understand-слоем → СТРУКТУРА решения + сайд-эффекты Ф3.
 
@@ -427,7 +429,7 @@ def understand_reply(
     if parsed is None:
         return _fallback_no_ai(
             reply_text, series_dir=series_dir, snapshot=snapshot, orig_ts=orig_ts,
-            date=date, source=source, apply=apply)
+            date=date, source=source, apply=apply, msg_id=msg_id, chat_id=chat_id)
 
     reply_lines = [ln.strip() for ln in str(reply_text or "").splitlines() if ln.strip()]
     result = _blank_result(engaged=False)
@@ -466,9 +468,13 @@ def understand_reply(
         result["questions"].append({"kind": "block_close", "tier": TIER_QUESTION,
                                     "segment": None, "matched": None, "label": None})
 
+    # Вовлекаемся на СТАТУСНЫХ решениях / настройке / непонятом — но НЕ на «только правки»:
+    # чистая правка — работа петли правок (её ack про дебаунс 20 мин), understand её не крадёт
+    # (РИСК1: правки утекают в петлю, а не подменяются). При статусе+правках — берём (applied
+    # непусто) и правки форвардим caller'ом.
     result["engaged"] = bool(
-        result["applied"] or result["questions"] or result["edits"]
-        or result["config_requests"] or result["unclear"])
+        result["applied"] or result["questions"]
+        or result["config_requests"] or (result["unclear"] or "").strip())
     logger.info(
         "[understand] series=%s applied=%d questions=%d edits=%d config=%d deferred=0",
         Path(series_dir).name, len(result["applied"]), len(result["questions"]),
@@ -478,17 +484,16 @@ def understand_reply(
 
 def _fallback_no_ai(
     reply_text, *, series_dir, snapshot, orig_ts, date, source, apply: bool,
+    msg_id=None, chat_id=None,
 ) -> dict:
-    """R9: ИИ недоступен → НЕ гадаем. Очевидное по словарю применяем детерминированно
-    (`apply_status_reply` — dict-детект + консервативный матч); неоднозначное/пачку — в
-    ОЧЕРЕДЬ дозабора (разберётся при оживлении ИИ). Ложных закрытий 0: apply_status_reply
-    сам возвращает None на неоднозначном. Опасная тройка: текст reply в лог не пишем."""
-    result = _blank_result(engaged=True)
-    result["deferred"] = True
-    looks_multi = mrs.looks_like_multi_status(reply_text)
-    applied_key = None
-    if not looks_multi and apply:
-        # Одиночный очевидный статус — детерминированный быстрый путь (без сети).
+    """R9: ИИ недоступен → НЕ гадаем. Развилка:
+      • одиночный ОЧЕВИДНЫЙ статус (словарь однозначен) → применяем детерминированно
+        (`apply_status_reply` — dict-детект + консервативный матч, ложных закрытий 0);
+      • чистая правка / нет статус-маркера вовсе → НЕ наш путь (engaged=False) → обычные
+        роуты (шлюз правок) отработают как сегодня, не копим;
+      • есть статус-маркер, но неоднозначно/пачка → в ОЧЕРЕДЬ дозабора (разберётся при
+        оживлении ИИ; переживёт рестарт). Опасная тройка: текст reply в лог не пишем."""
+    if apply and not mrs.looks_like_multi_status(reply_text):
         try:
             rec = psr.apply_status_reply(
                 reply_text, series_dir, date=date, source=f"{source}-obvious", snapshot=snapshot)
@@ -496,22 +501,28 @@ def _fallback_no_ai(
             logger.warning("[understand] очевидный apply упал (non-fatal): %s", type(e).__name__)
             rec = None
         if rec:
-            result["applied"].append({
-                "kind": "applied", "tier": TIER_CONFIDENT, "segment": None,
-                "matched": rec.get("matched"), "label": rec.get("label"),
-                "status": rec.get("status"), "source": "dict", "via": "obvious"})
-            result["status_groups"] = [(rec.get("label"), [rec.get("matched") or ""])]
-            applied_key = series_memory._status_key(rec.get("matched") or "")
-            if applied_key:
-                ruq.record_applied(series_dir, applied_key, orig_ts)
-            result["deferred"] = False        # одиночный статус разобран очевидным — не копим
-    if result["deferred"] and apply:
-        # Неоднозначное/пачка → в очередь (переживёт рестарт, разберётся ИИ позже).
-        ruq.enqueue(series_dir, orig_ts=orig_ts, chat_id=None, msg_id=int(orig_ts * 1000) % 2**31,
+            key = series_memory._status_key(rec.get("matched") or "")
+            if key:
+                ruq.record_applied(series_dir, key, orig_ts)
+            logger.info("[understand] ИИ недоступен → очевидный статус словарём series=%s",
+                        Path(series_dir).name)
+            return {
+                **_blank_result(engaged=True), "deferred": False,
+                "applied": [{"kind": "applied", "tier": TIER_CONFIDENT, "segment": None,
+                             "matched": rec.get("matched"), "label": rec.get("label"),
+                             "status": rec.get("status"), "source": "dict", "via": "obvious"}],
+                "status_groups": [(rec.get("label"), [rec.get("matched") or ""])],
+            }
+    # Не очевидный одиночный статус. Чистая правка / нет статус-маркера → чужой путь.
+    if psr.looks_edit_heavy(reply_text) or psr.detect_status_intent(reply_text) is None:
+        logger.info("[understand] ИИ недоступен, reply без однозначного статуса → обычные роуты")
+        return _blank_result(engaged=False)
+    # Статус-маркер есть, но неоднозначно/пачка → в очередь дозабора (R9).
+    if apply:
+        ruq.enqueue(series_dir, orig_ts=orig_ts, chat_id=chat_id, msg_id=msg_id,
                     reply_text=reply_text, snapshot=snapshot)
-    logger.info("[understand] ИИ недоступен → фолбэк R9 series=%s очевидное=%s очередь=%s",
-                Path(series_dir).name, bool(result["applied"]), result["deferred"])
-    return result
+    logger.info("[understand] ИИ недоступен → отложено в очередь series=%s", Path(series_dir).name)
+    return {**_blank_result(engaged=True), "deferred": True}
 
 
 def drain_deferred(series_dir, *, understand_fn=None, apply: bool = True) -> dict:

@@ -1296,7 +1296,7 @@ def _apply_digest_understand(
         result = reply_understand.understand_reply(
             text, series_dir=series_dir, replier=_msg_display_name(msg),
             snapshot=snapshot, orig_ts=msg.get("date"), date=_reply_date_str(msg),
-            source="understand-digest",
+            source="understand-digest", msg_id=msg.get("message_id"), chat_id=chat_id,
         )
     except Exception as e:  # noqa: BLE001 — understand не должен валить listener
         logger.exception("[understand-digest] разбор упал: %s", e)
@@ -1849,7 +1849,7 @@ def maybe_route_to_reply_understand(
         result = reply_understand.understand_reply(
             text, series_dir=series_dir, replier=_msg_display_name(msg),
             snapshot=snapshot, orig_ts=msg.get("date"), date=_reply_date_str(msg),
-            source="understand",
+            source="understand", msg_id=msg.get("message_id"), chat_id=chat_id,
         )
     except Exception as e:  # noqa: BLE001 — understand не должен валить listener
         logger.exception("[understand] разбор reply упал: %s", e)

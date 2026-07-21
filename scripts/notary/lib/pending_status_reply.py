@@ -755,11 +755,16 @@ def load_series_pending(series_dir: Optional[Path], *, snapshot: Optional[list] 
         merged = series_memory.merge_open_tasks_with_status(raw, store)
         cap = series_memory.open_tasks_max()
         live_hanging = merged["open"][:cap] if cap > 0 else merged["open"]
-        # РИСК2: снапшот отвечаемого документа ограничивает корзину висящих одним
-        # сообщением; нет снапшота → live-хвост (обратная совместимость, A14).
+        # РИСК2 + форвард-долг Ф2→Ф3: снапшот отвечаемого документа ограничивает корзину
+        # висящих одним сообщением. Различаем ЯВНО (иначе overlap мог бы закрыть висяк,
+        # которого в отвечаемом документе не было):
+        #   • snapshot is None → слепка НЕТ (сообщение до Ф3 / reissue без слепка, A14) →
+        #     live-хвост как раньше (обратная совместимость);
+        #   • snapshot == []   → документ ПОКАЗАЛ 0 нумерованных висяков → пустая корзина
+        #     висящих (НЕ live). Мелочь/doubt/closed это не затрагивает — они всегда live.
         hanging = (
             [t for t in snapshot if isinstance(t, str) and t.strip()]
-            if snapshot else list(live_hanging)
+            if snapshot is not None else list(live_hanging)
         )
         aux = list(series_memory.resolve_minor_open_tasks(digests))
         aux += [d.get("text") for d in merged["doubt"] if isinstance(d, dict)]
