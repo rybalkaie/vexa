@@ -1274,6 +1274,54 @@ def _apply_digest_status_batch(
     return True
 
 
+def _apply_digest_understand(
+    token: str, chat_id: int, series: str, text: str, msg: dict[str, Any],
+    *, snapshot: Optional[list] = None,
+) -> bool:
+    """Ф3 (watson, НЕС2): understand-слой на ДАЙДЖЕСТ-роуте — та же единая точка разбора,
+    что у протокола. Гейт `ENABLE_REPLY_UNDERSTAND` дефолт-OFF → OFF → False (прежний
+    batch/apply). На дайджесте правок протокола нет (A3): сегменты-правки НЕ уходят в шлюз,
+    а честной подсказкой (`edit_as_hint`). Возврат True = understand забрал reply."""
+    try:
+        from notary.lib import reply_understand  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[understand-digest] import failed (feature off?): %s", e)
+        return False
+    if not reply_understand.is_enabled():
+        return False
+    series_dir = _protokol_root() / series
+    if snapshot is None:
+        snapshot = _reply_open_tasks_snapshot(series_dir, msg)
+    try:
+        result = reply_understand.understand_reply(
+            text, series_dir=series_dir, replier=_msg_display_name(msg),
+            snapshot=snapshot, orig_ts=msg.get("date"), date=_reply_date_str(msg),
+            source="understand-digest",
+        )
+    except Exception as e:  # noqa: BLE001 — understand не должен валить listener
+        logger.exception("[understand-digest] разбор упал: %s", e)
+        return False
+    if not result.get("engaged"):
+        return False
+    if result.get("config_requests"):
+        _forward_config_to_owner(series, result["config_requests"])
+        send_message(token, chat_id, CONFIG_FORWARDED_REPLY, reply_to=msg.get("message_id"))
+    if result.get("deferred"):
+        if result.get("status_groups"):
+            _send_understand_ack(token, chat_id, msg, result, edit_as_hint=True)
+        send_message(token, chat_id, UNDERSTAND_DEFERRED_HINT, reply_to=msg.get("message_id"))
+        return True
+    if (result.get("applied") or result.get("questions") or result.get("edits")
+            or (result.get("unclear") or "").strip()):
+        _send_understand_ack(token, chat_id, msg, result, edit_as_hint=True)
+    logger.info(
+        "[understand-digest] reply разобран series=%s applied=%d questions=%d config=%d",
+        series, len(result.get("applied") or []), len(result.get("questions") or []),
+        len(result.get("config_requests") or []),
+    )
+    return True
+
+
 def _digest_voice_reply_enabled() -> bool:
     """Ф5-гейт `ENABLE_DIGEST_VOICE_REPLY` — ДЕФОЛТ OFF. ON ← `1/true/yes/on`.
 
@@ -1360,6 +1408,11 @@ def maybe_route_to_digest_reply(
         text = (msg.get("text") or "").strip()
         if not text:
             return True  # стикер/фото на дайджест — молча жуём, отвечать не на что
+    # Ф3 (watson, НЕС2): understand-слой ДО словарного precheck ниже — иначе настройка
+    # серии (R12) / нестандартный статус (R7) молча отсеклись бы `detect_status_intent
+    # is None`. Флаг ENABLE_REPLY_UNDERSTAND дефолт-OFF → OFF → прежний путь (совместимость).
+    if _apply_digest_understand(token, chat_id, series, text, msg):
+        return True
     try:
         from notary.lib import pending_status_reply  # noqa: PLC0415
         # Подсказку даём, только если человек ПЫТАЛСЯ дать статус (есть статус-маркер).
@@ -1626,6 +1679,207 @@ def maybe_route_to_mixed_reply(
         "queued=%s непонятое=%s overflow=%s",
         chat_id, series, len(status_segments), n_status_ok, n_status_unresolved,
         n_edits, edit_queued, bool(unclear), bool(overflow),
+    )
+    return True
+
+
+# ── Ф3 understand-слой (watson, R7-R12/R24/R27): единая точка разбора reply ────
+# Флаг ENABLE_REPLY_UNDERSTAND дефолт-OFF (R10) — при OFF роут сразу False, поведение
+# бота = ТЕКУЩЕЕ (mixed/status/digest как сегодня). Голос на протокол под отдельным
+# ENABLE_PROTOCOL_VOICE_REPLY (R27) транскрибируется ПЕРЕД разбором.
+CONFIG_FORWARDED_REPLY = (
+    "Передал Илье — формат протокола решает он. Как решит, вернусь 🙌"
+)
+UNDERSTAND_DEFERRED_HINT = (
+    "⏳ Сейчас не смог разобрать сообщение (техническая заминка). Ничего не потерял — "
+    "разберу и отвечу позже."
+)
+
+
+def _msg_display_name(msg: dict[str, Any]) -> Optional[str]:
+    """Имя ответившего для проверки «своя/чужая задача» (R11). Из `from`: имя+фамилия
+    либо username. Нет данных → None (R11 тогда не утверждает «чужая»)."""
+    frm = msg.get("from")
+    if not isinstance(frm, dict):
+        return None
+    parts = [frm.get("first_name"), frm.get("last_name")]
+    name = " ".join(p for p in parts if isinstance(p, str) and p.strip()).strip()
+    if name:
+        return name
+    uname = frm.get("username")
+    return uname if isinstance(uname, str) and uname.strip() else None
+
+
+def _protocol_voice_reply_enabled() -> bool:
+    """R27-гейт `ENABLE_PROTOCOL_VOICE_REPLY` — ДЕФОЛТ OFF (ради офлайн-тестов, как
+    `ENABLE_DIGEST_VOICE_REPLY`). На проде =1 в деплой-чек-листе Ф6."""
+    raw = (os.environ.get("ENABLE_PROTOCOL_VOICE_REPLY") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _maybe_transcribe_protocol_voice(
+    token: str, cid: Optional[int], msg: dict[str, Any]
+) -> dict[str, Any]:
+    """R27: голосовой reply на ПРОТОКОЛ серии → расшифровка ПЕРЕД разбором, чтобы
+    голос шёл тем же путём понимания, что текст (решение владельца 21.07). Раньше
+    voice на протокол мимо статус-роутов уходил в шлюз правок как «правка».
+
+    Действуем КОНСЕРВАТИВНО: только под флагом, только если это reply на распознанный
+    протокол (дайджест — свой роут выше), только голос/аудио. Успех → подставляем
+    `text`, чистим `voice`/`audio` (дальше обычный dispatch). Пусто/сбой → msg без
+    изменений (падёт в шлюз правок с его голос-фолбэком, как раньше). Опасная тройка:
+    расшифровку не логируем — только длину/исход."""
+    if not _protocol_voice_reply_enabled():
+        return msg
+    if not (msg.get("voice") or msg.get("audio")):
+        return msg
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return msg
+    if not _reply_context_series(cid, msg):
+        return msg  # не reply на протокол серии — не наш путь (дайджест обработан выше)
+    voice_text = transcribe_voice_or_none(token, msg)
+    if not voice_text or not voice_text.strip():
+        logger.info("[understand] голос на протокол: STT пусто → шлюз правок (как раньше)")
+        return msg
+    out = dict(msg)
+    out["text"] = voice_text.strip()
+    out.pop("voice", None)
+    out.pop("audio", None)
+    logger.info("[understand] голос на протокол расшифрован chars=%d → текст-путь", len(voice_text))
+    return out
+
+
+def _forward_config_to_owner(series: str, requests: list) -> None:
+    """R12: настройку формата серии пересылаем ВЛАДЕЛЬЦУ (бот сам формат не меняет).
+    Best-effort через `notify` (tg-send). Опасная тройка: шлём короткую пометку с серией
+    и числом просьб, БЕЗ полного текста участника наружу сверх необходимого."""
+    try:
+        from notary.lib import notify  # noqa: PLC0415
+        n = len(requests)
+        notify.push(
+            f"🔧 Просьба про формат серии «{series}» ({n}) — участник просит поменять "
+            f"вид протокола/дайджеста. Формат решаешь ты. Первая: {requests[0][:160]}",
+            identity=f"series-config:{series}",
+        )
+    except Exception as e:  # noqa: BLE001 — форвард best-effort, listener не валим
+        logger.warning("[understand] форвард настройки владельцу упал (non-fatal): %s", type(e).__name__)
+
+
+def _forward_understand_edits(
+    token: str, chat_id: int, allowed_chat: int, msg: dict[str, Any], edits: list
+) -> bool:
+    """РИСК1: правки understand-слоя ОБЯЗАНЫ утечь в СУЩЕСТВУЮЩУЮ петлю правок (дебаунс
+    20 мин / durable-learning / anti-injection / сводный ack / rollback-роут), а не
+    потеряться. Тот же путь, что у mixed-роута (:1608): `route_feedback_reply` с
+    ПОДАВЛЕННЫМ ack. Возвращает, приняла ли петля правку."""
+    remainder = "\n".join(e for e in edits if isinstance(e, str) and e.strip()).strip()
+    if not remainder:
+        return False
+    acked = {"v": False}
+    edit_msg = {**msg, "text": remainder}
+    edit_msg.pop("voice", None)
+    edit_msg.pop("audio", None)
+    try:
+        from notary.lib import feedback_worker  # noqa: PLC0415
+        feedback_worker.route_feedback_reply(
+            token, chat_id, edit_msg, allowed_chat=allowed_chat,
+            send=lambda *_a, **_k: acked.__setitem__("v", True),
+        )
+    except Exception as e:  # noqa: BLE001 — сбой правок не роняет обработку статусов
+        logger.exception("[understand] шлюз правок упал (non-fatal): %s", e)
+    return acked["v"]
+
+
+def _send_understand_ack(
+    token: str, chat_id: int, msg: dict[str, Any], result: dict, *, edit_as_hint: bool
+) -> None:
+    """ВРЕМЕННЫЙ ack understand-слоя (ЗАВ1: единый рендер — Ф4). Переиспользует
+    СУЩЕСТВУЮЩИЙ `build_mixed_ack` Ф2 для применённых статусов; вопросы ступени-3 пока
+    сворачиваются в «не смог привязать/уточните» (полноценный закрытый переспрос
+    цифрой — Ф4). Ничего молча: каждая часть отражена."""
+    from notary.lib import mixed_reply_split  # noqa: PLC0415
+    n_edits = len(result.get("edits") or [])
+    ack = mixed_reply_split.build_mixed_ack(
+        status_groups=result.get("status_groups") or [],
+        n_status_unresolved=len(result.get("questions") or []),
+        n_edits=n_edits, edit_queued=bool(result.get("_edit_queued")),
+        edit_as_hint=edit_as_hint, unclear=result.get("unclear") or "",
+    )
+    send_message(token, chat_id, ack, reply_to=msg.get("message_id"))
+
+
+def maybe_route_to_reply_understand(
+    token: str, chat_id: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """Ф3 (watson, R7-R12/R24): ЕДИНАЯ точка разбора reply на ПРОТОКОЛ серии (НЕС2).
+
+    Стоит ПЕРВЫМ из статус-роутов протокола (до mixed/pending/шлюза правок). Гейт
+    `ENABLE_REPLY_UNDERSTAND` дефолт-OFF (R10): OFF → сразу False, роуты ниже работают
+    как сегодня. ON → ИИ-разбор understand-слоя: применяет статусы ступеней 1-2, чужие/
+    неоднозначные — вопросом (ступени 3), правки → в петлю правок (РИСК1), настройку
+    серии → владельцу (R12), при недоступном ИИ — очевидное словарём + очередь (R9).
+
+    True = understand взял reply (что-то распознал/применил/спросил) → caller выходит.
+    False = не наш случай (флаг OFF / не reply на протокол / understand ничего не нашёл)
+    → обычные роуты ниже.
+
+    Опасная тройка: НЕ логируем текст reply/сегментов — только счётчики/классы."""
+    if chat_id is None:
+        return False
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text or msg.get("voice") or msg.get("audio"):
+        return False  # голос уже подставлен текстом в _maybe_transcribe_protocol_voice (R27)
+    try:
+        from notary.lib import reply_understand  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — модуль не грузится → фича выключена
+        logger.debug("[understand] import failed (feature off?): %s", e)
+        return False
+    if not reply_understand.is_enabled():
+        return False  # R10: дефолт-OFF → обычные роуты (обратная совместимость)
+    series = _reply_context_series(chat_id, msg)
+    if not series:
+        return False  # не reply на доставленный протокол серии (дайджест — свой роут)
+    series_dir = _protokol_root() / series
+    snapshot = _reply_open_tasks_snapshot(series_dir, msg)
+    try:
+        result = reply_understand.understand_reply(
+            text, series_dir=series_dir, replier=_msg_display_name(msg),
+            snapshot=snapshot, orig_ts=msg.get("date"), date=_reply_date_str(msg),
+            source="understand",
+        )
+    except Exception as e:  # noqa: BLE001 — understand не должен валить listener
+        logger.exception("[understand] разбор reply упал: %s", e)
+        return False
+    if not result.get("engaged"):
+        return False  # understand ничего не нашёл → обычные роуты ниже
+    # 1) Настройка серии (R12/И2): владельцу + сотруднику явный не-канцелярит (не молчим).
+    if result.get("config_requests"):
+        _forward_config_to_owner(series, result["config_requests"])
+        send_message(token, chat_id, CONFIG_FORWARDED_REPLY, reply_to=msg.get("message_id"))
+    # 2) Правки (РИСК1): в существующую петлю правок с подавленным ack.
+    result["_edit_queued"] = _forward_understand_edits(
+        token, chat_id, allowed_chat, msg, result.get("edits") or [])
+    # 3) ИИ недоступен (R9): очевидное уже применено, остальное в очереди — честная отбивка.
+    if result.get("deferred"):
+        if result.get("status_groups"):
+            _send_understand_ack(token, chat_id, msg, result, edit_as_hint=False)
+        send_message(token, chat_id, UNDERSTAND_DEFERRED_HINT, reply_to=msg.get("message_id"))
+        logger.info("[understand] reply отложен (ИИ недоступен) series=%s", series)
+        return True
+    # 4) Применённое/вопросы/непонятое → временный ack (Ф4 заменит единым рендером).
+    if (result.get("applied") or result.get("questions") or result.get("edits")
+            or (result.get("unclear") or "").strip() or result.get("config_requests")):
+        if not result.get("config_requests") or result.get("applied") or result.get("questions") \
+                or result.get("edits"):
+            _send_understand_ack(token, chat_id, msg, result, edit_as_hint=False)
+    logger.info(
+        "[understand] reply разобран series=%s applied=%d questions=%d edits=%d config=%d",
+        series, len(result.get("applied") or []), len(result.get("questions") or []),
+        len(result.get("edits") or []), len(result.get("config_requests") or []),
     )
     return True
 
@@ -2152,6 +2406,19 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # приходит) он молча дропнул бы ответ участника. Статус → в тот же sidecar Ф2;
     # голос / нераспознанное → подсказка, но НЕ молчание: канал сам просил ответить.
     if maybe_route_to_digest_reply(token, cid, msg):
+        return
+
+    # R27 (watson, решение владельца 21.07): голосовой reply на ПРОТОКОЛ серии →
+    # расшифровка ПЕРЕД разбором (под флагом `ENABLE_PROTOCOL_VOICE_REPLY`, дефолт-OFF),
+    # чтобы голос шёл тем же путём понимания, что текст. OFF / не-голос / не-протокол →
+    # msg без изменений (обратная совместимость: голос уходит в шлюз правок как раньше).
+    msg = _maybe_transcribe_protocol_voice(token, cid, msg)
+
+    # Ф3 (watson, R7-R12/R24): ЕДИНАЯ точка разбора reply на протокол (understand-слой).
+    # Гейт `ENABLE_REPLY_UNDERSTAND` дефолт-OFF (R10): OFF → сразу False, mixed/status/шлюз
+    # правок ниже работают как сегодня. ON → ИИ понимает reply, детерминированные проверки
+    # страхуют, при расхождении бот переспрашивает (структуру отдаёт, рендер вопроса — Ф4).
+    if maybe_route_to_reply_understand(token, cid, allowed_chat, msg):
         return
 
     # Ф5 (ISS-33): СМЕШАННЫЙ reply «правки текста + статусы задач» одним сообщением.

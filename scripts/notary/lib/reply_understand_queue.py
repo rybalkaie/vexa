@@ -45,6 +45,10 @@ QUEUE_FILE = "reply-understand-queue.json"
 _SCHEMA = 1
 _RETENTION_DAYS = int(os.environ.get("REPLY_UNDERSTAND_QUEUE_RETENTION_DAYS", "14") or "14")
 _MAX_PENDING = int(os.environ.get("REPLY_UNDERSTAND_QUEUE_MAX", "200") or "200")
+# applied-карта (out-of-order guard) капится ПО РАЗМЕРУ, а не по времени: её значения —
+# `orig_ts` (логическое время сообщения, произвольный epoch), сравнивать их с wall-clock
+# `now` некорректно (маленький ts ложно счёлся бы «протухшим»). Держим N самых свежих.
+_MAX_APPLIED = int(os.environ.get("REPLY_UNDERSTAND_QUEUE_MAX_APPLIED", "1000") or "1000")
 _MAX_TEXT_LEN = 4000       # потолок хранимого reply (как _MAX_REPLY_LEN сплиттера)
 
 # Один процесс-лок на read-modify-write (listener однопроцессный; фоновый воркер +
@@ -89,16 +93,19 @@ def _save(path: Path, data: dict) -> None:
 
 
 def _prune(data: dict, now: float) -> dict:
-    """Выкинуть pending-записи и applied-отметки старше `_RETENTION_DAYS` (по orig_ts)."""
+    """Ретеншн (опасная тройка): pending-записи, ПРОЛЕЖАВШИЕ в очереди дольше
+    `_RETENTION_DAYS`, выкидываем — по `enqueued_ts` (wall-clock постановки в очередь,
+    сопоставимо с `now`). applied-карту капим по РАЗМЕРУ (`_MAX_APPLIED` самых свежих по
+    orig_ts), НЕ по времени — иначе логическое `orig_ts` ложно счёлся бы протухшим."""
     cutoff = now - _RETENTION_DAYS * 86400
     data["pending"] = [
         e for e in data["pending"]
-        if isinstance(e, dict) and float(e.get("orig_ts") or 0) >= cutoff
+        if isinstance(e, dict) and float(e.get("enqueued_ts") or now) >= cutoff
     ][-_MAX_PENDING:]
-    data["applied"] = {
-        k: v for k, v in data["applied"].items()
-        if isinstance(v, (int, float)) and float(v) >= cutoff
-    }
+    ap = {k: float(v) for k, v in data["applied"].items() if isinstance(v, (int, float))}
+    if len(ap) > _MAX_APPLIED:
+        ap = dict(sorted(ap.items(), key=lambda kv: kv[1], reverse=True)[:_MAX_APPLIED])
+    data["applied"] = ap
     return data
 
 
