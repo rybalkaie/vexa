@@ -146,6 +146,19 @@ class TestDecisionMemory(unittest.TestCase):
         blob = self.p.read_text(encoding="utf-8")
         self.assertNotIn("реплик", blob.lower())
 
+    def test_negation_not_recalled(self):
+        # Ф3-цикл5: «не <слово>» память НЕ распознаёт — иначе ложное закрытие по отрицанию
+        # (класс бага FU-1). Утвердительная форма распознаётся, отрицательная — молчит.
+        dm.remember_word_class("разрулили", "done", store_path=self.p)
+        self.assertEqual(dm.recall_word_class("всё разрулили", store_path=self.p), "done")
+        self.assertIsNone(dm.recall_word_class("пока не разрулили", store_path=self.p))
+        self.assertTrue(dm.word_is_negated("склад не разрулили", "разрулили"))
+        self.assertFalse(dm.word_is_negated("склад разрулили", "разрулили"))
+        # анти-пере-подавление (ход4/НОВ1): короткое «не раз» (=многократно, УТВЕРЖДЕНИЕ)
+        # НЕ должно гасить «разрулили» из-за префикса «раз».
+        self.assertEqual(dm.recall_word_class("не раз склад разрулили", store_path=self.p), "done")
+        self.assertFalse(dm.word_is_negated("не раз склад разрулили", "разрулили"))
+
 
 # ==========================================================================
 # reply_understand_queue — R9 механика (порядок, out-of-order, TTL, дозабор)
@@ -401,6 +414,27 @@ class TestUnderstandMemoryR24(_SeriesBase):
         self.assertEqual(len(r["applied"]), 1)
         self.assertEqual(r["applied"][0]["source"], "memory")
         self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_DONE)
+
+    def test_negated_learned_word_not_false_closed(self):
+        # Ф3-цикл5: выучили «разрулили»→done; ОТРИЦАНИЕ «не разрулили» НЕ закрывает задачу
+        # (класс бага FU-1). ИИ без класса → память на отрицании молчит → ступень-3, не пишем.
+        stub1 = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        ru.understand_reply("по складу склад разрулили", series_dir=self.sd,
+                            replier="Татьяна", understand_fn=stub1, date="2026-06-10")
+        sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_OPEN)
+        stub2 = lambda rt, it: _canned([("по складу склад не разрулили", None)])
+        r = ru.understand_reply("по складу склад не разрулили", series_dir=self.sd,
+                                replier="Татьяна", understand_fn=stub2, date="2026-06-11")
+        self.assertEqual(len(r["applied"]), 0)                       # НЕ применено
+        self.assertEqual(self._status().get(sm._status_key(_ITEM_RASCH)), sm.STATUS_OPEN)
+
+    def test_no_poison_learn_from_negated_segment(self):
+        # Ф3-цикл5: «не раскидали»→reopen (ИИ) НЕ должно выучить «раскидали»→reopen —
+        # утвердительное «раскидали» = сделал. Из отрицательного сегмента слово не учим.
+        stub = lambda rt, it: _canned([("по складу склад не раскидали", "reopen")])
+        ru.understand_reply("по складу склад не раскидали", series_dir=self.sd,
+                            replier="Татьяна", understand_fn=stub, date="2026-06-10")
+        self.assertIsNone(dm.recall_word_class("раскидали", store_path=Path(self.memf)))
 
 
 # ==========================================================================

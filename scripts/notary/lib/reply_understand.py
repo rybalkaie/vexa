@@ -374,7 +374,10 @@ def _decide_and_apply_status(
     if apply and label_source in ("ai_only", "memory"):
         word = _status_word(seg_text, matched)
         if word:
-            if label_source == "ai_only":
+            # НЕ учим «слово→класс» из ОТРИЦАТЕЛЬНОГО сегмента: класс там относится к «не
+            # <слово>», а память — про утвердительную форму (иначе «не раскидали»→reopen
+            # отравит «раскидали»). Журнал R20 пишем всегда — аудит. Ф3-цикл5.
+            if label_source == "ai_only" and not decision_memory.word_is_negated(seg_text, word):
                 decision_memory.remember_word_class(word, label, source=source, store_path=store_path)
             decision_memory.record_unknown_word(word, outcome=label, store_path=store_path)
     return {"kind": "applied", "tier": tier, "segment": seg_text, "matched": matched,

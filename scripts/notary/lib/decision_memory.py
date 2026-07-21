@@ -52,6 +52,12 @@ _WRITE_LOCK = threading.Lock()
 _MAX_KEY_LEN = 48          # длина ключа-слова (защита от гигантских полей)
 _MIN_KEY_LEN = 4           # короче — не идентифицирующее слово (как токенайзер матчинга)
 
+# Прямое отрицание «не <слово>» — зеркало dict `pending_status_reply._REOPEN_RE`
+# (`\bне\s+<verb>`). Класс выученного слова относится к УТВЕРДИТЕЛЬНОЙ форме: «не разрулили»
+# ≠ «разрулили». Из отрицательного сегмента память НЕ учит и по памяти НЕ применяет — иначе
+# ложное закрытие по отрицанию (класс бага FU-1, который Ф1 закрыла для словаря). Ф3-цикл5.
+_NEG_WORD_RE = re.compile(r"\bне\s+([a-zа-я0-9]+)")
+
 
 def _store_path(explicit: Optional[Path] = None) -> Path:
     """Путь к JSONL-хранилищу. Приоритет: явный аргумент → env
@@ -180,6 +186,28 @@ def forget_word_class(word: str, *, store_path: Optional[Path] = None) -> bool:
     })
 
 
+def negated_words(text: str) -> set:
+    """Слова СРАЗУ после «не» (прямое отрицание). Зеркалит подход словаря
+    (`pending_status_reply._REOPEN_RE`: `\\bне\\s+<verb>`) для памяти: класс выученного
+    слова — про УТВЕРДИТЕЛЬНУЮ форму, «не <слово>» его переворачивает.
+
+    Берём только слова ≥`_MIN_KEY_LEN` (как фильтр токенов recall): словарные негации
+    статуса все длинные (закры/сдела/готов/…), а короткое «не раз», «не то» статус НЕ
+    отрицают — иначе префиксно пере-подавили бы «разрулили» из-за «не раз»."""
+    return {m.group(1) for m in _NEG_WORD_RE.finditer(_norm(text))
+            if len(m.group(1)) >= _MIN_KEY_LEN}
+
+
+def word_is_negated(text: str, word: str) -> bool:
+    """True, если `word` (или его основа) стоит под прямым отрицанием «не …» в `text`.
+    Из такого сегмента память НЕ учит и по нему НЕ применяет (иначе ложное закрытие по
+    отрицанию — класс FU-1). Префиксная терпимость к словоизменению, как в матчинге."""
+    w = _norm(word).strip()
+    if not w:
+        return False
+    return any(w == n or w.startswith(n) or n.startswith(w) for n in negated_words(text))
+
+
 def recall_word_class(text: str, *, store_path: Optional[Path] = None) -> Optional[str]:
     """Класс статуса для reply по ВЫУЧЕННОМУ слову, если оно встречается в тексте.
 
@@ -188,16 +216,23 @@ def recall_word_class(text: str, *, store_path: Optional[Path] = None) -> Option
     `_tok_match` матчинга висяков). Первое совпадение → его класс. Ничего → None (памяти
     по этому reply нет → understand идёт словарём/ИИ). Детерминированно, БЕЗ сети.
 
+    ОТРИЦАНИЕ: токен под «не …» (`negated_words`) память ПРОПУСКАЕТ — «не разрулили» ≠
+    «разрулили» (иначе ложное закрытие по отрицанию, класс FU-1; зеркалит dict `_REOPEN_RE`).
+    Тогда understand идёт классом ИИ (он отрицание понимает) или ступенью-3 (переспрос).
+
     Граница (РАЗМ1): это ТОЛЬКО распознавание слова → класс. Привязку к задаче и
     страховки чужих задач память НЕ обходит (это делает understand-слой отдельно)."""
     active = known_map(store_path=store_path)
     if not active:
         return None
+    neg = negated_words(text)
     tokens = [t for t in re.findall(r"[a-zа-я0-9]+", _norm(text)) if len(t) >= _MIN_KEY_LEN]
     if not tokens:
         return None
     for key, cls in active.items():
         for tok in tokens:
+            if any(tok == n or tok.startswith(n) or n.startswith(tok) for n in neg):
+                continue  # «не <слово>» — отрицание переворачивает класс, память молчит
             if tok == key or (len(key) >= _MIN_KEY_LEN and tok.startswith(key)) \
                     or (len(tok) >= _MIN_KEY_LEN and key.startswith(tok)):
                 return cls
