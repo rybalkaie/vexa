@@ -103,6 +103,9 @@ UNDERSTAND_SYSTEM_PROMPT = (
     "«не присылай дайджест») — это не статус и не правка конкретного текста.\n"
     "- «весь блок»: если участник просит закрыть/снять СРАЗУ ВСЕ свои вопросы блока — "
     "поставь \"block_close\": true.\n"
+    "- НОМЕРА ПО СПИСКУ: если участник называет НЕСКОЛЬКО номеров пунктов с одним действием "
+    "(«закрой 13, 14, 15», «13-15 и 17 — сделано»), выдай ОТДЕЛЬНЫЙ статус на КАЖДЫЙ номер "
+    "(text = сам номер, cls — общий класс). Не сваливай перечисление номеров в \"unclear\".\n"
     "- НЕПОНЯТНОЕ: всё, что не отнёс ни к чему — в \"unclear\".\n"
     "\n"
     "ПОКРЫТИЕ: каждый смысловой кусок ответа попадает РОВНО в одну часть. Ничего не "
@@ -309,6 +312,70 @@ def _write_status(series_dir, matched, label, *, source, date):
         return None
 
 
+# ISS-44.1: слова, допустимые в сегменте-«список номеров» помимо самих цифр. Если после
+# вычистки цифр/пунктуации остаются ТОЛЬКО эти слова — сегмент = «действие + номера пунктов»
+# (напр. «закрой 13, 14, 15», «17 закрой», «13 14 15 сделано»). Любое ДРУГОЕ слово (млн, тыс,
+# июля, встреча, к, до…) → это НЕ список ординалов (сумма/дата/проза) → не трогаем (страховка
+# от закрытия НЕ той задачи — худший провал по плану R5).
+_BARE_ORD_ALLOWED = frozenset(
+    "закрой закрыть закрыл закрыла закрыто закрываю закрывай закрываем "
+    "сделал сделала сделано сделай сделали делаю готово готов готова готовы "
+    "сними снять снял сняла снято сняли снимаю убери убрать убрал убрала "
+    "удали удалить удалил удалила reopen done "
+    "и да это эти этот эту эта тоже также номер номера номеру пункт пункты пункта "
+    "вопрос вопросы вопроса задача задачи задачу".split())
+_BARE_NUM_RE = re.compile(r"\d+")
+_BARE_WORD_RE = re.compile(r"[a-zа-я]+")
+
+
+def _bare_number_list(text: str, snap_len: int) -> set:
+    """ISS-44.1: голые номера пунктов в сегменте («закрой 13, 14, 15»), которые штатный
+    `detect_ordinals` НЕ ловит (нет ключа «задача/№», не лидирующие). Возвращает набор
+    номеров ТОЛЬКО если: (1) все цифры в диапазоне 1..snap_len; (2) после вычистки цифр в
+    тексте не осталось слов ВНЕ `_BARE_ORD_ALLOWED` (иначе это сумма/дата/проза — не ординалы).
+    Пусто → сегмент не является списком голых номеров."""
+    if snap_len <= 0:
+        return set()
+    t = text.lower().replace("ё", "е")
+    nums = [int(x) for x in _BARE_NUM_RE.findall(t)]
+    if not nums or not all(1 <= n <= snap_len for n in nums):
+        return set()  # нет чисел / есть вне диапазона → не угадываем (честнее переспросить)
+    leftover = _BARE_NUM_RE.sub(" ", t)
+    if any(w not in _BARE_ORD_ALLOWED for w in _BARE_WORD_RE.findall(leftover)):
+        return set()  # осталось «чужое» слово (млн/тыс/дата/проза) → НЕ список ординалов
+    return set(nums)
+
+
+def _ordinal_positions(text: str, snapshot) -> list:
+    """Позиции-ординалы сегмента: штатный `detect_ordinals` (задача N/№N/слова/лидирующий)
+    ∪ безопасный список голых номеров. Отсортированы, в диапазоне слепка."""
+    if not isinstance(snapshot, list):
+        return []
+    pos = set(psr.detect_ordinals(text)) | _bare_number_list(text, len(snapshot))
+    return sorted(p for p in pos if 1 <= p <= len(snapshot))
+
+
+def _expand_multi_ordinal(seg: dict, snapshot) -> list:
+    """ISS-44.1: «закрой 13, 14, 15, 17, 18» / «17 закрой» — как человек отвечает по
+    нумерованному дайджесту. Раньше несколько номеров → `unresolved`, а ГОЛЫЕ номера без
+    ключа не ловились вовсе → бот честно, но зря переспрашивал. Дробим статус-сегмент на
+    ПОД-СЕГМЕНТ на каждый номер с ЯВНОЙ позицией `_ordinal_pos` (тот же класс `cls`); каждый
+    применяется отдельно по `snapshot[pos-1]`.
+
+    Не трогаем: маркер правки (ISS-37); нет слепка (ординал недоступен). Одиночный
+    СТАНДАРТНЫЙ ординал (задача N) оставляем прежнему пути — не дробим без нужды."""
+    text = seg.get("text") or ""
+    if not isinstance(snapshot, list) or psr._EDIT_MARKER_RE.search(text):
+        return [seg]
+    bare = _bare_number_list(text, len(snapshot))
+    positions = _ordinal_positions(text, snapshot)
+    # Дробим, если номеров несколько ЛИБО есть голый номер (его штатный резолвер не поймает).
+    if not positions or (len(positions) == 1 and not bare):
+        return [seg]
+    return [{**seg, "text": str(n), "_ordinal_pos": n, "_multi_ordinal": True}
+            for n in positions]
+
+
 def _decide_and_apply_status(
     seg: dict, *, series_dir, items, snapshot, replier, reply_lines,
     orig_ts, date, source, store_path, apply: bool,
@@ -327,14 +394,20 @@ def _decide_and_apply_status(
     label, label_source = _resolve_label(seg_text, ai_cls, store_path=store_path)
 
     # Матч задачи: ординал (по слепку) приоритетнее overlap — как apply_status_reply.
-    ord_verdict, ord_matched = psr._resolve_ordinal_target(seg_text, snapshot)
-    if ord_verdict == "unresolved":
-        return {"kind": "ambiguous_ordinal", "tier": TIER_QUESTION, "segment": seg_text,
-                "matched": None, "label": label}
-    if ord_verdict == "match":
-        matched, is_ordinal = ord_matched, True
+    # ISS-44.1: явная позиция от дробителя множественных/голых номеров — берём напрямую
+    # (штатный detect_ordinals голый номер не поймал бы).
+    op = seg.get("_ordinal_pos")
+    if op is not None and isinstance(snapshot, list) and 1 <= op <= len(snapshot):
+        matched, is_ordinal = snapshot[op - 1], True
     else:
-        matched, is_ordinal = psr.match_pending_item(seg_text, items), False
+        ord_verdict, ord_matched = psr._resolve_ordinal_target(seg_text, snapshot)
+        if ord_verdict == "unresolved":
+            return {"kind": "ambiguous_ordinal", "tier": TIER_QUESTION, "segment": seg_text,
+                    "matched": None, "label": label}
+        if ord_verdict == "match":
+            matched, is_ordinal = ord_matched, True
+        else:
+            matched, is_ordinal = psr.match_pending_item(seg_text, items), False
     strength = _match_strength(seg_text, matched, ordinal=is_ordinal)
     foreign = _is_foreign(matched, replier)
 
@@ -448,7 +521,10 @@ def understand_reply(
     result["config_requests"] = config
 
     grouped: dict = {}
-    for seg in parsed.get("statuses") or []:
+    raw_segs = parsed.get("statuses") or []
+    # ISS-44.1: разворачиваем «закрой 13,14,15» в под-сегменты по одному ординалу.
+    seg_list = [sub for seg in raw_segs for sub in _expand_multi_ordinal(seg, snapshot)]
+    for seg in seg_list:
         d = _decide_and_apply_status(
             seg, series_dir=series_dir, items=items, snapshot=snapshot, replier=replier,
             reply_lines=reply_lines, orig_ts=orig_ts, date=date,

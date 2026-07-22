@@ -570,20 +570,23 @@ def _render_status_section(status_groups: list, n_status_ok: Optional[int]) -> l
     total = sum(len(names) for _lbl, names in status_groups)
     if total <= 0:
         return []
-    lines: list = []
-    if total >= _GROUP_ACK_THRESHOLD:
-        for label, names in status_groups:
-            emoji, human = _GROUP_META.get(label, _GROUP_META["other"])
-            shown = [_short_task_name(n) for n in names[:_MAX_NAMES_PER_GROUP]]
-            rest = len(names) - len(shown)
-            tail = f", +ещё {rest}" if rest > 0 else ""
-            lines.append(f"{emoji} {human} ({len(names)}): {', '.join(shown)}{tail}")
-    else:
-        for label, names in status_groups:
-            emoji, human = _GROUP_META.get(label, _GROUP_META["other"])
-            for n in names:
-                lines.append(f"{emoji} {human}: «{_short_task_name(n)}»")
-    return lines
+    # ISS-44.4 (просьба владельца 22.07): названия задач ПОЛНОСТЬЮ, не обрезаем; каждая
+    # задача с новой строки под заголовком группы; между блоками — пустая строка (её ставит
+    # `"\n\n".join` у вызывающего). Читаемость важнее компактности. Одна задача в группе —
+    # инлайн в кавычках; несколько — заголовок «эмодзи Статус (N):» + буллеты по строке.
+    # `_short_task_name(limit=огромный)` — снимает префикс исполнителя «Имя: », но НЕ режет
+    # длину (полное название — просьба владельца ISS-44.4).
+    def _full(n):
+        return _short_task_name(n, limit=10_000)
+    blocks: list = []
+    for label, names in status_groups:
+        emoji, human = _GROUP_META.get(label, _GROUP_META["other"])
+        if len(names) == 1:
+            blocks.append(f"{emoji} {human}: «{_full(names[0])}»")
+        else:
+            body = "\n".join(f"• {_full(n)}" for n in names)
+            blocks.append(f"{emoji} {human} ({len(names)}):\n{body}")
+    return blocks
 
 
 def build_mixed_ack(
@@ -644,4 +647,4 @@ def build_mixed_ack(
     if not parts:
         # Теоретически недостижимо (should_engage гарантирует ≥1 статус), но не молчим.
         return "Не нашёл в ответе ни статусов, ни правок — уточните, пожалуйста."
-    return "\n".join(parts)
+    return "\n\n".join(parts)  # ISS-44.4: пустая строка между блоками (читаемость)

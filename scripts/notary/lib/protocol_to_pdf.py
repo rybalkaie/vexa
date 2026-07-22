@@ -79,10 +79,12 @@ h2 { font-size: 13pt; color: #2c5282; margin: 20px 0 7px; padding: 0 0 4px;
 h3 { font-size: 11.5pt; color: #2d3748; margin: 14px 0 5px; }
 p { margin: 6px 0; }
 ul { margin: 6px 0; padding-left: 20px; }
-/* Ф3 (open-questions-reply-fix): нумерованные висяки (дайджест/протокол) — `<ol>` с тем
-   же отступом, что буллеты `<ul>`, иначе номера ушли бы на дефолтный отступ браузера
-   (рассинхрон с буллетами мелочи/прочих списков). */
-ol { margin: 6px 0; padding-left: 20px; }
+/* Ф3 (open-questions-reply-fix): нумерованные висяки (дайджест/протокол) — `<ol>` с
+   отступом под номер. ISS-44.5: маркер («13.») рисуется в левом жёлобе (list-style-position
+   outside); 20px хватало на однозначное «1.», но двузначные «10.»–«18.» шире — первая цифра
+   уезжала за левый край и обрезалась. 34px вмещает двузначный маркер. Не касается `ul`
+   (там точка, ширина от числа не зависит). */
+ol { margin: 6px 0; padding-left: 34px; }
 li { margin: 4px 0; }
 li::marker { color: #94a3b8; }
 strong { color: #111827; font-weight: 650; }

@@ -247,7 +247,9 @@ def build_ack(result: dict, *, series_dir, snapshot=None, replier: Optional[str]
         parts.append("\n".join(qlines))
 
     remaining = [q for q in questions if q is not consumed]
-    parts.extend(_echo_unattached(remaining))
+    echo = _echo_unattached(remaining)
+    if echo:
+        parts.append("\n".join(echo))  # блок эха — целиком, пустая строка только ВОКРУГ него
 
     snippet = (result.get("unclear") or "").strip()
     if snippet and not result.get("config_requests"):
@@ -260,7 +262,7 @@ def build_ack(result: dict, *, series_dir, snapshot=None, replier: Optional[str]
         text = ("🤔 Не разобрал, про какую задачу речь. Напишите: название задачи "
                 "(как в протоколе) + что с ней, например «юани — закупили».")
     else:
-        text = "\n".join(parts)
+        text = "\n\n".join(parts)  # ISS-44.4: пустая строка между блоками (читаемость)
     return {"text": text, "applied": applied_state, "has_tier2": has_tier2, "question": qstate}
 
 

@@ -152,26 +152,27 @@ class TestRunStatusLoop(unittest.TestCase):
 # ==========================================================================
 class TestBuildMixedAckGrouped(unittest.TestCase):
     def test_grouped_when_four_or_more(self):
-        # RAZM1: ≥4 статусов → РОВНО по строке на статус-группу, счётчик + ≤N имён.
+        # ISS-44.4: группа >1 задачи → заголовок «эмодзи Статус (N):» + буллеты ПОЛНЫМИ
+        # названиями (без обрезки, без «+ещё»); блоки разделены пустой строкой.
         groups = [
             ("done", [f"Илья: задача{i}" for i in range(10)]),
             ("wait", ["Илья: бюджет", "Илья: найм"]),
             ("cancelled", ["Илья: рассылка"]),
         ]
         ack = mrs.build_mixed_ack(status_groups=groups)
-        lines = ack.split("\n")
-        self.assertEqual(len(lines), 3)                 # ровно 3 группы = 3 строки
-        self.assertIn("(10)", lines[0])                 # счётчик группы
-        self.assertIn("(2)", lines[1])
-        self.assertIn("(1)", lines[2])
-        # ≤ _MAX_NAMES_PER_GROUP имён + честный «+ещё K» на остаток (не дамп 10 имён)
-        self.assertIn("+ещё", lines[0])
+        blocks = ack.split("\n\n")
+        self.assertEqual(len(blocks), 3)                # 3 группы = 3 блока (пустая строка между)
+        self.assertIn("(10)", blocks[0])                # счётчик группы
+        self.assertIn("(2)", blocks[1])
+        self.assertNotIn("+ещё", ack)                   # все имена показаны, не обрезаем
+        self.assertEqual(ack.count("• "), 12)           # 10 + 2 буллета (одиночная — инлайн)
+        self.assertIn("задача9", ack)                   # последнее имя не срезано
 
     def test_per_task_when_three_or_fewer(self):
         groups = [("done", ["Илья: отчёт"]), ("cancelled", ["Илья: рассылка"])]
         ack = mrs.build_mixed_ack(status_groups=groups)
-        lines = ack.split("\n")
-        self.assertEqual(len(lines), 2)                 # по строке на задачу
+        blocks = ack.split("\n\n")
+        self.assertEqual(len(blocks), 2)                # по блоку на задачу (одиночные — инлайн)
         self.assertIn("«отчёт»", ack)
         self.assertIn("«рассылка»", ack)
 
