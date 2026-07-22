@@ -88,6 +88,28 @@ class TestMultiOrdinal(unittest.TestCase):
         self.assertEqual(ru._bare_number_list("собрать 3-5 млн", 18), set())
         self.assertEqual(ru._bare_number_list("нужно 3 млн к 5 числу", 18), set())
 
+    def test_count_noun_not_ordinal(self):
+        """R5 (цикл5-2): «3 задачи закрыл» — это СЧЁТ, а не ссылка на пункт 3. НЕ ординал."""
+        self.assertEqual(ru._bare_number_list("3 задачи закрыл", 18), set())
+        self.assertIsNone(ru._leading_ordinal("3 задачи закрыл", list(_SNAP)))
+
+    def test_leading_number_with_description_confirmed(self):
+        """Кейс 00:48: ИИ выдал «14 <описание>». Ведущий номер + описание совпало со
+        слепком → резолвится в позицию 14."""
+        snap = list(_SNAP)
+        snap[13] = "Соня: Прислать Михаилу ссылку по акциям"
+        self.assertEqual(ru._leading_ordinal("14 Прислать ссылку по акциям", snap), 14)
+        r = ru.understand_reply(
+            "14 Прислать ссылку по акциям", series_dir=self.sd, replier="Илья Рыбалка",
+            snapshot=snap, understand_fn=lambda t, i: _canned([("14 Прислать ссылку по акциям", "cancelled")]),
+            date="2026-07-22")
+        # Соня ≠ Илья → чужая задача → R11-вопрос (не молча), но РАСПОЗНАНА (не «не привязал»).
+        self.assertTrue(r["applied"] or r["questions"], "номер 14 должен резолвиться, не теряться")
+
+    def test_leading_number_wrong_description_not_confirmed(self):
+        """Безопасность: ведущий номер + описание НЕ из той позиции → не подтверждаем."""
+        self.assertIsNone(ru._leading_ordinal("5 совсем другое непохожее дело", list(_SNAP)))
+
     def test_no_snapshot_falls_back_no_crash(self):
         """Без слепка (snapshot=None) множественные ординалы не дробятся — прежнее поведение."""
         r = ru.understand_reply(
