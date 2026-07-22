@@ -53,7 +53,7 @@ TIER2_DISAGREE_NOTE = (
 )
 # Настройка формата серии (R12/И2) — схлопнута в ОДИН ack (Ф3 слал вторым сообщением).
 # Формулировку «формат протокола решает он» согласовал владелец (И2), сохраняем дословно.
-CONFIG_FORWARDED_LINE = "🔧 Передал Илье — формат протокола решает он."
+CONFIG_FORWARDED_LINE = "🔧 Передал Илье — формат протокола решает он. Как решит, вернусь."
 
 
 def _label_human(label: Optional[str]) -> str:
@@ -191,10 +191,11 @@ def _echo_unattached(questions: list) -> list:
             segs.append(s.strip())
     if not segs:
         return []
-    lines = ["Не смог привязать к вопросу:"]
+    lines = ["⚠️ А эти не понял — не смог привязать к вопросу протокола:"]
     for i, s in enumerate(segs, 1):
         lines.append(f"{i}) «{_short(s, limit=80)}»")
-    lines.append("Уточните, по какому вопросу — можно ответить на это сообщение.")
+    lines.append("Подскажите, как они называются в протоколе, — и я сразу закрою "
+                 "(можно ответить на это сообщение).")
     return lines
 
 
@@ -205,7 +206,7 @@ def _edits_line(n_edits: int, *, edit_as_hint: bool, edit_queued: bool) -> Optio
         return (f"✏️ Заметил правки текста ({n_edits}) — их вносите ответом на сам протокол "
                 "встречи, не на дайджест.")
     if edit_queued:
-        return f"✏️ Правки текста: принял {n_edits}, перевыпущу протокол."
+        return f"✏️ И ещё правки к тексту ({n_edits}) — все внёс, сейчас пришлю обновлённый протокол."
     return (f"⚠️ Правки текста: {n_edits} не смог применить — ответьте на протокол с правкой "
             "ещё раз.")
 
@@ -250,10 +251,12 @@ def build_ack(result: dict, *, series_dir, snapshot=None, replier: Optional[str]
     if snippet and not result.get("config_requests"):
         if len(snippet) > 120:
             snippet = snippet[:119].rstrip() + "…"
-        parts.append(f"🤔 Эту часть не понял: «{snippet}» — уточните, пожалуйста.")
+        parts.append(f"🤔 Эту часть не понял: «{snippet}». Напишите: название задачи "
+                     "(как в протоколе) + что с ней, например «юани — закупили».")
 
     if not parts:
-        text = "Не нашёл в ответе ни статусов, ни правок — уточните, пожалуйста."
+        text = ("🤔 Не разобрал, про какую задачу речь. Напишите: название задачи "
+                "(как в протоколе) + что с ней, например «юани — закупили».")
     else:
         text = "\n".join(parts)
     return {"text": text, "applied": applied_state, "has_tier2": has_tier2, "question": qstate}

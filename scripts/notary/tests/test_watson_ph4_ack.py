@@ -155,7 +155,7 @@ class TestBuildAck(_Base):
         built = ra.build_ack(res, series_dir=self.sd)
         self.assertIn("Закрыто", built["text"])                 # применённое отражено
         self.assertIn("склад", built["text"].lower())           # именем
-        self.assertIn("Не смог привязать", built["text"])       # вопрос — как непонятое
+        self.assertIn("не смог привязать", built["text"].lower())  # вопрос — как непонятое
         self.assertNotIn("принял", built["text"].lower())       # не ложное «принял»
         self.assertEqual([a["text"] for a in built["applied"]], [_ITEM_RASCH])
 
