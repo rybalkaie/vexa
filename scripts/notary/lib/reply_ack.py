@@ -191,7 +191,9 @@ def _echo_unattached(questions: list) -> list:
             segs.append(s.strip())
     if not segs:
         return []
-    lines = ["⚠️ А эти не понял — не смог привязать к вопросу протокола:"]
+    head = ("⚠️ А это не понял — не смог привязать к вопросу протокола:" if len(segs) == 1
+            else "⚠️ А эти не понял — не смог привязать к вопросам протокола:")
+    lines = [head]
     for i, s in enumerate(segs, 1):
         lines.append(f"{i}) «{_short(s, limit=80)}»")
     lines.append("Подскажите, как они называются в протоколе, — и я сразу закрою "
