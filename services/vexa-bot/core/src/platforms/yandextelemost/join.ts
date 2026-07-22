@@ -18,6 +18,7 @@ import {
   telemostJoinButtonSelectors,
   telemostMicButtonSelectors,
   telemostCameraButtonSelectors,
+  telemostModalDismissSelectors,
 } from "./selectors";
 
 const LOG_PREFIX = "[adapter-telemost]";
@@ -80,9 +81,45 @@ async function jsClickByText(page: Page, text: string, stepName: string): Promis
   }
 }
 
-async function fillNameInput(page: Page, name: string, timeoutMs = 20000): Promise<boolean> {
+/**
+ * Гасит блокирующие модалки лобби, появившиеся у Telemost 2026-07-22 (регресс):
+ * «Включить микрофон/видео не удалось» (у бота нет медиаустройств) и «Частые вопросы».
+ * Они перекрывают форму лобби и прячут поле имени → без гашения заход падает
+ * `name_input_not_found`. Кликаем «Понятно»/крестик (Playwright + JS-fallback как у
+ * интерстициала, там тот же React-handler баг) и добиваем Escape. Идемпотентно и
+ * безопасно: если модалок нет — ничего не делает. Возвращает число погашенных.
+ */
+async function dismissLobbyModals(page: Page): Promise<number> {
+  let dismissed = 0;
+  for (const sel of telemostModalDismissSelectors) {
+    try {
+      const btns = await page.locator(sel).all();
+      for (const b of btns) {
+        if (await b.isVisible({ timeout: 300 }).catch(() => false)) {
+          await b.click({ timeout: 1500 }).catch(() => {});
+          dismissed++;
+        }
+      }
+    } catch {
+      // следующий селектор
+    }
+  }
+  // JS-fallback: Playwright click в Telemost иногда не триггерит React-handler.
+  if (await jsClickByText(page, "Понятно", "dismiss_modal").catch(() => false)) {
+    dismissed++;
+  }
+  // Добиваем generic-модалку клавишей Escape (безопасно — из лобби не выкидывает).
+  await page.keyboard.press("Escape").catch(() => {});
+  if (dismissed > 0) logStep("lobby_modals_dismissed", { count: dismissed });
+  return dismissed;
+}
+
+async function fillNameInput(page: Page, name: string, timeoutMs = 25000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    // Регресс 2026-07-22: новые модалки Telemost прячут поле имени — гасим каждый проход,
+    // они могут появляться повторно (на каждую неудачную попытку доступа к медиа).
+    await dismissLobbyModals(page).catch(() => {});
     for (const sel of telemostNameInputSelectors) {
       try {
         const loc = page.locator(sel).first();
@@ -101,6 +138,10 @@ async function fillNameInput(page: Page, name: string, timeoutMs = 20000): Promi
     }
     await page.waitForTimeout(500);
   }
+  // Диагностика при провале: скриншот лобби с непогашенными модалками.
+  try {
+    await page.screenshot({ path: "/app/vexa-bot/storage/screenshots/telemost-90-name-not-found.png", fullPage: true });
+  } catch {}
   logStep("name_input_not_found", { tried_selectors: telemostNameInputSelectors, waited_ms: Date.now() - start });
   return false;
 }

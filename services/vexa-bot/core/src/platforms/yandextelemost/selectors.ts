@@ -28,6 +28,17 @@ export const telemostJoinButtonSelectors: string[] = [
   'button:has-text("Подключиться")',
 ];
 
+// Lobby: блокирующие модалки, появившиеся у Telemost 2026-07-22.
+// Регресс: Telemost стал показывать поверх формы лобби модалки
+// «Включить микрофон не удалось» / «Включить видео не удалось» (у headless-бота
+// нет медиаустройств) и модалку «Частые вопросы». Они перекрывают/прячут поле
+// имени → `fillNameInput` не находит его и заход падает `name_input_not_found`.
+// Гасим их перед вводом имени: кнопки «Понятно» + крестик модалки.
+export const telemostModalDismissSelectors: string[] = [
+  'button:has-text("Понятно")',
+  '[data-testid="orb-button-close"]',
+];
+
 // Lobby: микрофон. ВАЖНО: по дефолту микрофон ВЫКЛЮЧЕН, кнопка ВКЛЮЧАЕТ.
 // Бот никогда не кликает по ней — но используем для детекта статуса.
 export const telemostMicButtonSelectors: string[] = [
