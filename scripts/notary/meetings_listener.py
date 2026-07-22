@@ -59,6 +59,11 @@ POLL_TIMEOUT_S = 25
 ERROR_BACKOFF_S = 10
 HEARTBEAT_EVERY_S = 30
 SWEEP_EVERY_S = 30  # частота проверки таймаутов clarify
+# R9 (watson Ф6): троттл дренажа очереди дозабора understand-слоя. Дозабор не срочный
+# («разберу позже, когда ИИ оживёт») — не хаммерим claude каждые 30с при затяжной
+# недоступности ИИ. Переопределяемо env'ом.
+DRAIN_DEFERRED_EVERY_S = int(os.environ.get("REPLY_UNDERSTAND_DRAIN_EVERY_S", "120") or "120")
+_last_deferred_drain_mono: Optional[float] = None  # None = ещё не дренажили → первый проход не троттлится
 TRIGGER_PREFIX = "\U0001F4C5"  # 📅 — вечерний блок (apply_reply flow)
 
 # ── Ф2: фоновый перевыпуск протокола ───────────────────────────────────────
@@ -2390,6 +2395,79 @@ def sweep_clarify_timeouts(token: Optional[str] = None) -> None:
     _maybe_cleanup_dormant_states()
 
 
+def _series_with_deferred_queue() -> list[Path]:
+    """R9: серии с НЕПУСТОЙ очередью дозабора understand (`reply-understand-queue.json`).
+
+    Дёшево: один glob по каталогу встреч + быстрая проверка pending. В обычном режиме
+    (ИИ доступен) очередь пуста → пустой список, дренаж не запускается. Очередь копится
+    лишь после недоступности claude на статус-reply."""
+    from notary.lib import reply_understand_queue as ruq  # noqa: PLC0415
+    root = _protokol_root()
+    if not root.exists():
+        return []
+    out: list[Path] = []
+    try:
+        for qf in sorted(root.glob("*/" + ruq.QUEUE_FILE)):
+            try:
+                if ruq.list_pending(qf.parent):
+                    out.append(qf.parent)
+            except Exception:  # noqa: BLE001 — битый sidecar одной серии не роняет обход
+                continue
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[understand] обход очередей дозабора не удался (non-fatal): %s",
+                       type(e).__name__)
+    return out
+
+
+def _sweep_drain_deferred(token: Optional[str] = None) -> None:
+    """R9 (Ф6 деплой-блокер, follow-ups-Ф3-1): подключение дренажа очереди дозабора к
+    sweep-циклу. Без него хинт сотруднику «разберу позже» = ложь — reply гниёт в очереди
+    до TTL 14д и молча пропадает.
+
+    • Гейт `ENABLE_REPLY_UNDERSTAND` дефолт-OFF → OFF → выход (очередь не наполняется).
+    • Разбор отложенного зовёт claude (до `_split_timeout`) → уводим в ФОНОВЫЙ воркер
+      через `_submit_command_job`: один claude за раз (общий `_reissue_executor`),
+      главный поток и heartbeat НЕ блокируются (иначе watchdog перезапустит листенер).
+    • Троттл `DRAIN_DEFERRED_EVERY_S` + дедуп по метке — не задваиваем и не хаммерим ИИ.
+    • Опасная тройка: в лог только счётчики/серии, НЕ тексты отложенных reply."""
+    global _last_deferred_drain_mono
+    try:
+        from notary.lib import reply_understand  # noqa: PLC0415
+        if not reply_understand.is_enabled():
+            return
+        now_mono = time.monotonic()
+        if _last_deferred_drain_mono is not None and \
+                now_mono - _last_deferred_drain_mono < DRAIN_DEFERRED_EVERY_S:
+            return
+        if _command_label_inflight("understand-drain"):
+            return  # предыдущий дренаж ещё в работе — не задваиваем claude
+        series_dirs = _series_with_deferred_queue()
+        if not series_dirs:
+            return
+        _last_deferred_drain_mono = now_mono
+
+        def _job() -> None:
+            processed = failed = 0
+            for sd in series_dirs:
+                try:
+                    r = reply_understand.drain_deferred(sd)
+                except Exception as e:  # noqa: BLE001 — сбой одной серии не роняет дренаж
+                    logger.warning("[understand] дренаж серии не удался (non-fatal): %s",
+                                   type(e).__name__)
+                    continue
+                processed += int(r.get("processed", 0))
+                failed += int(r.get("failed", 0))
+            if processed or failed:
+                logger.info("[understand] дренаж очереди дозабора: разобрано=%d осталось=%d серий=%d",
+                            processed, failed, len(series_dirs))
+
+        _submit_command_job(
+            _reissue_executor, _command_inflight,
+            _next_command_job_id("understand-drain"), "understand-drain", _job)
+    except Exception as e:  # noqa: BLE001 — sweep-врезка не роняет главный цикл
+        logger.exception("understand drain sweep failed: %s", e)
+
+
 def _job_apply_reply(
     token: str,
     chat_id: int,
@@ -2705,6 +2783,7 @@ def main() -> int:
         now_mono = time.monotonic()
         if now_mono - last_sweep >= SWEEP_EVERY_S:
             sweep_clarify_timeouts(token=token)
+            _sweep_drain_deferred(token=token)  # R9 (watson Ф6): дренаж очереди дозабора understand
             last_sweep = now_mono
 
         updates = get_updates(token, offset)
