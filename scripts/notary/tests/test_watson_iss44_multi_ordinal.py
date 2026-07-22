@@ -77,6 +77,17 @@ class TestMultiOrdinal(unittest.TestCase):
         self.assertEqual(len(r["applied"]), 0,
                          "смешанный in/out-range голый список не должен ничего закрывать")
 
+    def test_ordinal_suffix_hyphen_resolved(self):
+        """Цикл5: русский порядковый суффикс «18-е»/«17-й» резолвится (не теряется остатком)."""
+        r = self._run("17-е и 18-е закрывай", [("17-е и 18-е закрывай", "done")])
+        self.assertEqual(sorted(a["matched"] for a in r["applied"]),
+                         sorted([_SNAP[16], _SNAP[17]]))
+
+    def test_range_and_amount_not_ordinals(self):
+        """Безопасность: диапазон «3-5» и сумма «3 млн» НЕ трактуются как ординалы."""
+        self.assertEqual(ru._bare_number_list("собрать 3-5 млн", 18), set())
+        self.assertEqual(ru._bare_number_list("нужно 3 млн к 5 числу", 18), set())
+
     def test_no_snapshot_falls_back_no_crash(self):
         """Без слепка (snapshot=None) множественные ординалы не дробятся — прежнее поведение."""
         r = ru.understand_reply(

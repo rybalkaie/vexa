@@ -326,6 +326,9 @@ _BARE_ORD_ALLOWED = frozenset(
     "вопрос вопросы вопроса задача задачи задачу".split())
 _BARE_NUM_RE = re.compile(r"\d+")
 _BARE_WORD_RE = re.compile(r"[a-zа-я]+")
+# Порядковый суффикс через дефис: «18-е»/«17-й»/«13-ю»/«5-го» → номер (буквы после дефиса,
+# не цифры — диапазон «3-5» не трогаем).
+_ORD_SUFFIX_RE = re.compile(r"(\d+)-[а-я]{1,2}\b")
 
 
 def _bare_number_list(text: str, snap_len: int) -> set:
@@ -337,6 +340,10 @@ def _bare_number_list(text: str, snap_len: int) -> set:
     if snap_len <= 0:
         return set()
     t = text.lower().replace("ё", "е")
+    # ISS-44.1 (цикл5): русский порядковый суффикс через дефис — «18-е», «17-й», «13-ю» →
+    # «18/17/13». Иначе остаток «е/й/ю» бракует страховку и номер терялся. Только ДЕФИС+буквы
+    # (не «3-5» — там после дефиса цифра; не «3 млн» — там пробел, слово остаётся сигналом).
+    t = _ORD_SUFFIX_RE.sub(r"\1", t)
     nums = [int(x) for x in _BARE_NUM_RE.findall(t)]
     if not nums or not all(1 <= n <= snap_len for n in nums):
         return set()  # нет чисел / есть вне диапазона → не угадываем (честнее переспросить)
