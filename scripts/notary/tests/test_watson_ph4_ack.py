@@ -397,7 +397,7 @@ class TestAckReplyRoute(_Base):
     def test_ozhid1_progress_hint_on_batch(self):
         # ОЖИД1: пачка → «⏳ Получил, разбираю…» ДО долгого разбора (первым сообщением).
         batch = "по складу разрулили\nмедиаплан ещё в работе"      # 2 строки = пачка
-        stub = lambda rt, it: {  # noqa: E731
+        stub = lambda rt, it, snap=None: {  # noqa: E731
             "statuses": [{"text": "по складу склад разрулили", "cls": "done"}],
             "edits": [], "series_config": [], "block_close": False, "unclear": "",
         }

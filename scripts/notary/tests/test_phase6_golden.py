@@ -170,7 +170,7 @@ class _GoldenBase(unittest.TestCase):
 
     def _run(self, case):
         """Прогнать один understand-кейс → нормализованный исход (для теста и отчёта)."""
-        stub = (lambda cn: (lambda rt, it: cn))(case["stub"])
+        stub = (lambda cn: (lambda rt, it, snap=None: cn))(case["stub"])
         r = ru.understand_reply(
             case["reply"], series_dir=self.sd, replier=case["replier"],
             understand_fn=stub, date=_APPLY_DATE, store_path=Path(self.memf))

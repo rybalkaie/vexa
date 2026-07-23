@@ -239,7 +239,7 @@ class TestUnderstandCore(_SeriesBase):
     def test_r7_nonstandard_word_reaches_apply_without_dict(self):
         # R7: «разрулили» словарь НЕ ловит, ИИ-класс done → статус ПРОСТАВЛЕН (без словаря).
         self.assertIsNone(psr.detect_status_intent("по складу склад разрулили"))
-        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         r = ru.understand_reply("по складу склад разрулили", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertEqual(len(r["applied"]), 1)
@@ -248,7 +248,7 @@ class TestUnderstandCore(_SeriesBase):
 
     def test_r8_tier1_dict_strong_own(self):
         # Ступень 1: словарь + strong-матч + своя задача → делает, tier=1.
-        stub = lambda rt, it: _canned([("по расчёту Ozon всё готово", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по расчёту Ozon всё готово", "done")])
         r = ru.understand_reply("по расчёту Ozon всё готово", series_dir=self.sd,
                                 replier="Татьяна Филиппова", understand_fn=stub, date="2026-06-10")
         self.assertEqual(len(r["applied"]), 1)
@@ -257,14 +257,14 @@ class TestUnderstandCore(_SeriesBase):
 
     def test_r8_tier2_minor_doubt_ai_only(self):
         # Ступень 2: слово знал только ИИ → делает, но tier=2 (мелкое сомнение).
-        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         r = ru.understand_reply("по складу склад разрулили", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertEqual(r["applied"][0]["tier"], ru.TIER_MINOR)
 
     def test_r8_tier3_no_match_not_written(self):
         # Ступень 3: кандидат ∉ универсум → ВОПРОС, статус НЕ пишется.
-        stub = lambda rt, it: _canned([("по проекту альфа всё сделали", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по проекту альфа всё сделали", "done")])
         r = ru.understand_reply("по проекту альфа всё сделали", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertEqual(len(r["applied"]), 0)
@@ -273,7 +273,7 @@ class TestUnderstandCore(_SeriesBase):
 
     def test_r11_foreign_task_tier3_not_written(self):
         # R11: та же формулировка, но ответил ЧУЖОЙ (Илья на задачу Татьяны) → ступень 3.
-        stub = lambda rt, it: _canned([("по расчёту Ozon всё готово", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по расчёту Ozon всё готово", "done")])
         r = ru.understand_reply("по расчёту Ozon всё готово", series_dir=self.sd,
                                 replier="Илья Рыбалка", understand_fn=stub, date="2026-06-10")
         self.assertEqual(len(r["applied"]), 0)
@@ -282,14 +282,14 @@ class TestUnderstandCore(_SeriesBase):
 
     def test_own_task_applies_when_foreign_check_passes(self):
         # Контроль к R11: своя задача (Татьяна) при тех же данных — применяется.
-        stub = lambda rt, it: _canned([("по расчёту Ozon всё готово", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по расчёту Ozon всё готово", "done")])
         r = ru.understand_reply("по расчёту Ozon всё готово", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertEqual(len(r["applied"]), 1)
 
     def test_r12_series_config_forwarded_not_applied(self):
         # R12: настройка серии → в config_requests, статус НЕ трогается.
-        stub = lambda rt, it: _canned(config=["не включай блок задач в протокол"])
+        stub = lambda rt, it, snap=None: _canned(config=["не включай блок задач в протокол"])
         r = ru.understand_reply("не включай блок задач в протокол", series_dir=self.sd,
                                 replier="Илья", understand_fn=stub, date="2026-06-10")
         self.assertEqual(r["config_requests"], ["не включай блок задач в протокол"])
@@ -297,14 +297,14 @@ class TestUnderstandCore(_SeriesBase):
 
     def test_config_deterministic_net_without_ai_flag(self):
         # R12: детерминированный нетто-детектор ловит настройку даже без ИИ-метки.
-        stub = lambda rt, it: _canned(unclear="не присылай дайджест по этой серии")
+        stub = lambda rt, it, snap=None: _canned(unclear="не присылай дайджест по этой серии")
         r = ru.understand_reply("не присылай дайджест по этой серии", series_dir=self.sd,
                                 replier="Илья", understand_fn=stub, date="2026-06-10")
         self.assertTrue(r["config_requests"])
 
     def test_edit_marker_status_goes_to_edits(self):
         # ISS-37: статус-сегмент с маркером правки — это правка, не закрытие (в edits).
-        stub = lambda rt, it: _canned([("вместо Zil правильно Zeal, склад", "done")])
+        stub = lambda rt, it, snap=None: _canned([("вместо Zil правильно Zeal, склад", "done")])
         r = ru.understand_reply("вместо Zil правильно Zeal, склад", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertEqual(len(r["applied"]), 0)
@@ -314,7 +314,7 @@ class TestUnderstandCore(_SeriesBase):
     def test_pure_edit_does_not_engage(self):
         # РИСК1: чистая правка (без статуса) — работа петли правок, understand НЕ вовлекается
         # (не крадёт правку и её дебаунс-ack), чтобы reply ушёл в шлюз правок как раньше.
-        stub = lambda rt, it: _canned(edits=["не Дрим Стори, а 23МПКТК"])
+        stub = lambda rt, it, snap=None: _canned(edits=["не Дрим Стори, а 23МПКТК"])
         r = ru.understand_reply("не Дрим Стори, а 23МПКТК", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertFalse(r["engaged"])
@@ -323,7 +323,7 @@ class TestUnderstandCore(_SeriesBase):
     def test_opasnaya_troika_no_reply_text_in_logs(self):
         # Текст reply в лог understand-слоя не уходит (только счётчики/классы).
         secret = "СЕКРЕТ_ПРО_МАРЖУ_И_ЗАКУПКУ"
-        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         with self.assertLogs("notary.reply_understand", level="INFO") as cm:
             ru.understand_reply(secret + " по складу склад разрулили", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub, date="2026-06-10")
@@ -338,7 +338,7 @@ class TestUnderstandFallbackR9(_SeriesBase):
     def test_ai_down_single_obvious_applied_no_queue(self):
         # Одиночный очевидный статус словарём применяется сразу, очередь пуста.
         r = ru.understand_reply("расчёт по складу Ozon закрыли", series_dir=self.sd,
-                                replier="Татьяна", understand_fn=lambda rt, it: None,
+                                replier="Татьяна", understand_fn=lambda rt, it, snap=None: None,
                                 date="2026-06-10", orig_ts=1000.0)
         self.assertTrue(r["deferred"] is False or r["applied"])
         self.assertEqual(len(r["applied"]), 1)
@@ -348,7 +348,7 @@ class TestUnderstandFallbackR9(_SeriesBase):
     def test_ai_down_multi_no_false_close_queued(self):
         # Пачка при недоступном ИИ: НЕ гадаем (0 закрытий), reply в очередь (deferred).
         r = ru.understand_reply("склад готов\nмедиаплан снят", series_dir=self.sd,
-                                replier="Татьяна", understand_fn=lambda rt, it: None,
+                                replier="Татьяна", understand_fn=lambda rt, it, snap=None: None,
                                 date="2026-06-10", orig_ts=1000.0)
         self.assertTrue(r["deferred"])
         self.assertEqual(self._status(), {})              # ложных закрытий 0
@@ -359,7 +359,7 @@ class TestUnderstandFallbackR9(_SeriesBase):
         # (engaged=False), НЕ копит: обычный шлюз правок отработает как сегодня.
         r = ru.understand_reply("вместо Zil правильно Zeal, замените склад на склад-2",
                                 series_dir=self.sd, replier="Татьяна",
-                                understand_fn=lambda rt, it: None, date="2026-06-10", orig_ts=1000.0)
+                                understand_fn=lambda rt, it, snap=None: None, date="2026-06-10", orig_ts=1000.0)
         self.assertFalse(r["engaged"])
         self.assertEqual(ru.ruq.list_pending(self.sd), [])
         self.assertEqual(self._status(), {})
@@ -368,13 +368,13 @@ class TestUnderstandFallbackR9(_SeriesBase):
         # Поздний живой ответ закрыл задачу (ts=2000); ранний отложенный (ts=1000) при
         # применении НЕ откатывает — out-of-order guard.
         # 1) поздний живой: reopen расчёта (OPEN) в ts=2000
-        stub_reopen = lambda rt, it: _canned([("по расчёту Ozon верните, не закрыто", "reopen")])
+        stub_reopen = lambda rt, it, snap=None: _canned([("по расчёту Ozon верните, не закрыто", "reopen")])
         ru.understand_reply("по расчёту Ozon верните, не закрыто", series_dir=self.sd,
                             replier="Татьяна", understand_fn=stub_reopen, date="2026-06-10",
                             orig_ts=2000.0)
         self.assertEqual(self._status().get(sm._status_key(_ITEM_RASCH)), sm.STATUS_OPEN)
         # 2) ранний отложенный: done расчёта в ts=1000 — НЕ должен перетереть reopen
-        stub_done = lambda rt, it: _canned([("по расчёту Ozon всё готово", "done")])
+        stub_done = lambda rt, it, snap=None: _canned([("по расчёту Ozon всё готово", "done")])
         r = ru.understand_reply("по расчёту Ozon всё готово", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub_done, date="2026-06-10",
                                 orig_ts=1000.0)
@@ -384,10 +384,10 @@ class TestUnderstandFallbackR9(_SeriesBase):
     def test_drain_deferred_applies_when_ai_back(self):
         # Очередь дозабора: положили при ИИ-down, дренаж стабом-ИИ применяет.
         ru.understand_reply("склад готов\nмедиаплан снят", series_dir=self.sd,
-                            replier="Татьяна", understand_fn=lambda rt, it: None,
+                            replier="Татьяна", understand_fn=lambda rt, it, snap=None: None,
                             date="2026-06-10", orig_ts=1000.0)
         self.assertEqual(len(ru.ruq.list_pending(self.sd)), 1)
-        stub = lambda rt, it: _canned([("расчёт по складу Ozon закрыли", "done")])
+        stub = lambda rt, it, snap=None: _canned([("расчёт по складу Ozon закрыли", "done")])
         out = ru.drain_deferred(self.sd, understand_fn=stub)
         self.assertEqual(out["processed"], 1)
         self.assertEqual(ru.ruq.list_pending(self.sd), [])
@@ -401,14 +401,14 @@ class TestUnderstandMemoryR24(_SeriesBase):
 
     def test_learned_word_applies_second_time_without_ai_class(self):
         # 1-й раз: ИИ классифицировал «разрулили»→done → применено И запомнено.
-        stub1 = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub1 = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         ru.understand_reply("по складу склад разрулили", series_dir=self.sd,
                             replier="Татьяна", understand_fn=stub1, date="2026-06-10")
         self.assertEqual(dm.recall_word_class("разрулили", store_path=Path(self.memf)), "done")
         # сбросим статус, чтобы проверить повторное применение начисто
         sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_OPEN)
         # 2-й раз: ИИ НЕ дал класс (cls=None) — память узнаёт слово → применяет БЕЗ вопроса.
-        stub2 = lambda rt, it: _canned([("по складу склад разрулили", None)])
+        stub2 = lambda rt, it, snap=None: _canned([("по складу склад разрулили", None)])
         r = ru.understand_reply("по складу склад разрулили", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub2, date="2026-06-11")
         self.assertEqual(len(r["applied"]), 1)
@@ -418,11 +418,11 @@ class TestUnderstandMemoryR24(_SeriesBase):
     def test_negated_learned_word_not_false_closed(self):
         # Ф3-цикл5: выучили «разрулили»→done; ОТРИЦАНИЕ «не разрулили» НЕ закрывает задачу
         # (класс бага FU-1). ИИ без класса → память на отрицании молчит → ступень-3, не пишем.
-        stub1 = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub1 = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         ru.understand_reply("по складу склад разрулили", series_dir=self.sd,
                             replier="Татьяна", understand_fn=stub1, date="2026-06-10")
         sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_OPEN)
-        stub2 = lambda rt, it: _canned([("по складу склад не разрулили", None)])
+        stub2 = lambda rt, it, snap=None: _canned([("по складу склад не разрулили", None)])
         r = ru.understand_reply("по складу склад не разрулили", series_dir=self.sd,
                                 replier="Татьяна", understand_fn=stub2, date="2026-06-11")
         self.assertEqual(len(r["applied"]), 0)                       # НЕ применено
@@ -431,7 +431,7 @@ class TestUnderstandMemoryR24(_SeriesBase):
     def test_no_poison_learn_from_negated_segment(self):
         # Ф3-цикл5: «не раскидали»→reopen (ИИ) НЕ должно выучить «раскидали»→reopen —
         # утвердительное «раскидали» = сделал. Из отрицательного сегмента слово не учим.
-        stub = lambda rt, it: _canned([("по складу склад не раскидали", "reopen")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад не раскидали", "reopen")])
         ru.understand_reply("по складу склад не раскидали", series_dir=self.sd,
                             replier="Татьяна", understand_fn=stub, date="2026-06-10")
         self.assertIsNone(dm.recall_word_class("раскидали", store_path=Path(self.memf)))
@@ -472,7 +472,7 @@ class TestUnderstandListenerRoute(_SeriesBase):
     def test_protocol_route_applies_and_acks(self):
         # НЕС2: understand достижим из maybe_route_to_reply_understand; статус проставлен, ack.
         sent = []
-        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
              mock.patch.object(ml, "_protokol_root", return_value=self.root), \
              mock.patch.object(ru, "_request_understand", stub), \
@@ -493,7 +493,7 @@ class TestUnderstandListenerRoute(_SeriesBase):
                 send(token, chat_id, "ack")
             return True
 
-        stub = lambda rt, it: _canned([("расчёт по складу Ozon закрыли", "done")],
+        stub = lambda rt, it, snap=None: _canned([("расчёт по складу Ozon закрыли", "done")],
                                       edits=["не Дрим Стори, а 23МПКТК"])
         from notary.lib import feedback_worker
         with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
@@ -511,7 +511,7 @@ class TestUnderstandListenerRoute(_SeriesBase):
         # R12 на уровне listener: настройка → форвард владельцу + ответ сотруднику.
         sent = []
         pushed = []
-        stub = lambda rt, it: _canned(config=["не включай блок задач в протокол"])
+        stub = lambda rt, it, snap=None: _canned(config=["не включай блок задач в протокол"])
         from notary.lib import notify
         # autospec=True → мок ЭНФОРСИТ реальную сигнатуру push (ловит неверный kwarg типа
         # `identity=` — в проде он бы уронил форвард в try/except молча).
@@ -549,7 +549,7 @@ class TestUnderstandListenerRoute(_SeriesBase):
     def test_process_message_dispatches_to_understand(self):
         # Достижимость из РЕАЛЬНОГО триггера: process_message → maybe_route_to_reply_understand
         # (не изолированный вызов роута). Статус реально проставлен через полный dispatch.
-        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
              mock.patch.object(ml, "_protokol_root", return_value=self.root), \
              mock.patch.object(ru, "_request_understand", stub), \
@@ -560,7 +560,7 @@ class TestUnderstandListenerRoute(_SeriesBase):
     def test_digest_route_understand_reachable(self):
         # НЕС2: understand достижим и на дайджест-роуте (_apply_digest_understand).
         sent = []
-        stub = lambda rt, it: _canned([("по складу склад разрулили", "done")])
+        stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
         with mock.patch.object(ml, "_protokol_root", return_value=self.root), \
              mock.patch.object(ru, "_request_understand", stub), \
              mock.patch.object(ml, "send_message", side_effect=lambda *a, **k: sent.append(a)):
