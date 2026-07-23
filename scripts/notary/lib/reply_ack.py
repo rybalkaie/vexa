@@ -232,16 +232,18 @@ def _echo_unattached(questions: list) -> list:
     return lines
 
 
-def _already_line(already: list) -> Optional[str]:
+def _already_line(already: list, *, applied_keys: Optional[set] = None) -> Optional[str]:
     """ISS-46: задачи, уже стоящие в названном статусе, — «уже закрыто», не «отметил
-    закрытым» (владелец 23.07: бот перезакрывал старые закрытые и вводил в заблуждение)."""
+    закрытым» (владелец 23.07: бот перезакрывал старые закрытые и вводил в заблуждение).
+    `applied_keys` — задачи, реально применённые в ЭТОМ reply: их из «уже» исключаем
+    (та же задача дважды в пачке не должна показаться и «✅ Закрыто», и «ℹ️ уже», Н1 цикл5)."""
     by_key: dict = {}
     for a in already or []:
         m = a.get("matched")
         if not m:
             continue
         k = series_memory._status_key(m)
-        if k:
+        if k and not (applied_keys and k in applied_keys):
             by_key[k] = a
     if not by_key:
         return None
@@ -277,7 +279,9 @@ def build_ack(result: dict, *, series_dir, snapshot=None, replier: Optional[str]
     groups = _groups_from_applied(deduped)
     parts: list = list(mrs._render_status_section(groups, None))
 
-    already_line = _already_line(result.get("already") or [])
+    applied_keys = {series_memory._status_key(a.get("matched"))
+                    for a in deduped if a.get("matched")}
+    already_line = _already_line(result.get("already") or [], applied_keys=applied_keys)
     if already_line:
         parts.append(already_line)
 

@@ -237,6 +237,17 @@ class TestBuildAck(_Base):
         self.assertIn("ℹ️", built["text"])                        # инфо-строка, не свежий ✅
         self.assertNotIn("✅", built["text"])                     # не ложное свежее закрытие
 
+    def test_iss46_already_excluded_when_also_applied(self):
+        # Н1 цикл5: та же задача и в applied, и в already (дважды в пачке) → «уже» НЕ
+        # показываем (применённое побеждает, нет противоречия «✅ Закрыто» + «ℹ️ уже»).
+        res = self._blank(
+            applied=[_applied(_ITEM_RASCH, "done")],
+            already=[{"kind": "already_closed", "matched": _ITEM_RASCH,
+                      "label": "done", "status": sm.STATUS_DONE}])
+        built = ra.build_ack(res, series_dir=self.sd)
+        self.assertIn("Закрыто", built["text"])                   # применённое показано
+        self.assertNotIn("повторно не трогаю", built["text"].lower())  # «уже» подавлено
+
     def test_single_foreign_still_one_line(self):
         # Регрессия: одна чужая задача → прежняя одиночная формулировка (не список).
         res = self._blank(questions=[
