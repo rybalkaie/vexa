@@ -122,10 +122,12 @@ def _numbered(options: list) -> list:
 # ── Построение единого ack + первичного переспроса ────────────────────────────
 def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
     """Выбрать ОДИН закрытый переспрос (минимум действий, R15) из вопросов ступени-3.
-    Приоритет: block_close (И1) → чужая (R11) → неясный класс (R24) → к какой задаче.
-    Возвращает (qstate|None, lines, consumed_question|None)."""
+    Приоритет: block_close (И1) → чужие (R11) → неясный класс (R24) → к какой задаче.
+    Возвращает (qstate|None, lines, consumed_questions:list). `consumed_questions` —
+    вопросы, СЪЕДЕННЫЕ этим переспросом (их не эхошит `_echo_unattached`); чужих может
+    быть НЕСКОЛЬКО в одном reply — их подтверждаем одним блоком «да/нет» (ISS-44.8)."""
     block = next((q for q in questions if q.get("kind") == "block_close"), None)
-    foreign = next((q for q in questions if q.get("kind") == "foreign"), None)
+    foreigns = [q for q in questions if q.get("kind") == "foreign" and q.get("matched")]
     unclear = next((q for q in questions if q.get("kind") == "unclear_label"
                     and q.get("matched")), None)
     pick = next((q for q in questions if q.get("kind") in ("no_match", "ambiguous_ordinal")
@@ -136,20 +138,45 @@ def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
         if not options:
             # У2 (цикл5): «закрой всё» при нуле висящих — не молчим и не врём «не нашёл
             # статусов»: честно говорим, что закрывать нечего (block_close «съеден»).
-            return None, ["Сейчас у вас нет открытых вопросов — закрывать нечего."], block
+            return None, ["Сейчас у вас нет открытых вопросов — закрывать нечего."], [block]
         lines = ["Закрыть все ваши вопросы?", *_numbered(options),
                  "Ответьте «да», «нет» или «да, кроме 3» (номер)."]
         return ({"mode": "confirm_close", "label": "done", "options": options, "word": None},
-                lines, block)
+                lines, [block])
 
-    if foreign is not None and foreign.get("matched"):
-        label = foreign.get("label") or "done"
-        human = _label_human(label)
-        lines = [f"«{_short(foreign['matched'])}» — вопрос не ваш (заведён на другого "
-                 f"участника). Всё равно отметить как «{human}»?",
-                 "Ответьте «да» или «нет»."]
-        return ({"mode": "confirm_foreign", "label": label,
-                 "matched": foreign["matched"], "word": None}, lines, foreign)
+    if foreigns:
+        # ISS-44.8: несколько чужих задач в одном reply → ОДИН блок подтверждения «да/нет»
+        # (а не «1 спросил + N в „не понял“»). Все привязаны (к чужим задачам) — просто не
+        # свои. Дедуп по задаче в пачке: одна задача — один пункт (последний label побеждает).
+        options, labels, seen = [], [], {}
+        for q in foreigns:
+            m = q["matched"]
+            key = series_memory._status_key(m)
+            lbl = q.get("label") or "done"
+            if key and key in seen:
+                labels[seen[key]] = lbl      # повтор задачи — обновить статус, не дублить пункт
+                continue
+            if key:
+                seen[key] = len(options)
+            options.append(m)
+            labels.append(lbl)
+        if len(options) == 1:
+            human = _label_human(labels[0])
+            lines = [f"«{_short(options[0])}» — вопрос не ваш (заведён на другого "
+                     f"участника). Всё равно отметить как «{human}»?",
+                     "Ответьте «да» или «нет»."]
+        else:
+            if len(set(labels)) == 1:
+                human = _label_human(labels[0])
+                head = (f"Эти вопросы не ваши (заведены на другого участника) — всё равно "
+                        f"отметить все как «{human}»?")
+            else:
+                head = ("Эти вопросы не ваши (заведены на другого участника) — всё равно "
+                        "отметить?")
+            lines = [head, *_numbered(options),
+                     "Ответьте «да», «нет» или «да, кроме 2» (номер)."]
+        return ({"mode": "confirm_foreign", "label": labels[0], "options": options,
+                 "labels": labels, "word": None}, lines, list(foreigns))
 
     if unclear is not None:
         matched = unclear["matched"]
@@ -160,12 +187,12 @@ def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
         lines = [f"Не понял статус по «{_short(matched)}»: сделано, снято, в работе или "
                  "под вопросом? Ответьте словом."]
         return ({"mode": "clarify_class", "label": None, "matched": matched, "word": word},
-                lines, unclear)
+                lines, [unclear])
 
     if pick is not None:
         options = _load_items(series_dir, snapshot)
         if not options:
-            return None, [], None
+            return None, [], []
         label = pick["label"]
         human = _label_human(label)
         seg = pick.get("segment") or ""
@@ -175,9 +202,9 @@ def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
         lines = [f"Не понял, к какому вопросу относится «{human}»:", *_numbered(options),
                  "Ответьте цифрой (или «мимо», если ни к какому)."]
         return ({"mode": "pick_target", "label": label, "options": options, "word": word},
-                lines, pick)
+                lines, [pick])
 
-    return None, [], None
+    return None, [], []
 
 
 def _echo_unattached(questions: list) -> list:
@@ -246,7 +273,8 @@ def build_ack(result: dict, *, series_dir, snapshot=None, replier: Optional[str]
     if qlines:
         parts.append("\n".join(qlines))
 
-    remaining = [q for q in questions if q is not consumed]
+    consumed_ids = {id(q) for q in (consumed or [])}
+    remaining = [q for q in questions if id(q) not in consumed_ids]
     echo = _echo_unattached(remaining)
     if echo:
         parts.append("\n".join(echo))  # блок эха — целиком, пустая строка только ВОКРУГ него
@@ -389,15 +417,41 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
             return {"text": _closed_reply(done, label), "consume": True, "learned": False}
 
         if mode == "confirm_foreign":
-            matched = question.get("matched")
-            if ans["yes"] and matched:
-                ok = _apply_status(series_dir, matched, label, date=date)
-                return {"text": _closed_reply([matched] if ok else [], label),
+            # ISS-44.8: чужих задач может быть несколько — один блок «да/нет» на ВСЕ.
+            # options/labels — параллельные списки (у каждой чужой задачи свой статус);
+            # обратная совместимость со старым одиночным state (`matched`+`label`).
+            options = question.get("options") or []
+            labels = question.get("labels") or []
+            if not options and question.get("matched"):
+                options, labels = [question["matched"]], [label]
+            multi = len(options) > 1
+            if ans["yes"]:
+                idxs = [i for i in range(1, len(options) + 1) if i not in ans["excluded"]]
+            elif ans["digits"]:
+                idxs = [i for i in sorted(ans["digits"]) if 1 <= i <= len(options)]
+            elif ans["no"]:
+                txt = "Ок, чужие вопросы не трогаю." if multi else "Ок, чужой вопрос не трогаю."
+                return {"text": txt, "consume": True, "learned": False}
+            else:
+                hint = ("Ответьте «да», «нет» или «да, кроме 2» (номер), пожалуйста."
+                        if multi else "Ответьте «да» или «нет», пожалуйста.")
+                return {"text": hint, "consume": False, "learned": False}
+            done, done_label = [], None
+            for i in idxs:
+                lbl = labels[i - 1] if i - 1 < len(labels) else label
+                if _apply_status(series_dir, options[i - 1], lbl, date=date):
+                    done.append(options[i - 1])
+                    done_label = lbl
+            # Сводка: при едином статусе — как «отметил как «X»»; при разных — общий текст.
+            uniform = done and len({labels[i - 1] for i in idxs
+                                    if i - 1 < len(labels)}) == 1
+            if uniform:
+                return {"text": _closed_reply(done, done_label),
                         "consume": True, "learned": False}
-            if ans["no"]:
-                return {"text": "Ок, чужой вопрос не трогаю.", "consume": True, "learned": False}
-            return {"text": "Ответьте «да» или «нет», пожалуйста.",
-                    "consume": False, "learned": False}
+            if not done:
+                return {"text": "Ок, ничего не отметил.", "consume": True, "learned": False}
+            names = ", ".join(f"«{_short(t)}»" for t in done)
+            return {"text": f"Готово — отметил: {names}.", "consume": True, "learned": False}
 
         if mode == "pick_target":
             if ans["no"]:

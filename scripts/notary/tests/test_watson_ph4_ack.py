@@ -206,6 +206,37 @@ class TestBuildAck(_Base):
         self.assertNotIn("Не нашёл", built["text"])
         self.assertIsNone(built["question"])
 
+    def test_iss448_multi_foreign_one_confirm_not_unattached(self):
+        # ISS-44.8: несколько ЧУЖИХ задач в одном reply → ОДИН блок «да/нет», а НЕ
+        # «1 спросил + N в „не понял“». Скрин владельца: «Удали задачи Соны. 13,14,15».
+        f1 = "Сона: закрыть ВЭД по Toledo"
+        f2 = "Сона: прислать ссылку на карточку"
+        f3 = "Сона: согласовать поставку Toledo"
+        res = self._blank(questions=[
+            _question("foreign", matched=f1, label="cancelled", segment="удали, по ошибке"),
+            _question("foreign", matched=f2, label="cancelled", segment="удали, по ошибке"),
+            _question("foreign", matched=f3, label="cancelled", segment="удали, по ошибке"),
+        ])
+        built = ra.build_ack(res, series_dir=self.sd)
+        # один блок подтверждения со всеми тремя, единым «да/нет»
+        self.assertEqual(built["question"]["mode"], "confirm_foreign")
+        self.assertEqual(built["question"]["options"], [f1, f2, f3])
+        self.assertEqual(built["question"]["labels"], ["cancelled"] * 3)
+        self.assertIn("не ваши", built["text"].lower())
+        # НИ ОДНА чужая не утекла в «не смог привязать»
+        self.assertNotIn("не понял", built["text"].lower())
+        self.assertNotIn("не смог привязать", built["text"].lower())
+
+    def test_single_foreign_still_one_line(self):
+        # Регрессия: одна чужая задача → прежняя одиночная формулировка (не список).
+        res = self._blank(questions=[
+            _question("foreign", matched="Сона: закрыть ВЭД", label="done",
+                      segment="готово")])
+        built = ra.build_ack(res, series_dir=self.sd)
+        self.assertEqual(built["question"]["mode"], "confirm_foreign")
+        self.assertEqual(built["question"]["options"], ["Сона: закрыть ВЭД"])
+        self.assertIn("не ваш", built["text"].lower())
+
 
 # ==========================================================================
 # parse_answer — цифры / «да, кроме третьей» (И1) / «верни» / класс словом
@@ -277,6 +308,44 @@ class TestHandleAckReply(_Base):
                                        "matched": _ITEM_RASCH, "word": None})
         ra.handle_ack_reply(st_yes, "да")
         self.assertEqual(self._status().get(sm._status_key(_ITEM_RASCH)), sm.STATUS_DONE)
+
+    def test_iss448_confirm_foreign_multi_yes_applies_all(self):
+        # ISS-44.8: «да» на мульти-foreign → применяет статус ко ВСЕМ чужим задачам.
+        f1, f2, f3 = "Сона: ВЭД Toledo", "Сона: ссылка", "Сона: поставка"
+        st = self._state(question={"mode": "confirm_foreign", "label": "cancelled",
+                                   "options": [f1, f2, f3],
+                                   "labels": ["cancelled", "cancelled", "cancelled"],
+                                   "word": None})
+        res = ra.handle_ack_reply(st, "да")
+        self.assertTrue(res["consume"])
+        s = self._status()
+        self.assertEqual(s.get(sm._status_key(f1)), sm.STATUS_CANCELLED)
+        self.assertEqual(s.get(sm._status_key(f2)), sm.STATUS_CANCELLED)
+        self.assertEqual(s.get(sm._status_key(f3)), sm.STATUS_CANCELLED)
+
+    def test_iss448_confirm_foreign_multi_except(self):
+        # «да, кроме 2» на мульти-foreign → 1 и 3 сняты, 2 не тронута.
+        f1, f2, f3 = "Сона: ВЭД Toledo", "Сона: ссылка", "Сона: поставка"
+        st = self._state(question={"mode": "confirm_foreign", "label": "cancelled",
+                                   "options": [f1, f2, f3],
+                                   "labels": ["cancelled", "cancelled", "cancelled"],
+                                   "word": None})
+        res = ra.handle_ack_reply(st, "да, кроме 2")
+        self.assertTrue(res["consume"])
+        s = self._status()
+        self.assertEqual(s.get(sm._status_key(f1)), sm.STATUS_CANCELLED)
+        self.assertNotIn(sm._status_key(f2), s)
+        self.assertEqual(s.get(sm._status_key(f3)), sm.STATUS_CANCELLED)
+
+    def test_iss448_confirm_foreign_multi_no_touches_nothing(self):
+        # «нет» на мульти-foreign → ничего не трогаем.
+        f1, f2 = "Сона: ВЭД Toledo", "Сона: ссылка"
+        st = self._state(question={"mode": "confirm_foreign", "label": "cancelled",
+                                   "options": [f1, f2], "labels": ["cancelled", "cancelled"],
+                                   "word": None})
+        res = ra.handle_ack_reply(st, "нет")
+        self.assertTrue(res["consume"])
+        self.assertEqual(self._status(), {})
 
     def test_r24_clarify_class_learns_word(self):
         # R24-триггер: класс неизвестен, человек назвал «сделано» → применяем + ЗАПОМИНАЕМ.
