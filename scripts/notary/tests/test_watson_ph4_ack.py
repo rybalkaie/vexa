@@ -227,6 +227,16 @@ class TestBuildAck(_Base):
         self.assertNotIn("не понял", built["text"].lower())
         self.assertNotIn("не смог привязать", built["text"].lower())
 
+    def test_iss46_already_bucket_says_already_not_closed(self):
+        # ISS-46: задача уже в статусе → «уже … повторно не трогаю», НЕ «Закрыто».
+        res = self._blank(already=[{"kind": "already_closed", "matched": _ITEM_RASCH,
+                                    "label": "done", "status": sm.STATUS_DONE}])
+        built = ra.build_ack(res, series_dir=self.sd)
+        self.assertIn("уже", built["text"].lower())
+        self.assertIn("повторно не трогаю", built["text"].lower())
+        self.assertIn("ℹ️", built["text"])                        # инфо-строка, не свежий ✅
+        self.assertNotIn("✅", built["text"])                     # не ложное свежее закрытие
+
     def test_single_foreign_still_one_line(self):
         # Регрессия: одна чужая задача → прежняя одиночная формулировка (не список).
         res = self._blank(questions=[
@@ -432,6 +442,39 @@ class TestAckReplyRoute(_Base):
         with mock.patch.object(ml, "send_message"):
             claimed = ml.maybe_route_to_ack_reply("tok", self.GROUP, self._reply_msg("верни", 777))
         self.assertFalse(claimed)
+
+    def test_iss47_voice_reply_to_ack_transcribed_and_applied(self):
+        # ISS-47: ГОЛОСОВОЙ ответ на вопрос бота расшифровывается и применяется (раньше
+        # молча терялся). «да» голосом на «Закрыть все вопросы?» → задача закрыта.
+        ras.record(890, series_dir=self.sd, chat_id=self.GROUP,
+                   question={"mode": "confirm_close", "label": "done",
+                             "options": [_ITEM_RASCH], "word": None})
+        voice_msg = {"chat": {"id": self.GROUP}, "from": {"id": 777},
+                     "reply_to_message": {"message_id": 890}, "message_id": 999,
+                     "voice": {"file_id": "x"}}       # text ОТСУТСТВУЕТ
+        sent = []
+        with mock.patch.dict(os.environ, {"ENABLE_DIGEST_VOICE_REPLY": "1"}), \
+             mock.patch.object(ml, "transcribe_voice_or_none", return_value="да"), \
+             mock.patch.object(ml, "send_message", side_effect=lambda *a, **k: sent.append(a[2])):
+            claimed = ml.maybe_route_to_ack_reply("tok", self.GROUP, voice_msg)
+        self.assertTrue(claimed)
+        self.assertEqual(self._status().get(sm._status_key(_ITEM_RASCH)), sm.STATUS_DONE)
+
+    def test_iss47_voice_unrecognized_hints_not_silent(self):
+        # ISS-47: голос на наш ack, но STT пусто → подсказка «ответьте текстом», НЕ молчание.
+        ras.record(891, series_dir=self.sd, chat_id=self.GROUP,
+                   question={"mode": "confirm_close", "label": "done",
+                             "options": [_ITEM_RASCH], "word": None})
+        voice_msg = {"chat": {"id": self.GROUP}, "reply_to_message": {"message_id": 891},
+                     "message_id": 999, "voice": {"file_id": "x"}}
+        sent = []
+        with mock.patch.dict(os.environ, {"ENABLE_DIGEST_VOICE_REPLY": "1"}), \
+             mock.patch.object(ml, "transcribe_voice_or_none", return_value=None), \
+             mock.patch.object(ml, "send_message", side_effect=lambda *a, **k: sent.append(a[2])):
+            claimed = ml.maybe_route_to_ack_reply("tok", self.GROUP, voice_msg)
+        self.assertTrue(claimed)                                  # прожевали (не молчим)
+        self.assertTrue(any("текстом" in s.lower() for s in sent))
+        self.assertNotIn(sm._status_key(_ITEM_RASCH), self._status())  # ничего не применили
 
     def test_route_cross_chat_collision_ignored(self):
         # Цикл5 Н1: message_id уникален ПО-ЧАТНО. Ack записан для ДРУГОГО чата (999), reply

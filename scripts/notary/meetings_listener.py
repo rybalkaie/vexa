@@ -2121,9 +2121,6 @@ def maybe_route_to_ack_reply(
     mid = reply_to.get("message_id")
     if mid is None:
         return False
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return False  # голос/стикер на ack — не канал закрытого ответа (не наш случай)
     try:
         from notary.lib import reply_understand, reply_ack, reply_ack_state  # noqa: PLC0415
     except Exception as e:  # noqa: BLE001 — модули не грузятся → фича выключена
@@ -2141,6 +2138,22 @@ def maybe_route_to_ack_reply(
     st_chat = state.get("chat_id")
     if st_chat is not None and st_chat != chat_id:
         return False  # тот же message_id, но другой чат → не наш ack → обычные роуты
+    # Текст ответа. ISS-47: голосовой ответ на ВОПРОС бота (переспрос) — РАСШИФРОВЫВАЕМ,
+    # а не теряем. Раньше voice на ack молча падал сквозь все роуты («да» на «Закрыть все
+    # вопросы?» игнорировался). Транскрипция — тот же Groq-путь и флаг, что у дайджест-
+    # голоса; делаем ПОСЛЕ подтверждения «это наш ack» — чужой голос не транскрибируем.
+    text = (msg.get("text") or "").strip()
+    if not text and (msg.get("voice") or msg.get("audio")):
+        if _digest_voice_reply_enabled():
+            text = (transcribe_voice_or_none(token, msg) or "").strip()
+        if not text:
+            # Наш ack, но голос не расшифровался / флаг OFF → не молчим (мы обещали ответ).
+            send_message(token, chat_id,
+                         "Не расслышал голос — ответьте, пожалуйста, текстом: «да», «нет» "
+                         "или цифрой.", reply_to=msg.get("message_id"))
+            return True
+    if not text:
+        return False  # стикер/фото на наш ack — не канал закрытого ответа
     try:
         res = reply_ack.handle_ack_reply(state, text)
     except Exception as e:  # noqa: BLE001 — обработка ответа не должна валить listener

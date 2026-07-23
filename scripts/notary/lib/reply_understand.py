@@ -374,7 +374,7 @@ def _blank_result(engaged: bool = False) -> dict:
     return {
         "engaged": engaged, "applied": [], "questions": [], "edits": [],
         "config_requests": [], "unclear": "", "deferred": False,
-        "n_status_raw": 0, "status_groups": [],
+        "n_status_raw": 0, "status_groups": [], "already": [],
     }
 
 
@@ -608,6 +608,22 @@ def _decide_and_apply_status(
         logger.info("[understand] пропуск: задача тронута более поздним ответом (out-of-order)")
         return {"kind": "superseded", "tier": tier, "segment": seg_text, "matched": matched,
                 "label": label}
+    # ISS-46 (требование владельца 23.07): не «перезакрываем» уже закрытую задачу и не
+    # рапортуем «отметил закрытым» повторно. Если задача УЖЕ в целевом ТЕРМИНАЛЬНОМ статусе
+    # (ответ «закрой» на уже-снятой/сделанной) — честно «уже закрыта», без перезаписи. Смена
+    # статуса (reopen «верни»: open ≠ done) сюда НЕ попадает — статусы разные, проходит.
+    target_status = psr._STATUS_MAP.get(label)
+    if key and target_status in series_memory._TERMINAL_CLOSED:
+        try:
+            cur = series_memory.load_task_status(series_dir).get(key)
+            cur_status = cur.get("status") if isinstance(cur, dict) else None
+        except Exception:  # noqa: BLE001 — чтение статуса best-effort
+            cur_status = None
+        if cur_status == target_status:
+            logger.info("[understand] задача уже в статусе %s — не перезакрываем (ISS-46)",
+                        target_status)
+            return {"kind": "already_closed", "tier": tier, "segment": seg_text,
+                    "matched": matched, "label": label, "status": target_status}
     rec = _write_status(series_dir, matched, label, source=source, date=date) if apply else True
     if rec is None:
         return {"kind": "write_failed", "tier": TIER_QUESTION, "segment": seg_text,
@@ -735,6 +751,9 @@ def understand_reply(
         if d["kind"] == "applied":
             result["applied"].append(d)
             grouped.setdefault(d["label"], []).append(d["matched"] or "")
+        elif d["kind"] == "already_closed":
+            # ISS-46: уже в целевом статусе → сообщаем «уже закрыта», не «отметил закрытым».
+            result["already"].append(d)
         elif d["kind"] in ("edit_origin",):
             # Статус-сегмент оказался правкой (ISS-37) → в петлю правок, не теряем.
             result["edits"].append(d["segment"])
@@ -755,7 +774,7 @@ def understand_reply(
     # (РИСК1: правки утекают в петлю, а не подменяются). При статусе+правках — берём (applied
     # непусто) и правки форвардим caller'ом.
     result["engaged"] = bool(
-        result["applied"] or result["questions"]
+        result["applied"] or result["questions"] or result["already"]
         or result["config_requests"] or (result["unclear"] or "").strip())
     logger.info(
         "[understand] series=%s applied=%d questions=%d edits=%d config=%d deferred=0",

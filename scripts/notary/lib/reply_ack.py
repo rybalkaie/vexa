@@ -232,6 +232,27 @@ def _echo_unattached(questions: list) -> list:
     return lines
 
 
+def _already_line(already: list) -> Optional[str]:
+    """ISS-46: задачи, уже стоящие в названном статусе, — «уже закрыто», не «отметил
+    закрытым» (владелец 23.07: бот перезакрывал старые закрытые и вводил в заблуждение)."""
+    by_key: dict = {}
+    for a in already or []:
+        m = a.get("matched")
+        if not m:
+            continue
+        k = series_memory._status_key(m)
+        if k:
+            by_key[k] = a
+    if not by_key:
+        return None
+    names = ", ".join(f"«{_short(a.get('matched'))}»" for a in by_key.values())
+    labels = {a.get("label") for a in by_key.values()}
+    if len(labels) == 1:
+        human = _label_human(next(iter(labels)))
+        return f"ℹ️ Это уже было отмечено как «{human}» раньше — повторно не трогаю: {names}."
+    return f"ℹ️ Это уже было закрыто раньше — повторно не трогаю: {names}."
+
+
 def _edits_line(n_edits: int, *, edit_as_hint: bool, edit_queued: bool) -> Optional[str]:
     if not n_edits:
         return None
@@ -255,6 +276,10 @@ def build_ack(result: dict, *, series_dir, snapshot=None, replier: Optional[str]
     deduped = _dedup_applied(result.get("applied") or [])
     groups = _groups_from_applied(deduped)
     parts: list = list(mrs._render_status_section(groups, None))
+
+    already_line = _already_line(result.get("already") or [])
+    if already_line:
+        parts.append(already_line)
 
     if result.get("config_requests"):
         parts.append(CONFIG_FORWARDED_LINE)

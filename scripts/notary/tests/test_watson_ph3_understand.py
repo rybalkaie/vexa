@@ -255,6 +255,36 @@ class TestUnderstandCore(_SeriesBase):
         self.assertEqual(r["applied"][0]["tier"], ru.TIER_CONFIDENT)
         self.assertEqual(r["applied"][0]["source"], "dict")
 
+    def test_iss46_already_closed_not_reclosed(self):
+        # ISS-46 (владелец 23.07): задача УЖЕ done → повторное «закрой» НЕ переписывает и
+        # не «отмечает закрытым», а сообщает «уже» (bucket already). Корень бага караоке.
+        sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_DONE, source="earlier", date="2026-06-05")
+        stub = lambda rt, it, snap=None: _canned([("по расчёту Ozon всё готово", "done")])
+        r = ru.understand_reply("по расчёту Ozon всё готово", series_dir=self.sd,
+                                replier="Татьяна Филиппова", understand_fn=stub, date="2026-06-10")
+        self.assertEqual(len(r["applied"]), 0)                    # повторно НЕ применили
+        self.assertEqual(len(r["already"]), 1)                    # сообщили «уже»
+        self.assertEqual(r["already"][0]["matched"], _ITEM_RASCH)
+        self.assertTrue(r["engaged"])                             # не молчим
+
+    def test_iss46_reopen_on_closed_still_works(self):
+        # Гейт «уже» — ТОЛЬКО про тот же статус. Смена (reopen: done→open) проходит.
+        sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_DONE, source="earlier", date="2026-06-05")
+        stub = lambda rt, it, snap=None: _canned([("по расчёту Ozon верните", "reopen")])
+        r = ru.understand_reply("по расчёту Ozon верните", series_dir=self.sd,
+                                replier="Татьяна Филиппова", understand_fn=stub, date="2026-06-10")
+        self.assertEqual(len(r["already"]), 0)                    # не «уже» — статус меняется
+        self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_OPEN)
+
+    def test_iss46_cancelled_then_done_changes_status(self):
+        # Терминальный, но ДРУГОЙ статус (cancelled → done) — не «уже», меняем.
+        sm.set_task_status(self.sd, _ITEM_RASCH, sm.STATUS_CANCELLED, source="earlier", date="2026-06-05")
+        stub = lambda rt, it, snap=None: _canned([("по расчёту Ozon сделано", "done")])
+        r = ru.understand_reply("по расчёту Ozon сделано", series_dir=self.sd,
+                                replier="Татьяна Филиппова", understand_fn=stub, date="2026-06-10")
+        self.assertEqual(len(r["already"]), 0)
+        self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_DONE)
+
     def test_r8_tier2_minor_doubt_ai_only(self):
         # Ступень 2: слово знал только ИИ → делает, но tier=2 (мелкое сомнение).
         stub = lambda rt, it, snap=None: _canned([("по складу склад разрулили", "done")])
