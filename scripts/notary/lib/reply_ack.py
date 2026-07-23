@@ -60,7 +60,11 @@ def _label_human(label: Optional[str]) -> str:
     return mrs._GROUP_META.get(label or "other", mrs._GROUP_META["other"])[1]
 
 
-def _short(text: str, *, limit: int = 48) -> str:
+def _short(text: str, *, limit: int = 10_000) -> str:
+    """Имя РАСПОЗНАННОЙ задачи для переспроса/сводки: снимаем префикс исполнителя
+    «Имя: », длину по умолчанию НЕ режем (ISS-44.4 + фидбэк владельца 23.07: обрезка
+    «…через знакомого по…» мешает понять, что подтверждаешь). Явный `limit` (эхо сырого
+    сегмента человека в `_echo_unattached`) — режет как прежде."""
     return mrs._short_task_name(text, limit=limit)
 
 
