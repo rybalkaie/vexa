@@ -918,7 +918,9 @@ def _resend_protocol(token: str, cid: int, series: str, msg: dict[str, Any]) -> 
     reply_to_id = msg.get("message_id")
     found = _latest_protocol_path(series)
     if not found:
-        send_message(token, cid, "Не нашёл протокол этой встречи на диске — гляну, что не так.",
+        # Протокола ещё нет: встреча прошла, но сборка не завершилась (или это первая
+        # встреча серии). Не пугаем «потерялся» — честно про «ещё не готов».
+        send_message(token, cid, "Протокол этой встречи пока не готов — пришлю, как соберётся.",
                      reply_to=reply_to_id)
         return True
     md_path, date = found
@@ -971,6 +973,15 @@ def _resend_digest(token: str, cid: int, series: str, msg: dict[str, Any]) -> bo
     status, reason = res.get("status"), res.get("reason")
     if status == "sent":
         logger.info("[send-artifact] дайджест серии %s переотправлен по просьбе", series)
+        # Дайджест уходит в ПРИВЯЗАННЫЙ чат серии (штатный канал). Если просьбу дали в
+        # другом чате («серию X шли сюда» развёл источник и канал) — не молчим в источнике.
+        sent_chat = res.get("chat_id")
+        try:
+            if sent_chat is not None and int(sent_chat) != int(cid):
+                send_message(token, cid, "Прислал открытые вопросы в чат этой серии.",
+                             reply_to=reply_to_id)
+        except (TypeError, ValueError):
+            pass
         return True
     if reason == "empty":
         send_message(token, cid, "Открытых вопросов по этой встрече сейчас нет — список пуст.",

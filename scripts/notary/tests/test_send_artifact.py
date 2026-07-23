@@ -33,9 +33,13 @@ import notary.meetings_listener as ml  # noqa: E402
 class TestDetect(unittest.TestCase):
     def test_protocol_requests(self):
         for t in ("пришли протокол", "скинь актуальную версию файла",
-                  "Ты можешь скинуть актуальную версию файла?", "отправь документ",
+                  "Ты можешь скинуть актуальную версию файла?",
                   "повтори протокол, пожалуйста"):
             self.assertEqual(sa.detect_artifact_request(t), "protocol", t)
+
+    def test_document_word_not_captured(self):
+        # Н1 цикл5: «документ» слишком общее — «пришли документ по клиенту» не про протокол.
+        self.assertIsNone(sa.detect_artifact_request("пришли документ по клиенту"))
 
     def test_digest_requests(self):
         for t in ("пришли открытые вопросы", "скинь дайджест", "отправь список вопросов",
