@@ -31,11 +31,21 @@ import notary.meetings_listener as ml  # noqa: E402
 # Детект интента (чистая функция)
 # ==========================================================================
 class TestDetect(unittest.TestCase):
-    def test_protocol_requests(self):
-        for t in ("пришли протокол", "скинь актуальную версию файла",
-                  "Ты можешь скинуть актуальную версию файла?",
-                  "повтори протокол, пожалуйста"):
+    def test_protocol_requests_explicit(self):
+        # Явное слово «протокол» → protocol независимо от контекста.
+        for t in ("пришли протокол", "повтори протокол, пожалуйста", "скинь протокол"):
             self.assertEqual(sa.detect_artifact_request(t), "protocol", t)
+
+    def test_version_file_is_ambiguous_by_surface(self):
+        # Фидбэк владельца 23.07: «актуальную версию файла» — НЕ признак протокола.
+        # Ответ на дайджест «Открытые вопросы» → digest (слова «протокол» нет).
+        self.assertEqual(
+            sa.detect_artifact_request("Ты можешь скинуть актуальную версию файла?",
+                                       reply_surface="digest"), "digest")
+        self.assertEqual(
+            sa.detect_artifact_request("скинь версию файла", reply_surface="protocol"), "protocol")
+        # без контекста — протокол (главный документ)
+        self.assertEqual(sa.detect_artifact_request("скинь актуальную версию файла"), "protocol")
 
     def test_document_word_not_captured(self):
         # Н1 цикл5: «документ» слишком общее — «пришли документ по клиенту» не про протокол.
@@ -109,13 +119,15 @@ class TestRoute(unittest.TestCase):
         rd.assert_not_called()
 
     def test_ambiguous_file_uses_reply_surface(self):
-        # «скинь файл» в ответ на ДАЙДЖЕСТ → digest (surface разрешает неоднозначность)
+        # Кейс владельца 23.07: ответ на ДАЙДЖЕСТ «актуальную версию файла» → digest
+        # (surface разрешает неоднозначность; слова «протокол» нет — не шлём протокол).
         with mock.patch.object(ml, "_reply_context_series", return_value=None), \
              mock.patch.object(ml, "_reply_context_series_digest", return_value="koord"), \
              mock.patch.object(ml, "_resend_digest", return_value=True) as rd, \
              mock.patch.object(ml, "_resend_protocol", return_value=True) as rp:
             ml.maybe_route_to_send_artifact(
-                "tok", self.GROUP, self.GROUP, self._msg("скинь файл"))
+                "tok", self.GROUP, self.GROUP,
+                self._msg("Ты можешь скинуть актуальную версию файла?"))
         rd.assert_called_once()
         rp.assert_not_called()
 
