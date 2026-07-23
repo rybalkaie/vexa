@@ -30,6 +30,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -1185,23 +1186,50 @@ DIGEST_BATCH_UNPARSED_HINT = (
 )
 
 
+_OPEN_TASKS_SURFACE_RE = re.compile(
+    r"открыт\w*\s+вопрос|вопрос\w*\s+с\s+прошл|протокол", re.IGNORECASE)
+
+
+def _looks_numbered_open_tasks_surface(text: str) -> bool:
+    """Отвечаемое сообщение узнаётся как НУМЕРОВАННАЯ поверхность серии (дайджест открытых
+    вопросов / протокол встречи) — по маркеру в тексте/подписи. Нужен для фолбэка слепка
+    (ниже): включать добор свежего слепка ТОЛЬКО когда reply реально на такой документ, а
+    не на произвольное сообщение."""
+    return bool(text and _OPEN_TASKS_SURFACE_RE.search(text))
+
+
 def _reply_open_tasks_snapshot(series_dir, msg: dict[str, Any]) -> Optional[list]:
     """Ф4 (RISK4/A15): нумерованный СЛЕПОК висяков ОТВЕЧАЕМОГО документа по его
-    message_id (`reply_to`). Ординал резолвится против слепка ИМЕННО того сообщения, на
+    message_id (`reply_to`). Ординал/pos резолвится против слепка ИМЕННО того сообщения, на
     которое reply (дайджест ИЛИ конкретная версия протокола) — читатель
-    `series_memory.open_tasks_snapshot_for_message`. Нет слепка (сообщение до Ф3 /
-    reissue-версия без снапшота, FU-4) → None: ординал недоступен, матчинг идёт overlap'ом
-    как до Ф4 (honest-остаток). Best-effort — любой сбой → None (ординал просто не активен).
+    `series_memory.open_tasks_snapshot_for_message`.
+
+    Фолбэк (план `ai-owns-reply-mapping`, ISS-44 добор): у ЭТОГО message_id слепка нет
+    (участник ответил на ПЕРЕОТПРАВЛЕННУЮ копию дайджеста/протокола — слепок пишется под id
+    ПЕРВОЙ отправки), НО отвечаемое сообщение узнаётся как нумерованная поверхность серии →
+    берём самый свежий слепок ТОЙ ЖЕ даты (номер бьётся в тот список, что человек видел).
+    Без фолбэка бот терял «13,14,15» на копии дайджеста (промпт уходил без нумерации → ИИ
+    ронял числа в правку/no_match — боевой инцидент 23.07). Best-effort — сбой → None.
     """
     reply_to = msg.get("reply_to_message")
     if not isinstance(reply_to, dict):
         return None
     mid = reply_to.get("message_id")
-    if mid is None:
-        return None
     try:
         from notary.lib import series_memory  # noqa: PLC0415
-        return series_memory.open_tasks_snapshot_for_message(series_dir, mid)
+        snap = (series_memory.open_tasks_snapshot_for_message(series_dir, mid)
+                if mid is not None else None)
+        if snap is None:
+            text = str(reply_to.get("text") or reply_to.get("caption") or "")
+            m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+            # Фолбэк только при ЯВНОЙ дате в подписи (R5: номер бьём в слепок ИМЕННО той
+            # даты, что человек видел; без даты не гадаем — honest-остаток, FU-4).
+            if m and _looks_numbered_open_tasks_surface(text):
+                snap = series_memory.latest_open_tasks_snapshot(series_dir, date=m.group(1))
+                if snap is not None:
+                    logger.info("[ordinal] слепок по message_id отсутствовал → фолбэк на "
+                                "свежий слепок серии за %s (позиций=%d)", m.group(1), len(snap))
+        return snap
     except Exception as e:  # noqa: BLE001 — резолв слепка best-effort, ординал не активен
         logger.debug("[ordinal] snapshot lookup failed (non-fatal): %s", type(e).__name__)
         return None

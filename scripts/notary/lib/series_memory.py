@@ -2368,6 +2368,39 @@ def open_tasks_snapshot_for_message(series_dir: Optional[Path], message_id) -> O
     return list(pos) if isinstance(pos, list) else None
 
 
+def latest_open_tasks_snapshot(
+    series_dir: Optional[Path], *, date: Optional[str] = None,
+    surface: Optional[str] = None,
+) -> Optional[list]:
+    """Фолбэк-резолв слепка (план `ai-owns-reply-mapping`, ISS-44 добор): САМЫЙ СВЕЖИЙ
+    сохранённый слепок серии (по `at`), опц. фильтр по `date` и/или `surface`. Нужен, когда
+    reply целит в ПЕРЕОТПРАВЛЕННУЮ копию дайджеста/протокола, у которой своего слепка нет
+    (слепок пишется под message_id ПЕРВОЙ отправки), а участник ссылается на номера из ТОГО
+    ЖЕ видимого списка → без него ординал/pos-сопоставление молча отваливалось (бот терял
+    «13,14,15»). Возвращает positions или None.
+
+    Безопасность нумерации (R5): при заданном `date` берём слепки ТОЛЬКО этой даты — номер
+    бьётся в тот список, что человек видел в тот день, а не в новый пересчёт."""
+    if series_dir is None:
+        return None
+    try:
+        snaps = _load_open_tasks_snapshots(series_dir)
+    except Exception:  # noqa: BLE001 — фолбэк best-effort
+        return None
+    best = None
+    for rec in snaps.values():
+        if not isinstance(rec, dict) or not isinstance(rec.get("positions"), list):
+            continue
+        if date is not None and rec.get("date") != date:
+            continue
+        if surface is not None and rec.get("surface") != surface:
+            continue
+        at = rec.get("at") or ""
+        if best is None or at > best[0]:
+            best = (at, rec["positions"])
+    return list(best[1]) if best else None
+
+
 # ---------------------------------------------------------------------------
 # Ф4 (pending-items, R4) — холодный старт без бэкфилла истории
 # ---------------------------------------------------------------------------
