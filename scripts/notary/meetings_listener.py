@@ -893,6 +893,142 @@ def _reply_context_series_digest(cid: int, msg: dict[str, Any]) -> Optional[str]
         return None
 
 
+# ── ISS-45: переотправка артефакта (протокол / дайджест) по просьбе участника ──
+def _latest_protocol_path(series: str) -> Optional[tuple]:
+    """Последний `<date>-protokol.md` серии → (Path, дата). Имена ISO-датой →
+    лексикографический max == хронологический. None, если протоколов нет."""
+    try:
+        from notary.lib import series_memory  # noqa: PLC0415
+        series_dir = _protokol_root() / series
+        best = None
+        for p in series_dir.glob(f"*{series_memory.PROTOCOL_FILE_SUFFIX}"):
+            d = series_memory._date_from_protocol_filename(p.name)
+            if d and (best is None or d > best[1]):
+                best = (p, d)
+        return best
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[send-artifact] поиск протокола не удался: %s", type(e).__name__)
+        return None
+
+
+def _resend_protocol(token: str, cid: int, series: str, msg: dict[str, Any]) -> bool:
+    """Переотправить ПОСЛЕДНИЙ протокол серии PDF-вложением. Идемпотентный
+    `deliver_protocol` обходим (не трогаем bookkeeping доставки) — читаем md с диска,
+    рендерим PDF, шлём напрямую. Опасная тройка: тексты НЕ логируем."""
+    reply_to_id = msg.get("message_id")
+    found = _latest_protocol_path(series)
+    if not found:
+        send_message(token, cid, "Не нашёл протокол этой встречи на диске — гляну, что не так.",
+                     reply_to=reply_to_id)
+        return True
+    md_path, date = found
+    try:
+        protocol_text = md_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("[send-artifact] чтение протокола не удалось: %s", type(e).__name__)
+        send_message(token, cid, "Не смог прочитать файл протокола — гляну, что не так.",
+                     reply_to=reply_to_id)
+        return True
+    try:
+        import tempfile  # noqa: PLC0415
+        from notary.lib import protocol_to_pdf, protocol_to_tg, telegram_api  # noqa: PLC0415
+        meta = {"series": series, "date": date}
+        caption = protocol_to_tg.build_pdf_caption(protocol_text, meta)
+        title, subtitle = protocol_to_tg.build_pdf_title_subtitle(protocol_text, meta)
+        safe_date = re.sub(r"[^0-9A-Za-z._-]", "-", str(date)) or "protokol"
+        filename = f"protokol-{safe_date}.pdf"
+        with tempfile.TemporaryDirectory(prefix="resend-protokol-") as td:
+            pdf_path = Path(td) / filename
+            protocol_to_pdf.render_pdf_from_markdown(
+                protocol_text, str(pdf_path), title=title, subtitle=subtitle)
+            telegram_api.send_document(token, cid, str(pdf_path),
+                                       caption=caption, filename=filename)
+    except Exception as e:  # noqa: BLE001 — сбой рендера/отправки не валит listener
+        logger.error("[send-artifact] переотправка протокола серии %s не удалась: %s",
+                     series, type(e).__name__)
+        send_message(token, cid, "Не смог собрать/отправить протокол сейчас — гляну, что не так.",
+                     reply_to=reply_to_id)
+        return True
+    logger.info("[send-artifact] протокол серии %s (%s) переотправлен по просьбе", series, date)
+    return True
+
+
+def _resend_digest(token: str, cid: int, series: str, msg: dict[str, Any]) -> bool:
+    """Переотправить дайджест открытых вопросов серии по просьбе. Через
+    `send_series_digest(force=True)` — обходит только `already_sent`, слепок нумерации
+    пишется (ordinal-ответы на переотправленный дайджест работают). Тексты НЕ логируем."""
+    reply_to_id = msg.get("message_id")
+    try:
+        from notary.lib import morning_digest  # noqa: PLC0415
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        res = morning_digest.send_series_digest(series, date=today, force=True)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[send-artifact] переотправка дайджеста серии %s не удалась: %s",
+                     series, type(e).__name__)
+        send_message(token, cid, "Не смог собрать открытые вопросы сейчас — гляну, что не так.",
+                     reply_to=reply_to_id)
+        return True
+    status, reason = res.get("status"), res.get("reason")
+    if status == "sent":
+        logger.info("[send-artifact] дайджест серии %s переотправлен по просьбе", series)
+        return True
+    if reason == "empty":
+        send_message(token, cid, "Открытых вопросов по этой встрече сейчас нет — список пуст.",
+                     reply_to=reply_to_id)
+        return True
+    # disabled / no-chat / send-failed / state-write-failed — не молчим ложно.
+    logger.warning("[send-artifact] дайджест серии %s не ушёл: reason=%s", series, reason)
+    send_message(token, cid, "Не смог прислать открытые вопросы сейчас — гляну, что не так.",
+                 reply_to=reply_to_id)
+    return True
+
+
+def maybe_route_to_send_artifact(
+    token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """ISS-45: reply-просьба «пришли протокол / открытые вопросы» → переотправить нужный
+    артефакт (вместо глухого «🤔 не понял»). Стоит ПОСЛЕ ack-роута и ДО digest-роута —
+    иначе digest-роут проглотил бы reply на дайджест первым. Узкий детерминированный
+    триггер (глагол отправки + объект); статус-ответ уступаем роутам ниже (не крадём)."""
+    if cid is None:
+        return False
+    if not isinstance(msg.get("reply_to_message"), dict):
+        return False  # нужен контекст серии (на что отвечают)
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+    # Серия + surface по тому, на ЧТО ответили (протокол приоритетнее — точный индекс).
+    series = _reply_context_series(cid, msg)
+    surface = "protocol" if series else None
+    if not series:
+        series = _reply_context_series_digest(cid, msg)
+        surface = "digest" if series else None
+    try:
+        from notary.lib import send_artifact  # noqa: PLC0415
+        kind = send_artifact.detect_artifact_request(text, reply_surface=surface)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[send-artifact] детект не удался: %s", type(e).__name__)
+        return False
+    if not kind:
+        return False
+    # Не крадём статус-ответ: явный статус-интент в тексте → уступаем роутам ниже.
+    try:
+        from notary.lib import pending_status_reply  # noqa: PLC0415
+        if pending_status_reply.detect_status_intent(text):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    if not series:
+        send_message(token, cid,
+                     "Чтобы прислать файл, ответьте на дайджест или протокол нужной встречи "
+                     "— по нему я пойму, о какой серии речь.",
+                     reply_to=msg.get("message_id"))
+        return True
+    if kind == "digest":
+        return _resend_digest(token, cid, series, msg)
+    return _resend_protocol(token, cid, series, msg)
+
+
 def maybe_route_to_set_chat_command(
     token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
 ) -> bool:
@@ -2603,6 +2739,12 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # игнор. Ищет контекст ack по message_id (переживает рестарт). Гейт ENABLE_REPLY_UNDERSTAND
     # дефолт-OFF: OFF / не наш ack → False → обычные роуты ниже (обратная совместимость).
     if maybe_route_to_ack_reply(token, cid, msg):
+        return
+
+    # ISS-45: reply-просьба «пришли протокол / открытые вопросы» → переотправить артефакт.
+    # ПОСЛЕ ack-роута и ДО digest-роута: иначе digest-роут проглотил бы reply на дайджест
+    # первым. Узкий триггер (глагол отправки + объект); статус-ответ уступает роутам ниже.
+    if maybe_route_to_send_artifact(token, cid, allowed_chat, msg):
         return
 
     # Ф4 (watson, R11): reply на УТРЕННИЙ ДАЙДЖЕСТ «Открытые вопросы к встрече».

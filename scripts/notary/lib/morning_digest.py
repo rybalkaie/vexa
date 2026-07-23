@@ -562,12 +562,18 @@ def send_series_digest(
     dry_run: bool = False,
     chat_resolver: Optional[Callable[[str], Optional[int]]] = None,
     sender: Optional[Callable[..., Optional[int]]] = None,
+    force: bool = False,
 ) -> dict:
     """Собрать и отправить дайджест ОДНОЙ серии. Возвращает счётчики (без текстов).
 
     Исходы: `sent` (ушёл), `skipped` — `empty` (нет висяков → не шлём, R13),
     `already` (сегодня уже слали), `no-chat` (серия ни к чему не привязана и нет лички),
     `send-failed`. `sender`/`chat_resolver` инъектируются тестами.
+
+    `force=True` (ISS-45, переотправка ПО ПРОСЬБЕ участника) обходит ТОЛЬКО защиту
+    `already_sent` — гейт `is_enabled` и запись слепка нумерации сохраняются, чтобы
+    ordinal-ответы на переотправленный дайджест резолвились; `record_sent` тоже
+    пишется → переотправленный дайджест остаётся отвечабельным (закрытие ответом).
     """
     series_dir = (Path(root) if root is not None else protocols_root()) / series
     res: dict = {"series": series, "date": date, "status": "skipped",
@@ -578,7 +584,7 @@ def send_series_digest(
         # рубильник — рычаг не должен обходиться в обход тика.
         res["reason"] = "disabled"
         return res
-    if already_sent(series_dir, date):
+    if not force and already_sent(series_dir, date):
         res["reason"] = "already"
         return res
     items = collect_items(series_dir)
