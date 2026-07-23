@@ -347,6 +347,17 @@ class TestHandleAckReply(_Base):
         self.assertTrue(res["consume"])
         self.assertEqual(self._status(), {})
 
+    def test_iss448_confirm_foreign_no_with_stray_digit_touches_nothing(self):
+        # Н1 (цикл5): «нет» с мелькнувшим числом («нет 2») на ЧУЖОЙ задаче НЕ закрывает
+        # её — деклайн приоритетнее цифры (ложно-закрыть чужое хуже, чем оставить висеть).
+        f1, f2 = "Сона: ВЭД Toledo", "Сона: ссылка"
+        st = self._state(question={"mode": "confirm_foreign", "label": "cancelled",
+                                   "options": [f1, f2], "labels": ["cancelled", "cancelled"],
+                                   "word": None})
+        res = ra.handle_ack_reply(st, "нет 2")
+        self.assertTrue(res["consume"])
+        self.assertEqual(self._status(), {})            # НИ одна чужая не тронута
+
     def test_r24_clarify_class_learns_word(self):
         # R24-триггер: класс неизвестен, человек назвал «сделано» → применяем + ЗАПОМИНАЕМ.
         st = self._state(question={"mode": "clarify_class", "label": None,

@@ -425,13 +425,16 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
             if not options and question.get("matched"):
                 options, labels = [question["matched"]], [label]
             multi = len(options) > 1
+            # «нет» проверяем ПЕРВЫМ: ответ-деклайн на ЧУЖУЮ задачу не должен ничего
+            # закрывать, даже если в нём мелькнуло число («нет 2») — ложно-закрыть чужое
+            # хуже, чем оставить висеть (R5-консерватизм проекта; Н1 цикл5).
+            if ans["no"]:
+                txt = "Ок, чужие вопросы не трогаю." if multi else "Ок, чужой вопрос не трогаю."
+                return {"text": txt, "consume": True, "learned": False}
             if ans["yes"]:
                 idxs = [i for i in range(1, len(options) + 1) if i not in ans["excluded"]]
             elif ans["digits"]:
                 idxs = [i for i in sorted(ans["digits"]) if 1 <= i <= len(options)]
-            elif ans["no"]:
-                txt = "Ок, чужие вопросы не трогаю." if multi else "Ок, чужой вопрос не трогаю."
-                return {"text": txt, "consume": True, "learned": False}
             else:
                 hint = ("Ответьте «да», «нет» или «да, кроме 2» (номер), пожалуйста."
                         if multi else "Ответьте «да» или «нет», пожалуйста.")
