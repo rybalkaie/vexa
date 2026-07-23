@@ -193,6 +193,38 @@ class AiOwnsMappingTest(unittest.TestCase):
             sorted(a["matched"] for a in r["applied"]),
             sorted(_SNAP[p - 1] for p in (13, 14, 15)))
 
+    # ── Детерминированный ФЛОР номеров (инцидент 23.07) ───────────────────────
+    def test_floor_recovers_numbers_ai_dropped(self):
+        """ГЛАВНОЕ: ИИ уронил числа (вернул 1 pos + огрызки без pos), а в ответе явный
+        список «13,14,15» + глагол → флор восстанавливает ВСЕ три; огрызки выкинуты."""
+        snap = list(_SNAP)
+        for i in (13, 14, 15):
+            snap[i - 1] = f"Соня: Задача {i}"
+        # стаб имитирует провал: только 13 с pos, 14/15 — безпозиционные огрызки
+        stub = [{"pos": 13, "cls": "cancelled", "text": "13"},
+                {"cls": "cancelled", "text": "удали, по ошибке"},
+                {"cls": "cancelled", "text": "удали, по ошибке"}]
+        r = self._run("Удали задачи Соны. 13,14,15. Они в этом протоколе по ошибке",
+                      stub, snapshot=snap)
+        foreign = [q for q in r["questions"] if q.get("kind") == "foreign"]
+        self.assertEqual(len(foreign), 3, "все 3 номера Сони → 3 подтверждения")
+        self.assertFalse(any(q.get("kind") == "no_match" for q in r["questions"]),
+                         "безпозиционные огрызки ИИ выкинуты, не 'не понял'")
+
+    def test_floor_direct_helper_safety(self):
+        """Гарды флора: счёт/сумма/дата/диапазон НЕ дают номеров; чистый список — даёт."""
+        self.assertEqual(ru._recover_ordinal_list("Удали задачи Соны. 13,14,15. По ошибке", _SNAP),
+                         {13, 14, 15})
+        self.assertEqual(ru._recover_ordinal_list("3 задачи закрыл", _SNAP), set())
+        self.assertEqual(ru._recover_ordinal_list("надо собрать 3-5 млн", _SNAP), set())
+        self.assertEqual(ru._recover_ordinal_list("сделал к 5 июля", _SNAP), set())
+        self.assertEqual(ru._recover_ordinal_list("отчёт за 3 квартал", _SNAP), set())
+        self.assertEqual(ru._recover_ordinal_list("закрой 17, 18", _SNAP), {17, 18})
+        # без глагола действия — не трогаем (просто числа в прозе)
+        self.assertEqual(ru._recover_ordinal_list("там было 13, 14, 15 человек", _SNAP), set())
+        # число вне диапазона в списке → пусто (не гадаем)
+        self.assertEqual(ru._recover_ordinal_list("закрой 3, 99", _SNAP), set())
+
     # ── Инвариант выравнивания: pos строго = snapshot[pos-1] ──────────────────
     def test_pos_indexes_exact_snapshot_slot(self):
         """Разные позиции не схлопываются и каждая бьётся в СВОЙ слот слепка."""

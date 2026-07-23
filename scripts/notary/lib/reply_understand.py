@@ -491,6 +491,44 @@ def _expand_multi_ordinal(seg: dict, snapshot) -> list:
             for n in positions]
 
 
+# ── Детерминированный ФЛОР под ИИ: список номеров из ОРИГИНАЛА ответа ───────────
+# Инцидент 23.07: на «Удали задачи Соны. 13,14,15. Они по ошибке» Sonnet цеплял ОДНУ задачу
+# семантически и РОНЯЛ 14,15 (то в правку, то в no_match) — нестабильно от прогона к прогону.
+# Промпт этот класс не лечит надёжно. Решение: если в ответе есть ЯВНЫЙ список номеров + глагол
+# действия и НЕТ денежно/датно/счётных примесей — код сам разбирает номера в позиции, ИИ уже
+# не может их уронить. Гарды (R5, «не закрыть не ту»): маскируем диапазоны «3-5», единицы
+# «3 млн», счётные «3 задачи», даты «5 июля/5 числа» — их числа в список НЕ попадают; любое
+# оставшееся число ВНЕ диапазона слепка → пусто (подозрительно, не гадаем).
+_RECOVER_VERB_RE = re.compile(
+    r"(?:удали|убер|сним|снят|закро|закрыл|закрыт|сдела|сделан|готов|"
+    r"выполн|реши|отработа|переоткр|верн|reopen|done)", re.IGNORECASE)
+_RECOVER_RANGE_RE = re.compile(r"\d+\s*[-–—]\s*\d+")
+_RECOVER_UNIT_RE = re.compile(
+    r"\d+\s*(?:млн|млрд|тыс|руб|₽|%|процент|час|мин|дн|дне|дня|дней|недел|"
+    r"числ|январ|феврал|март|апрел|мая|мае|июн|июл|август|сентябр|октябр|ноябр|декабр)",
+    re.IGNORECASE)
+_RECOVER_COUNT_RE = re.compile(r"\d+\s+(?:задач|пункт|вопрос|номер|штук|раз\b)", re.IGNORECASE)
+
+
+def _recover_ordinal_list(reply_text: str, snapshot) -> set:
+    """Позиции-номера из ОРИГИНАЛА ответа (флор под ИИ). Пусто, если: нет слепка; нет
+    глагола-действия; после маскировки денег/дат/счёта/диапазонов не осталось чисел; есть
+    число вне диапазона слепка (подозрительно → не гадаем, R5)."""
+    if not isinstance(snapshot, list) or not snapshot:
+        return set()
+    t = (reply_text or "").lower().replace("ё", "е")
+    if not _RECOVER_VERB_RE.search(t):
+        return set()
+    t = _ORD_SUFFIX_RE.sub(r"\1", t)  # «13-е»→«13» (тот же нормализатор, что у _bare_number_list)
+    masked = _RECOVER_RANGE_RE.sub(" ", t)
+    masked = _RECOVER_UNIT_RE.sub(" ", masked)
+    masked = _RECOVER_COUNT_RE.sub(" ", masked)
+    nums = [int(x) for x in re.findall(r"\d+", masked)]
+    if not nums or any(not (1 <= n <= len(snapshot)) for n in nums):
+        return set()  # нет чисел / есть вне диапазона → не список ординалов (честнее переспросить)
+    return set(nums)
+
+
 def _decide_and_apply_status(
     seg: dict, *, series_dir, items, snapshot, replier, reply_lines,
     orig_ts, date, source, store_path, apply: bool,
@@ -669,6 +707,26 @@ def understand_reply(
             seg_list.append(seg)
         else:
             seg_list.extend(_expand_multi_ordinal(seg, snapshot))
+
+    # Детерминированный ФЛОР (инцидент 23.07): если в ОРИГИНАЛЕ ответа есть явный список
+    # номеров + глагол действия, ИИ НЕ должен иметь возможности их уронить. Синтезируем
+    # статус-сегмент на каждый номер, которого ИИ не покрыл своим `pos`, и ВЫКИДЫВАЕМ
+    # безпозиционные огрызки ИИ (это и есть провал разбора номеров: «удали, по ошибке»×2).
+    # Класс — из словаря по всему ответу; удали/убери/сними → «cancelled», иначе «done».
+    recovered = _recover_ordinal_list(reply_text, snapshot)
+    if recovered:
+        floor_label = psr.detect_status_intent(reply_text)
+        if floor_label is None:
+            floor_label = "cancelled" if re.search(
+                r"(?:удали|убер|сним|снят)", (reply_text or "").lower()) else "done"
+        covered = {s.get("pos") for s in seg_list if s.get("pos")}
+        seg_list = [s for s in seg_list if s.get("pos")]  # огрызки без pos — прочь
+        for n in sorted(recovered):
+            if n not in covered:
+                seg_list.append({"text": "", "cls": floor_label, "pos": n,
+                                 "conf": "high", "_recovered": True})
+        logger.info("[understand] флор номеров: recovered=%d covered_by_ai=%d",
+                    len(recovered), len(covered & recovered))
     for seg in seg_list:
         d = _decide_and_apply_status(
             seg, series_dir=series_dir, items=items, snapshot=snapshot, replier=replier,

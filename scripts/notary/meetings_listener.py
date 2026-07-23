@@ -1217,18 +1217,23 @@ def _reply_open_tasks_snapshot(series_dir, msg: dict[str, Any]) -> Optional[list
     mid = reply_to.get("message_id")
     try:
         from notary.lib import series_memory  # noqa: PLC0415
-        snap = (series_memory.open_tasks_snapshot_for_message(series_dir, mid)
-                if mid is not None else None)
-        if snap is None:
-            text = str(reply_to.get("text") or reply_to.get("caption") or "")
-            m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-            # Фолбэк только при ЯВНОЙ дате в подписи (R5: номер бьём в слепок ИМЕННО той
-            # даты, что человек видел; без даты не гадаем — honest-остаток, FU-4).
-            if m and _looks_numbered_open_tasks_surface(text):
-                snap = series_memory.latest_open_tasks_snapshot(series_dir, date=m.group(1))
-                if snap is not None:
-                    logger.info("[ordinal] слепок по message_id отсутствовал → фолбэк на "
-                                "свежий слепок серии за %s (позиций=%d)", m.group(1), len(snap))
+        direct = (series_memory.open_tasks_snapshot_for_message(series_dir, mid)
+                  if mid is not None else None)
+        if direct is not None:
+            return direct
+        text = str(reply_to.get("text") or reply_to.get("caption") or "")
+        m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+        surface = _looks_numbered_open_tasks_surface(text)
+        # Фолбэк только при ЯВНОЙ дате в подписи (R5: номер бьём в слепок ИМЕННО той даты,
+        # что человек видел; без даты не гадаем — honest-остаток, FU-4).
+        snap = (series_memory.latest_open_tasks_snapshot(series_dir, date=m.group(1))
+                if (m and surface) else None)
+        # Диагностика (безопасно: только метаданные ПОДПИСИ бота, не текст reply участника):
+        # почему слепок не резолвнулся — самый частый корень «бот молчит на номера».
+        logger.info(
+            "[ordinal] snapshot resolve: mid=%s direct=miss date=%s surface=%s cap_len=%d fallback=%s",
+            mid, (m.group(1) if m else None), surface, len(text),
+            (len(snap) if snap else "none"))
         return snap
     except Exception as e:  # noqa: BLE001 — резолв слепка best-effort, ординал не активен
         logger.debug("[ordinal] snapshot lookup failed (non-fatal): %s", type(e).__name__)
