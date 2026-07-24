@@ -431,5 +431,109 @@ class TestUnderstandCarriesScope(unittest.TestCase):
         self.assertEqual(r["block_scope"], "mine")
 
 
+# ==========================================================================
+# Цикл5: страховки, найденные ревью (regex-канал не должен вредить)
+# ==========================================================================
+class TestCycle5Guards(_Base):
+    def test_krome_by_description_never_closes_all(self):
+        # Н1/Н2: «да, кроме караоке» регулярка номер не достаёт. Закрыть ВЕСЬ список
+        # (включая исключённое) нельзя — бот обязан переспросить номером.
+        self.assertFalse(aiu.is_trivial_answer("да, кроме караоке"))
+        a = ra.parse_answer("да, кроме караоке")
+        self.assertTrue(a["excluded_unresolved"])
+        res = ra.handle_ack_reply(self._state(self._confirm_close_q()), "да, кроме караоке")
+        self.assertEqual(self._status(), {})
+        self.assertFalse(res["consume"])
+        self.assertIn("НОМЕР", res["text"])
+
+    def test_da_net_is_refusal(self):
+        # Н3: «да нет, не надо» — разговорное отрицание, не согласие.
+        for t in ("да нет, не надо", "да не, погоди"):
+            a = ra.parse_answer(t)
+            self.assertFalse(a["yes"], t)
+            self.assertTrue(a["no"], t)
+        res = ra.handle_ack_reply(self._state(self._confirm_close_q()), "да нет, не надо")
+        self.assertEqual(self._status(), {})
+        self.assertIn("ничего не закрываю", res["text"])
+
+    def test_krome_number_still_works(self):
+        ra.handle_ack_reply(self._state(self._confirm_close_q()), "да, кроме 2")
+        self.assertEqual(self._closed_texts(), {_KARAOKE})
+
+    def test_long_list_split_into_portions(self):
+        # У5: список режется по бюджету символов — сообщение не пробивает лимит Telegram.
+        long_items = [f"Илья Рыбалка: Очень длинная задача номер {i} " + "ы" * 120
+                      for i in range(1, 31)]
+        head, rest = ra._split_by_budget(long_items, with_owner=True)
+        self.assertTrue(rest)
+        self.assertLessEqual(sum(len(x) + 5 for x in head), ra._MASS_LIST_BUDGET + 200)
+
+    def test_rest_is_offered_after_confirmation(self):
+        # У1/Н4: остаток не теряется — после «да» бот сам предлагает следующую порцию.
+        q = self._confirm_close_q([_KARAOKE])
+        q["rest"] = [_MEDIA, _DEMO]
+        res = ra.handle_ack_reply(self._state(q), "да")
+        self.assertEqual(self._closed_texts(), {_KARAOKE})
+        self.assertIn("Осталось ещё 2", res["text"])
+        self.assertEqual(res["question"]["options"], [_MEDIA, _DEMO])
+        # …и следующая порция реально закрывается.
+        ra.handle_ack_reply(self._state(res["question"]), "да")
+        self.assertEqual(self._closed_texts(), {_KARAOKE, _MEDIA, _DEMO})
+
+    def test_rest_not_pushed_on_pointed_answer(self):
+        # НОВ1: точечный ответ цифрой — не навязываем остаток.
+        q = self._confirm_close_q()
+        q["rest"] = [_MEDIA]
+        res = ra.handle_ack_reply(self._state(q), "2")
+        self.assertEqual(self._closed_texts(), {_AGENT})
+        self.assertIsNone(res.get("question"))
+
+    def test_already_closed_not_reclosed_in_portion(self):
+        # НОВ2 (класс ISS-46): задача из порции закрыта другим ответом → не перезакрываем
+        # и не рапортуем «отметил закрытым» повторно.
+        sm.set_task_status(self.sd, _MEDIA, sm.STATUS_DONE, source="test", date="2026-06-04")
+        q = self._confirm_close_q([_KARAOKE, _MEDIA])
+        res = ra.handle_ack_reply(self._state(q), "да")
+        self.assertIn("Уже было отмечено раньше", res["text"])
+        self.assertIn("Отслушать сэмплы караоке", res["text"])
+
+    def test_open_left_summary(self):
+        # У7: после закрытия видно, что осталось открытым.
+        res = ra.handle_ack_reply(self._state(self._confirm_close_q()), "да")
+        self.assertIn("Открытыми по серии остаются", res["text"])
+
+    def test_rollback_does_not_call_ai(self):
+        # У8: явный откат не платит за вызов ИИ.
+        calls = []
+        st = self._state(None, applied=[{"text": _KARAOKE, "label": "done"}])
+        res = ra.handle_ack_reply(st, "не так, верни обратно",
+                                  answer_fn=lambda t, c: calls.append(t))
+        self.assertEqual(calls, [])
+        self.assertIn("Вернул в работу", res["text"])
+
+    def test_named_scope_without_owner_prefix_explains(self):
+        # У2: охват понят, но задач под именами нет → объясняем и показываем открытые,
+        # а не отвечаем «не понял».
+        res = ra.handle_ack_reply(
+            self._state(self._confirm_close_q()), "закрой всё у Петра и Семёна",
+            answer_fn=lambda t, c: {"intent": "apply", "all": True, "positions": [],
+                                    "keep": [], "scope": "named",
+                                    "owners": ["Пётр", "Семён"], "cls": None,
+                                    "unclear": ""})
+        self.assertEqual(self._status(), {})
+        self.assertIn("не нашёл", res["text"])
+        self.assertIsNotNone(res.get("question"))
+
+    def test_answer_hint_mentions_plain_speech(self):
+        # У6: подсказка сообщает, что можно ответить обычными словами.
+        result = {"applied": [], "questions": [
+            {"kind": "block_close", "tier": 3, "segment": None, "matched": None,
+             "label": None, "scope": "mine", "owners": []}], "edits": [],
+            "config_requests": [], "unclear": "", "already": []}
+        built = ra.build_ack(result, series_dir=self.sd, snapshot=None,
+                             replier="Илья Рыбалка")
+        self.assertIn("словами", built["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

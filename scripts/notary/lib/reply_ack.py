@@ -46,8 +46,16 @@ logger = logging.getLogger("notary.reply_ack")
 
 _MAX_OPTIONS = 10        # потолок нумерованного списка кандидатов (не дамп)
 # ISS-48: массовое закрытие («закрой всё у всех») законно затрагивает больше 10 задач —
-# потолок показа выше, но НЕ бесконечный; обрезали → говорим об этом вслух (честность).
-_MAX_MASS_OPTIONS = 40
+# потолок показа выше, но НЕ бесконечный. Остаток НЕ теряется: он кладётся в `rest` вопроса,
+# и после подтверждения бот сам предлагает следующую порцию (цикл5 У1).
+_MAX_MASS_OPTIONS = 25
+# Бюджет символов на СПИСОК в одном сообщении. Telegram режет на 4096, а `send_message`
+# длину не режет (цикл5 У5): пробитое сообщение НЕ уходит вовсе — на просьбу «закрой всё»
+# бот бы просто промолчал. 2200 оставляет запас на остальные блоки ack и хвост-подсказку.
+_MASS_LIST_BUDGET = 2200
+# Подсказка формата ответа: с ISS-49 канал понимает и обычную речь — говорим об этом (У6).
+_ANSWER_HINT = ("Ответьте «да», «нет», «да, кроме 3» (номер) — или просто словами: "
+                "«оставь только про агента», «закрой ещё у Татьяны».")
 _SOURCE = "ack-reply"
 
 # Обещание несогласия ступени-2 (R26): молчание = согласие, но канал отката реален.
@@ -139,8 +147,12 @@ def _open_only(items: list, series_dir) -> list:
 
 def _all_open_items(series_dir, snapshot) -> list:
     """Все открытые задачи серии (ЛЮБОГО владельца) — универсум массового закрытия
-    (ISS-48: «закрой всё у всех / у Татьяны, Александры, Марии»). Ограничен тем же
-    снапшотом, что и показ: закрывать можно только то, что участник ВИДЕЛ (инв. Ф2 R4)."""
+    (ISS-48: «закрой всё у всех / у Татьяны, Александры, Марии»).
+
+    `snapshot` передан (построение вопроса по отвечаемому документу) → корзина ограничена
+    тем, что участник ВИДЕЛ (инв. Ф2 R4). При разборе ОТВЕТА на вопрос бота снапшота нет
+    (state его не хранит) → берём живой хвост серии; инвариант «не закрываем невиданное»
+    держится другим механизмом: получившийся список бот ПОКАЗЫВАЕТ и ждёт подтверждения."""
     try:
         items = psr.load_series_pending(series_dir, snapshot=snapshot)
     except Exception as e:  # noqa: BLE001
@@ -176,6 +188,22 @@ def _replier_tasks(items: list, replier: Optional[str]) -> list:
         if owner and rt and (ru._name_tokens(owner) & rt):
             owned.append(it)
     return owned or list(items)
+
+
+def _split_by_budget(items: list, *, with_owner: bool) -> tuple:
+    """Порция списка, влезающая в одно сообщение, + ОСТАТОК (цикл5 У1/У5).
+    Режем и по количеству (`_MAX_MASS_OPTIONS`), и по символам (`_MASS_LIST_BUDGET`):
+    длинные названия пробивают лимит Telegram раньше, чем счётчик. Остаток не выбрасываем —
+    его несёт `rest` вопроса, и после подтверждения бот предложит следующую порцию."""
+    head, used = [], 0
+    for t in items:
+        shown = t if with_owner else _short(t)
+        cost = len(str(shown)) + 5           # «12) » + перевод строки
+        if head and (len(head) >= _MAX_MASS_OPTIONS or used + cost > _MASS_LIST_BUDGET):
+            break
+        head.append(t)
+        used += cost
+    return head, list(items[len(head):])
 
 
 def _numbered(options: list, *, with_owner: bool = False) -> list:
@@ -225,18 +253,19 @@ def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
             # У2 (цикл5): «закрой всё» при нуле висящих — не молчим и не врём «не нашёл
             # статусов»: честно говорим, что закрывать нечего (block_close «съеден»).
             return None, ["Сейчас у вас нет открытых вопросов — закрывать нечего."], [block]
+        with_owner = scope != "mine"
         total = len(options)
-        options = options[:_MAX_MASS_OPTIONS]
+        options, rest = _split_by_budget(options, with_owner=with_owner)
         lines = [head]
         if note:
             lines.append(note)
-        lines.extend(_numbered(options, with_owner=(scope != "mine")))
-        if total > len(options):
-            lines.append(f"(открытых {total} — показал первые {len(options)}, "
-                         "остальные закроем следующим ответом)")
-        lines.append("Ответьте «да», «нет» или «да, кроме 3» (номер).")
+        lines.extend(_numbered(options, with_owner=with_owner))
+        if rest:
+            lines.append(f"(открытых {total} — показываю первые {len(options)}, "
+                         f"после ответа предложу оставшиеся {len(rest)})")
+        lines.append(_ANSWER_HINT)
         return ({"mode": "confirm_close", "label": "done", "options": options, "word": None,
-                 "scope": scope, "owners": owners},
+                 "scope": scope, "owners": owners, "rest": rest},
                 lines, [block])
 
     if foreigns:
@@ -424,6 +453,10 @@ _ROLLBACK_RE = re.compile(
     re.IGNORECASE)
 _YES_RE = re.compile(r"^\s*(да\b|ага\b|угу\b|верно\b|точно\b|подтвержда|ок\b|окей\b|"
                      r"конечно\b|yes\b|y\b|\+)", re.IGNORECASE)
+# «да нет», «да не надо», «да ну нафиг» — РАЗГОВОРНОЕ ОТРИЦАНИЕ, а не согласие: частица
+# «да» здесь усилительная. Проверяется ПЕРЕД `_YES_RE`, иначе «да нет, не надо» закрывало
+# бы весь список (цикл5 ISS-49: канал ответа обязан ошибаться в сторону «не тронул»).
+_DA_NET_RE = re.compile(r"^\s*да[\s,]+(?:не\b|нет\b|ну\b|ладно\b|погод|подожд)", re.IGNORECASE)
 _NO_RE = re.compile(r"^\s*(нет\b|неа\b|мимо\b|ни\s*к\s*как|no\b|n\b)", re.IGNORECASE)
 _KROME_RE = re.compile(r"кроме\s+(.+)$", re.IGNORECASE)
 
@@ -449,18 +482,24 @@ def parse_answer(text: str) -> dict:
     """Разобрать ответ человека на ack/переспрос в интент. Опасная тройка: текст не логируем."""
     t = (text or "").strip()
     rollback = bool(_ROLLBACK_RE.search(t))
-    yes = bool(_YES_RE.match(t))
-    no = bool(_NO_RE.match(t))
+    da_net = bool(_DA_NET_RE.match(t))
+    yes = bool(_YES_RE.match(t)) and not da_net
+    no = bool(_NO_RE.match(t)) or da_net
     excluded: set = set()
+    unresolved = False
     m = _KROME_RE.search(t)
     if m:
         excluded = _positions_in(m.group(1))
+        # «кроме караоке» / «кроме двух» — исключение по ОПИСАНИЮ или количеству. Номера из
+        # него не достать; принять такой ответ за голое «да» = закрыть в т.ч. то, что просили
+        # оставить (инцидент ISS-48). Помечаем — caller честно переспросит, а не угадает.
+        unresolved = not excluded
     # Цифры/номера ВНЕ «кроме …» — прямой выбор (pick_target / выборочное закрытие).
     head = _KROME_RE.sub("", t)
     digits = _positions_in(head)
     cls = psr.detect_status_intent(t)          # назвал класс словом (для clarify_class R24)
-    return {"rollback": rollback, "yes": yes, "no": no,
-            "digits": digits, "excluded": excluded, "cls": cls}
+    return {"rollback": rollback, "yes": yes, "no": no, "digits": digits,
+            "excluded": excluded, "excluded_unresolved": unresolved, "cls": cls}
 
 
 # ── ISS-49: ИИ-первый разбор ответа на ВОПРОС БОТА (регулярки — фолбэк) ───────
@@ -591,37 +630,131 @@ def _smart_confirm_close(smart: dict, *, state: dict, question: dict, series_dir
         if kept:
             return {"text": "Понял: ничего не закрываю, оставляю как есть — "
                             + _names_line(kept) + ".", "consume": True, "learned": False}
+        if scope != "shown":
+            # Просьбу поняли (охват назван), но задач под него не нашли — частая причина:
+            # вопрос записан БЕЗ имени владельца. Не отвечаем «не понял» на понятное
+            # (цикл5 У2): называем причину и показываем, что открыто, одним вопросом.
+            pool, rest = _split_by_budget(_all_open_items(series_dir, None), with_owner=True)
+            if pool:
+                lines = [f"Понял охват ({_scope_human(smart)}), но вопросов, записанных на "
+                         "этих людей, не нашёл — возможно, они заведены без имени. "
+                         "Вот что открыто сейчас:", *_numbered(pool, with_owner=True)]
+                if rest:
+                    lines.append(f"(показываю {len(pool)}, дальше предложу оставшиеся "
+                                 f"{len(rest)})")
+                lines.append("Скажите «да» — закрою всё из списка, или назовите номера.")
+                return {"text": "\n".join(lines), "consume": True, "learned": False,
+                        "question": {"mode": "confirm_close", "label": label,
+                                     "options": pool, "word": None, "scope": scope,
+                                     "owners": smart.get("owners") or [], "rest": rest}}
+            return {"text": "Открытых вопросов сейчас нет — закрывать нечего.",
+                    "consume": True, "learned": False}
         return {"text": _SMART_HINT, "consume": False, "learned": False}
 
     total = len(targets)
-    targets = targets[:_MAX_MASS_OPTIONS]
     shown_keys = {series_memory._status_key(o) for o in options}
     widened = any(series_memory._status_key(t) not in shown_keys for t in targets)
 
     if widened:
         # Шире, чем спрашивал бот → НЕ применяем молча: показываем ровно то, что закроем,
         # и берём одно подтверждение (ISS-48 «в»: показать намерение списком).
+        targets, rest = _split_by_budget(targets, with_owner=True)
         head = (f"Понял — закрываем шире, чем я спрашивал: {_scope_human(smart)}. "
                 f"Отмечу как «{_label_human(label)}» вот эти:")
         # Список чужих задач показываем С ИМЕНЕМ владельца — иначе непонятно, что
         # подтверждаешь («Свести демо-трек» без «Александра Ким:» ни о чём не говорит).
         lines = [head, *_numbered(targets, with_owner=True)]
-        if total > len(targets):
-            lines.append(f"(всего подходит {total} — показал первые {len(targets)}, "
-                         "остальные добьём следующим ответом)")
+        if rest:
+            lines.append(f"(подходит {total} — в одно сообщение влезло {len(targets)}, "
+                         f"оставшиеся {len(rest)} предложу сразу после подтверждения)")
         if kept:
             lines.append(f"Оставляю открытым: {_names_line(kept, with_owner=True)}.")
         lines.append("Подтвердите «да» — закрою весь список. «Нет» — ничего не трогаю.")
         qstate = {"mode": "confirm_close", "label": label, "options": targets,
-                  "word": None, "scope": scope, "owners": smart.get("owners") or []}
+                  "word": None, "scope": scope, "owners": smart.get("owners") or [],
+                  "rest": rest}
+        # Аудит массового закрытия ЧУЖИХ задач (ход5): одним «да» затрагиваются задачи
+        # других участников — след в логе обязателен. Только счётчики и охват, БЕЗ текстов
+        # задач и без текста ответа (опасная тройка).
+        foreign_n = sum(1 for t in targets if series_memory._status_key(t) not in shown_keys)
+        logger.info("[ack] массовое закрытие: охват=%s предложено=%d чужих=%d остаток=%d",
+                    scope, len(targets), foreign_n, len(rest))
         return {"text": "\n".join(lines), "consume": True, "learned": False,
                 "question": qstate}
 
-    done = [t for t in targets if _apply_status(series_dir, t, label, date=date)]
+    targets, rest = _split_by_budget(targets, with_owner=False)
+    done, already = _apply_many(series_dir, targets, label, date=date)
     parts = [_closed_reply(done, label)]
+    already_line = _already_suffix(already)
+    if already_line:
+        parts.append(already_line)
     if kept:
         parts.append(f"Оставил открытым: {_names_line(kept)}.")
-    return {"text": " ".join(parts), "consume": True, "learned": False}
+    return _with_rest_or_summary({"text": " ".join(parts), "consume": True, "learned": False},
+                                 rest=rest, label=label, question=question,
+                                 series_dir=series_dir)
+
+
+def _apply_many(series_dir, targets: list, label, *, date) -> tuple:
+    """Применить статус к пачке → (записанные, уже стоявшие в этом статусе).
+    ISS-46 в массовом канале (цикл5 НОВ2): порции живут минутами, задача из остатка могла
+    закрыться другим ответом. Перезаписывать и рапортовать «отметил закрытым» повторно
+    нельзя — владелец на это прямо жаловался. Смена статуса (reopen) сюда не попадает:
+    фильтр только про ТОТ ЖЕ терминальный статус."""
+    target_status = psr._STATUS_MAP.get(label)
+    try:
+        cur = series_memory.load_task_status(series_dir) or {}
+    except Exception:  # noqa: BLE001 — чтение best-effort, применение не блокируем
+        cur = {}
+    done, already = [], []
+    for t in targets:
+        k = series_memory._status_key(t)
+        rec = cur.get(k) if k else None
+        if (target_status in series_memory._TERMINAL_CLOSED and isinstance(rec, dict)
+                and rec.get("status") == target_status):
+            already.append(t)
+            continue
+        if _apply_status(series_dir, t, label, date=date):
+            done.append(t)
+    return done, already
+
+
+def _already_suffix(already: list) -> Optional[str]:
+    if not already:
+        return None
+    return f"ℹ️ Уже было отмечено раньше — повторно не трогал: {_names_line(already)}."
+
+
+def _open_left_line(series_dir) -> Optional[str]:
+    """Сколько вопросов осталось открытыми после массового закрытия (цикл5 У7). Владелец
+    жаловался ровно на неопределённость «закрыл — а висит ли ещё что-то»."""
+    try:
+        left = _all_open_items(series_dir, None)
+    except Exception:  # noqa: BLE001 — сводка best-effort, ответ не валим
+        return None
+    if not left:
+        return "Открытых вопросов по серии больше нет — чистый лист."
+    return f"Открытыми по серии остаются {len(left)} (в т.ч. у других участников)."
+
+
+def _with_rest_or_summary(res: dict, *, rest: list, label, question: dict, series_dir) -> dict:
+    """После применения порции: остаток есть → сразу предлагаем следующую (обещание «закрою
+    остальные» становится РАБОЧИМ, цикл5 У1); остатка нет → говорим, сколько осталось
+    открытыми (У7). Новый вопрос caller персистит под своим message_id."""
+    if rest:
+        chunk, tail = _split_by_budget(rest, with_owner=True)
+        lines = [res["text"],
+                 f"Осталось ещё {len(rest)} — закрыть и их?",
+                 *_numbered(chunk, with_owner=True)]
+        if tail:
+            lines.append(f"(показываю {len(chunk)}, дальше предложу оставшиеся {len(tail)})")
+        lines.append("Ответьте «да», «нет» или «да, кроме 2» (номер).")
+        return {**res, "text": "\n".join(lines),
+                "question": {"mode": "confirm_close", "label": label, "options": chunk,
+                             "word": None, "scope": question.get("scope") or "mine",
+                             "owners": question.get("owners") or [], "rest": tail}}
+    line = _open_left_line(series_dir)
+    return {**res, "text": f"{res['text']} {line}".strip()} if line else res
 
 
 def _smart_to_ans(smart: Optional[dict], n_options: int) -> Optional[dict]:
@@ -700,7 +833,13 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
     ans = parse_answer(text)
     # ISS-49: ответ на вопрос бота разбирает ТОТ ЖЕ ИИ-слой, что и ответ на протокол —
     # регулярки остаются быстрым путём для однозначного и фолбэком при недоступном ИИ.
-    smart = _smart_answer(state, question, text, answer_fn=answer_fn)
+    # На ЯВНОМ откате («не так», «верни») ИИ не зовём вовсе (цикл5 У8): вердикт уже
+    # однозначен, а откат — самый нервный момент диалога, лишние секунды там дороже всего.
+    plain_rollback = bool(
+        ans["rollback"] and applied
+        and not (question and question.get("mode") == "clarify_class"))
+    smart = None if plain_rollback else _smart_answer(state, question, text,
+                                                      answer_fn=answer_fn)
     if smart and smart.get("intent") == "rollback":
         ans = {**ans, "rollback": True}
 
@@ -732,6 +871,12 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
             if smart is not None:
                 return _smart_confirm_close(smart, state=state, question=question,
                                             series_dir=series_dir, date=date)
+            if ans["yes"] and ans.get("excluded_unresolved"):
+                # «да, кроме караоке» без ИИ: что именно оставить — не поняли. Закрыть всё
+                # (включая исключённое) нельзя — переспрашиваем номером.
+                return {"text": "Понял «да, кроме…», но не понял, что именно оставить. "
+                                "Назовите НОМЕР пункта из списка, например «да, кроме 2».",
+                        "consume": False, "learned": False}
             if ans["yes"]:
                 targets = [o for i, o in enumerate(options, 1) if i not in ans["excluded"]]
             elif ans["digits"]:
@@ -740,10 +885,17 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
             elif ans["no"]:
                 return {"text": "Ок, ничего не закрываю.", "consume": True, "learned": False}
             else:
-                return {"text": "Ответьте «да», «нет» или «да, кроме 3» (номер), пожалуйста.",
-                        "consume": False, "learned": False}
-            done = [t for t in targets if _apply_status(series_dir, t, label, date=date)]
-            return {"text": _closed_reply(done, label), "consume": True, "learned": False}
+                return {"text": _ANSWER_HINT, "consume": False, "learned": False}
+            done, already = _apply_many(series_dir, targets, label, date=date)
+            text = " ".join(x for x in (_closed_reply(done, label),
+                                        _already_suffix(already)) if x)
+            # Остаток порции предлагаем ТОЛЬКО когда человек согласился закрыть ВЕСЬ список
+            # («да»). При точечном выборе цифрами он выбрал конкретное — не навязываемся
+            # (цикл5 НОВ1). Остатка нет → говорим, сколько осталось открытыми (У1/У7).
+            rest = list(question.get("rest") or []) if ans["yes"] else []
+            return _with_rest_or_summary(
+                {"text": text, "consume": True, "learned": False},
+                rest=rest, label=label, question=question, series_dir=series_dir)
 
         if mode == "confirm_foreign":
             # ISS-44.8: чужих задач может быть несколько — один блок «да/нет» на ВСЕ.
@@ -761,6 +913,10 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
             if ans["no"]:
                 txt = "Ок, чужие вопросы не трогаю." if multi else "Ок, чужой вопрос не трогаю."
                 return {"text": txt, "consume": True, "learned": False}
+            if ans["yes"] and ans.get("excluded_unresolved"):
+                return {"text": "Понял «да, кроме…», но не понял, что именно оставить. "
+                                "Назовите НОМЕР пункта, например «да, кроме 2».",
+                        "consume": False, "learned": False}
             if ans["yes"]:
                 idxs = [i for i in range(1, len(options) + 1) if i not in ans["excluded"]]
             elif ans["digits"]:
