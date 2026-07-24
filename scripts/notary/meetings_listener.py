@@ -2163,7 +2163,15 @@ def maybe_route_to_ack_reply(
         reply_ack_state.consume(mid)
     out = res.get("text") or ""
     if out:
-        send_message(token, chat_id, out, reply_to=msg.get("message_id"))
+        out_mid = send_message(token, chat_id, out, reply_to=msg.get("message_id"))
+        # ISS-48: ответ мог оказаться ШИРЕ вопроса («закрой и у Татьяны») — бот показал
+        # получившийся список и ждёт ОДНО подтверждение. Персистим новый контекст под
+        # message_id этого сообщения, иначе «да» на него упало бы в никуда.
+        if out_mid is not None and res.get("question"):
+            reply_ack_state.record(
+                out_mid, series_dir=state.get("series_dir"), chat_id=chat_id,
+                replier=state.get("replier"), applied=None, has_tier2=False,
+                question=res["question"], date=state.get("date"))
     logger.info("[ack-reply] обработан ответ на ack mid=%s consume=%s learned=%s",
                 mid, res.get("consume"), res.get("learned"))
     return True

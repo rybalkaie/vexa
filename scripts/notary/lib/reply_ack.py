@@ -35,6 +35,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from . import ack_understand as aiu
 from . import decision_memory as dm
 from . import mixed_reply_split as mrs
 from . import pending_status_reply as psr
@@ -44,6 +45,9 @@ from . import series_memory
 logger = logging.getLogger("notary.reply_ack")
 
 _MAX_OPTIONS = 10        # потолок нумерованного списка кандидатов (не дамп)
+# ISS-48: массовое закрытие («закрой всё у всех») законно затрагивает больше 10 задач —
+# потолок показа выше, но НЕ бесконечный; обрезали → говорим об этом вслух (честность).
+_MAX_MASS_OPTIONS = 40
 _SOURCE = "ack-reply"
 
 # Обещание несогласия ступени-2 (R26): молчание = согласие, но канал отката реален.
@@ -107,6 +111,61 @@ def _load_items(series_dir, snapshot) -> list:
     return [t for t in items if isinstance(t, str) and t.strip()][:_MAX_OPTIONS]
 
 
+def _terminal_keys(series_dir) -> set:
+    """Ключи задач, уже стоящих в ТЕРМИНАЛЬНОМ статусе (сделано/снято/авто-закрыто).
+    ISS-48 (побочное): список «Закрыть все ваши вопросы?» показывал задачу, закрытую двумя
+    минутами ранее — `load_series_pending` намеренно тащит и закрытые (нужны для reopen),
+    но в вопросе «что закрыть» им не место. Сбой чтения → пустое множество (не режем)."""
+    try:
+        store = series_memory.load_task_status(series_dir) or {}
+    except Exception as e:  # noqa: BLE001 — чтение статусов best-effort
+        logger.warning("[ack] чтение статусов не удалось (non-fatal): %s", type(e).__name__)
+        return set()
+    out = set()
+    for k, rec in store.items():
+        st = rec.get("status") if isinstance(rec, dict) else None
+        if st in series_memory._TERMINAL_CLOSED:
+            out.add(k)
+    return out
+
+
+def _open_only(items: list, series_dir) -> list:
+    """Оставить только НЕ закрытые задачи (ISS-48: не предлагаем закрыть уже закрытое)."""
+    closed = _terminal_keys(series_dir)
+    if not closed:
+        return list(items)
+    return [t for t in items if series_memory._status_key(t) not in closed]
+
+
+def _all_open_items(series_dir, snapshot) -> list:
+    """Все открытые задачи серии (ЛЮБОГО владельца) — универсум массового закрытия
+    (ISS-48: «закрой всё у всех / у Татьяны, Александры, Марии»). Ограничен тем же
+    снапшотом, что и показ: закрывать можно только то, что участник ВИДЕЛ (инв. Ф2 R4)."""
+    try:
+        items = psr.load_series_pending(series_dir, snapshot=snapshot)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[ack] резолв висяков не удался (non-fatal): %s", type(e).__name__)
+        return []
+    items = [t for t in items if isinstance(t, str) and t.strip()]
+    return _open_only(items, series_dir)
+
+
+def _owned_by_names(items: list, names: list) -> list:
+    """Задачи, заведённые на кого-то из `names` (ISS-48, охват «у Татьяны, у Марии»).
+    Владелец закодирован префиксом «Имя: текст» (карта series_memory)."""
+    want: set = set()
+    for n in names or []:
+        want |= ru._name_tokens(n)
+    if not want:
+        return []
+    out = []
+    for it in items:
+        owner = ru._owner_of(it)
+        if owner and (ru._name_tokens(owner) & want):
+            out.append(it)
+    return out
+
+
 def _replier_tasks(items: list, replier: Optional[str]) -> list:
     """Задачи, заведённые НА ответившего (для «закрыть все свои», block_close R11).
     Нет опознаваемых своих (безымянные / чужой) → весь список (не молчим, спросим по всем)."""
@@ -119,8 +178,11 @@ def _replier_tasks(items: list, replier: Optional[str]) -> list:
     return owned or list(items)
 
 
-def _numbered(options: list) -> list:
-    return [f"{i}) {_short(o)}" for i, o in enumerate(options, 1)]
+def _numbered(options: list, *, with_owner: bool = False) -> list:
+    """Нумерованный список кандидатов. `with_owner=True` — НЕ снимаем префикс «Имя: »
+    (ISS-48: в массовом закрытии по нескольким людям без имени владельца не понять, что
+    подтверждаешь; в списке «ваши вопросы» имя, наоборот, шум — оно и так ваше)."""
+    return [f"{i}) {o if with_owner else _short(o)}" for i, o in enumerate(options, 1)]
 
 
 # ── Построение единого ack + первичного переспроса ────────────────────────────
@@ -138,14 +200,43 @@ def _build_primary_question(questions: list, *, series_dir, snapshot, replier):
                  and q.get("label")), None)
 
     if block is not None:
-        options = _replier_tasks(_load_items(series_dir, snapshot), replier)
+        # ISS-48: «закрой всё» бывает НЕ только про свои задачи — «у всех», «у Татьяны, у
+        # Александры». Охват даёт understand-слой (`scope`/`owners`); показываем СРАЗУ тот
+        # список, который человек просил, а не молча сужаем до своих.
+        scope = (block.get("scope") if isinstance(block, dict) else None) or "mine"
+        owners = list((block.get("owners") if isinstance(block, dict) else None) or [])
+        pool = _all_open_items(series_dir, snapshot)
+        mine = _replier_tasks(pool, replier)
+        note = None
+        if scope == "everyone":
+            options, head = pool, "Закрыть ВСЕ открытые вопросы — у всех участников?"
+        elif scope == "named" and owners:
+            named = _owned_by_names(pool, owners)
+            if named:
+                options = named
+                head = f"Закрыть все открытые вопросы ({', '.join(owners)})?"
+            else:
+                options, head = mine, "Закрыть все ваши вопросы?"
+                note = (f"Вопросов, заведённых на {', '.join(owners)}, в этой серии не "
+                        "нашёл — показываю только ваши.")
+        else:
+            options, head = mine, "Закрыть все ваши вопросы?"
         if not options:
             # У2 (цикл5): «закрой всё» при нуле висящих — не молчим и не врём «не нашёл
             # статусов»: честно говорим, что закрывать нечего (block_close «съеден»).
             return None, ["Сейчас у вас нет открытых вопросов — закрывать нечего."], [block]
-        lines = ["Закрыть все ваши вопросы?", *_numbered(options),
-                 "Ответьте «да», «нет» или «да, кроме 3» (номер)."]
-        return ({"mode": "confirm_close", "label": "done", "options": options, "word": None},
+        total = len(options)
+        options = options[:_MAX_MASS_OPTIONS]
+        lines = [head]
+        if note:
+            lines.append(note)
+        lines.extend(_numbered(options, with_owner=(scope != "mine")))
+        if total > len(options):
+            lines.append(f"(открытых {total} — показал первые {len(options)}, "
+                         "остальные закроем следующим ответом)")
+        lines.append("Ответьте «да», «нет» или «да, кроме 3» (номер).")
+        return ({"mode": "confirm_close", "label": "done", "options": options, "word": None,
+                 "scope": scope, "owners": owners},
                 lines, [block])
 
     if foreigns:
@@ -338,15 +429,19 @@ _KROME_RE = re.compile(r"кроме\s+(.+)$", re.IGNORECASE)
 
 
 def _positions_in(text: str) -> set:
-    """Позиции (1..N) из текста: цифры + порядковые/количественные словом («третьей»,
-    «третью», «два»). Для «кроме 3 и 5» / «да, кроме третьей» (И1)."""
+    """Позиции (1..N) из текста: цифры + ПОРЯДКОВЫЕ словом («третьей», «третью»). Для
+    «кроме 3 и 5» / «да, кроме третьей» (И1).
+
+    ISS-48: КОЛИЧЕСТВЕННЫЕ словом («один», «два») сюда НЕ входят. Они выглядят как номер,
+    а значат количество: «оставь только ОДИН вопрос» → регулярка делала `digits={1}` и
+    закрывала пункт 1 — ровно противоположное сказанному (инцидент 24.07, закрыта 1 задача
+    из 21). Порядковые однозначны («третью» = пункт 3) и остаются. Количественные разбирает
+    ИИ-слой [[ack_understand]] по смыслу фразы."""
     t = (text or "").lower().replace("ё", "е")
     pos = {int(x) for x in re.findall(r"\d+", t)}
     for tok in re.findall(r"[а-я]+", t):
         if tok in psr._ORDINAL_WORD_TO_POS:
             pos.add(psr._ORDINAL_WORD_TO_POS[tok])
-        elif tok in psr._CARDINAL_WORD_TO_NUM:
-            pos.add(psr._CARDINAL_WORD_TO_NUM[tok])
     return pos
 
 
@@ -366,6 +461,194 @@ def parse_answer(text: str) -> dict:
     cls = psr.detect_status_intent(t)          # назвал класс словом (для clarify_class R24)
     return {"rollback": rollback, "yes": yes, "no": no,
             "digits": digits, "excluded": excluded, "cls": cls}
+
+
+# ── ISS-49: ИИ-первый разбор ответа на ВОПРОС БОТА (регулярки — фолбэк) ───────
+_MODE_QUESTION_HINT = {
+    "confirm_close": "Бот спросил: закрыть все перечисленные вопросы? (да / нет / да, кроме N)",
+    "confirm_foreign": ("Бот спросил: перечисленные вопросы заведены на других участников — "
+                        "всё равно отметить? (да / нет)"),
+    "pick_target": ("Бот спросил: к какому из перечисленных вопросов относится ваш ответ? "
+                    "(номер)"),
+    "clarify_class": ("Бот спросил: каким статусом отметить вопрос — сделано / снято / "
+                      "в работе / под вопросом?"),
+}
+
+
+def _smart_answer(state: dict, question: Optional[dict], text: str, *, answer_fn=None):
+    """ИИ-разбор ответа человека на вопрос бота (ISS-49). Возвращает структуру намерения
+    (+ `_candidates` — тот самый пронумерованный список, по которому ИИ давал номера) или
+    None → caller идёт регулярками.
+
+    ИИ НЕ зовём, когда ответ и так однозначен («да» / «нет» / «2» / «да, кроме 3») — это
+    быстрый путь, как в understand-слое. Для `confirm_close` универсум расширяем до ВСЕХ
+    открытых задач серии: человек законно может ответить шире вопроса («закрой и у
+    Татьяны»). Расширение НЕ означает тихого закрытия чужого — код ниже показывает
+    получившийся список и просит одно подтверждение."""
+    if not question or aiu.is_trivial_answer(text):
+        return None
+    if answer_fn is None and not (ru.is_enabled() and aiu.is_enabled()):
+        return None                       # R10: без флага реальный claude не зовём
+    options = list(question.get("options") or [])
+    if not options and question.get("matched"):
+        options = [question["matched"]]
+    candidates = list(options)
+    if question.get("mode") == "confirm_close":
+        seen = {series_memory._status_key(o) for o in options}
+        for t in _all_open_items(Path(state.get("series_dir") or "."), None):
+            k = series_memory._status_key(t)
+            if k and k not in seen:
+                seen.add(k)
+                candidates.append(t)
+    candidates = candidates[: aiu._MAX_ITEMS_IN_PROMPT]
+    res = aiu.understand_answer(
+        text, candidates, shown_count=len(options),
+        question_text=_MODE_QUESTION_HINT.get(question.get("mode")),
+        replier=state.get("replier"), answer_fn=answer_fn)
+    if not isinstance(res, dict):
+        return None
+    return {**res, "_candidates": candidates}
+
+
+def _pick(candidates: list, positions) -> list:
+    """Номера от ИИ → тексты задач, ТОЛЬКО в пределах показанного списка (номер вне
+    диапазона игнорируем — не угадываем, R5)."""
+    return [candidates[i - 1] for i in sorted(positions or []) if 1 <= i <= len(candidates)]
+
+
+def _scope_targets(smart: dict, *, candidates: list, options: list, replier) -> list:
+    """Задачи, которых КАСАЕТСЯ массовое «закрой всё» с учётом охвата (ISS-48):
+      • shown    — только то, что бот показал в вопросе;
+      • everyone — все открытые задачи серии;
+      • named    — задачи названных людей (+ показанные свои, если человек назвал и себя)."""
+    scope = smart.get("scope") or "shown"
+    if scope == "everyone":
+        return list(candidates)
+    if scope == "named" and smart.get("owners"):
+        named = _owned_by_names(candidates, smart["owners"])
+        self_named = bool(ru._name_tokens(replier) & {
+            t for n in smart["owners"] for t in ru._name_tokens(n)})
+        if self_named:
+            keys = {series_memory._status_key(t) for t in named}
+            named = named + [o for o in options
+                             if series_memory._status_key(o) not in keys]
+        return named
+    return list(options)
+
+
+def _scope_human(smart: dict) -> str:
+    """Охват человеческим языком (склонять имена не пытаемся — перечисляем через двоеточие)."""
+    scope = smart.get("scope") or "shown"
+    if scope == "everyone":
+        return "по всем участникам"
+    if scope == "named" and smart.get("owners"):
+        return "по участникам: " + ", ".join(smart["owners"])
+    return "по вашим вопросам"
+
+
+_SMART_HINT = ("Не до конца понял ответ. Скажите проще: «да» — закрыть всё из списка, "
+               "«нет» — не трогать, либо назовите номера или названия вопросов.")
+
+
+def _dedup_texts(items: list, *, skip_keys: Optional[set] = None) -> list:
+    out, seen = [], set(skip_keys or ())
+    for t in items:
+        k = series_memory._status_key(t)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def _smart_confirm_close(smart: dict, *, state: dict, question: dict, series_dir, date) -> dict:
+    """ISS-48/ISS-49: применить ИИ-разбор ответа на «Закрыть все ваши вопросы?».
+
+    ИНВАРИАНТ ЧЕСТНОСТИ (требование владельца): бот не выполняет молча малую долю просьбы.
+    Просьба шире показанного («у всех», «у Татьяны») → собираем ПОЛНЫЙ список намерения,
+    показываем его и просим ОДНО подтверждение; ничего чужого не закрываем догадкой."""
+    candidates = smart.get("_candidates") or []
+    options = list(question.get("options") or [])
+    label = smart.get("cls") or question.get("label") or "done"
+    intent = smart.get("intent")
+
+    if intent == "decline":
+        return {"text": "Ок, ничего не закрываю.", "consume": True, "learned": False}
+    if intent not in ("apply", "class"):
+        return {"text": _SMART_HINT, "consume": False, "learned": False}
+
+    kept = _pick(candidates, smart.get("keep"))
+    keep_keys = {series_memory._status_key(t) for t in kept}
+    explicit = _pick(candidates, smart.get("positions"))
+    scope = smart.get("scope") or "shown"
+    if smart.get("all") or (not explicit and scope != "shown"):
+        base = _scope_targets(smart, candidates=candidates, options=options,
+                              replier=state.get("replier"))
+    else:
+        base = explicit
+    targets = _dedup_texts(base, skip_keys=keep_keys)
+    if not targets:
+        if kept:
+            return {"text": "Понял: ничего не закрываю, оставляю как есть — "
+                            + _names_line(kept) + ".", "consume": True, "learned": False}
+        return {"text": _SMART_HINT, "consume": False, "learned": False}
+
+    total = len(targets)
+    targets = targets[:_MAX_MASS_OPTIONS]
+    shown_keys = {series_memory._status_key(o) for o in options}
+    widened = any(series_memory._status_key(t) not in shown_keys for t in targets)
+
+    if widened:
+        # Шире, чем спрашивал бот → НЕ применяем молча: показываем ровно то, что закроем,
+        # и берём одно подтверждение (ISS-48 «в»: показать намерение списком).
+        head = (f"Понял — закрываем шире, чем я спрашивал: {_scope_human(smart)}. "
+                f"Отмечу как «{_label_human(label)}» вот эти:")
+        # Список чужих задач показываем С ИМЕНЕМ владельца — иначе непонятно, что
+        # подтверждаешь («Свести демо-трек» без «Александра Ким:» ни о чём не говорит).
+        lines = [head, *_numbered(targets, with_owner=True)]
+        if total > len(targets):
+            lines.append(f"(всего подходит {total} — показал первые {len(targets)}, "
+                         "остальные добьём следующим ответом)")
+        if kept:
+            lines.append(f"Оставляю открытым: {_names_line(kept, with_owner=True)}.")
+        lines.append("Подтвердите «да» — закрою весь список. «Нет» — ничего не трогаю.")
+        qstate = {"mode": "confirm_close", "label": label, "options": targets,
+                  "word": None, "scope": scope, "owners": smart.get("owners") or []}
+        return {"text": "\n".join(lines), "consume": True, "learned": False,
+                "question": qstate}
+
+    done = [t for t in targets if _apply_status(series_dir, t, label, date=date)]
+    parts = [_closed_reply(done, label)]
+    if kept:
+        parts.append(f"Оставил открытым: {_names_line(kept)}.")
+    return {"text": " ".join(parts), "consume": True, "learned": False}
+
+
+def _smart_to_ans(smart: Optional[dict], n_options: int) -> Optional[dict]:
+    """ISS-49: структура намерения от ИИ → тот же контракт, что у `parse_answer`, для
+    режимов БЕЗ расширения охвата (чужие задачи / выбор пункта). None → ИИ не дал внятного
+    намерения → caller остаётся на регулярках (и, если и те молчат, честно переспросит).
+    Номера вне диапазона показанного отбрасываем — не угадываем (R5)."""
+    if not smart:
+        return None
+    base = {"rollback": False, "yes": False, "no": False,
+            "digits": set(), "excluded": set(), "cls": smart.get("cls")}
+    intent = smart.get("intent")
+    if intent == "decline":
+        return {**base, "no": True}
+    if intent not in ("apply", "class"):
+        return None
+    keep = {i for i in (smart.get("keep") or []) if 1 <= i <= n_options}
+    pos = {i for i in (smart.get("positions") or []) if 1 <= i <= n_options}
+    if smart.get("all") or (not pos and keep):
+        return {**base, "yes": True, "excluded": keep}
+    if pos:
+        return {**base, "digits": pos - keep}
+    return None
+
+
+def _names_line(items: list, *, with_owner: bool = False) -> str:
+    return ", ".join(f"«{t if with_owner else _short(t)}»" for t in items)
 
 
 def _apply_status(series_dir, task_text: str, label: str, *, date) -> bool:
@@ -399,18 +682,27 @@ def _closed_reply(applied_texts: list, label: str) -> str:
     return f"Готово — отметил как «{human}»: {names}."
 
 
-def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
+def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None) -> dict:
     """Обработать reply человека НА ack/переспрос бота (R15/R26/R24). `state` — запись
     [[reply_ack_state]] по message_id. Возвращает:
       • `text` — ответ человеку («» = отвечать не на что, не молчим ложно);
       • `consume` — можно ли удалить контекст (действие завершено vs ждём внятный ответ);
-      • `learned` — сработал ли триггер памяти R24.
+      • `learned` — сработал ли триггер памяти R24;
+      • `question` — НОВЫЙ контекст переспроса (ISS-48: просьба оказалась шире вопроса →
+        показали список и ждём одно подтверждение). Есть → caller персистит его под
+        message_id своего ответа, иначе канал ответа оборвётся.
+    `answer_fn` инъектируется тестами вместо реального Claude (ISS-49, стаб не зовёт CLI).
     Опасная тройка: тексты reply не логируем."""
     series_dir = Path(state.get("series_dir") or ".")
     date = state.get("date")
     applied = state.get("applied") or []
     question = state.get("question")
     ans = parse_answer(text)
+    # ISS-49: ответ на вопрос бота разбирает ТОТ ЖЕ ИИ-слой, что и ответ на протокол —
+    # регулярки остаются быстрым путём для однозначного и фолбэком при недоступном ИИ.
+    smart = _smart_answer(state, question, text, answer_fn=answer_fn)
+    if smart and smart.get("intent") == "rollback":
+        ans = {**ans, "rollback": True}
 
     # 1) Несогласие (R26): «не так / верни» на ступени-2 → РЕАЛЬНЫЙ reopen применённого.
     #    НО: слова отмены — омонимы. «отмени/отменили» = и «откати», и класс «снято»
@@ -418,7 +710,8 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
     #    ОТВЕТ НА ПЕРЕСПРОС (снять эту задачу), а не откат применённого. Не крадём его в
     #    reopen, иначе вернули бы в работу уже применённое и не сняли спрошенное.
     answering_clarify = bool(
-        question and question.get("mode") == "clarify_class" and ans["cls"])
+        question and question.get("mode") == "clarify_class"
+        and (ans["cls"] or (smart or {}).get("cls")))
     if ans["rollback"] and applied and not answering_clarify:
         reopened = [a["text"] for a in applied
                     if a.get("text") and _reopen(series_dir, a["text"], date=date)]
@@ -436,6 +729,9 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
         options = question.get("options") or []
 
         if mode == "confirm_close":
+            if smart is not None:
+                return _smart_confirm_close(smart, state=state, question=question,
+                                            series_dir=series_dir, date=date)
             if ans["yes"]:
                 targets = [o for i, o in enumerate(options, 1) if i not in ans["excluded"]]
             elif ans["digits"]:
@@ -458,6 +754,7 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
             if not options and question.get("matched"):
                 options, labels = [question["matched"]], [label]
             multi = len(options) > 1
+            ans = _smart_to_ans(smart, len(options)) or ans   # ISS-49: ИИ-первый разбор
             # «нет» проверяем ПЕРВЫМ: ответ-деклайн на ЧУЖУЮ задачу не должен ничего
             # закрывать, даже если в нём мелькнуло число («нет 2») — ложно-закрыть чужое
             # хуже, чем оставить висеть (R5-консерватизм проекта; Н1 цикл5).
@@ -490,6 +787,7 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
             return {"text": f"Готово — отметил: {names}.", "consume": True, "learned": False}
 
         if mode == "pick_target":
+            ans = _smart_to_ans(smart, len(options)) or ans   # ISS-49: ИИ-первый разбор
             if ans["no"]:
                 return {"text": "Понял, ни к какому — оставил как есть.",
                         "consume": True, "learned": False}
@@ -502,7 +800,8 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
 
         if mode == "clarify_class":
             matched = question.get("matched")
-            cls = ans["cls"]
+            # ISS-49: класс словарём → ИИ (нестандартная формулировка «да всё ок, замяли»).
+            cls = ans["cls"] or (smart or {}).get("cls")
             if cls is None:
                 return {"text": "Как отметить — «сделано», «снято», «в работе» или «под "
                         "вопросом»? Ответьте словом.", "consume": False, "learned": False}
@@ -511,7 +810,10 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None) -> dict:
             # чтобы впредь узнать без ИИ (Ф3 дала механику, Ф4 — триггер).
             learned = False
             word = question.get("word")
-            if ok and word:
+            # Учим слово ТОЛЬКО когда класс назвал ЧЕЛОВЕК словарным словом (канон R24).
+            # Класс, выведенный ИИ по смыслу, в долгую память не кладём — иначе редкая
+            # ИИ-догадка навсегда переопределила бы разбор слова без участия человека.
+            if ok and word and ans["cls"]:
                 learned = dm.remember_word_class(word, cls, source="ack-clarify",
                                                  store_path=store_path)
             return {"text": _closed_reply([matched] if ok else [], cls),
