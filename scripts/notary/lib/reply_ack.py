@@ -690,7 +690,8 @@ def _smart_confirm_close(smart: dict, *, state: dict, question: dict, series_dir
         parts.append(already_line)
     if kept:
         parts.append(f"Оставил открытым: {_names_line(kept)}.")
-    return _with_rest_or_summary({"text": " ".join(parts), "consume": True, "learned": False},
+    return _with_rest_or_summary({"text": " ".join(parts), "consume": True, "learned": False,
+                                  "applied_texts": done},
                                  rest=rest, label=label, question=question,
                                  series_dir=series_dir)
 
@@ -894,7 +895,7 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
             # (цикл5 НОВ1). Остатка нет → говорим, сколько осталось открытыми (У1/У7).
             rest = list(question.get("rest") or []) if ans["yes"] else []
             return _with_rest_or_summary(
-                {"text": text, "consume": True, "learned": False},
+                {"text": text, "consume": True, "learned": False, "applied_texts": done},
                 rest=rest, label=label, question=question, series_dir=series_dir)
 
         if mode == "confirm_foreign":
@@ -936,11 +937,12 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
                                     if i - 1 < len(labels)}) == 1
             if uniform:
                 return {"text": _closed_reply(done, done_label),
-                        "consume": True, "learned": False}
+                        "consume": True, "learned": False, "applied_texts": done}
             if not done:
                 return {"text": "Ок, ничего не отметил.", "consume": True, "learned": False}
             names = ", ".join(f"«{_short(t)}»" for t in done)
-            return {"text": f"Готово — отметил: {names}.", "consume": True, "learned": False}
+            return {"text": f"Готово — отметил: {names}.", "consume": True, "learned": False,
+                    "applied_texts": done}
 
         if mode == "pick_target":
             ans = _smart_to_ans(smart, len(options)) or ans   # ISS-49: ИИ-первый разбор
@@ -952,7 +954,8 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
                 return {"text": "Ответьте цифрой из списка (или «мимо»), пожалуйста.",
                         "consume": False, "learned": False}
             done = [t for t in chosen if _apply_status(series_dir, t, label, date=date)]
-            return {"text": _closed_reply(done, label), "consume": True, "learned": False}
+            return {"text": _closed_reply(done, label), "consume": True, "learned": False,
+                    "applied_texts": done}
 
         if mode == "clarify_class":
             matched = question.get("matched")
@@ -973,7 +976,8 @@ def handle_ack_reply(state: dict, text: str, *, store_path=None, answer_fn=None)
                 learned = dm.remember_word_class(word, cls, source="ack-clarify",
                                                  store_path=store_path)
             return {"text": _closed_reply([matched] if ok else [], cls),
-                    "consume": True, "learned": bool(learned)}
+                    "consume": True, "learned": bool(learned),
+                    "applied_texts": [matched] if ok else []}
 
     # 3) Reply на ack без вопроса и без «верни» (согласие «ок/спасибо» = молчание) — не
     #    досаждаем повторным ответом; неясное — мягко подсказываем канал несогласия.

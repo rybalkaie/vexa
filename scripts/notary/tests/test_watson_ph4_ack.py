@@ -487,6 +487,43 @@ class TestAckReplyRoute(_Base):
         self.assertTrue(any("текстом" in s.lower() for s in sent))
         self.assertNotIn(sm._status_key(_ITEM_RASCH), self._status())  # ничего не применили
 
+    def test_iss49_fresh_instruction_under_terminal_ack_reunderstood(self):
+        # ISS-49 (кейс 24.07): reply на ФИНАЛЬНОЕ «Готово — отметил…» (ack без вопроса) —
+        # это СВЕЖАЯ инструкция «закрой всё у всех, кроме агента», а не ответ да/нет.
+        # Раньше такой reply не ловился (у финала не было state) и молча тонул в шлюзе
+        # правок. Теперь ack-state под «Готово» есть → route отдаёт текст в understand.
+        ras.record(600, series_dir=self.sd, chat_id=self.GROUP,
+                   applied=[{"text": _ITEM_RASCH, "label": "done"}], has_tier2=False)
+        seen = {}
+
+        def _fake_understand(token, cid, allowed, m, **kw):
+            seen["text"] = kw.get("text")
+            seen["series_dir"] = str(kw.get("series_dir"))
+            return True
+
+        with mock.patch.object(ml, "_understand_and_ack", side_effect=_fake_understand), \
+             mock.patch.object(ml, "send_message"):
+            claimed = ml.maybe_route_to_ack_reply(
+                "tok", self.GROUP,
+                self._reply_msg("закрой все вопросы у меня и у Татьяны, кроме караоке", 600))
+        self.assertTrue(claimed)
+        self.assertIn("у Татьяны", seen.get("text", ""))          # инструкция ушла в understand
+        self.assertIsNone(ras.get(600))                            # старый контекст погашен
+
+    def test_iss49_pending_question_not_rerouted(self):
+        # Обратная сторона: если под сообщением ЖДЁТ вопрос — «да» остаётся ответом на него,
+        # в understand НЕ уводим (иначе сломали бы да/нет).
+        ras.record(601, series_dir=self.sd, chat_id=self.GROUP,
+                   question={"mode": "confirm_close", "label": "done",
+                             "options": [_ITEM_RASCH], "word": None})
+        called = {"understand": False}
+        with mock.patch.object(ml, "_understand_and_ack",
+                               side_effect=lambda *a, **k: called.__setitem__("understand", True)), \
+             mock.patch.object(ml, "send_message"):
+            ml.maybe_route_to_ack_reply("tok", self.GROUP, self._reply_msg("да", 601))
+        self.assertFalse(called["understand"])                     # ответ на вопрос, не re-route
+        self.assertEqual(self._status().get(sm._status_key(_ITEM_RASCH)), sm.STATUS_DONE)
+
     def test_route_cross_chat_collision_ignored(self):
         # Цикл5 Н1: message_id уникален ПО-ЧАТНО. Ack записан для ДРУГОГО чата (999), reply
         # с тем же mid пришёл в наш GROUP → chat_id не совпал → не наш ack (False), чужую

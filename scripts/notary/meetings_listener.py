@@ -2054,8 +2054,23 @@ def maybe_route_to_reply_understand(
     series_dir = _protokol_root() / series
     snapshot = _reply_open_tasks_snapshot(series_dir, msg)
     replier = _msg_display_name(msg)
-    # ОЖИД1: пачка → лёгкая реакция ДО долгого ИИ-разбора (десятки секунд), не молчим.
+    return _understand_and_ack(
+        token, chat_id, allowed_chat, msg, series=series, series_dir=series_dir,
+        snapshot=snapshot, replier=replier, text=text)
+
+
+def _understand_and_ack(
+    token: str, chat_id: int, allowed_chat: int, msg: dict[str, Any], *,
+    series: str, series_dir, snapshot, replier: Optional[str], text: str,
+) -> bool:
+    """Общий движок «понять reply → применить → единый ack» (Ф3+Ф4). Вынесен из
+    `maybe_route_to_reply_understand`, чтобы ТОТ ЖЕ разбор мог запускать и ack-роут
+    (ISS-49: reply на любое сообщение бота — не только на его вопрос — понимается как
+    свежая инструкция, а не молча падает в шлюз правок). `series_dir` передан явно
+    (ack-роут берёт его из ack-state, а не резолвит по reply_to)."""
+    from notary.lib import reply_understand  # noqa: PLC0415
     from notary.lib import mixed_reply_split  # noqa: PLC0415
+    # ОЖИД1: пачка → лёгкая реакция ДО долгого ИИ-разбора (десятки секунд), не молчим.
     if mixed_reply_split.looks_like_multi_status(text):
         send_message(token, chat_id, UNDERSTAND_PROGRESS_HINT, reply_to=msg.get("message_id"))
     try:
@@ -2097,7 +2112,8 @@ def maybe_route_to_reply_understand(
 
 
 def maybe_route_to_ack_reply(
-    token: str, chat_id: Optional[int], msg: dict[str, Any]
+    token: str, chat_id: Optional[int], msg: dict[str, Any],
+    allowed_chat: Optional[int] = None,
 ) -> bool:
     """Ф4 (R26/УПУ1 + R15): reply человека НА ack/переспрос бота.
 
@@ -2154,6 +2170,37 @@ def maybe_route_to_ack_reply(
             return True
     if not text:
         return False  # стикер/фото на наш ack — не канал закрытого ответа
+
+    # ISS-49 (реальный кейс 24.07): под нашим сообщением может ждать ЗАКРЫТЫЙ вопрос
+    # («Закрыть все ваши вопросы?») — тогда это ОТВЕТ на него. А может НЕ ждать (reply на
+    # финальное «Готово — отметил…») — тогда это СВЕЖАЯ инструкция («закрой всё у всех,
+    # кроме агента»). Раньше свежая инструкция под «Готово» вообще не ловилась (у финала
+    # нет ack-state) и молча тонула в шлюзе правок. Теперь: нет ждущего вопроса и это не
+    # откат/не «ок» → гоним тем же understand-движком, что reply на протокол.
+    ans = reply_ack.parse_answer(text)
+    fresh_instruction = (
+        not state.get("question")
+        and not ans["rollback"]
+        and not ans["yes"]
+        and not ans["no"]
+        and not ans["digits"])
+    if fresh_instruction:
+        series_dir = state.get("series_dir")
+        series = Path(series_dir).name if series_dir else None
+        if series:
+            handled = _understand_and_ack(
+                token, chat_id, allowed_chat, msg, series=series,
+                series_dir=Path(series_dir), snapshot=None,
+                replier=state.get("replier") or _msg_display_name(msg), text=text)
+            if handled:
+                # Свежая инструкция под старым ack — прежний контекст больше не нужен
+                # (понимание перешло на новое сообщение бота, оно и записало свой state).
+                reply_ack_state.consume(mid)
+                logger.info("[ack-reply] reply на ack понят как свежая инструкция (understand)")
+                return True
+        # understand ничего не нашёл / серия не резолвится → падаем в обычный handle ниже
+        # (мягкая подсказка, не молчание).
+
     try:
         res = reply_ack.handle_ack_reply(state, text)
     except Exception as e:  # noqa: BLE001 — обработка ответа не должна валить listener
@@ -2164,14 +2211,18 @@ def maybe_route_to_ack_reply(
     out = res.get("text") or ""
     if out:
         out_mid = send_message(token, chat_id, out, reply_to=msg.get("message_id"))
-        # ISS-48: ответ мог оказаться ШИРЕ вопроса («закрой и у Татьяны») — бот показал
-        # получившийся список и ждёт ОДНО подтверждение. Персистим новый контекст под
-        # message_id этого сообщения, иначе «да» на него упало бы в никуда.
-        if out_mid is not None and res.get("question"):
+        # Персистим контекст под НАШИМ ответом, чтобы reply на него не осиротел:
+        #  • есть новый вопрос (ISS-48: ответ шире вопроса → показали список, ждём «да»);
+        #  • ЛИБО просто применили статусы (ISS-49, кейс 24.07): reply на финальное
+        #    «Готово — отметил…» должен ловиться — иначе свежая инструкция под ним молча
+        #    тонет в шлюзе правок. applied → и откат «верни» работает, и re-understand.
+        applied_texts = res.get("applied_texts") or []
+        applied_recs = [{"text": t, "label": None} for t in applied_texts if t]
+        if out_mid is not None and (res.get("question") or applied_recs):
             reply_ack_state.record(
                 out_mid, series_dir=state.get("series_dir"), chat_id=chat_id,
-                replier=state.get("replier"), applied=None, has_tier2=False,
-                question=res["question"], date=state.get("date"))
+                replier=state.get("replier"), applied=applied_recs or None,
+                has_tier2=False, question=res.get("question"), date=state.get("date"))
     logger.info("[ack-reply] обработан ответ на ack mid=%s consume=%s learned=%s",
                 mid, res.get("consume"), res.get("learned"))
     return True
@@ -2770,7 +2821,7 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # ack бота не протокол и не дайджест, иначе «не так/верни»/«ответ цифрой» утекли бы в
     # игнор. Ищет контекст ack по message_id (переживает рестарт). Гейт ENABLE_REPLY_UNDERSTAND
     # дефолт-OFF: OFF / не наш ack → False → обычные роуты ниже (обратная совместимость).
-    if maybe_route_to_ack_reply(token, cid, msg):
+    if maybe_route_to_ack_reply(token, cid, msg, allowed_chat):
         return
 
     # ISS-45: reply-просьба «пришли протокол / открытые вопросы» → переотправить артефакт.
