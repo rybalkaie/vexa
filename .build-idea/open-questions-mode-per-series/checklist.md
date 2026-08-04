@@ -1,0 +1,127 @@
+# checklist.md
+
+Формат: `- [ ]` открыт · `- [x] → путь` закрыт артефактом · `[x] SKIP/N/A/MANUAL: причина` · `[!] BLOCKED: причина`.
+Гейт фазы: `python3 .claude/skills/build-idea/scripts/verify-checklist.py .build-idea/open-questions-mode-per-series/checklist.md --до "Фаза N" --корень .`
+
+## Этап 0. Классификация и опора
+
+- [x] Паспорт среды снят → .build-idea/open-questions-mode-per-series/passport.md
+- [x] Базовая линия до первой правки прогнана → .build-idea/open-questions-mode-per-series/artifacts/baseline-gate.txt
+- [x] Список несущих утверждений выложен → .build-idea/open-questions-mode-per-series/requirements.md
+- [x] Гейт зоны заведён и запущен → .build-idea/open-questions-mode-per-series/gate.sh
+- [x] Верификатор чек-листа проверен запуском → .build-idea/open-questions-mode-per-series/artifacts/verify-first-run.txt
+
+## Этап 0.5. Разведка зоны
+
+- [x] Карта зоны семью разведчиками → .build-idea/open-questions-mode-per-series/zone-map.md
+- [x] Список файлов прогона → .build-idea/open-questions-mode-per-series/files.txt
+- [x] Пересказ владельцу → .build-idea/open-questions-mode-per-series/owner-brief.md
+
+## Фаза 1. Режим в реестре, чтение и знание своей серии
+
+- [ ] Поле open_questions_mode + валидация, неизвестное → дефолт last-only + предупреждение в лог
+- [ ] Хелпер series_open_questions_mode с нормализацией ключа (ISS-7)
+- [ ] ISS-52: фолбэк резолва серии по chat_id текущего чата (одна → молча, несколько → переспрос)
+- [ ] Тесты фазы написаны и зелёные
+- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f1.txt
+- [ ] След 1: прошёл путь как пользователь → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [ ] След 2: невалидные входы каждого перехода перечислены → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [ ] След 3: грепнул, где ещё этот же класс → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [ ] След 4: мерил на боевых объёмах → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f1-reviews.md
+- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f1-mutation.md
+- [ ] Коммит фазы поимённо
+
+## Фаза 2. Переключение режима командой боту
+
+- [ ] Узкий детерминированный триггер обеих сторон + форма с явным именем серии
+- [ ] Owner-гейт по образцу set_chat
+- [ ] Видимое подтверждение владельцу
+- [ ] Команда «в каком режиме эта серия?»
+- [ ] Строка в чат серии о смене формата
+- [ ] Тесты фазы написаны и зелёные
+- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f2.txt
+- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f2-traces.md
+- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f2-reviews.md
+- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f2-mutation.md
+- [ ] Коммит фазы поимённо
+
+## Фаза 3. Поведение справочного режима
+
+- [ ] Дайджест last-only: источник — задачи, рождённые на последней прошедшей встрече
+- [ ] Мелочь входит, группировка по ответственным сохранена, формат доставки прежний
+- [ ] Убран запрос статусов: инструкция, нумерация, регистрация снапшота
+- [ ] Мягкая подпись-шапка
+- [ ] Гейт хвоста в ОБОИХ call-site (finalize + clarify_worker)
+- [ ] Проверено, что пропуск блока не ломает commit_pending_shown / record_open_tasks_snapshot
+- [ ] Ночной сверщик и напоминания пропускают last-only
+- [ ] Reply со статусом в шпаргалке: ответ-объяснение, в стор ничего не пишется
+- [ ] При возврате в carry первый дайджест снова регистрирует снапшот
+- [ ] Тесты фазы написаны и зелёные
+- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f3.txt
+- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f3-traces.md
+- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f3-reviews.md
+- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f3-mutation.md
+- [ ] Коммит фазы поимённо
+
+## Фаза 4. ISS-53 + ISS-55
+
+- [ ] Приёмочные тесты зоны написаны ПЕРВЫМИ (сторожа не было — находка Н2)
+- [ ] reject пишет отказ по конкретному инстансу в реестр
+- [ ] Реестр сохраняется и при rejected > 0
+- [ ] Различие «нет» vs «не предлагай серию» сохранено
+- [ ] Ретеншн отказных записей старше 30 дней
+- [ ] fmt_when_short читает MEETING_NOTARY_DISPLAY_TZ
+- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f4.txt
+- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f4-traces.md
+- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f4-reviews.md
+- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f4-mutation.md
+- [ ] Коммит фазы поимённо
+
+## Фаза 5. ISS-54
+
+- [ ] Приёмочные тесты зоны написаны ПЕРВЫМИ (сторожа не было — находка Н2)
+- [ ] iCalUID протянут от календарного слоя до записи реестра (находка Н1)
+- [ ] Дедуп при записи в реестр по iCalUID, пара «время старта + URL» страховкой
+- [ ] Дедуп в scheduler по (url, start) + лог о схлопывании
+- [ ] Разовая чистка боевого дубля
+- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f5.txt
+- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f5-traces.md
+- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f5-reviews.md
+- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f5-mutation.md
+- [ ] Коммит фазы поимённо
+
+## Фаза 6. ISS-51
+
+- [ ] Детект «пришли артефакт» переведён на ИИ-первый разбор по образцу ack_understand
+- [ ] Сохранён гейт detect_status_intent и позиция роута
+- [ ] Регулярка осталась быстрым путём и офлайн-фолбэком, гейт дефолт-OFF в коде
+- [ ] Тест на дыру Н7: глагол отправки + объект + статус-маркер не перехватывается
+- [ ] Тесты фазы написаны и зелёные
+- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f6.txt
+- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f6-traces.md
+- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f6-reviews.md
+- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f6-mutation.md
+- [ ] Коммит фазы поимённо
+
+## Фаза 7. Прод-выкатка, раскладка режимов и живой документ
+
+- [ ] Деплой
+- [ ] Раскладка режимов по каждой серии боевого реестра
+- [ ] Наблюдение на живых встречах
+- [ ] Живой документ обновлён
+- [ ] Статусы FIXED в журнале косяков
+
+## Этап 7. Финальная сквозная проверка
+
+- [ ] Швы между фазами свежими агентами → .build-idea/open-questions-mode-per-series/artifacts/final-seams.md
+- [ ] Полный гейт зоны зелёный → .build-idea/open-questions-mode-per-series/artifacts/gate-final.txt
+- [ ] Закрывающая таблица по 10 утверждениям с командами-доказательствами → .build-idea/open-questions-mode-per-series/report.md
+
+## Этап 8. Отчёт и сдача
+
+- [ ] Отчёт «как было / как стало» → .build-idea/open-questions-mode-per-series/report.md
+- [ ] Лист решений владельцу → .build-idea/open-questions-mode-per-series/decisions.md
+- [ ] Файл долгов → plans/follow-ups-open-questions-mode-per-series.md
+- [ ] «Что нового» для сотрудников → whats-new/2026-08-04-open-questions-mode-per-series.md
+- [ ] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
