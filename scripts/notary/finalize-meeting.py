@@ -810,6 +810,12 @@ def main() -> int:
     # подтверждённой доставки — фундамент под ординал-матчинг Ф4 против слепка именно
     # отвечаемой версии протокола (не live-пересчёта).
     pending_open_positions: list[str] = []
+    # ISS-51 (Ф3): серия-накопление (`carry`) или серия-шпаргалка (`last-only`).
+    # В шпаргалке раздел «Вопросы с прошлых встреч…» в протокол НЕ печатается — именно
+    # он и есть механизм накопления (раздел парсится обратно в выжимку `extract_open_tasks`,
+    # и хвост переезжает дальше). Дефолт True = прежнее поведение, если до резолва не
+    # дошли (серия без slug, память серии выключена).
+    open_questions_carry = True
     # Ф4б (REQ 1.2): закреплённое человеком сопоставление спикер→имя из памяти серии
     # (правка авторства реплаем на прошлой встрече). Подаётся якорем в map_all ДО
     # догадки Ф4а. {} если нет/старые файлы без ключа (ленивое поле, УПУ3).
@@ -849,11 +855,20 @@ def main() -> int:
             # откладываем — собираем ключи закрытых в shown_sink и коммитим ПОСЛЕ
             # подтверждённой доставки протокола (mark_shown игнорируется, когда передан
             # shown_sink). clarify по-прежнему НЕ помечает (lib/clarify_worker.py).
-            open_tasks_block = series_memory.build_open_tasks_block(
-                series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
-                date=date_part, shown_sink=pending_shown_keys,
-                open_sink=pending_open_positions,
-            )
+            # ISS-51 (Ф3, РИСК1): гейт режима — ОБА call-site (второй в
+            # lib/clarify_worker.py). Фикс только здесь означал бы, что поздняя
+            # пересборка протокола вернёт хвост в шпаргалочную серию (ровно грабли
+            # ISS-10, память [[review-checks-two-call-sites]]).
+            open_questions_carry = series_memory.carries_open_questions(meta.get("series"))
+            if open_questions_carry:
+                open_tasks_block = series_memory.build_open_tasks_block(
+                    series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,
+                    date=date_part, shown_sink=pending_shown_keys,
+                    open_sink=pending_open_positions,
+                )
+            else:
+                log.info("[open-tasks] серия %s в режиме last-only — раздел «с прошлых "
+                         "встреч» в протокол не печатаю", meta.get("series") or "?")
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
                 session_uid, meta.get("series") or "?", len(series_memory_digests),
@@ -1759,7 +1774,12 @@ def main() -> int:
     # участников, алерт владельцу) → НЕ коммитим: вопросы никто не увидел. Best-effort.
     # Гейтим тем же условием, что и СБОРКУ блока (is_enabled + has_series_slug): иначе
     # для one-off (без серии) series_dir = корень протоколов → spurious маркер в корне.
+    # ISS-51 (Ф3, РИСК3): в шпаргалочной серии блок не строился — коммитить нечего.
+    # `commit_pending_shown` при пустом `shown_keys` всё равно ставит маркер онбординга
+    # («хвост показан»), а показан он не был: серия молча стала бы «тёплой», и при
+    # возврате в `carry` холодный старт R4 (бэкфилл ≤1 встречи) бесшумно пропал бы.
     if (delivery_result.get("status") == "sent"
+            and open_questions_carry
             and series_memory.is_enabled()
             and series_memory.has_series_slug(meta.get("series"))):
         try:

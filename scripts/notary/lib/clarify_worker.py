@@ -235,11 +235,22 @@ def _apply_resolution(
                 # Ф4 (ISS-34): `date` ОБЯЗАТЕЛЕН — без него origin-даты висяков «от
                 # DD.MM.YYYY» не проставятся при перевыпуске (паритет с finalize,
                 # память review-checks-two-call-sites).
-                open_tasks_block = series_memory.build_open_tasks_block(
-                    _smem, series_dir=transcript_path.parent,
-                    meeting_sid=state.get("meeting_id"),
-                    date=meta_block.get("date") or None,
-                )
+                # ISS-51 (Ф3, РИСК1): ВТОРОЙ call-site гейта режима (первый — в
+                # finalize-meeting.py). Без него поздняя пересборка протокола вернула бы
+                # раздел «с прошлых встреч» в шпаргалочную серию — и ком поехал бы
+                # дальше через сам протокол ([[review-checks-two-call-sites]], ISS-10).
+                if series_memory.carries_open_questions(meta_block.get("series")):
+                    open_tasks_block = series_memory.build_open_tasks_block(
+                        _smem, series_dir=transcript_path.parent,
+                        meeting_sid=state.get("meeting_id"),
+                        date=meta_block.get("date") or None,
+                    )
+                else:
+                    logger.info(
+                        "[open-tasks] серия %s в режиме last-only — при пересборке "
+                        "раздел «с прошлых встреч» не печатаю",
+                        meta_block.get("series") or "?",
+                    )
         except Exception:  # noqa: BLE001
             series_memory_block = ""
             open_tasks_block = ""

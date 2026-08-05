@@ -1046,7 +1046,7 @@ class ReconcileResult:
     """Счётчики прогона (НЕ тексты — опасная тройка). Для лога/CLI-отчёта."""
 
     __slots__ = ("series", "hanging", "closed", "doubt", "kept", "persist_fail",
-                 "doubt_pruned", "skipped")
+                 "doubt_pruned", "skipped", "mode")
 
     def __init__(self, series: str = "?"):
         self.series = series
@@ -1057,12 +1057,14 @@ class ReconcileResult:
         self.persist_fail = 0  # set_task_status вернул None (FU-3)
         self.doubt_pruned = 0  # FU-6: выпрунено doubt по TTL
         self.skipped = False   # серия пропущена (нет висяков / нет свидетельств)
+        self.mode = ""         # ISS-51: режим открытых вопросов серии (пусто = не смотрели)
 
     def as_dict(self) -> dict:
         return {
             "series": self.series, "hanging": self.hanging, "closed": self.closed,
             "doubt": self.doubt, "kept": self.kept, "persist_fail": self.persist_fail,
             "doubt_pruned": self.doubt_pruned, "skipped": self.skipped,
+            "mode": self.mode,
         }
 
 
@@ -1099,6 +1101,7 @@ def reconcile_series(
     reason: str = REASON_BY_MEETING,
     dry_run: bool = False,
     doubt_ttl: Optional[int] = None,
+    watched: Optional[dict] = None,
 ) -> ReconcileResult:
     """Свести висяки ОДНОЙ серии со свидетельствами. Пишет статусы в sidecar Ф2.
 
@@ -1162,7 +1165,7 @@ def reconcile_series(
         try:
             rec = series_memory.set_task_status(
                 series_dir, item, target,
-                reason=reason, source=source, date=date,
+                reason=reason, source=source, date=date, watched=watched,
             )
         except Exception as e:  # noqa: BLE001 — запись best-effort, прогон не валим
             logger.warning("[reconciler] set_task_status failed (non-fatal): %s", type(e).__name__)
@@ -1246,17 +1249,53 @@ def reconcile_all(
     if only_series:
         series_dirs = [d for d in series_dirs if d.name == only_series]
     ttl = doubt_ttl if doubt_ttl is not None else doubt_ttl_days()
+    # ISS-51 (Ф3): реестр серий читаем ОДИН раз на прогон — режим открытых вопросов
+    # нужен КАЖДОЙ серии, а сверщик ходит по всем каталогам. Реестр не прочитался →
+    # `watched_modes = None` → `series_memory.open_questions_mode` сам откатится на
+    # `carry` (старое поведение), сверка пройдёт как раньше.
+    try:
+        # `SystemExit` — тоже сюда: `cli/registry._read_yaml` кидает ИМЕННО его на
+        # «верхний уровень YAML не словарь» (обычный исход ручной правки реестра), а
+        # `except Exception` его не ловит: BaseException. Без этого одна запятая в
+        # `watched.yaml` роняла бы ночной сверщик целиком, молча и до утра.
+        watched_modes = series_memory.load_watched_for_modes()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — нет PyYAML/реестра → carry
+        logger.info("[reconciler] реестр режимов недоступен (%s) — свожу все серии",
+                    type(e).__name__)
+        watched_modes = None
     results: list[ReconcileResult] = []
     for sd in series_dirs:
+        # ISS-51 (Ф3): серии-шпаргалки сверщик НЕ трогает. В них висяков как сущности
+        # нет — список последней встречи живёт до следующей и снимается сам, а
+        # статусы никто не проставляет. Свести такую серию значило бы писать
+        # auto-closed/doubt в sidecar, который в этом режиме никто не читает, и
+        # (через возврат в `carry`) поднять давно неактуальные пометки.
         # FU-6: TTL-прун буфера doubt — для КАЖДОЙ серии, ДО проверки висящих (иначе
         # серия без открытых, но с протухшим doubt, никогда бы не очистилась). Прун
         # может вернуть doubt→open, поэтому hanging считаем ПОСЛЕ него.
+        #
+        # ISS-51 (Ф3): прун идёт и ВЫШЕ гейта режима. `doubt` — буфер с ЧАСАМИ: пункт
+        # лежит в нём TTL дней и возвращается в «висит». Отсечь серию до пруна значит
+        # ОСТАНОВИТЬ ЭТИ ЧАСЫ: пока серия в шпаргалке, ничего не протухает, а на первом
+        # же возврате в накопление весь буфер оживает разом — пункты месячной давности
+        # одномоментно всплывают «висящими». Прун ничего не закрывает и наружу не
+        # ходит (чистая работа с sidecar), поэтому «тишина статус-машины» им не нарушена.
         pruned = 0
         if not dry_run and ttl > 0:
             try:
                 pruned = series_memory.prune_doubt_buffer(sd, max_age_days=ttl, today=date)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[reconciler] doubt prune failed (non-fatal): %s", type(e).__name__)
+        mode = series_memory.open_questions_mode(sd.name, watched=watched_modes)
+        if mode != series_memory.OPEN_QUESTIONS_MODE_CARRY:
+            res = ReconcileResult(series=sd.name)
+            res.skipped = True
+            res.mode = mode
+            res.doubt_pruned = pruned
+            results.append(res)
+            logger.info("[reconciler] series=%s mode=%s — пропускаю сверку (справочный "
+                        "режим), буфер doubt при этом протух на %d", sd.name, mode, pruned)
+            continue
         # Дешёвая проверка: есть ли висяки (иначе свидетельства — дорогой обход — не собираем).
         if not _hanging_items(sd):
             res = ReconcileResult(series=sd.name)
@@ -1268,7 +1307,7 @@ def reconcile_all(
         # doubt_ttl=0 → reconcile_series НЕ прунит повторно (уже сделали выше).
         res = reconcile_series(
             sd, evidence=evidence, matcher=matcher, date=date,
-            dry_run=dry_run, doubt_ttl=0,
+            dry_run=dry_run, doubt_ttl=0, watched=watched_modes,
         )
         # Ф7 (R18): второй проход — свидетельства из ПЕРЕПИСОК компании серии. Идёт на
         # ещё-ВИСЯЩИХ (reconcile_series пере-резолвит корзину `open` → уже закрытые/
@@ -1286,6 +1325,7 @@ def reconcile_all(
                 res_chat = reconcile_series(
                     sd, evidence=ev_chat, matcher=matcher, date=date,
                     reason=REASON_BY_CHAT, source=SOURCE_CHAT, dry_run=dry_run, doubt_ttl=0,
+                    watched=watched_modes,
                 )
                 # Слияние счётчиков двух проходов. `hanging` — исходное. Закрытия/сомнения
                 # пасса 1 ТЕРМИНАЛЬНЫ (в `open` больше не попадут) → суммируем. НО `kept` и
@@ -1318,6 +1358,7 @@ def reconcile_all(
                 res_bx = reconcile_series(
                     sd, evidence=ev_bx, matcher=matcher, date=date,
                     reason=REASON_BY_BITRIX, source=SOURCE_BITRIX, dry_run=dry_run, doubt_ttl=0,
+                    watched=watched_modes,
                 )
                 res.closed += res_bx.closed
                 res.doubt += res_bx.doubt

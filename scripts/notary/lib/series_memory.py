@@ -78,6 +78,9 @@ _HAS_DIGIT_RE = re.compile(r"\d")
 # серии (storage cap, РАЗМ/приватность): не даём хвосту незакрытых разрастаться без
 # предела. Подача в промпт капится отдельно env-лимитом `open_tasks_max()` (≤ этого).
 _MAX_OPEN_TASKS = 25
+# ISS-51 (Ф3): потолок чтения протокола при фолбэке происхождения (боевые — 5–30 КБ).
+# Больше — не читаем: утренний дайджест не место для разбора мегабайтного файла.
+_PROTOCOL_READ_CAP = 2 * 1024 * 1024
 # Дефолт подачи в промпт = storage cap (НЕ меньше!). Инвариант G9: всё, что осело
 # в выжимке, ОБЯЗАНО попасть в промпт — иначе задача на позиции 16..25 хранится, но
 # в «🔻 С прошлых встреч» не выводится → на следующей (кумулятивной) выжимке её уже
@@ -242,6 +245,204 @@ def is_open_tasks_enabled() -> bool:
     """
     raw = (os.environ.get("ENABLE_OPEN_TASKS_TRACKING") or "").strip().lower()
     return raw not in ("0", "false", "no")
+
+
+# ISS-51 (Ф3): режим открытых вопросов серии — ЕДИНАЯ точка чтения для боевых
+# потребителей (дайджест, оба call-site протокола, ночной сверщик, статус-роуты
+# listener'а). Значения и резолв по реестру живут в `cli/registry.py`; здесь —
+# только тонкая обёртка «прочитать реестр и не упасть».
+OPEN_QUESTIONS_MODE_CARRY = "carry"          # серия-накопление: как было всегда
+OPEN_QUESTIONS_MODE_LAST_ONLY = "last-only"  # серия-шпаргалка: только прошлая встреча
+
+# ISS-51 (Ф3): ленивый ключ выжимки — какие из `open_tasks` РОДИЛИСЬ на этой встрече
+# (раздел «Задачи» протокола), а не приехали хвостом. Пишется всегда, когда пишется
+# `open_tasks` (в т.ч. пустым списком); ОТСУТСТВИЕ ключа = выжимка старого формата.
+OPEN_TASKS_BORN_HERE_KEY = "open_tasks_born_here"
+
+
+def open_questions_mode(series: Optional[str], *, watched: Optional[dict] = None) -> str:
+    """Режим открытых вопросов серии: `carry` | `last-only`.
+
+    Обёртка над `cli.registry.series_open_questions_mode` для БОЕВЫХ потребителей.
+    Отличие от резолвера реестра — направление фолбэка, когда реестр НЕ ОТВЕЧАЕТ:
+
+      • поле у записи серии не проставлено → решает резолвер (дефолт `last-only`,
+        решение владельца 29.07: новые серии живут справкой);
+      • серии в реестре НЕТ ВООБЩЕ → `carry`;
+      • реестр НЕ ПРОЧИТАЛСЯ (нет PyYAML, битый YAML, гонка правки руками) → `carry`.
+
+    Последние два — сознательный fail-safe В СТОРОНУ СТАРОГО ПОВЕДЕНИЯ. Накопленный хвост
+    серии физически живёт ТОЛЬКО в разделе протокола: `extract_open_tasks` парсит его
+    обратно в выжимку. Один протокол, собранный без раздела, обнуляет хвост НАВСЕГДА —
+    восстановить его неоткуда. Поэтому «не знаю режим» обязано значить «веду себя как
+    вчера», а не «показываю справку»: ошибка в сторону carry стоит одного лишнего
+    раздела в протоколе, ошибка в сторону last-only — потери висяков Директората.
+
+    «Серии нет в реестре» — из той же семьи: сам дефолт `last-only` владелец назначал
+    ЗАПИСЯМ реестра (Ф7 плана проходит его целиком и проставляет режим каждой серии).
+    Встреча, дошедшая до протокола/дайджеста, в реестре есть по построению — она
+    оттуда и приехала; отсутствие ключа значит, что мы смотрим не в тот реестр
+    (потерянный env, чужой каталог), а не «владелец выбрал справку».
+
+    `watched` можно инъектировать (тесты и caller'ы, которые уже держат реестр в
+    руках, — не читаем файл дважды). Логируем только имя серии и код ошибки.
+    """
+    if watched is None:
+        # `except (Exception, SystemExit)` — ИМЕННО ВОКРУГ ЧТЕНИЯ ФАЙЛА. `cli/registry
+        # ._read_yaml` на «верхний уровень YAML не словарь» кидает `SystemExit` (это
+        # BaseException, НЕ Exception): реестр правят руками, и одна лишняя запятая
+        # роняла бы утренний дайджест, ночного сверщика, финализатор и слушателя
+        # (последнего — в ЦИКЛ падений: его `except Exception` тоже не ловит SystemExit,
+        # offset не сохраняется, то же сообщение прилетает снова после рестарта).
+        try:
+            watched = load_watched_for_modes()
+        except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort
+            logger.warning("[open-tasks] реестр недоступен (%s) — режим серии считаю "
+                           "%s (старое поведение)", type(e).__name__, OPEN_QUESTIONS_MODE_CARRY)
+            return OPEN_QUESTIONS_MODE_CARRY
+        if watched is None:
+            logger.warning("[open-tasks] реестр режимов не прочитан — режим серии %s "
+                           "считаю %s (РЕЖИМ НЕ ОПРЕДЕЛЁН, не выбор владельца)",
+                           series, OPEN_QUESTIONS_MODE_CARRY)
+            return OPEN_QUESTIONS_MODE_CARRY
+    try:
+        try:
+            from notary.cli.registry import (  # noqa: PLC0415
+                series_open_questions_mode, series_records,
+            )
+        except ImportError:  # окружение без пакета `notary` (sys.path = scripts/notary)
+            from cli.registry import (  # noqa: PLC0415
+                series_open_questions_mode, series_records,
+            )
+        records = series_records(series, watched)
+        if not records:
+            logger.warning("[open-tasks] серии %s нет в реестре — режим считаю %s "
+                           "(РЕЖИМ НЕ ОПРЕДЕЛЁН, не выбор владельца)",
+                           series, OPEN_QUESTIONS_MODE_CARRY)
+            return OPEN_QUESTIONS_MODE_CARRY
+        mode = series_open_questions_mode(series, watched)
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — SystemExit из _read_yaml
+        logger.warning("[open-tasks] режим серии %s не прочитан (%s) — считаю %s",
+                       series, type(e).__name__, OPEN_QUESTIONS_MODE_CARRY)
+        return OPEN_QUESTIONS_MODE_CARRY
+    if mode not in (OPEN_QUESTIONS_MODE_CARRY, OPEN_QUESTIONS_MODE_LAST_ONLY):
+        # Резолвер такого вернуть не должен; страхуемся в сторону старого поведения.
+        logger.warning("[open-tasks] неизвестный режим %r серии %s — считаю %s",
+                       mode, series, OPEN_QUESTIONS_MODE_CARRY)
+        return OPEN_QUESTIONS_MODE_CARRY
+    if mode == OPEN_QUESTIONS_MODE_LAST_ONLY:
+        reason = _explicit_carry_signal(records)
+        if reason:
+            # Дефолт «поле не задано → шпаргалка» — решение владельца, его не трогаем.
+            # Но если поле ЗАДАНО и его нельзя прочитать (опечатка «карри», число,
+            # список) ЛИБО другая запись серии явно просит `carry` — молча уводить
+            # серию в справку нельзя: потеря хвоста НЕОБРАТИМА (он живёт только в
+            # разделе протокола), а лишний хвост — нет. Ошибаемся в сторону carry
+            # и говорим об этом в лог.
+            logger.warning("[open-tasks] серия %s: %s — оставляю %s, чтобы не потерять "
+                           "хвост (поправьте реестр или скажите боту «эта серия — "
+                           "шпаргалка»)", series, reason, OPEN_QUESTIONS_MODE_CARRY)
+            return OPEN_QUESTIONS_MODE_CARRY
+    return mode
+
+
+def _explicit_carry_signal(records: Optional[list]) -> Optional[str]:
+    """Есть ли у записей серии ЯВНЫЙ сигнал «накопление», который резолвер потерял?
+
+    Две ситуации, обе — про необратимость потери хвоста:
+      • значение поля ЗАДАНО, но нечитаемо (опечатка/число/список) — резолвер
+        трактует его как «поле не задано» и отдаёт дефолт `last-only`;
+      • какая-то запись серии явно говорит `carry`, а резолвер до неё не дошёл
+        (мёртвая запись с `carry` + живая без поля — приоритет слотов).
+
+    Возвращает причину строкой (для лога) либо None. Только ЧИТАЕТ записи.
+    """
+    invalid = False
+    for w in records or []:
+        if not isinstance(w, dict):
+            continue
+        raw = w.get("open_questions_mode")
+        if raw is None:
+            continue  # поле не задано — это и есть дефолт владельца, не сигнал
+        if isinstance(raw, str) and raw.strip().casefold() == OPEN_QUESTIONS_MODE_CARRY:
+            return "запись реестра явно просит режим накопления"
+        if not (isinstance(raw, str)
+                and raw.strip().casefold() == OPEN_QUESTIONS_MODE_LAST_ONLY):
+            invalid = True
+    return "значение open_questions_mode задано, но не читается" if invalid else None
+
+
+def load_watched_for_modes() -> Optional[dict]:
+    """Реестр серий для резолва режима. Нет PyYAML/реестра/битый YAML → None.
+
+    Оба варианта импорта — как у `llm_postprocess`: на проде путь `notary.cli.registry`,
+    в окружении, где на `sys.path` лежит сам `scripts/notary`, — `cli.registry`.
+
+    Глотаем и `SystemExit`: `cli/registry._read_yaml` кидает ЕГО (а не Exception) на
+    «верхний уровень YAML не словарь» — обычный исход ручной правки реестра. Ловим
+    ЗДЕСЬ, на самом чтении, потому что эту функцию зовут напрямую и мимо
+    `open_questions_mode` (ночной сверщик берёт реестр один раз на прогон): защита
+    только у одного caller'а означала бы, что остальные по-прежнему падают целиком.
+    """
+    try:
+        try:
+            from notary.cli import registry as _registry  # noqa: PLC0415
+        except ImportError:
+            from cli import registry as _registry  # noqa: PLC0415
+        cached = _cached_watched(_registry)
+        if cached is not None:
+            return cached
+        data = _registry.load_watched()
+        _remember_watched(_registry, data)
+        return data
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort
+        logger.warning("[open-tasks] реестр режимов не читается (%s) — режимы серий "
+                       "резолвятся в %s (старое поведение)",
+                       type(e).__name__, OPEN_QUESTIONS_MODE_CARRY)
+        return None
+
+
+# Кэш реестра ключом (mtime_ns, size) файла. Режим спрашивают на КАЖДУЮ запись
+# статуса: пачка из 8–20 задач одним ответом = 8–20 полных разборов YAML, а ночной
+# сверщик так обнулял собственный префетч. Ключ по mtime+size, а не по времени: правка
+# реестра (в т.ч. командой бота) меняет файл → кэш промахивается и мы читаем заново,
+# то есть залипания режима не бывает. Значение отдаётся ЧИТАТЕЛЯМ РЕЖИМА (они его не
+# мутируют); писатели реестра ходят в `cli.registry.load_watched` напрямую, мимо кэша.
+_WATCHED_CACHE: dict = {}
+
+
+def _watched_stat(registry_mod) -> Optional[tuple]:
+    try:
+        st = Path(registry_mod.WATCHED_FILE).stat()
+    except (OSError, AttributeError, TypeError):
+        return None  # нет файла/пути → кэш не работает, читаем как раньше
+    # `st_ino` в ключе обязателен: `save_watched` пишет через atomic-rename, поэтому
+    # ЛЮБАЯ правка реестра меняет inode — даже если ФС округляет mtime до секунды и
+    # размер совпал. Без него смена режима командой бота могла бы «залипнуть».
+    return (str(registry_mod.WATCHED_FILE), st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _cached_watched(registry_mod) -> Optional[dict]:
+    key = _watched_stat(registry_mod)
+    if key is None:
+        return None
+    hit = _WATCHED_CACHE.get("key")
+    return _WATCHED_CACHE.get("data") if hit == key else None
+
+
+def _remember_watched(registry_mod, data) -> None:
+    key = _watched_stat(registry_mod)
+    if key is not None and isinstance(data, dict):
+        _WATCHED_CACHE["key"], _WATCHED_CACHE["data"] = key, data
+
+
+def carries_open_questions(series: Optional[str], *, watched: Optional[dict] = None) -> bool:
+    """`True` — серия-накопление (`carry`): хвост в протоколе, статусы, сверщик.
+
+    Читается на каждом call-site как ОДНО условие, чтобы «шпаргалочная» ветка нигде
+    не расползлась в собственную копию сравнения строк.
+    """
+    return open_questions_mode(series, watched=watched) == OPEN_QUESTIONS_MODE_CARRY
 
 
 def open_tasks_max() -> int:
@@ -600,6 +801,40 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
     `_MAX_OPEN_TASKS`. Порядок (висящие раньше новых) держит «хвост» серии при капе.
     Чистая функция (без IO, без claude) — основной объект unit-тестов Ф8. НЕ кладёт
     сырые реплики (РИСК4): только формулировки задач из уже сжатого протокола.
+
+    Разбор вынесен в `_split_open_tasks_by_section` (тот же проход, те же правила) —
+    ISS-51 нужен РАЗДЕЛЬНЫЙ доступ к двум источникам: шпаргалка показывает только
+    «эту встречу». Публичное поведение здесь не изменилось ни на элемент.
+    """
+    carried, fresh = _split_open_tasks_by_section(protocol_text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in carried + fresh:
+        k = _task_key(t)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out[:_MAX_OPEN_TASKS]
+
+
+def _split_open_tasks_by_section(protocol_text: str) -> "tuple[list[str], list[str]]":
+    """Тот же разбор, что `extract_open_tasks`, но БЕЗ схлопывания источников.
+
+    Возвращает `(carried, fresh)`:
+      • `carried` — раздел «🔻 С прошлых встреч» (section==carryover): УНАСЛЕДОВАННЫЙ
+        хвост, не факт этой встречи;
+      • `fresh`   — раздел «Задачи» (section==tasks): то, что зафиксировали ИМЕННО
+        НА ЭТОЙ встрече.
+
+    Это структурный (по разделам протокола) ответ на вопрос «что родилось здесь».
+    Ключевой момент ISS-51: ответ по ТЕКСТУ задачи (совпадение `_status_key` между
+    соседними выжимками) на бою НЕ работает — модель переписывает формулировки при
+    каждой генерации протокола, и один и тот же вопрос приезжает под новым ключом.
+    Замер на боевых сериях: пересечение соседних выжимок 0/16/1/6/0 из ~18–25 задач,
+    то есть накопленный ком целиком выглядел бы «рождённым вчера». Раздел же — якорь
+    структуры, а не текста: он переживает любую переформулировку.
+
+    Без дедупа и без капа — их делает публичная обёртка (порядок «висящие → новые»).
     """
     carried: list[str] = []
     fresh: list[str] = []
@@ -703,14 +938,7 @@ def extract_open_tasks(protocol_text: str) -> list[str]:
                     txt = f"{current_owner}: {txt}"
                 carried.append(txt)
     _flush_pending_task()  # хвост: последняя строка-данных таблицы в конце протокола
-    out: list[str] = []
-    seen: set[str] = set()
-    for t in carried + fresh:
-        k = _task_key(t)
-        if k and k not in seen:
-            seen.add(k)
-            out.append(t)
-    return out[:_MAX_OPEN_TASKS]
+    return carried, fresh
 
 
 def extract_decisions(protocol_text: str) -> list[str]:
@@ -864,6 +1092,12 @@ def build_digest(
     # берёт его из самой свежей выжимки и подаёт в промпт генерации (Вызов 1). РИСК4:
     # только формулировки задач из уже сжатого протокола, не сырые реплики.
     open_tasks = extract_open_tasks(protocol_text or "")
+    # ISS-51 (Ф3): ЗДЕСЬ и только здесь известно, какие из задач родились НА ЭТОЙ
+    # встрече (раздел «Задачи»), а какие приехали хвостом (раздел «С прошлых встреч»).
+    # В `open_tasks` оба источника схлопываются в один список, и восстановить границу
+    # позже нечем: тексты хвоста модель переписывает на каждой генерации. Поэтому
+    # происхождение фиксируем СРАЗУ, рядом с выжимкой (`OPEN_TASKS_BORN_HERE_KEY`).
+    _, _fresh_here = _split_open_tasks_by_section(protocol_text or "")
     # Ф4 (R8): фильтр значимости — мелкое разовое («отправить файл») в раздел
     # протокола не тянем, значимое («подготовить расчёт») остаётся. Применяется ЗДЕСЬ
     # (после extract_open_tasks, ДО записи в open_tasks). Инъекция: None → без фильтра
@@ -883,6 +1117,22 @@ def build_digest(
                            type(e).__name__)
     if open_tasks:
         digest["open_tasks"] = open_tasks
+        # Ключ пишем ВСЕГДА рядом с `open_tasks` — в том числе пустым списком (встреча,
+        # где новых задач не поставили). Его ОТСУТСТВИЕ = выжимка старого формата, и
+        # только по этому признаку читатель понимает, что происхождение неизвестно и
+        # нужен фолбэк по протоколу.
+        #
+        # Список берём из РАЗДЕЛА, а не пересечением с `open_tasks`: тот уже подрезан
+        # капом (`_MAX_OPEN_TASKS`), и подрезан С КОНЦА — то есть первым выпадает как
+        # раз свежее (перенесённый хвост идёт впереди). На боевом Директорате это 21
+        # хвостовой пункт + 4 свежих из 13: справка «что было на прошлой встрече»
+        # потеряла бы девять пунктов ТОЙ САМОЙ встречи. Мелочь исключаем — у неё свой
+        # блок, который в шпаргалку входит целиком (решение владельца 29.07).
+        _minor_keys = {_status_key(_open_task_text(t))
+                       for t in open_tasks if is_minor_item(t)}
+        digest[OPEN_TASKS_BORN_HERE_KEY] = [
+            t for t in _fresh_here if _status_key(t) not in _minor_keys
+        ][:_MAX_OPEN_TASKS]
     sm = _norm_speaker_mapping(speaker_mapping)
     if sm:
         digest["speaker_mapping"] = sm
@@ -1693,6 +1943,95 @@ def origin_dates_for_tasks(digests: list[dict]) -> dict:
     return origins
 
 
+def latest_digest_date(digests: Optional[list]) -> Optional[str]:
+    """Дата САМОЙ СВЕЖЕЙ выжимки серии = дата последней ПРОШЕДШЕЙ встречи.
+
+    `list_series_digests` отдаёт по возрастанию, поэтому смотрим РОВНО `[-1]` и ни
+    на шаг раньше. Пропустить битую дату у самой свежей выжимки и «доехать» до
+    предыдущей нельзя: справка молча стала бы справкой по позапрошлой встрече —
+    человек читает список, которого на вчерашней встрече не было, и не видит того,
+    что было. Свежая выжимка без пригодной даты → None (caller решает сам).
+    """
+    for dig in reversed(digests or []):
+        if not isinstance(dig, dict):
+            continue  # не-словарь в хвосте — мусор файла, а не «выжимка без даты»
+        date = dig.get("date")
+        if isinstance(date, str) and _ORIGIN_ISO_DATE_RE.match(date.strip()):
+            return date.strip()
+        logger.warning("[open-tasks] у самой свежей выжимки серии нет пригодной даты "
+                       "(%s) — на предыдущую встречу НЕ откатываюсь", type(date).__name__)
+        return None
+    return None
+
+
+def _fresh_tasks_from_protocol(series_dir: Path, date: Optional[str]) -> Optional[list[str]]:
+    """Задачи раздела «Задачи» протокола встречи `date` (фолбэк для СТАРЫХ выжимок).
+
+    Протокол лежит рядом с выжимкой (`<date>-protokol.md` — то же имя, что знают
+    `feedback_reissue` и `clarify_worker`). Нет файла / не читается / нет даты →
+    None (не пустой список: «не знаю» и «пусто» — разные ответы). Читаем не больше
+    `_PROTOCOL_READ_CAP` байт: файл на боевом пути утреннего дайджеста.
+    """
+    if not date:
+        return None
+    p = Path(series_dir) / f"{date}-protokol.md"
+    try:
+        if not p.is_file() or p.stat().st_size > _PROTOCOL_READ_CAP:
+            return None
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.info("[open-tasks] протокол %s не прочитан (%s)", p.name, type(e).__name__)
+        return None
+    _, fresh = _split_open_tasks_by_section(text)
+    return fresh
+
+
+def tasks_born_on_last_meeting(
+    series_dir: Path, digests: Optional[list],
+) -> list[str]:
+    """ISS-51 (Ф3): значимые задачи, зафиксированные НА ПОСЛЕДНЕЙ прошедшей встрече.
+
+    Источник справки — раздел «Задачи» протокола той встречи, а НЕ хвост выжимки:
+    хвост кумулятивен по построению, и серия, переключённая вчера, показала бы весь
+    накопленный ком (РИСК2 плана). Две ступени:
+
+      1. У свежей выжимки есть `open_tasks_born_here` — её писал финализатор в тот
+         момент, когда границу разделов ещё было видно. Без IO, точно.
+      2. Ключа нет (выжимка старого формата — таковы ВСЕ выжимки на диске до этой
+         фазы) — разбираем по разделам протокол этой встречи, он лежит рядом.
+
+    Возвращённые тексты caller обязан прогнать через `merge_open_tasks_with_status`:
+    закрытое руками/сверщиком в справку не попадёт, даже если стоит в протоколе.
+    Ни на одной ступени НЕЛЬЗЯ вернуть весь хвост. Нет ни ключа, ни протокола → []
+    + предупреждение: «не знаю происхождения» безопаснее трактовать как «показывать
+    нечего», чем как «показать всё».
+    """
+    digests = list(digests or [])
+    if not digests:
+        return []
+    latest = digests[-1] if isinstance(digests[-1], dict) else {}
+    date = latest_digest_date(digests)
+    if date is None:
+        logger.warning("[open-tasks] дата последней встречи неизвестна — справку "
+                       "собирать не из чего, показываю пусто")
+        return []
+
+    born = latest.get(OPEN_TASKS_BORN_HERE_KEY)
+    if isinstance(born, list):
+        return [_open_task_text(t) for t in born if _open_task_text(t)]
+
+    fresh = _fresh_tasks_from_protocol(Path(series_dir), date)
+    if not fresh:
+        logger.warning("[open-tasks] выжимка %s без пометки происхождения и без "
+                       "протокола рядом — справку показываю пустой (ком не шлю)", date)
+        return []
+    minor_keys = {_status_key(t) for t in _resolve_minor_open_tasks_raw(digests)}
+    out = [t for t in fresh if _status_key(t) not in minor_keys]
+    logger.info("[open-tasks] выжимка %s без пометки происхождения — беру раздел "
+                "«Задачи» из протокола встречи (%d)", date, len(out))
+    return out[:_MAX_OPEN_TASKS]
+
+
 def origin_prefix_for(
     text: str, origins: Optional[dict], current_date: Optional[str]
 ) -> str:
@@ -2083,6 +2422,7 @@ def set_task_status(
     reason: Optional[str] = None,
     source: Optional[str] = None,
     date: Optional[str] = None,
+    watched: Optional[dict] = None,
 ) -> Optional[dict]:
     """Ф2: выставить/обновить статус висяка в sidecar (потребители — Ф5 reply, Ф6 сверщик).
 
@@ -2103,6 +2443,20 @@ def set_task_status(
         raise ValueError(f"unknown task status: {status!r}")
     key = _status_key(task_text)
     if not key:
+        return None
+    # ISS-51 (Ф3): в серии-ШПАРГАЛКЕ статус-стор не пишется ВООБЩЕ. Гейт стоит здесь,
+    # у единственного физического писателя, а не только в роутах listener'а: писателей
+    # шесть (reply, ИИ-разбор, ack-слой, сверщик…), и «каждый помнит про режим» — это
+    # ровно тот класс упущения, на котором фича и разъезжается. Имя серии берём из
+    # каталога (`<protocols_root>/<series>`) — так же, как это делает сверщик.
+    # None (а не тихое «ок») — потому что caller обязан узнать, что статус НЕ применён:
+    # он на это уже умеет реагировать (FU-3, «не применилось» → без ложного ack).
+    # `watched` — уже прочитанный реестр. Пачка статусов одним ответом (8–20 задач) и
+    # обход всех серий ночным сверщиком иначе перечитывали бы YAML НА КАЖДУЮ запись,
+    # обнуляя собственный префетч caller'а. Не передан → читаем сами (прежнее поведение).
+    series_name = Path(series_dir).name if series_dir is not None else ""
+    if series_name and not carries_open_questions(series_name, watched=watched):
+        logger.info("[open-tasks] серия %s в режиме last-only — статус НЕ пишу", series_name)
         return None
     with _status_store_lock(series_dir):
         store = load_task_status(series_dir)
