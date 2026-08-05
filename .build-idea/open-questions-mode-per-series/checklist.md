@@ -67,17 +67,17 @@
 
 ## Фаза 4. ISS-53 + ISS-55
 
-- [ ] Приёмочные тесты зоны написаны ПЕРВЫМИ (сторожа не было — находка Н2)
-- [ ] reject пишет отказ по конкретному инстансу в реестр
-- [ ] Реестр сохраняется и при rejected > 0
-- [ ] Различие «нет» vs «не предлагай серию» сохранено
-- [ ] Ретеншн отказных записей старше 30 дней
-- [ ] fmt_when_short читает MEETING_NOTARY_DISPLAY_TZ
-- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f4.txt
-- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f4-traces.md
-- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f4-reviews.md
-- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f4-mutation.md
-- [ ] Коммит фазы поимённо
+- [x] Приёмочные тесты зоны написаны ПЕРВЫМИ (сторожа не было — находка Н2) → .build-idea/open-questions-mode-per-series/artifacts/f4-impl.md
+- [x] reject пишет отказ по конкретному инстансу в реестр → .build-idea/open-questions-mode-per-series/artifacts/f4-diff.txt
+- [x] Реестр сохраняется и при rejected > 0 → .build-idea/open-questions-mode-per-series/artifacts/f4-impl.md
+- [x] Различие «нет» vs «не предлагай серию» сохранено → .build-idea/open-questions-mode-per-series/artifacts/f4-repair.md
+- [x] Ретеншн отказных записей старше 30 дней → .build-idea/open-questions-mode-per-series/artifacts/f4-repair.md
+- [x] fmt_when_short читает MEETING_NOTARY_DISPLAY_TZ → .build-idea/open-questions-mode-per-series/artifacts/f4-repair.md
+- [x] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/f4-repair.md
+- [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f4-traces.md
+- [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f4-review-1.md
+- [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f4-mutation.md
+- [x] Коммит фазы поимённо → 2b8135e
 
 ## Фаза 5. ISS-54
 
