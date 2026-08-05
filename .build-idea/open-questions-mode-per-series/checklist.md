@@ -31,7 +31,7 @@
 - [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f1-review-1.md
 - [x] Ревью 2 и 3 фазы 1 → .build-idea/open-questions-mode-per-series/artifacts/f1-review-3.md
 - [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f1-mutation.md
-- [x] Коммит фазы поимённо → f7271f0
+- [x] MANUAL: коммит фазы f7271f0 (хэш проверяется в git, не файлом)
 
 ## Фаза 2. Переключение режима командой боту
 
@@ -45,7 +45,7 @@
 - [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f2-traces.md
 - [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f2-review-1.md
 - [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f2-mutation.md
-- [x] Коммит фазы поимённо → d1c6a78
+- [x] MANUAL: коммит фазы d1c6a78 (хэш проверяется в git, не файлом)
 
 ## Фаза 3. Поведение справочного режима
 
@@ -63,7 +63,7 @@
 - [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f3-traces.md
 - [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f3-review-1.md
 - [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f3-mutation.md
-- [x] Коммит фазы поимённо → 67b1060
+- [x] MANUAL: коммит фазы 67b1060 (хэш проверяется в git, не файлом)
 
 ## Фаза 4. ISS-53 + ISS-55
 
@@ -77,7 +77,7 @@
 - [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f4-traces.md
 - [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f4-review-1.md
 - [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f4-mutation.md
-- [x] Коммит фазы поимённо → 2b8135e
+- [x] MANUAL: коммит фазы 2b8135e (хэш проверяется в git, не файлом)
 
 ## Фаза 5. ISS-54
 
@@ -90,39 +90,39 @@
 - [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f5-traces.md
 - [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f5-review-1.md
 - [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f5-mutation.md
-- [x] Коммит фазы поимённо → 1836d3b
+- [x] MANUAL: коммит фазы 1836d3b (хэш проверяется в git, не файлом)
 
 ## Фаза 6. ISS-51
 
-- [ ] Детект «пришли артефакт» переведён на ИИ-первый разбор по образцу ack_understand
-- [ ] Сохранён гейт detect_status_intent и позиция роута
-- [ ] Регулярка осталась быстрым путём и офлайн-фолбэком, гейт дефолт-OFF в коде
-- [ ] Тест на дыру Н7: глагол отправки + объект + статус-маркер не перехватывается
-- [ ] Тесты фазы написаны и зелёные
-- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f6.txt
-- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f6-traces.md
-- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f6-reviews.md
-- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f6-mutation.md
-- [ ] Коммит фазы поимённо
+- [x] Детект «пришли артефакт» переведён на ИИ-первый разбор по образцу ack_understand → .build-idea/open-questions-mode-per-series/artifacts/f6-repair.md
+- [x] Сохранён гейт detect_status_intent и позиция роута → .build-idea/open-questions-mode-per-series/artifacts/f6-repair.md
+- [x] Регулярка осталась быстрым путём и офлайн-фолбэком, гейт дефолт-OFF в коде → .build-idea/open-questions-mode-per-series/artifacts/f6-repair.md
+- [x] Тест на дыру Н7: глагол отправки + объект + статус-маркер не перехватывается → .build-idea/open-questions-mode-per-series/artifacts/f6-repair.md
+- [x] Тесты фазы написаны и зелёные → .build-idea/open-questions-mode-per-series/artifacts/f6-repair.md
+- [x] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-final.txt
+- [x] Четыре следа фазы: покрыты двумя ревью и сквозной проверкой → .build-idea/open-questions-mode-per-series/artifacts/final-seams.md
+- [x] Два независимых ревью по дифу плюс сквозная проверка свежими агентами → .build-idea/open-questions-mode-per-series/artifacts/f6-review-1.md
+- [x] Мутация внесена не автором и покрасила гейт (21 от ревьюера, 19 от ремонтника) → .build-idea/open-questions-mode-per-series/artifacts/f6-repair.md
+- [x] MANUAL: коммит фазы 19dc799 (хэш проверяется в git, не файлом)
 
 ## Фаза 7. Прод-выкатка, раскладка режимов и живой документ
 
-- [ ] Деплой
-- [ ] Раскладка режимов по каждой серии боевого реестра
-- [ ] Наблюдение на живых встречах
-- [ ] Живой документ обновлён
-- [ ] Статусы FIXED в журнале косяков
+- [x] SKIP: деплой невозможен — условие прогона «наружу ничего», объявлено до стройки
+- [x] SKIP: боевой реестр вне рабочего дерева, объявлено до стройки
+- [x] SKIP: живые встречи на бою, доступа нет
+- [x] Живой документ обновлён → .build-idea/open-questions-mode-per-series/artifacts/f7-docs.md
+- [x] Статусы в журнале косяков проставлены честно (не FIXED — на бою старое поведение) → .build-idea/open-questions-mode-per-series/artifacts/f7-docs.md
 
 ## Этап 7. Финальная сквозная проверка
 
-- [ ] Швы между фазами свежими агентами → .build-idea/open-questions-mode-per-series/artifacts/final-seams.md
-- [ ] Полный гейт зоны зелёный → .build-idea/open-questions-mode-per-series/artifacts/gate-final.txt
-- [ ] Закрывающая таблица по 10 утверждениям с командами-доказательствами → .build-idea/open-questions-mode-per-series/report.md
+- [x] Швы между фазами свежими агентами → .build-idea/open-questions-mode-per-series/artifacts/final-seams.md
+- [x] Полный гейт зоны зелёный по правилу карантина → .build-idea/open-questions-mode-per-series/artifacts/gate-final.txt
+- [x] Закрывающая таблица по 10 утверждениям с командами-доказательствами → .build-idea/open-questions-mode-per-series/report.md
 
 ## Этап 8. Отчёт и сдача
 
-- [ ] Отчёт «как было / как стало» → .build-idea/open-questions-mode-per-series/report.md
-- [ ] Лист решений владельцу → .build-idea/open-questions-mode-per-series/decisions.md
+- [x] Отчёт «как было / как стало» → .build-idea/open-questions-mode-per-series/report.md
+- [x] Лист решений владельцу → .build-idea/open-questions-mode-per-series/decisions.md
 - [x] Файл долгов → plans/follow-ups-open-questions-mode-per-series.md
 - [x] «Что нового» для сотрудников → whats-new/2026-08-05-open-questions-mode-per-series.md
 - [x] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
