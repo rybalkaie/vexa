@@ -67,6 +67,7 @@ from notary.lib.meeting_identity import (  # noqa: E402
     MATCH_NONE,
     compare,
     fingerprint,
+    is_owner_named,
 )
 
 # STATE_DIR читаем из env — ровно как вечерний блок и остальные модули зоны.
@@ -545,6 +546,19 @@ def apply_decisions(
                                 + _muted_ru(muted)
                                 + " — это та же встреча из другого календаря)"
                             )
+                        # Та же встреча может приезжать ЭКЗЕМПЛЯРОМ уже ведомой
+                        # СЕРИИ (копия из второго календаря). Запись серии не
+                        # гасим — «нет» сказано про одну встречу, — но и молчать
+                        # нельзя: владелец должен знать, что серия жива.
+                        # Сам старт при этом не поставится
+                        # (`scheduler.drop_rejected_occurrences`).
+                        series_twins = _live_series_twin_ids(item, data, rooms)
+                        if series_twins:
+                            line += (
+                                " (эту встречу приносит ведомая серия — "
+                                + _muted_ru(series_twins)
+                                + "; серию не трогаю, но на эту встречу не приду)"
+                            )
                         summary_lines.append(line)
                         rejected += 1
                     continue
@@ -607,18 +621,53 @@ def apply_decisions(
                     continue
 
                 rec = _build_record(item, room=chosen_room, kind_series_if_possible=is_series)
-                # Если такой id уже есть (например, повторное подтверждение) — пропускаем.
-                existing = find_watched(rec["id"], data)
-                duplicate = None
-                proof, conflict = MATCH_ID, False
-                if existing is None:
-                    # ISS-54: то же событие из другого календаря приезжает с
-                    # другим event_id → и id записи другой. Заводить вторую
-                    # запись нельзя: на встречу придут два бота.
-                    duplicate, proof, conflict = find_duplicate_watched(
+                # Кого оживляем. Запись под тем же id (повторное «да», след
+                # прошлого «нет») — ЛИШЬ ОДИН из кандидатов, а не готовый ответ.
+                # Раньше поиск по id стоял ДО дедупа и коротко замыкал его: у
+                # отказной заглушки ISS-53 id считается из того же события, что
+                # и у новой записи, поэтому по id она находилась ВСЕГДА, а
+                # `find_duplicate_watched` (который и знает, что оживлять надо
+                # запись с привязкой чата и режимом) не звался вовсе. Оживала
+                # заглушка: встреча шла серией без чата (протокол уезжал
+                # владельцу в личку) и с дефолтным режимом открытых вопросов, а
+                # настроенная запись владельца оставалась выключенной навсегда —
+                # и владельцу про это не говорилось ни слова.
+                by_id = find_watched(rec["id"], data)
+                candidates: list[tuple] = []
+                if by_id is not None:
+                    candidates.append((by_id, MATCH_ID, False))
+                # ISS-54: то же событие из другого календаря приезжает с
+                # другим event_id → и id записи другой. Заводить вторую
+                # запись нельзя: на встречу придут два бота.
+                for twin in find_duplicates_watched(
                         item, data, series=bool(rec.get("recurring_event_id")),
-                        rooms=rooms, room=chosen_room)
-                    existing = duplicate
+                        rooms=rooms, room=chosen_room):
+                    if twin[0] is not by_id:
+                        candidates.append(twin)
+                existing, proof, conflict = (None, MATCH_ID, False)
+                if candidates:
+                    existing, proof, conflict = min(
+                        candidates, key=lambda m: _dup_rank(m[0]))
+                # «Дубль» для строки владельцу — это «оживил НЕ ту запись, что
+                # под ключом этой копии»: именно тогда он обязан узнать, какая
+                # запись реально поведёт встречу.
+                duplicate = existing if (existing is not None and existing is not by_id) else None
+                was_rejected_by_id = bool(by_id is not None and (
+                    by_id.get(REJECTION_OWNER_FIELD) or by_id.get("rejected_start_at")))
+                # «Да» отменяет прошлое «нет» по ЭТОЙ встрече целиком — со всех
+                # её записей, а не только с ожившей. Иначе оставшаяся заглушка
+                # продолжала бы гасить старт в планировщике (`drop_rejected_
+                # occurrences`), и согласие владельца снова осталось бы словами.
+                for other, _p, _c in candidates:
+                    if other is existing:
+                        continue
+                    if other.get(REJECTION_OWNER_FIELD) or other.get("rejected_start_at"):
+                        _clear_rejection_marks(other)
+                        logger.info(
+                            "«да» по номеру %s снял отказ с записи «%s» (она "
+                            "остаётся выключенной — встречу ведёт «%s»)",
+                            n, other.get("id"), existing.get("id") if existing else "?",
+                        )
                 if existing is not None:
                     was_ignored = bool(existing.get("ignored"))
                     # обновим enabled=True, ignored=False — Илья «передумал»
@@ -653,6 +702,11 @@ def apply_decisions(
                             )
                         if was_ignored:
                             line += "; снял с неё «больше не предлагать»"
+                        if was_rejected_by_id:
+                            # Владелец сказал «нет», потом передумал. Оживает не
+                            # заглушка отказа, а настроенная запись — и он должен
+                            # видеть, что она другая (на ней чат серии и режим).
+                            line += "; прошлое «нет» по этой встрече снял"
                         summary_lines.append(line)
                     else:
                         line = f"{n}. {title} ({when}) — уже была в реестре, включил"
@@ -826,6 +880,30 @@ def _mute_twins(
             twin.get("calendar_id"), item.get("calendar_id"),
         )
     return muted
+
+
+def _live_series_twin_ids(
+    item: dict[str, Any], data: dict[str, Any], rooms: dict[str, Any],
+) -> list[str]:
+    """ЖИВЫЕ записи СЕРИИ, которые приносят эту же встречу. Их id, best-effort.
+
+    `_mute_twins` ищет близнецов только своего рода (`series=False` у отказа):
+    «серия» и «экземпляр» — разные обещания владельцу, и гасить всю серию из-за
+    одного «нет» нельзя. Но и промолчать нельзя — раньше владелец слышал «не
+    записываю, больше про эту встречу не спрошу», а бот всё равно приходил по
+    записи серии. Сам старт теперь снимает планировщик по следу отказа; здесь —
+    только честная строка владельцу.
+    """
+    out: list[str] = []
+    try:
+        for twin, _proof, _conflict in find_duplicates_watched(
+                item, data, series=True, rooms=rooms):
+            if not twin.get("enabled", True) or twin.get("ignored", False):
+                continue
+            out.append(str(twin.get("id")))
+    except Exception as e:  # noqa: BLE001 — строка владельцу опциональна, отказ уже записан
+        logger.warning("не смог проверить записи серии для отказа: %s", type(e).__name__)
+    return out
 
 
 def _mark_rejected(
@@ -1028,8 +1106,26 @@ def find_duplicates_watched(
 
 
 def _dup_rank(rec: dict[str, Any]) -> tuple:
-    """Кого из найденных копий брать первой: живую запись владельца."""
-    return (not rec.get("enabled", True), bool(rec.get(REJECTION_OWNER_FIELD)))
+    """Кого из найденных копий брать первой: живую настроенную запись владельца.
+
+    Три ступени, в порядке убывания важности:
+      1. живая раньше выключенной — по живой бот ходит прямо сейчас;
+      2. не-отказная раньше отказной заглушки — надгробие прошлого «нет» не
+         несёт ни привязки чата, ни режима открытых вопросов;
+      3. имя дал владелец раньше автоимени `oneoff-<hash>` — ЭТО ТО ЖЕ ПРАВИЛО,
+         по которому планировщик выбирает, по какой записи вести встречу
+         (`scheduler._pick_winner` → `meeting_identity.is_owner_named`).
+
+    Третья ступень появилась после сквозной проверки: без неё среди двух ЖИВЫХ
+    копий решал порядок записей в файле, и на встречу приезжал бот по записи
+    владельца, а владельцу называлась (и приметами лечилась) голая автозапись —
+    вместе с её дефолтным режимом открытых вопросов и без привязки чата.
+    """
+    return (
+        not rec.get("enabled", True),
+        bool(rec.get(REJECTION_OWNER_FIELD)),
+        not is_owner_named(rec.get("id")),
+    )
 
 
 def find_duplicate_watched(

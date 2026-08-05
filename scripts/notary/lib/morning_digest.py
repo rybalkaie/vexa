@@ -329,7 +329,11 @@ def collect_items(series_dir: Path, *, mode: Optional[str] = None) -> dict:
         if mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY:
             fresh = series_memory.tasks_born_on_last_meeting(Path(series_dir), digests)
         else:
-            fresh = series_memory._resolve_open_tasks_raw(digests)
+            # `series_dir` включает отсечку «счёт с чистого листа» (решение
+            # владельца 7): серию вернули в накопление — до-переключательный ком
+            # не поднимаем. Обещание бота владельцу и всему чату серии.
+            fresh = series_memory._resolve_open_tasks_raw(
+                digests, series_dir=Path(series_dir))
         hanging = series_memory.merge_open_tasks_with_status(fresh, store).get("open") or []
         minor_all = series_memory._resolve_minor_open_tasks_raw(digests)
         minor = series_memory.merge_open_tasks_with_status(minor_all, store).get("open") or []

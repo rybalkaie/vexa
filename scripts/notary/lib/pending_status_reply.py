@@ -751,7 +751,10 @@ def load_series_pending(series_dir: Optional[Path], *, snapshot: Optional[list] 
     aux: list = []
     try:
         digests = series_memory.list_series_digests(sd)
-        raw = series_memory._resolve_open_tasks_raw(digests)
+        # `series_dir` — отсечка «счёт с чистого листа» (решение владельца 7).
+        # Универсум обязан совпадать с ПОКАЗОМ: то, что после возврата серии в
+        # накопление не показывается, не должно и матчиться ординалом.
+        raw = series_memory._resolve_open_tasks_raw(digests, series_dir=sd)
         merged = series_memory.merge_open_tasks_with_status(raw, store)
         cap = series_memory.open_tasks_max()
         live_hanging = merged["open"][:cap] if cap > 0 else merged["open"]

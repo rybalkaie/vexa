@@ -10,12 +10,19 @@
     привязке чата покрыт в `test_iss51_mode_registry.py`);
   • `_resend_digest`: зовёт `send_series_digest(force=True)`, пустой список → честная строка.
 
+Герметичность (ремонт Ф6, ревью-2 🟡-2). Тесты этого файла зовут `detect_artifact_request`
+без `answer_fn` и рассчитывают на регулярку. Пока `ENABLE_SEND_ARTIFACT_AI` не выставлен —
+так и есть; но `README.md:133` учит делать `set -a; source .env.notary; set +a`, а
+`.env.notary.example` везёт `ENABLE_SEND_ARTIFACT_AI=1`, и из такой сессии прогон уходил
+в РЕАЛЬНУЮ модель (3 вызова из этого файла). Тест не должен зависеть от окружения
+машины: `setUpModule` чистит переменную и ставит часового на границу процесса.
+
 Запуск:
-    cd ~/Projects/meeting-notary/vexa/scripts/notary
-    ../../../.venv-cli/bin/python -m unittest tests.test_send_artifact -v
+    cd scripts/notary/tests && python3 test_send_artifact.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -25,8 +32,33 @@ _HERE = Path(__file__).resolve().parent
 _SCRIPTS = _HERE.parent.parent
 sys.path.insert(0, str(_SCRIPTS))
 
+from notary.lib import claude_cli  # noqa: E402
 from notary.lib import send_artifact as sa  # noqa: E402
 import notary.meetings_listener as ml  # noqa: E402
+
+_ENV_KEYS = ("ENABLE_SEND_ARTIFACT_AI", "SEND_ARTIFACT_AI_TIMEOUT", "CLAUDE_MIN_TIMEOUT")
+_saved_env: dict = {}
+_cli_sentinel = None
+
+
+def setUpModule():
+    global _cli_sentinel
+    for k in _ENV_KEYS:
+        _saved_env[k] = os.environ.pop(k, None)
+    _cli_sentinel = mock.patch.object(
+        claude_cli, "call_claude_print",
+        side_effect=AssertionError("тест ушёл в реальный claude — это запрещено"))
+    _cli_sentinel.start()
+
+
+def tearDownModule():
+    if _cli_sentinel is not None:
+        _cli_sentinel.stop()
+    for k, v in _saved_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 # ==========================================================================

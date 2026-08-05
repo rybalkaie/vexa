@@ -1249,5 +1249,249 @@ class TestRoomNamedInWords(unittest.TestCase):
         self.assertEqual(len(_gcal_records(data)), 2)
 
 
+# ==========================================================================
+# ШВЫ Ф4↔Ф5 (сквозная проверка): «нет»→«да», одно правило победителя,
+# «нет» по экземпляру ведомой серии
+# ==========================================================================
+class TestNoThenYesRevivesTheConfiguredRecord(unittest.TestCase):
+    """🔴 Владелец сказал «нет», через пять минут передумал и сказал «да».
+
+    Поиск записи по id стоял ДО дедупа, а у отказной заглушки id считается из
+    ТОГО ЖЕ события, что и у новой записи, — значит по id она находилась всегда
+    и дедуп (который один и знает, что оживлять надо запись с привязкой чата и
+    режимом) не звался вовсе. Оживала заглушка: встреча шла серией без чата
+    (протокол уезжал владельцу в личку) и с дефолтным режимом открытых вопросов,
+    настроенная запись владельца оставалась выключенной навсегда, а владельцу
+    говорилось только «уже была в реестре, включил».
+    """
+
+    def setUp(self):
+        self.start = _soon(20)
+        self.owner_rec = _rec_once(
+            "anzhee-vystavka-st1", CAL_ANZHEE, "evt-anzhee-copy",
+            ical_uid=ICAL_VYSTAVKA,
+            event_start_at=self.start.isoformat(),
+            event_url=ROOM_URL,
+            telegram_chat_id=-5589869859,
+            open_questions_mode="carry",
+        )
+        self.copy = _snapshot_item(1, CAL_MAIN, "evt-personal-copy", self.start,
+                                   ical_uid=ICAL_VYSTAVKA)
+
+    def _no_then_yes(self):
+        _res, data = _apply([{"n": 1, "action": "reject", "room": None}], [self.copy],
+                            watched_records=[self.owner_rec])
+        res2, data2 = _apply([{"n": 1, "action": "accept_once", "room": None}],
+                             [self.copy], watched_records=data["watched"])
+        return res2, data2
+
+    def _live(self, data):
+        return [r for r in _gcal_records(data) if r.get("enabled", True)]
+
+    def test_the_record_that_wakes_up_is_the_owners(self):
+        _res, data = self._no_then_yes()
+        live = self._live(data)
+        self.assertEqual([r["id"] for r in live], ["anzhee-vystavka-st1"],
+                         "ожила не та запись: %s" % [r["id"] for r in _gcal_records(data)])
+
+    def test_the_meeting_keeps_its_chat_and_mode(self):
+        # Ради чего всё и делалось: на записи владельца висят привязка чата
+        # (протокол уходит в чат серии, а не в личку) и режим открытых вопросов.
+        _res, data = self._no_then_yes()
+        live = self._live(data)[0]
+        self.assertEqual(live.get("telegram_chat_id"), -5589869859)
+        self.assertEqual(live.get("open_questions_mode"), "carry")
+
+    def test_owner_is_told_which_record_woke_up(self):
+        res, _data = self._no_then_yes()
+        said = " ".join(res["summary_lines"])
+        self.assertIn("anzhee-vystavka-st1", said, said)
+        self.assertIn("прошлое «нет»", said, said)
+
+    def test_the_rejection_stub_stays_dead_and_stops_being_a_rejection(self):
+        # Заглушка остаётся в реестре (иначе вечерний блок спросит про ту же
+        # копию завтра), но отказом быть перестаёт — иначе она продолжала бы
+        # гасить старт в планировщике.
+        _res, data = self._no_then_yes()
+        stub = [r for r in _gcal_records(data) if r["id"] != "anzhee-vystavka-st1"]
+        self.assertEqual(len(stub), 1)
+        self.assertFalse(stub[0].get("enabled", True))
+        self.assertFalse(stub[0].get(mar.REJECTION_OWNER_FIELD))
+        self.assertIsNone(stub[0].get("rejected_start_at"))
+        self.assertFalse(_offered_again(data, CAL_MAIN, "evt-personal-copy"))
+
+    def test_bot_really_comes_after_the_owner_changed_his_mind(self):
+        # Сквозной рубеж: после «нет»→«да» старт обязан появиться в очереди
+        # (след отказа больше не гасит встречу).
+        _res, data = self._no_then_yes()
+        events = {CAL_ANZHEE: [_event("evt-anzhee-copy", self.start,
+                                      ical_uid=ICAL_VYSTAVKA)]}
+        _rc, queue, _logs, _pushes = _run_scheduler(data["watched"], events)
+        self.assertEqual(len(queue), 1, queue)
+        self.assertEqual(queue[0]["meeting_id"], "anzhee-vystavka-st1")
+
+    def test_plain_yes_after_no_without_any_twin_is_unchanged(self):
+        # Обычный случай (близнеца нет) не тронут: оживает та же запись, что и
+        # раньше, и строка владельцу прежняя.
+        res, data = _apply([{"n": 1, "action": "reject", "room": None}], [self.copy])
+        res2, data2 = _apply([{"n": 1, "action": "accept_once", "room": None}],
+                             [self.copy], watched_records=data["watched"])
+        self.assertEqual(len(_gcal_records(data2)), 1)
+        self.assertTrue(_gcal_records(data2)[0].get("enabled"))
+        self.assertTrue(any("уже была в реестре, включил" in line
+                            for line in res2["summary_lines"]), res2["summary_lines"])
+
+
+class TestOneRuleForTheWinner(unittest.TestCase):
+    """🟡 «Кто победил в дубле» считался ДВУМЯ правилами.
+
+    Планировщик брал запись с человеческим именем (на ней чат, разметка и режим),
+    а apply-reply среди двух ЖИВЫХ копий — просто первую в файле. Владельцу
+    называлась одна запись, встречу вёл бот по другой, приметы дописывались не
+    туда. Правило теперь одно — `meeting_identity.is_owner_named`.
+    """
+
+    def setUp(self):
+        self.start = _soon(20)
+        self.bare = _rec_once(
+            "oneoff-1a2b3c4d", CAL_MAIN, "evt-bare",
+            ical_uid=ICAL_VYSTAVKA, event_start_at=self.start.isoformat(),
+            event_url=ROOM_URL,
+        )
+        self.owner_rec = _rec_once(
+            "anzhee-vystavka-st1", CAL_ANZHEE, "evt-anzhee-copy",
+            ical_uid=ICAL_VYSTAVKA, event_start_at=self.start.isoformat(),
+            event_url=ROOM_URL, telegram_chat_id=-5589869859,
+            open_questions_mode="carry",
+        )
+        # Голая автозапись стоит в файле ПЕРВОЙ — прежнее правило брало её.
+        self.watched = [self.bare, self.owner_rec]
+        self.item = _snapshot_item(1, "third@example.com", "evt-third", self.start,
+                                   ical_uid=ICAL_VYSTAVKA)
+
+    def test_registry_and_scheduler_name_the_same_record(self):
+        res, data = _apply([{"n": 1, "action": "accept_once", "room": None}],
+                           [self.item], watched_records=self.watched)
+        said = " ".join(res["summary_lines"])
+        self.assertIn("anzhee-vystavka-st1", said, said)
+        self.assertNotIn("oneoff-1a2b3c4d", said, said)
+        # И планировщик ведёт встречу по ней же.
+        events = {
+            CAL_MAIN: [_event("evt-bare", self.start, ical_uid=ICAL_VYSTAVKA)],
+            CAL_ANZHEE: [_event("evt-anzhee-copy", self.start, ical_uid=ICAL_VYSTAVKA)],
+        }
+        _rc, queue, _logs, _pushes = _run_scheduler(data["watched"], events)
+        self.assertEqual(len(queue), 1, queue)
+        self.assertEqual(queue[0]["meeting_id"], "anzhee-vystavka-st1")
+
+    def test_fingerprints_are_healed_on_the_record_that_leads(self):
+        # Приметы третьего календаря дописываются в запись, которая реально
+        # ведёт встречу, а не в проигравшую автозапись.
+        item = _snapshot_item(1, "third@example.com", "evt-third", self.start,
+                              ical_uid=ICAL_VYSTAVKA, url=OTHER_URL)
+        bare = dict(self.bare); bare.pop("event_url")
+        owner = dict(self.owner_rec); owner.pop("event_url")
+        _res, data = _apply([{"n": 1, "action": "accept_once", "room": None}], [item],
+                            watched_records=[bare, owner])
+        by_id = {r["id"]: r for r in _gcal_records(data)}
+        self.assertEqual(by_id["anzhee-vystavka-st1"].get("event_url"), OTHER_URL)
+        self.assertIsNone(by_id["oneoff-1a2b3c4d"].get("event_url"))
+
+    def test_the_rule_itself_is_shared(self):
+        self.assertTrue(mid.is_owner_named("anzhee-vystavka-st1"))
+        self.assertFalse(mid.is_owner_named("oneoff-22a5d597"))
+        self.assertFalse(mid.is_owner_named("series-22a5d597"))
+        self.assertIs(sched.AUTO_MEETING_ID_RE, mid.AUTO_RECORD_ID_RE)
+        self.assertTrue(sched._is_owner_named({"meeting_id": "anzhee-vystavka-st1"}))
+
+    def test_a_live_record_still_beats_a_dead_one(self):
+        # Порядок ступеней не перевернулся: живая запись важнее имени.
+        dead_named = dict(self.owner_rec); dead_named["enabled"] = False
+        _res, data = _apply([{"n": 1, "action": "accept_once", "room": None}],
+                            [self.item], watched_records=[dead_named, self.bare])
+        live = [r["id"] for r in _gcal_records(data) if r.get("enabled", True)]
+        self.assertEqual(live, ["oneoff-1a2b3c4d"], live)
+
+
+class TestNoOnAnInstanceOfAWatchedSeries(unittest.TestCase):
+    """🟡 «Нет» по копии встречи, которую приносит ВЕДОМАЯ СЕРИЯ.
+
+    Отказ ищет близнецов только среди разовых записей: «серия» и «экземпляр» —
+    разные обещания владельцу, и гасить всю серию из-за одного «нет» нельзя. Но
+    и обещание «не записываю, больше про эту встречу не спрошу» надо исполнить:
+    раньше бот всё равно приходил — по записи серии.
+    """
+
+    def setUp(self):
+        self.start = _soon(5)
+        self.other_start = _soon(29)
+        self.series_rec = _rec_series(
+            "anzhee-direktorat", CAL_ANZHEE, "rec-direktorat",
+            ical_uid=ICAL_VYSTAVKA, event_start_at=self.start.isoformat(),
+            event_url=ROOM_URL, telegram_chat_id=-5589869859,
+        )
+        self.copy = _snapshot_item(1, CAL_MAIN, "evt-personal-copy", self.start,
+                                   ical_uid=ICAL_VYSTAVKA, recurring=None)
+
+    def _reject(self):
+        return _apply([{"n": 1, "action": "reject", "room": None}], [self.copy],
+                      watched_records=[self.series_rec])
+
+    def test_the_series_itself_is_not_switched_off(self):
+        _res, data = self._reject()
+        series = [r for r in _gcal_records(data) if r["id"] == "anzhee-direktorat"][0]
+        self.assertTrue(series.get("enabled", True))
+        self.assertFalse(series.get("ignored", False))
+
+    def test_the_bot_does_not_come_to_that_meeting(self):
+        # 🔴 Ядро находки: обещание «не записываю» обязано исполниться делом.
+        _res, data = self._reject()
+        events = {CAL_ANZHEE: [
+            _event("inst-1", self.start, ical_uid=ICAL_VYSTAVKA,
+                   recurring="rec-direktorat"),
+            _event("inst-2", self.other_start, ical_uid=ICAL_VYSTAVKA,
+                   recurring="rec-direktorat"),
+        ]}
+        _rc, queue, logs, _pushes = _run_scheduler(data["watched"], events)
+        starts = [it["start_at"] for it in queue]
+        self.assertEqual(len(queue), 1, starts)
+        self.assertEqual(queue[0]["start_at"], self.other_start.isoformat(),
+                         "погашен не тот старт: %s" % starts)
+        self.assertTrue(any("сказал «нет»" in m for m in logs), logs[-5:])
+
+    def test_owner_is_told_the_series_stays_on(self):
+        res, _data = self._reject()
+        said = " ".join(res["summary_lines"])
+        self.assertIn("anzhee-direktorat", said, said)
+        self.assertIn("не приду", said, said)
+
+    def test_a_series_without_this_meeting_is_never_skipped(self):
+        # Сторож обратной стороны: отказ гасит РОВНО свой старт. Другая серия в
+        # той же комнате в другое время идёт как шла.
+        _res, data = self._reject()
+        other = _rec_series("mpervyi-koord", CAL_ANZHEE, "rec-other")
+        events = {CAL_ANZHEE: [
+            _event("inst-other", self.other_start, ical_uid="other@google.com",
+                   recurring="rec-other"),
+        ]}
+        _rc, queue, _logs, _pushes = _run_scheduler(
+            data["watched"] + [other], events)
+        self.assertEqual([it["meeting_id"] for it in queue], ["mpervyi-koord"])
+
+    def test_a_broken_rejection_record_does_not_eat_the_queue(self):
+        # Fail-open: мусор в приметах отказа не имеет права оставить бота без
+        # стартов («бот не пришёл ни на одну встречу» — катастрофа).
+        broken = {"id": "oneoff-deadbeef", "series": "oneoff-deadbeef",
+                  "type": "google-calendar", "calendar_id": CAL_MAIN,
+                  "event_id": "evt-x", "enabled": False,
+                  "created_by_rejection": True, "event_start_at": "не дата"}
+        events = {CAL_ANZHEE: [
+            _event("inst-1", self.start, ical_uid=ICAL_VYSTAVKA,
+                   recurring="rec-direktorat"),
+        ]}
+        _rc, queue, _logs, _pushes = _run_scheduler([self.series_rec, broken], events)
+        self.assertEqual(len(queue), 1, queue)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

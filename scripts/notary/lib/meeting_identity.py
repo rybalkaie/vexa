@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+import re
 from collections import namedtuple
 from datetime import datetime, timezone
 from typing import Any
@@ -97,6 +98,26 @@ def compare(a: Fingerprint, b: Fingerprint, *, series_scope: bool = False) -> tu
     if same_start and a.url and a.url == b.url:
         return (MATCH_ROOM, both_ical and a.ical != b.ical)
     return (MATCH_NONE, False)
+
+
+# Автоимя, которое выдаёт вечерний блок новой записи (`make_record_id`):
+# `oneoff-<8 hex>` / `series-<8 hex>`. Всё остальное имя дал владелец руками.
+AUTO_RECORD_ID_RE = re.compile(r"^(?:oneoff|series)-[0-9a-f]{8}$")
+
+
+def is_owner_named(record_id: Any) -> bool:
+    """Имя записи дал ВЛАДЕЛЕЦ (а не автогенератор вечернего блока)?
+
+    Второй вопрос, который задают ОБА дедупа: «эти два описания про одну
+    встречу?» решает `compare`, а «какую из копий вести/оживлять?» — вот это.
+    На записи с человеческим именем висят привязка чата, разметка
+    company/visibility и режим открытых вопросов; автоимя `oneoff-<hash>` —
+    расходный материал вечернего блока. Пока правило было списано в двух
+    файлах по-разному (`scheduler._pick_winner` знал про имя, а
+    `meetings_apply_reply._dup_rank` — нет), планировщик вёл встречу по одной
+    записи, а владельцу называлась и лечилась приметами другая.
+    """
+    return not AUTO_RECORD_ID_RE.match(str(record_id or ""))
 
 
 def proof_ru(proof: str, a: Fingerprint) -> str:

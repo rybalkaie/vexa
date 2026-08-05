@@ -550,12 +550,23 @@ class TestIdempotencyAndSelfHealing(unittest.TestCase):
         env.save.assert_called_once()
         self.assertEqual([r["open_questions_mode"] for r in w["watched"]],
                          ["last-only", "last-only"])
-        self.assertIn("и так в режиме шпаргалки", _said(env.send))
+        # 🔴 ШОВ (сквозная проверка, S4): «какой режим сейчас» обязано быть ОДНИМ
+        # ответом на обе ветки команды и совпадать с ФАКТИЧЕСКИМ поведением бота.
+        # Мёртвая запись с явным `carry` включает fail-safe боевого резолвера
+        # (`_explicit_carry_signal`): дайджест и протокол по этой серии реально
+        # шли в накоплении. Значит команда «режим шпаргалка» здесь — НАСТОЯЩЕЕ
+        # переключение, и говорить «и так в шпаргалке, формат не меняется»
+        # (прежний ответ по букве реестра) означало соврать: формат менялся, а
+        # людей в чате никто не предупреждал.
+        self.assertIn("теперь в режиме шпаргалки", _said(env.send))
 
     def test_disabled_record_no_longer_hijacks_live_series(self):
         # Тот же реестр, но команда — в ПРОТИВОПОЛОЖНУЮ сторону: живая запись
-        # last-only, мёртвая carry. Раньше бот отвечал «и так в накоплении»
-        # (по мёртвой) и не менял ничего.
+        # last-only, мёртвая carry. Реестр после команды лечится (во всех
+        # записях `carry`), а формат встреч при этом действительно НЕ меняется:
+        # боевой резолвер и до команды считал серию накоплением (fail-safe по
+        # явному сигналу мёртвой записи). Ответ обязан говорить именно это —
+        # и он тот же самый, что даст ветка «в каком режиме серия».
         w = _watched(_rec("koord", telegram_chat_id=GROUP, enabled=False, ignored=True,
                           open_questions_mode="carry"),
                      _rec("koord", telegram_chat_id=GROUP, open_questions_mode="last-only"))
@@ -563,7 +574,65 @@ class TestIdempotencyAndSelfHealing(unittest.TestCase):
             ml.maybe_route_to_mode_command("tok", GROUP, OWNER, _msg("режим накопление"))
         env.save.assert_called_once()
         self.assertEqual(registry.series_open_questions_mode("koord", w), "carry")
-        self.assertIn("теперь в режиме накопления", _said(env.send))
+        self.assertEqual([r["open_questions_mode"] for r in w["watched"]],
+                         ["carry", "carry"])
+        self.assertIn("и так в режиме накопления", _said(env.send))
+
+
+# ==========================================================================
+# 3в. ШОВ Ф1↔Ф2: обе ветки команды отвечают ОДНО и то же (сквозная проверка, S4)
+# ==========================================================================
+class TestBothBranchesAgreeOnTheCurrentMode(unittest.TestCase):
+    """🔴 Опечатка в реестре ломала отчёт команды.
+
+    `open_questions_mode: карри` (ровно то, что рождает ручная раскладка режимов
+    при выкатке) резолвер реестра читает как «поле не задано» и отдаёт дефолт
+    `last-only`, а боевой путь (дайджест, протокол, сверщик) в этом случае
+    ОСТАЁТСЯ в накоплении: потерять хвост необратимо, показать лишний — нет.
+    Ветка «вопрос» этот fail-safe спрашивала, ветка «команда» — нет. Итог: на
+    «режим шпаргалка» бот рапортовал «и так в шпаргалке, формат встреч не
+    меняется, участников не беспокоил», реально переводя серию из накопления в
+    справку и никого не предупредив.
+    """
+
+    TYPO = "карри"
+
+    def test_query_and_command_call_the_same_resolver(self):
+        w = _watched(_rec("koord", telegram_chat_id=GROUP, open_questions_mode=self.TYPO))
+        self.assertEqual(ml._oq_effective_mode("koord", w), "carry")
+        self.assertEqual(registry.series_open_questions_mode("koord", w), "last-only")
+
+    def test_typo_makes_the_command_a_real_switch(self):
+        w = _watched(_rec("koord", telegram_chat_id=GROUP, open_questions_mode=self.TYPO))
+        with _route_env(w, display_map={"koord": "Координация"}) as env:
+            ml.maybe_route_to_mode_command("tok", GROUP, OWNER, _msg("режим шпаргалка"))
+        said = _said(env.send)
+        self.assertIn("теперь в режиме шпаргалки", said)
+        self.assertNotIn("формат встреч не меняется", said)
+        self.assertEqual(registry.series_open_questions_mode("koord", w), "last-only")
+
+    def test_participants_are_warned_when_the_format_really_changes(self):
+        # Команда из лички: люди в чате серии обязаны узнать о смене формата.
+        w = _watched(_rec("koord", telegram_chat_id=GROUP, open_questions_mode=self.TYPO))
+        with _route_env(w) as env:
+            ml.maybe_route_to_mode_command(
+                "tok", OWNER, OWNER, _msg("режим шпаргалка koord", chat=OWNER))
+        chats = [c.args[1] for c in env.send.call_args_list]
+        self.assertIn(GROUP, chats, "чат серии не предупредили: %s" % chats)
+
+    def test_both_branches_say_the_same_words_about_the_typo_registry(self):
+        w = _watched(_rec("koord", telegram_chat_id=GROUP, open_questions_mode=self.TYPO))
+        with _route_env(w, display_map={"koord": "Координация"}) as env:
+            ml.maybe_route_to_mode_command("tok", GROUP, OWNER, _msg("режим"))
+        asked = _said(env.send)
+        w2 = _watched(_rec("koord", telegram_chat_id=GROUP, open_questions_mode=self.TYPO))
+        with _route_env(w2, display_map={"koord": "Координация"}) as env2:
+            ml.maybe_route_to_mode_command("tok", GROUP, OWNER, _msg("режим накопление"))
+        commanded = _said(env2.send)
+        self.assertIn("в режиме накопления", asked)
+        self.assertIn("и так в режиме накопления", commanded)
+        # И реестр после команды вылечен: опечатки в нём больше нет.
+        self.assertEqual([r["open_questions_mode"] for r in w2["watched"]], ["carry"])
 
 
 # ==========================================================================

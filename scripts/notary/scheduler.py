@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -42,10 +41,12 @@ from notary.cli.registry import (  # noqa: E402
 )
 from notary.lib.cron_expand import expand_cron  # noqa: E402
 from notary.lib.meeting_identity import (  # noqa: E402
+    AUTO_RECORD_ID_RE,
     MATCH_NONE,
     compare,
     fingerprint,
     ical_key,
+    is_owner_named,
     proof_ru,
 )
 from notary.lib.gcal import (  # noqa: E402
@@ -77,8 +78,10 @@ MCP_DEAD_THRESHOLD_HOURS = 1
 # ISS-54: id, который бот сгенерировал сам (вечерний блок, `make_record_id`).
 # При схлопывании дубля побеждает запись с человеческим именем: её вёл владелец,
 # и на ней висят привязка чата, разметка company/visibility и режим открытых
-# вопросов. Автоимя — расходный материал.
-AUTO_MEETING_ID_RE = re.compile(r"^(?:oneoff|series)-[0-9a-f]{8}$")
+# вопросов. Автоимя — расходный материал. Само правило живёт в
+# `lib/meeting_identity` — ОДНО на планировщик и на реестр (apply-reply брал
+# среди двух живых копий просто первую в файле и называл владельцу не ту).
+AUTO_MEETING_ID_RE = AUTO_RECORD_ID_RE
 
 # ISS-54: кого мы выбрали вести встречу в прошлые тики. Схлопывание жило в
 # памяти одного прогона, и это давало ВТОРОГО бота на ровном месте: если в
@@ -175,6 +178,13 @@ def main() -> int:
     # Сортируем очередь по времени старта.
     queue.sort(key=lambda x: x.get("start_at", ""))
 
+    # ISS-53: «нет» по встрече, которую приносит ЖИВАЯ запись серии из второго
+    # календаря. Fail-open — сбой не имеет права унести очередь целиком.
+    try:
+        queue = drop_rejected_occurrences(queue, items_in_yaml)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Отсев отказных стартов упал (%s) — очередь как есть", e)
+
     # ISS-54: одно и то же событие, видное в двух календарях, приезжает сюда
     # двумя элементами с разными meeting_id/event_id — и на встречу приходят два
     # бота. Схлопываем ДО записи очереди: это последний рубеж, где виден весь
@@ -238,7 +248,73 @@ def main() -> int:
 
 
 def _is_owner_named(item: dict[str, Any]) -> bool:
-    return not AUTO_MEETING_ID_RE.match(str(item.get("meeting_id") or ""))
+    return is_owner_named(item.get("meeting_id"))
+
+
+# ISS-53 (шов Ф4↔Ф5): «нет» по конкретной встрече оставляет в реестре мёртвую
+# запись-отказ с приметами (`created_by_rejection`). Планировщик мёртвые записи
+# не раскрывает — и обычно этого хватает. Но если ту же встречу приносит ЖИВАЯ
+# запись (та же встреча видна вторым календарём как экземпляр уже ведомой СЕРИИ),
+# отказ оставался словами: бот приходил, хотя владельцу сказано «не записываю».
+# Гасить саму серию нельзя — «нет» сказано про ОДНУ встречу, а не про серию,
+# поэтому пропускаем ровно этот старт.
+def _rejected_fingerprints(watched_records: list[dict[str, Any]]) -> list:
+    out: list = []
+    for rec in watched_records or []:
+        if not isinstance(rec, dict):
+            continue
+        if not rec.get("created_by_rejection"):
+            continue
+        if rec.get("enabled", True) or rec.get("ignored", False):
+            # Отказ сняли («да» после «нет») либо он дорос до «никогда» —
+            # запись работает по общим правилам, старты гасить не наше дело.
+            continue
+        fp = fingerprint(rec.get("event_start_at"), rec.get("event_url"),
+                         rec.get("ical_uid"))
+        if fp.start and (fp.ical or fp.url):
+            out.append((rec.get("id"), fp))
+    return out
+
+
+def drop_rejected_occurrences(
+    queue: list[dict[str, Any]], watched_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Выкинуть из очереди старты, по которым владелец сказал «нет».
+
+    Сравнение — общей формулой тождества (`compare`, БЕЗ `series_scope`: отказ
+    всегда про один экземпляр, и общий `iCalUID` серии сам по себе старт не
+    гасит — нужно совпадение секунды старта).
+
+    Fail-open, как и весь дедуп очереди: любой сбой → очередь как есть. «Бот
+    пришёл на встречу, от которой отказались» неприятно, «бот не пришёл ни на
+    одну» — катастрофа.
+    """
+    rejected = _rejected_fingerprints(watched_records)
+    if not rejected:
+        return queue
+    kept: list[dict[str, Any]] = []
+    for item in queue:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
+        hit = None
+        for rec_id, rfp in rejected:
+            proof, _conflict = compare(rfp, fp)
+            if proof:
+                hit = (rec_id, proof)
+                break
+        if hit is None:
+            kept.append(item)
+            continue
+        logger.info(
+            "Старт «%s» @ %s не ставлю: по этой встрече владелец сказал «нет» "
+            "(запись отказа «%s», %s). Саму серию веду дальше — отказ был про "
+            "одну встречу",
+            item.get("meeting_id"), item.get("start_at"), hit[0],
+            proof_ru(hit[1], fp),
+        )
+    return kept
 
 
 def _memory_keys(fp) -> list[str]:

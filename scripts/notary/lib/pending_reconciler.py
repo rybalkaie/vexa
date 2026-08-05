@@ -1082,7 +1082,10 @@ def _hanging_items(series_dir: Path) -> list[str]:
     """
     try:
         digests = series_memory.list_series_digests(Path(series_dir))
-        fresh = series_memory.resolve_open_tasks(digests)
+        # `series_dir` — отсечка «счёт с чистого листа» (решение владельца 7):
+        # сверщик не имеет права поднимать (и закрывать) то, что бот обещал
+        # больше не поднимать.
+        fresh = series_memory.resolve_open_tasks(digests, series_dir=Path(series_dir))
         store = series_memory.load_task_status(Path(series_dir))
         merged = series_memory.merge_open_tasks_with_status(fresh, store)
         return list(merged.get("open") or [])

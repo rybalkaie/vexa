@@ -1219,5 +1219,234 @@ class TestForcedResend(unittest.TestCase):
         self.assertIsNone(md.digest_mode_for_message(self.fx.dir, -100500, 999))
 
 
+# ==========================================================================
+# 9. Т6 (решение владельца 7): возврат в накопление — счёт с ЧИСТОГО ЛИСТА
+# ==========================================================================
+# 🔴 ШОВ, найденный сквозной проверкой (S1). «Чистый лист» был обещан двумя
+# сообщениями бота — подтверждением владельцу («то, что копилось до
+# переключения, я не поднимаю») и строкой всему чату серии, — но кодом не
+# реализован НИГДЕ: он получался ПОБОЧНО из того, что протокол в шпаргалке
+# печатается без раздела хвоста. Стоило переключить в справку и передумать в тот
+# же день (встречи между переключениями не было — хвост не перегенерировался), и
+# весь до-переключательный ком возвращался целиком: в дайджест, в раздел
+# протокола и дальше копиться. Единственный тест про «чистый лист» сверял ТЕКСТ
+# подтверждения, поэтому поведение никто не держал.
+#
+# Тесты ниже держат ПОВЕДЕНИЕ. Даты фикстур считаются от «сегодня» — отсечку
+# ставит команда бота по часам, и вмороженные даты сделали бы тест зависимым от
+# того, какое сегодня число на машине.
+def _days_ago(n: int) -> str:
+    return (datetime.now(MSK).date() - timedelta(days=n)).isoformat()
+
+
+def _today_msk() -> str:
+    return datetime.now(MSK).date().isoformat()
+
+
+class TestCleanSlateOnReturnToCarry(unittest.TestCase):
+
+    OLD_A = "Пётр: согласовать бюджет"
+    OLD_B = "Анна: прислать смету"
+    FRESH = "Иван: закрыть договор"
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.tmpdir.name)
+        self.addCleanup(self.tmpdir.cleanup)
+        self.fx = _Series(self.tmp)
+        # Две встречи ДО переключения: ком копился как обычно.
+        self.fx.meeting(_days_ago(14), fresh=[self.OLD_A])
+        self.fx.meeting(_days_ago(7), carried=[self.OLD_A], fresh=[self.OLD_B])
+
+    def _switch(self, watched, text, chat=-100500, owner=12345):
+        """Переключить режим НАСТОЯЩИМ роутом листенера (он и ставит отсечку)."""
+        msg = {"chat": {"id": chat}, "from": {"id": owner}, "message_id": 1,
+               "date": 1718000000, "text": text}
+        with mock.patch("notary.cli.registry.load_watched", return_value=watched), \
+             mock.patch("notary.cli.registry.save_watched"), \
+             mock.patch("notary.cli.registry.release_watched_lock"), \
+             mock.patch.object(ml, "_series_display_map", return_value={}), \
+             mock.patch.object(ml, "send_message", return_value=1):
+            claimed = ml.maybe_route_to_mode_command("tok", chat, owner, msg)
+        self.assertTrue(claimed, text)
+        return watched
+
+    def _open(self, watched):
+        with _registry(*watched["watched"]):
+            return md.collect_items(self.fx.dir, mode=CARRY)["open"]
+
+    def test_there_and_back_without_a_meeting_starts_from_zero(self):
+        # 🔴 ЯДРО Т6. Владелец попробовал шпаргалку и в тот же день передумал.
+        # Встречи между переключениями не было — и старый ком обязан НЕ вернуться.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        self.assertEqual(self._open(w), [],
+                         "старые вопросы поднялись после возврата в накопление")
+
+    def test_the_switch_writes_the_cutoff_to_every_record(self):
+        # Отсечка — не память процесса, а факт в реестре: переживает рестарт бота
+        # и одинаково видна дайджесту, протоколу, сверщику и ответам.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500),
+                     _rec(self.fx.series, CARRY, enabled=False))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        self.assertEqual(
+            [r.get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD) for r in w["watched"]],
+            [_today_msk(), _today_msk()])
+
+    def test_meeting_after_the_return_accumulates_again(self):
+        # «С ближайшей встречи вопросы снова копятся» — отсечка не выключает
+        # накопление навсегда, она только не поднимает старое.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        self.fx.meeting(_today_msk(), fresh=[self.FRESH])
+        self.assertEqual(self._open(w), [self.FRESH])
+
+    def test_protocol_tail_is_clean_too(self):
+        # Иначе «чистый лист» продержался бы ровно до следующего протокола:
+        # раздел хвоста парсится обратно в выжимку (`extract_open_tasks`), и ком
+        # въехал бы в накопление снова — уже официально.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        with _registry(*w["watched"]):
+            block = sm.build_open_tasks_block(
+                sm.list_series_digests(self.fx.dir), series_dir=self.fx.dir,
+                date=_today_msk())
+        self.assertNotIn("бюджет", block)
+        self.assertNotIn("смету", block)
+
+    def test_night_reconciler_does_not_raise_them_either(self):
+        # Сверщик спрашивает по своему универсуму: если бы отсечка стояла только
+        # в дайджесте, ночью бот всё равно вернулся бы к тем же вопросам.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        with _registry(*w["watched"]):
+            self.assertEqual(pr._hanging_items(self.fx.dir), [])
+
+    def test_reply_universe_matches_what_is_shown(self):
+        # Универсум ответов обязан совпадать с показом: иначе ординал «закрой
+        # первую» уехал бы на пункт, которого человек не видел.
+        from notary.lib import pending_status_reply as psr  # noqa: PLC0415
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        with _registry(*w["watched"]):
+            universe = psr.load_series_pending(self.fx.dir)
+        self.assertNotIn(self.OLD_A, universe)
+        self.assertNotIn(self.OLD_B, universe)
+
+    def test_same_question_raised_again_after_the_cutoff_is_shown(self):
+        # 🔴 Тонкое место отсечки: пункт, снятый чистым листом, могут поставить
+        # заново теми же словами. Считай мы происхождение «первым появлением за
+        # всю историю», он не показался бы НИКОГДА — тихая потеря живого вопроса.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим шпаргалка")
+        self._switch(w, "режим накопление")
+        self.fx.meeting(_today_msk(), fresh=[self.OLD_A])
+        self.assertEqual(self._open(w), [self.OLD_A])
+
+    def test_repeat_of_the_same_command_does_not_wipe_the_tail(self):
+        # Серия и так в накоплении, владелец повторил команду (или разложил
+        # режимы руками при выкатке) — хвост трогать НЕЛЬЗЯ: он живёт только в
+        # разделе протокола, и стереть его нечем будет восстановить.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим накопление")
+        self.assertIsNone(w["watched"][0].get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD))
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
+
+    def test_healing_a_diverged_registry_does_not_wipe_the_tail(self):
+        # 🔴 Опаснее повтора: записи серии разошлись (у второй поля нет), и
+        # команда «режим накопление» реестр ЛЕЧИТ — то есть до записи доходит.
+        # Формат встреч при этом не меняется, значит отсечку ставить нельзя:
+        # иначе ремонтная команда (и ручная раскладка режимов при выкатке)
+        # стирала бы накопленный хвост, а восстановить его нечем.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500),
+                     _rec(self.fx.series))
+        self._switch(w, "режим накопление")
+        self.assertEqual([r["open_questions_mode"] for r in w["watched"]],
+                         [CARRY, CARRY])   # реестр вылечен
+        self.assertEqual([r.get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD)
+                          for r in w["watched"]], [None, None])
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
+
+    def test_switch_to_last_only_alone_sets_no_cutoff(self):
+        # Отсечку ставит ВОЗВРАТ в накопление, а не уход в справку: иначе серия,
+        # которую перевели в шпаргалку и оставили там, потеряла бы хвост молча.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self._switch(w, "режим шпаргалка")
+        self.assertIsNone(w["watched"][0].get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD))
+
+    def test_no_cutoff_in_registry_keeps_the_whole_tail(self):
+        # Фолбэк для боевого реестра, разложенного руками (Ф7): поля нет —
+        # поведение ровно прежнее.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
+
+    def test_garbage_cutoff_is_ignored(self):
+        # Опечатка в дате — не повод молча стереть хвост.
+        w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500,
+                          open_questions_carry_since="вчера"))
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
+        self.assertIsNone(reg.series_open_questions_carry_since(self.fx.series, w))
+
+    def test_unreadable_registry_keeps_the_whole_tail(self):
+        # Реестр не читается (нет PyYAML, битый YAML) → отсечки не знаем →
+        # ведём себя как вчера. Ошибка в сторону лишнего хвоста обратима.
+        with mock.patch.object(sm, "load_watched_for_modes", side_effect=SystemExit(1)):
+            items = md.collect_items(self.fx.dir, mode=CARRY)
+        self.assertEqual(len(items["open"]), 2)
+
+    def test_last_only_series_is_untouched_by_the_cutoff(self):
+        # Шпаргалка собирается из раздела «Задачи» протокола и отсечки не знает —
+        # проверяем, что мы не сломали её заодно.
+        w = _watched(_rec(self.fx.series, LAST_ONLY, telegram_chat_id=-100500,
+                          open_questions_carry_since=_today_msk()))
+        with _registry(*w["watched"]):
+            items = md.collect_items(self.fx.dir, mode=LAST_ONLY)
+        self.assertEqual(items["open"], [self.OLD_B])
+
+
+class TestCarrySinceRegistry(unittest.TestCase):
+    """Реестр как носитель отсечки: запись, чтение, валидация."""
+
+    def test_writer_stamps_every_record_of_the_series(self):
+        w = _watched(_rec("koord"), _rec("koord", enabled=False), _rec("other"))
+        n = reg.set_open_questions_mode_for_series("koord", CARRY, w,
+                                                   carry_since="2026-08-05")
+        self.assertEqual(n, 2)
+        self.assertEqual([r.get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD)
+                          for r in w["watched"]], ["2026-08-05", "2026-08-05", None])
+
+    def test_latest_cutoff_wins(self):
+        # Записи серии могли разойтись (одну добавили позже, реестр правили
+        # руками) — последнее решение владельца не имеет права ослабнуть.
+        w = _watched(_rec("koord", open_questions_carry_since="2026-07-01"),
+                     _rec("koord", open_questions_carry_since="2026-08-05"))
+        self.assertEqual(reg.series_open_questions_carry_since("koord", w), "2026-08-05")
+
+    def test_cutoff_without_carry_is_refused(self):
+        w = _watched(_rec("koord"))
+        with self.assertRaises(ValueError):
+            reg.set_open_questions_mode_for_series("koord", LAST_ONLY, w,
+                                                   carry_since="2026-08-05")
+        with self.assertRaises(ValueError):
+            reg.set_open_questions_mode_for_series("koord", CARRY, w, carry_since="05.08")
+
+    def test_validator_catches_a_typo_in_the_field(self):
+        rec = {"id": "koord-evt", "series": "koord", "type": "manual",
+               "cron": "0 11 * * 2", "tz": "Europe/Moscow",
+               reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD: "2026-8-5"}
+        errors = reg.validate_watched_record(rec, {"rooms": []})
+        self.assertTrue(any(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD in e for e in errors),
+                        errors)
+        rec[reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD] = "2026-08-05"
+        self.assertEqual(reg.validate_watched_record(rec, {"rooms": []}), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

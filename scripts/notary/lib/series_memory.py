@@ -436,6 +436,137 @@ def _remember_watched(registry_mod, data) -> None:
         _WATCHED_CACHE["key"], _WATCHED_CACHE["data"] = key, data
 
 
+def open_questions_carry_since(
+    series: Optional[str], *, watched: Optional[dict] = None
+) -> Optional[str]:
+    """Отсечка «счёт с чистого листа» серии (`YYYY-MM-DD`) или None (её нет).
+
+    Решение владельца 7: возврат серии в накопление начинает счёт С МОМЕНТА
+    ПЕРЕКЛЮЧЕНИЯ — то, что копилось до перехода в шпаргалку, не поднимается.
+    Ровно это бот обещает и владельцу («счёт идёт с чистого листа»), и всему
+    чату серии («старые вопросы не поднимаю»).
+
+    Обёртка над реестром, зеркальная `open_questions_mode`, но фолбэк ДРУГОЙ:
+    любая беда (нет PyYAML, битый YAML, серии нет) → None = «отсечки нет» =
+    прежнее поведение. Ошибиться в сторону лишнего хвоста можно (владелец
+    закроет вопросы руками), в сторону потерянного — нет.
+    """
+    if watched is None:
+        try:
+            watched = load_watched_for_modes()
+        except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort
+            logger.warning("[open-tasks] отсечка накопления не прочитана (%s) — "
+                           "показываю хвост целиком", type(e).__name__)
+            return None
+    if not watched:
+        return None
+    try:
+        try:
+            from notary.cli.registry import (  # noqa: PLC0415
+                series_open_questions_carry_since,
+            )
+        except ImportError:  # окружение без пакета `notary`
+            from cli.registry import (  # noqa: PLC0415
+                series_open_questions_carry_since,
+            )
+        return series_open_questions_carry_since(series, watched)
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        logger.warning("[open-tasks] отсечка накопления серии %s не прочитана (%s)",
+                       series, type(e).__name__)
+        return None
+
+
+def _digest_keys(dig: dict, key: str) -> set:
+    return {
+        k for k in (_status_key(_open_task_text(t)) for t in (dig.get(key) or []))
+        if k
+    }
+
+
+def _tail_run_origins(digests: Optional[list]) -> dict:
+    """Для задач ХВОСТА — дата, с которой они держатся в нём БЕЗ ПЕРЕРЫВА.
+
+    Считаем от самой свежей выжимки НАЗАД и останавливаем полосу пункта на
+    первой же встрече, где он ЗАПИСАН КАК СВОЙ (`open_tasks_born_here` — раздел
+    «Задачи» протокола) либо где его в хвосте не было вовсе.
+
+    Почему не `origin_dates_for_tasks` (самое раннее появление ЗА ВСЮ историю):
+    после отсечки старый пункт из хвоста исчезает, но ту же задачу могут
+    поставить заново теми же словами — и по «самому раннему появлению» она
+    навсегда считалась бы до-отсечечной и не показывалась бы НИКОГДА. Тихо
+    потерять живой вопрос хуже, чем показать лишний.
+
+    Выжимки СТАРОГО формата (без пометки происхождения) полосу не обрывают —
+    для них работает только правило «пропал из хвоста»; это ровно то, что даёт
+    прежнее поведение там, где происхождение неизвестно.
+    """
+    items = [d for d in (digests or [])
+             if isinstance(d, dict) and isinstance(d.get("date"), str) and d.get("date")]
+    if not items:
+        return {}
+    latest = items[-1]
+    origins: dict = {}
+    for t in latest.get("open_tasks") or []:
+        k = _status_key(_open_task_text(t))
+        if k:
+            origins[k] = latest["date"]
+    # Помеченное «родилось здесь» дальше не отматываем — происхождение известно точно.
+    alive = set(origins) - _digest_keys(latest, OPEN_TASKS_BORN_HERE_KEY)
+    for dig in reversed(items[:-1]):
+        if not alive:
+            break
+        present = alive & _digest_keys(dig, "open_tasks")
+        for k in present:
+            origins[k] = dig["date"]
+        alive = present - _digest_keys(dig, OPEN_TASKS_BORN_HERE_KEY)
+    return origins
+
+
+def _drop_tasks_before_carry_since(
+    tasks: list, digests: Optional[list], series_dir: Optional[Path],
+    *, watched: Optional[dict] = None,
+) -> list:
+    """Убрать из хвоста то, что копилось ДО возврата серии в накопление.
+
+    Единственная реализация решения 7 — стоит на общем корне хвоста
+    (`_resolve_open_tasks_raw`), поэтому одинаково действует на дайджест, на
+    раздел протокола, на универсум ответов и на ночного сверщика. Без неё
+    «чистый лист» получался побочно (протокол шпаргалки идёт без раздела хвоста)
+    и разваливался ровно в самом вероятном сценарии: переключил в шпаргалку,
+    в тот же день передумал — встречи между переключениями не было, хвост не
+    перегенерировался, и весь ком возвращался.
+
+    Имя серии берём из каталога (`<protocols_root>/<series>`) — так же, как это
+    делают статус-стор и сверщик. Нет каталога / нет отсечки / origin пункта
+    неизвестен → НИЧЕГО не режем (fail-safe в сторону старого поведения).
+    """
+    if series_dir is None or not tasks:
+        return tasks
+    series_name = Path(series_dir).name
+    if not series_name:
+        return tasks
+    since = open_questions_carry_since(series_name, watched=watched)
+    if not since:
+        return tasks
+    # Полосу считаем по ТОМУ ЖЕ списку выжимок, из которого собран хвост. Один
+    # caller (`build_open_tasks_block` на холодном старте) отдаёт только самую
+    # свежую — тогда все пункты считаются свежими и не режется ничего. Это
+    # безопасная сторона (лишний хвост обратим, потерянный — нет), а холодный
+    # старт по определению значит, что копить эта серия ещё не начинала.
+    origins = _tail_run_origins(digests)
+    kept = []
+    for t in tasks:
+        origin = origins.get(_status_key(t))
+        if origin is not None and origin < since:
+            continue
+        kept.append(t)
+    if len(kept) != len(tasks):
+        logger.info("[open-tasks] серия %s: счёт с чистого листа с %s — не поднимаю "
+                    "%d пункт(ов), копившихся до переключения",
+                    series_name, since, len(tasks) - len(kept))
+    return kept
+
+
 def carries_open_questions(series: Optional[str], *, watched: Optional[dict] = None) -> bool:
     """`True` — серия-накопление (`carry`): хвост в протоколе, статусы, сверщик.
 
@@ -1624,8 +1755,18 @@ def format_memory_block(digests: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Ф8 — трекинг открытых задач серии во времени (G9)
 # ---------------------------------------------------------------------------
-def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
+def _resolve_open_tasks_raw(
+    digests: list[dict], *, series_dir: Optional[Path] = None,
+    watched: Optional[dict] = None,
+) -> list[str]:
     """Хвост открытых задач из САМОЙ СВЕЖЕЙ выжимки, дедуплицированный, БЕЗ капа.
+
+    `series_dir` (решение владельца 7) — применить отсечку «счёт с чистого
+    листа»: если серию возвращали в накопление, всё, что копилось ДО того
+    момента, из хвоста уходит. Не передан → отсечки нет, поведение прежнее.
+    ОДНО место на всех потребителей хвоста (дайджест, раздел протокола,
+    универсум ответов, ночной сверщик) — иначе «чистый лист» держался бы в
+    одном месте и протекал в трёх остальных.
 
     Выделено из `resolve_open_tasks`, чтобы Ф2-слияние (`build_open_tasks_block`)
     накладывало статусы на ПОЛНЫЙ хвост и капило уже ВИСЯЩИЕ — иначе закрытая задача
@@ -1655,7 +1796,7 @@ def _resolve_open_tasks_raw(digests: list[dict]) -> list[str]:
         if s and k and k not in seen:
             seen.add(k)
             out.append(s)
-    return out
+    return _drop_tasks_before_carry_since(out, digests, series_dir, watched=watched)
 
 
 def _resolve_minor_open_tasks_raw(digests: list[dict]) -> list[str]:
@@ -1697,7 +1838,9 @@ def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
     return out[:cap] if cap > 0 else out
 
 
-def resolve_open_tasks(digests: list[dict]) -> list[str]:
+def resolve_open_tasks(
+    digests: list[dict], *, series_dir: Optional[Path] = None,
+) -> list[str]:
     """Ф8: открытые задачи серии для подачи в промпт генерации (Вызов 1).
 
     Берём `open_tasks` из САМОЙ СВЕЖЕЙ выжимки (`digests` по дате ВОЗРАСТАНИЮ → [-1]).
@@ -1706,9 +1849,10 @@ def resolve_open_tasks(digests: list[dict]) -> list[str]:
     Поэтому достаточно последней — она уже учитывает все предыдущие состояния;
     старые выжимки не подмешиваем, иначе воскресили бы давно закрытые задачи.
     Нет выжимок / нет ключа (история до Ф8) / пусто → [] (блок не строится). Capped
-    `open_tasks_max()`.
+    `open_tasks_max()`. `series_dir` — см. `_resolve_open_tasks_raw` (отсечка
+    «счёт с чистого листа», решение владельца 7).
     """
-    out = _resolve_open_tasks_raw(digests)
+    out = _resolve_open_tasks_raw(digests, series_dir=series_dir)
     cap = open_tasks_max()
     return out[:cap] if cap > 0 else out
 
@@ -2200,7 +2344,7 @@ def build_open_tasks_block(
         digests_for_tail = (digests[-1:] if digests else []) if cold_start else digests
         # Раскручиваем хвост БЕЗ капа, накладываем статусы, и капим уже ВИСЯЩИЕ —
         # чтобы закрытая задача не съедала слот капа у живого висяка (Ф2).
-        fresh = _resolve_open_tasks_raw(digests_for_tail)
+        fresh = _resolve_open_tasks_raw(digests_for_tail, series_dir=series_dir)
         store = load_task_status(series_dir) if series_dir is not None else {}
         merged = merge_open_tasks_with_status(fresh, store)
         cap = open_tasks_max()

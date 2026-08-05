@@ -314,6 +314,18 @@ VALID_GENRES = {"директорат", "координация", "продук�
 VALID_OPEN_QUESTIONS_MODES = {"carry", "last-only"}
 DEFAULT_OPEN_QUESTIONS_MODE = "last-only"
 
+# ISS-51…55, решение владельца 7: возврат серии в накопление начинает счёт С
+# ЧИСТОГО ЛИСТА — вопросы, копившиеся до переключения, не поднимаются. Дата
+# (`YYYY-MM-DD`, пояс выжимок) ставится ТОЛЬКО в момент реального переключения в
+# `carry` командой бота. Пока «чистый лист» был лишь обещанием в тексте
+# подтверждения, он получался ПОБОЧНО — из того, что протокол в шпаргалке идёт
+# без раздела хвоста; стоило переключить туда и обратно, не проведя ни одной
+# встречи, и весь до-переключательный ком возвращался целиком.
+# Поля нет (реестр разложен руками, серия никогда не переключалась) → отсечки
+# нет → прежнее поведение.
+OPEN_QUESTIONS_CARRY_SINCE_FIELD = "open_questions_carry_since"
+_CARRY_SINCE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[str]:
     errors: list[str] = []
@@ -372,6 +384,16 @@ def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[
             errors.append(
                 f"open_questions_mode={oqm!r}: допустимо "
                 f"{sorted(VALID_OPEN_QUESTIONS_MODES)} или отсутствие"
+            )
+    # Решение владельца 7: отсечка «счёт с чистого листа». Дата или отсутствие;
+    # мусор ловим здесь, потому что читатель его молча игнорирует (нет отсечки =
+    # старое поведение), и без валидации опечатка жила бы в файле незамеченной.
+    since = rec.get(OPEN_QUESTIONS_CARRY_SINCE_FIELD)
+    if since is not None:
+        if not isinstance(since, str) or not _CARRY_SINCE_RE.match(since.strip()):
+            errors.append(
+                f"{OPEN_QUESTIONS_CARRY_SINCE_FIELD}={since!r}: допустима дата "
+                "YYYY-MM-DD или отсутствие"
             )
     return errors
 
@@ -713,12 +735,19 @@ def set_telegram_chat_id_for_series(series: str, chat_id: int, watched: dict[str
 
 
 def set_open_questions_mode_for_series(
-    series: str, mode: str, watched: dict[str, Any]
+    series: str, mode: str, watched: dict[str, Any], *, carry_since: str | None = None
 ) -> int:
     """Ф2 (ISS-51…55): проставляет `open_questions_mode=<mode>` ВСЕМ записям серии.
 
     Возвращает число обновлённых записей. Caller обязан после этого вызвать
     `save_watched(watched)` (atomic + flock уже внутри `save_watched`).
+
+    `carry_since` (дата `YYYY-MM-DD`) — отсечка «счёт с чистого листа» решения
+    владельца 7. Ставится ТОЛЬКО вместе с `mode='carry'` и ТОЛЬКО когда серия
+    реально переезжает из шпаргалки в накопление. Повтор команды «режим
+    накопление» по серии, которая и так в накоплении, отсечку НЕ трогает —
+    иначе одна лишняя команда обнуляла бы накопленный хвост (а он живёт только
+    в разделе протокола, и восстановить его нечем).
 
     КОНВЕНЦИЯ ПОЛЯ (одна на всех, Ф2): единица владения `open_questions_mode` —
     СЕРИЯ, не запись. Пишем во ВСЕ записи серии (включая выключенные — чтобы
@@ -757,11 +786,42 @@ def set_open_questions_mode_for_series(
         raise ValueError(
             f"mode={mode!r}: допустимо {sorted(VALID_OPEN_QUESTIONS_MODES)}"
         )
+    if carry_since is not None:
+        if canon != "carry":
+            raise ValueError("carry_since имеет смысл только при mode='carry'")
+        if not isinstance(carry_since, str) or not _CARRY_SINCE_RE.match(carry_since.strip()):
+            raise ValueError(f"carry_since={carry_since!r}: нужна дата YYYY-MM-DD")
     n = 0
     for w in series_records(series, watched):
         w["open_questions_mode"] = canon
+        if carry_since is not None:
+            w[OPEN_QUESTIONS_CARRY_SINCE_FIELD] = carry_since.strip()
         n += 1
     return n
+
+
+def series_open_questions_carry_since(series: Any, watched: Any) -> str | None:
+    """Отсечка «счёт с чистого листа» серии (`YYYY-MM-DD`) или None.
+
+    Берём САМУЮ ПОЗДНЮЮ дату среди записей серии, а не первую валидную (как
+    company/visibility/genre): отсечку ставит команда бота сразу во ВСЕ записи,
+    и если одна из них отстала (её добавили позже, реестр правили руками),
+    старая дата не имеет права ослабить последнее решение владельца.
+
+    Мусор и нечитаемую дату игнорируем — «отсечки нет» значит «веду себя как
+    раньше». Это безопасная сторона: лишний хвост обратим, потерянный — нет.
+    """
+    latest: str | None = None
+    for w in series_records(series, watched):
+        raw = w.get(OPEN_QUESTIONS_CARRY_SINCE_FIELD)
+        if not isinstance(raw, str):
+            continue
+        val = raw.strip()
+        if not _CARRY_SINCE_RE.match(val):
+            continue
+        if latest is None or val > latest:
+            latest = val
+    return latest
 
 
 def series_records(series: Any, watched: Any) -> list[dict[str, Any]]:
