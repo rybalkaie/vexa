@@ -57,8 +57,16 @@ from notary.cli.registry import (  # noqa: E402
     load_rooms,
     load_watched,
     release_watched_lock,
+    resolve_room_to_url,
     save_watched,
     validate_watched_record,
+)
+from notary.lib.meeting_identity import (  # noqa: E402
+    MATCH_ICAL,
+    MATCH_ID,
+    MATCH_NONE,
+    compare,
+    fingerprint,
 )
 
 # STATE_DIR читаем из env — ровно как вечерний блок и остальные модули зоны.
@@ -513,7 +521,7 @@ def apply_decisions(
                     # известным всё, что есть в реестре, планировщик disabled-записи
                     # не берёт. Серия при этом жива — следующая встреча придёт с другим
                     # event_id и будет предложена (в этом и разница с ignore_forever).
-                    errors = _mark_rejected(item, data, rooms, today=today_day)
+                    errors, muted = _mark_rejected(item, data, rooms, today=today_day)
                     if errors:
                         # Отказ не записан — обещать «больше не спрошу» нельзя,
                         # и счётчик не растим: сохранять нечего.
@@ -523,10 +531,21 @@ def apply_decisions(
                             f"(но запомнить отказ не смог, спрошу ещё раз)"
                         )
                     else:
-                        summary_lines.append(
+                        line = (
                             f"{n}. {title} ({when}) — не записываю, "
                             f"больше про эту встречу не спрошу"
                         )
+                        if muted:
+                            # ISS-54: гасим не только копию, но и запись, по
+                            # которой бот реально приходил. Молча выключать
+                            # чужую живую запись нельзя — владелец должен
+                            # увидеть это в тот же вечер.
+                            line += (
+                                " (заодно выключил "
+                                + _muted_ru(muted)
+                                + " — это та же встреча из другого календаря)"
+                            )
+                        summary_lines.append(line)
                         rejected += 1
                     continue
 
@@ -537,19 +556,35 @@ def apply_decisions(
                     rec["ignored"] = True
                     # Не задваиваем — если уже есть с тем же id, обновим флаги.
                     existing = find_watched(rec["id"], data)
+                    # ISS-54: у копии из второго календаря id другой. Глушить надо
+                    # И её (иначе вечерний блок предложит копию завтра — он
+                    # ключует (calendar_id, event_id) и про близнеца не знает),
+                    # И ту запись, по которой бот реально приходит, — иначе
+                    # «никогда» останется обещанием на словах.
+                    muted = _mute_twins(
+                        item, data, rooms, skip=existing,
+                        series=bool(rec.get("recurring_event_id")), forever=True,
+                    )
                     if existing is not None:
                         existing["enabled"] = False
                         existing["ignored"] = True
                         # Была разовым отказом (у не-recurring встречи id тот же) —
                         # снимаем метки, иначе ретеншн через 30 дней съест «никогда».
                         _clear_rejection_marks(existing)
+                        _merge_fingerprint(existing, item, proof=MATCH_ID)
                     else:
                         errors = validate_watched_record(rec, rooms)
                         if errors:
                             skipped.append(f"{n}: {'; '.join(errors)}")
                             continue
                         data["watched"].append(rec)
-                    summary_lines.append(f"{n}. {title} ({when}) — больше не предлагаю эту серию")
+                    line = f"{n}. {title} ({when}) — больше не предлагаю эту серию"
+                    if muted:
+                        line += (
+                            " (заодно выключил " + _muted_ru(muted)
+                            + " — это та же встреча из другого календаря)"
+                        )
+                    summary_lines.append(line)
                     ignored += 1
                     continue
 
@@ -574,7 +609,18 @@ def apply_decisions(
                 rec = _build_record(item, room=chosen_room, kind_series_if_possible=is_series)
                 # Если такой id уже есть (например, повторное подтверждение) — пропускаем.
                 existing = find_watched(rec["id"], data)
+                duplicate = None
+                proof, conflict = MATCH_ID, False
+                if existing is None:
+                    # ISS-54: то же событие из другого календаря приезжает с
+                    # другим event_id → и id записи другой. Заводить вторую
+                    # запись нельзя: на встречу придут два бота.
+                    duplicate, proof, conflict = find_duplicate_watched(
+                        item, data, series=bool(rec.get("recurring_event_id")),
+                        rooms=rooms, room=chosen_room)
+                    existing = duplicate
                 if existing is not None:
+                    was_ignored = bool(existing.get("ignored"))
                     # обновим enabled=True, ignored=False — Илья «передумал»
                     existing["enabled"] = True
                     existing["ignored"] = False
@@ -583,9 +629,36 @@ def apply_decisions(
                     _clear_rejection_marks(existing)
                     if chosen_room:
                         existing["room"] = chosen_room
-                    summary_lines.append(
-                        f"{n}. {title} ({when}) — уже была в реестре, включил"
-                    )
+                    _merge_fingerprint(existing, item, proof=proof)
+                    if duplicate is not None:
+                        logger.info(
+                            "ISS-54: номер %s (%s) — та же встреча, что запись «%s» "
+                            "(%s; календарь %s vs %s); второй записи не завожу",
+                            n, item.get("start_at"), existing.get("id"), proof,
+                            existing.get("calendar_id"), item.get("calendar_id"),
+                        )
+                        line = (
+                            f"{n}. {title} ({when}) — это та же встреча, что уже "
+                            f"в реестре («{existing.get('id')}»), просто видна в двух "
+                            f"календарях: пишу по ней, второй записи не завожу"
+                        )
+                        if conflict:
+                            # Комната и секунда те же, а события календаря разные.
+                            # Схлопнуть обязаны (иначе два бота), но владелец
+                            # должен знать: возможно, он продублировал событие.
+                            line += (
+                                "; в календаре это два РАЗНЫХ события в одной "
+                                "комнате в одну секунду — проверь, если это "
+                                "разные встречи"
+                            )
+                        if was_ignored:
+                            line += "; снял с неё «больше не предлагать»"
+                        summary_lines.append(line)
+                    else:
+                        line = f"{n}. {title} ({when}) — уже была в реестре, включил"
+                        if was_ignored:
+                            line += ", снял «больше не предлагать»"
+                        summary_lines.append(line)
                     applied += 1
                     continue
 
@@ -703,14 +776,68 @@ def _clear_rejection_marks(rec: dict[str, Any]) -> None:
     rec.pop(REJECTION_OWNER_FIELD, None)
 
 
+def _muted_ru(ids: list[str]) -> str:
+    """«запись «X»» / «записи «X», «Y»» — для строки владельцу."""
+    quoted = ", ".join("«%s»" % i for i in ids)
+    return ("запись " if len(ids) == 1 else "записи ") + quoted
+
+
+def _mute_twins(
+    item: dict[str, Any],
+    data: dict[str, Any],
+    rooms: dict[str, Any],
+    *,
+    skip: dict[str, Any] | None,
+    series: bool,
+    forever: bool,
+) -> list[str]:
+    """Погасить ВСЕ записи-близнецы этой встречи. Возвращает их id.
+
+    Близнец — запись про ту же встречу под другим `event_id` (то же событие
+    видно во втором календаре). Если её не погасить, «нет» и «никогда» остаются
+    словами: бот всё равно придёт — по ней.
+
+    Гасим все найденные, а не первую: в боевом реестре на одну встречу уже лежат
+    две записи. Чужую (не нашу запись отказа) на удаление НЕ помечаем — иначе
+    ретеншн через 30 дней унёс бы её вместе с привязкой чата, разметкой
+    company/visibility и режимом открытых вопросов.
+    """
+    muted: list[str] = []
+    for twin, proof, _conflict in find_duplicates_watched(
+            item, data, series=series, rooms=rooms):
+        if twin is skip:
+            continue
+        was_live = bool(twin.get("enabled", True))
+        _merge_fingerprint(twin, item, proof=proof)
+        twin["enabled"] = False
+        if forever:
+            twin["ignored"] = True
+        if not twin.get(REJECTION_OWNER_FIELD):
+            _clear_rejection_marks(twin)
+        if not was_live:
+            # Запись и так была выключена — бот по ней не приходил, владельцу
+            # сообщать не о чем.
+            continue
+        muted.append(str(twin.get("id")))
+        logger.info(
+            "ISS-54: «%s» по копии встречи — выключил запись-близнеца «%s» "
+            "(%s; календарь %s vs %s)",
+            "никогда" if forever else "нет", twin.get("id"), proof,
+            twin.get("calendar_id"), item.get("calendar_id"),
+        )
+    return muted
+
+
 def _mark_rejected(
     item: dict[str, Any],
     data: dict[str, Any],
     rooms: dict[str, Any],
     *,
     today: date,
-) -> list[str]:
-    """ISS-53: записать отказ по КОНКРЕТНОМУ экземпляру. Возвращает ошибки валидации.
+) -> tuple:
+    """ISS-53: записать отказ по КОНКРЕТНОМУ экземпляру.
+
+    Возвращает (ошибки валидации, id погашенных записей-близнецов).
 
     Формат намеренно не новый: это обычная запись watched с `enabled=false`
     (её уже понимают и вечерний блок, и планировщик, и CLI) плюс метки —
@@ -743,33 +870,212 @@ def _mark_rejected(
         )
 
     existing = find_watched(rec["id"], data)
+    # ISS-54: «нет» пришло по копии события из второго календаря. Гасить надо
+    # запись-близнеца — иначе бот всё равно придёт по ней, и отказ владельца
+    # окажется услышанным только на словах.
+    muted = _mute_twins(item, data, rooms, skip=existing, series=False, forever=False)
+
     if existing is not None:
         existing["enabled"] = False
+        _merge_fingerprint(existing, item, proof=MATCH_ID)
         if existing.get("ignored"):
             # «Нет» пришло по записи-глушилке («не предлагай эту серию»). У
             # не-recurring встречи id отказа и id глушилки совпадают, и снятие
             # ignored понизило бы вечное «никогда» до 30-дневного отказа.
             logger.info("отказ %s: запись уже «никогда» — оставляю как есть", rec["id"])
-            return []
+            return ([], muted)
         if existing.get(REJECTION_OWNER_FIELD):
             # Повторное «нет» по той же встрече — не задваиваем, обновляем метки.
             existing["ignored"] = False
             existing["rejected_at"] = rec["rejected_at"]
             if "rejected_start_at" in rec:
                 existing["rejected_start_at"] = rec["rejected_start_at"]
-            return []
+            return ([], muted)
         # Запись вёл владелец — гасим, но не помечаем на удаление.
         _clear_rejection_marks(existing)
         logger.info(
             "отказ %s: запись владельца — выключил, метки отказа не ставлю", rec["id"]
         )
-        return []
+        return ([], muted)
 
+    # ISS-54/ISS-53: след под ключом САМОЙ копии нужен, даже когда близнеца уже
+    # погасили. Вечерний блок ключует (calendar_id, event_id) и про близнеца не
+    # знает — без этой записи он завтра предложит ту же встречу снова, сразу
+    # после обещания «больше про эту встречу не спрошу».
     errors = validate_watched_record(rec, rooms)
     if errors:
-        return errors
+        return (errors, muted)
     data["watched"].append(rec)
-    return []
+    return ([], muted)
+
+
+# ---------------------------------------------------------------------------
+# ISS-54: одна встреча — одна запись, даже если событие видно в двух календарях
+# ---------------------------------------------------------------------------
+# Боевой случай: выставка СТ-1 27.07 лежала и в личном календаре, и в календаре
+# Anzhee. Google отдал её двумя разными `event_id` → в реестре появились две
+# записи (`oneoff-ef50c3ab` и `anzhee-vystavka-st1-20260727`) → на встречу
+# пришли два бота. `event_id`/`recurring_event_id` тут не помогают: у копий они
+# РАЗНЫЕ. Точный ключ — `iCalUID` события: у копий он совпадает.
+#
+# Приметы пишем прямо в запись, потому что сверять их потом не с чем: в
+# watched.yaml нет ни времени встречи, ни ссылки, а лезть за ними в календарь на
+# каждое «да» — лишний сетевой поход.
+#   • `ical_uid`        — точный ключ (когда календарный слой его дал);
+#   • `event_start_at`  — старт того экземпляра, по которому завели запись.
+#     Обязателен рядом с `iCalUID`: у всех экземпляров одной рекуррентной серии
+#     `iCalUID` ОБЩИЙ, и без времени «вторник» и «четверг» одной серии
+#     схлопнулись бы в одну запись;
+#   • `event_url`       — ссылка из события; вторая половина страховочного ключа
+#     «время старта + URL». На боевом пути этот ключ — ГЛАВНЫЙ: `iCalUID` в
+#     снапшот вечернего блока пока не приезжает.
+#
+# Сама формула тождества — общая с планировщиком, живёт в
+# `lib/meeting_identity.py`. Раньше она была скопирована в оба файла и успела
+# разойтись: два дедупа давали противоположные ответы на одном случае.
+FINGERPRINT_FIELDS = ("ical_uid", "event_start_at", "event_url")
+
+
+def _clean_str(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def meeting_fingerprint(item: dict[str, Any]) -> dict[str, Any]:
+    """Приметы встречи из элемента snapshot (см. блок выше).
+
+    `ical_uid` в snapshot появляется, когда его начнёт класть вечерний блок;
+    пока его нет — работает страховка «время старта + URL». Оба варианта
+    поддерживаем одновременно, чтобы включение шло без миграции реестра.
+    """
+    return {
+        "ical_uid": _clean_str(item.get("ical_uid")),
+        "event_start_at": _clean_str(item.get("start_at")),
+        "event_url": _clean_str(item.get("url_in_event")),
+    }
+
+
+def _room_url(value: Any, rooms: dict[str, Any] | None) -> str | None:
+    """`@name` из реестра/ответа → URL комнаты. Не разрешилось — None.
+
+    Нужен для встреч БЕЗ ссылки в событии: владелец называет комнату словами
+    («да, @t11»), в событии календаря ссылки нет — и страховочный ключ
+    «время + URL» без этого шага не срабатывал, давая вторую запись.
+    """
+    if not value or not rooms:
+        return None
+    try:
+        return resolve_room_to_url(value, rooms)
+    except SystemExit:
+        # Комната исчезла из rooms.yaml — сверять нечем, но падать тут нельзя.
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _record_fp(rec: dict[str, Any], rooms: dict[str, Any] | None):
+    return fingerprint(
+        rec.get("event_start_at"),
+        rec.get("event_url") or _room_url(rec.get("room"), rooms),
+        rec.get("ical_uid"),
+    )
+
+
+def _item_fp(fp: dict[str, Any], room: str | None, rooms: dict[str, Any] | None):
+    return fingerprint(
+        fp.get("event_start_at"),
+        fp.get("event_url") or _room_url(room, rooms),
+        fp.get("ical_uid"),
+    )
+
+
+def find_duplicates_watched(
+    item: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    series: bool,
+    rooms: dict[str, Any] | None = None,
+    room: str | None = None,
+) -> list[tuple]:
+    """ВСЕ записи реестра про ту же встречу. Список (запись, чем доказано, конфликт).
+
+    Ищем и среди выключенных записей: отказ владельца (ISS-53, `enabled=false`)
+    — это тоже «встреча известна». Завести поверх отказа новую запись значило бы
+    вернуть владельцу встречу, от которой он отказался.
+
+    Не «первую попавшуюся», а все: в боевом реестре прямо сейчас лежат ДВА
+    дубля одной встречи, и «нет», погасившее один из них, было бы исполнено
+    наполовину — бот всё равно пришёл бы по второму.
+
+    Записи без примет (старый реестр, ручные записи) сюда не попадают — их
+    подстраховывает схлопывание очереди в scheduler по «URL + время старта».
+    """
+    cand = _item_fp(meeting_fingerprint(item), room, rooms)
+    if not cand.ical and not (cand.start and cand.url):
+        return []
+    out: list[tuple] = []
+    for rec in data.get("watched", []) or []:
+        if not isinstance(rec, dict) or rec.get("type") != "google-calendar":
+            continue
+        # Запись другого рода подменой не считаем: «серия» и «только этот
+        # экземпляр» — разные обещания владельцу. Двойного бота на их
+        # пересечении подстрахует схлопывание очереди в scheduler.
+        if bool(rec.get("recurring_event_id")) != series:
+            continue
+        proof, conflict = compare(_record_fp(rec, rooms), cand, series_scope=series)
+        if proof:
+            out.append((rec, proof, conflict))
+    return out
+
+
+def _dup_rank(rec: dict[str, Any]) -> tuple:
+    """Кого из найденных копий брать первой: живую запись владельца."""
+    return (not rec.get("enabled", True), bool(rec.get(REJECTION_OWNER_FIELD)))
+
+
+def find_duplicate_watched(
+    item: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    series: bool,
+    rooms: dict[str, Any] | None = None,
+    room: str | None = None,
+) -> tuple:
+    """Лучшая копия: (запись | None, чем доказано, конфликт точных ключей).
+
+    Лучшая — живая настроенная запись владельца, а не надгробие прошлого отказа:
+    оживлять надо ту, на которой висят привязка чата, разметка и режим открытых
+    вопросов.
+    """
+    matches = find_duplicates_watched(
+        item, data, series=series, rooms=rooms, room=room)
+    if not matches:
+        return (None, MATCH_NONE, False)
+    return min(matches, key=lambda m: _dup_rank(m[0]))
+
+
+def _merge_fingerprint(
+    rec: dict[str, Any],
+    item: dict[str, Any],
+    *,
+    proof: str = MATCH_ID,
+) -> None:
+    """Дописать недостающие приметы в существующую запись.
+
+    Только пустые поля: чужое значение не перетираем (запись мог вести владелец).
+    Так реестр лечится сам — по мере того, как владелец касается своих записей
+    (любым ответом: «да», «нет», «никогда»).
+
+    `ical_uid` дописываем ТОЛЬКО когда это буквально та же запись или тождество
+    доказано точным ключом. Иначе одно срабатывание страховки «комната + секунда»
+    вписало бы в запись точный ключ ЧУЖОГО события — и дальше он считался бы
+    доказательством, а откатить его нечем: в YAML лежит правдоподобное значение.
+    """
+    fp = meeting_fingerprint(item)
+    for field in FINGERPRINT_FIELDS:
+        if field == "ical_uid" and proof not in (MATCH_ID, MATCH_ICAL):
+            continue
+        if fp.get(field) and not _clean_str(rec.get(field)):
+            rec[field] = fp[field]
 
 
 def _build_record(
@@ -793,6 +1099,10 @@ def _build_record(
         rec["event_id"] = item["event_id"]
     if room:
         rec["room"] = room
+    # ISS-54: приметы для опознания той же встречи из другого календаря.
+    for field, value in meeting_fingerprint(item).items():
+        if value:
+            rec[field] = value
     rec["enabled"] = True
     rec["ignored"] = False
     rec["keep_audio"] = False
