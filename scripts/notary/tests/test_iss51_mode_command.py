@@ -476,6 +476,19 @@ class TestSwitchBothWays(unittest.TestCase):
         self.assertIn("с чистого листа", said)
         self.assertIn("не поднимаю", said)
 
+    def test_carry_confirmation_on_a_legacy_series_promises_no_clean_slate(self):
+        # 🔴 ЦИКЛ5, обратная сторона починки: у серии поля режима НЕТ (боевое
+        # состояние до раскладки). Отсечку мы не ставим — значит и обещать
+        # «старое не поднимаю» нельзя: владелец пошёл бы искать пропажу того,
+        # что на месте. Текст обязан описывать сделанное, а не задуманное.
+        w = _watched(_rec("koord", telegram_chat_id=GROUP))
+        with _route_env(w, display_map={"koord": "Координация"}) as env:
+            ml.maybe_route_to_mode_command("tok", GROUP, OWNER, _msg("режим накопление"))
+        said = _said(env.send)
+        self.assertIn("теперь в режиме накопления", said)
+        self.assertNotIn("с чистого листа", said)
+        self.assertIn("сохранил", said)
+
     def test_dated_slug_series_is_switchable(self):
         # 🔴 Три серии боевого реестра были недостижимы ни одним набором текста:
         # дата в slug'е гасила команду, и бот молчал.

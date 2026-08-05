@@ -1434,6 +1434,16 @@ _OQ_MODE_CONFIRM = {
     ),
 }
 
+# ЦИКЛ5: включение накопления серии, которая шпаргалку НИКОГДА не выбирала (в
+# реестре просто не было поля — так выглядят все серии до ручной раскладки
+# режимов). Отсечки в этом случае нет, значит и обещать «чистый лист» нельзя:
+# накопленный хвост остаётся на месте, и текст обязан говорить именно это.
+_OQ_MODE_CONFIRM_CARRY_KEEPS_TAIL = (
+    "✅ Принято: серия «{display}» теперь в режиме накопления — вопросы копятся и "
+    "переносятся из встречи во встречу. Всё, что уже накопилось по этой серии, "
+    "я сохранил и продолжу показывать."
+)
+
 # Строка в чат самой серии: там сидят люди, у которых иначе висяки молча
 # исчезнут из вида (или наоборот — внезапно вернутся). Пункт 5 плана.
 _OQ_MODE_SERIES_NOTICE = {
@@ -1449,6 +1459,14 @@ _OQ_MODE_SERIES_NOTICE = {
         "не поднимаю."
     ),
 }
+
+# Тот же случай, что у `_OQ_MODE_CONFIRM_CARRY_KEEPS_TAIL`: отсечки нет, старое
+# никуда не делось — людям в чате обещать «счёт заново» было бы неправдой.
+_OQ_MODE_SERIES_NOTICE_CARRY_KEEPS_TAIL = (
+    "⚙️ Формат к следующей встрече меняется: открытые вопросы по этой серии "
+    "копятся и переносятся из встречи во встречу — незакрытые буду показывать, "
+    "пока их не закроют. Уже накопленное сохраняю."
+)
 
 _OQ_MODE_STATE = {
     "carry": (
@@ -1543,6 +1561,32 @@ def _oq_effective_mode(slug: str, watched: dict[str, Any]) -> str:
             series_memory._explicit_carry_signal(series_records(slug, watched)):
         return series_memory.OPEN_QUESTIONS_MODE_CARRY
     return mode
+
+
+def _oq_last_only_was_chosen(recs: Optional[list]) -> bool:
+    """Шпаргалка у серии ВЫБРАНА явно (а не получилась дефолтом)?
+
+    ЦИКЛ5. Отсечку «счёт с чистого листа» (решение владельца 7) ставит ВОЗВРАТ в
+    накопление, то есть переезд из шпаргалки, которую кто-то выбрал. Отсутствие
+    поля `open_questions_mode` — НЕ выбор: так выглядит любая серия боевого
+    реестра до ручной раскладки режимов (на 05.08 таких 16 из 17). Такая серия
+    всё это время копила вопросы, и «чистый лист» на первой же команде «режим
+    накопление» срезал бы её хвост НЕОБРАТИМО — он живёт только в разделе
+    протокола, восстановить его нечем.
+
+    Цена ошибки прежняя и несимметричная: лишний хвост владелец закроет руками,
+    потерянный не вернёт никто. Поэтому «не знаю, выбирали ли шпаргалку» значит
+    «отсечку не ставлю».
+    """
+    from notary.lib.mode_command import LAST_ONLY  # noqa: PLC0415 — stdlib-only
+
+    for rec in recs or []:
+        if not isinstance(rec, dict):
+            continue
+        raw = rec.get("open_questions_mode")
+        if isinstance(raw, str) and raw.strip().casefold() == LAST_ONLY:
+            return True
+    return False
 
 
 def _oq_mode_series_hint(
@@ -1776,7 +1820,17 @@ def maybe_route_to_mode_command(
         # разваливался, если между переключениями не было ни одной встречи.
         # Отсечку ставим ТОЛЬКО на реальном переезде шпаргалка → накопление:
         # повтор команды по серии, которая и так в накоплении, хвост не трогает.
-        carry_since = _oq_carry_since() if (not same and parsed.mode == "carry") else None
+        # ЦИКЛ5: и только если шпаргалку ВЫБИРАЛИ (в реестре явно записано
+        # `last-only`). Серия, у которой поля просто нет, в шпаргалке никогда не
+        # была — её туда поставил дефолт нового кода, а не владелец; отсечка на
+        # первой же команде «режим накопление» стёрла бы весь её накопленный
+        # хвост, и вернуть его было бы нечем (`_oq_last_only_was_chosen`).
+        carry_since = (
+            _oq_carry_since()
+            if (not same and parsed.mode == "carry"
+                and _oq_last_only_was_chosen(recs))
+            else None
+        )
         n = set_open_questions_mode_for_series(
             slug, parsed.mode, watched, carry_since=carry_since)
         series_chat = get_telegram_chat_id_for_series(slug, watched)
@@ -1806,7 +1860,12 @@ def maybe_route_to_mode_command(
         )
         return True
 
-    confirm = _OQ_MODE_CONFIRM[parsed.mode].format(display=display)
+    # Текст обязан описывать то, что РЕАЛЬНО сделано: отсечка поставлена — обещаем
+    # чистый лист; не поставлена (серия шпаргалку не выбирала) — обещаем сохранность
+    # накопленного. Иначе владелец слышит «старое не поднимаю» и идёт искать пропажу.
+    keeps_tail = parsed.mode == "carry" and carry_since is None
+    confirm = (_OQ_MODE_CONFIRM_CARRY_KEEPS_TAIL if keeps_tail
+               else _OQ_MODE_CONFIRM[parsed.mode]).format(display=display)
     if series_chat is None:
         # Честно: предупредить участников физически некуда.
         confirm += " Чат этой серии не привязан — участников не предупредил."
@@ -1821,7 +1880,9 @@ def maybe_route_to_mode_command(
     # прямо в чате серии, подтверждение выше уже стоит у них перед глазами и
     # говорит то же самое, а второе сообщение подряд — просто шум.
     if series_chat is not None and series_chat != cid and series_live:
-        send_message(token, series_chat, _OQ_MODE_SERIES_NOTICE[parsed.mode])
+        send_message(token, series_chat,
+                     _OQ_MODE_SERIES_NOTICE_CARRY_KEEPS_TAIL if keeps_tail
+                     else _OQ_MODE_SERIES_NOTICE[parsed.mode])
     logger.info(
         "[oq-mode] режим серии %s: %s → %s (записей=%d, from=%s, chat=%s, серия-чат=%s)",
         slug, old_mode, parsed.mode, n, from_id, cid, series_chat,

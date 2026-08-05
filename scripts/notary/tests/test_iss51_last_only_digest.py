@@ -1387,6 +1387,38 @@ class TestCleanSlateOnReturnToCarry(unittest.TestCase):
         w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500))
         self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
 
+    def test_first_ever_carry_command_on_a_legacy_series_keeps_the_tail(self):
+        # 🔴 ЦИКЛ5. Боевое состояние 16 серий после выкатки 05.08: поля
+        # `open_questions_mode` в записи НЕТ вовсе — оно там никогда не стояло.
+        # Владелец раскладывает режимы ровно так, как советует долг №5
+        # («после выкатки это делается командой боту»): «режим накопление <серия>».
+        # Серия при этом НИКОГДА не была в шпаргалке — её туда поставил дефолт
+        # нового кода, а не решение владельца. Значит «возврата в накопление»
+        # (решение владельца 7) не происходит, и отсечку ставить НЕЛЬЗЯ: она
+        # необратимо срезает весь накопленный хвост, живущий только в разделе
+        # протокола. Разница с ручной правкой YAML (там отсечки нет) не должна
+        # решать судьбу данных.
+        w = _watched(_rec(self.fx.series, telegram_chat_id=-100500))
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]))
+        self._switch(w, "режим накопление")
+        self.assertEqual([r["open_questions_mode"] for r in w["watched"]], [CARRY])
+        self.assertIsNone(w["watched"][0].get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD),
+                          "первое явное включение накопления поставило отсечку")
+        self.assertEqual(sorted(self._open(w)), sorted([self.OLD_A, self.OLD_B]),
+                         "команда «режим накопление» стёрла накопленный хвост")
+
+    def test_legacy_series_still_gets_the_cutoff_on_a_REAL_round_trip(self):
+        # Обратная сторона починки выше: не сломали ли мы решение владельца 7.
+        # Та же легаси-серия, но теперь шпаргалку ВЫБРАЛИ явно — и вернулись.
+        # Это настоящий возврат, отсечка обязана встать, ком обязан не подняться.
+        w = _watched(_rec(self.fx.series, telegram_chat_id=-100500))
+        self._switch(w, "режим накопление")          # первое включение — без отсечки
+        self._switch(w, "режим шпаргалка")           # владелец ВЫБРАЛ справку
+        self._switch(w, "режим накопление")          # …и вернулся
+        self.assertEqual(w["watched"][0].get(reg.OPEN_QUESTIONS_CARRY_SINCE_FIELD),
+                         _today_msk())
+        self.assertEqual(self._open(w), [])
+
     def test_garbage_cutoff_is_ignored(self):
         # Опечатка в дате — не повод молча стереть хвост.
         w = _watched(_rec(self.fx.series, CARRY, telegram_chat_id=-100500,
