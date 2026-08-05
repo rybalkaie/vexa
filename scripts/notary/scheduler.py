@@ -90,7 +90,19 @@ AUTO_MEETING_ID_RE = AUTO_RECORD_ID_RE
 # проигравший — с другим `event_id`, а на `event_id` ключуются все барьеры ниже
 # по течению (`runner._candidates`, `state_acquire`). Файл маленький, живёт
 # рядом с `.queue.json`, чинится удалением.
-DEDUP_WINNERS_FILE = DEFAULT_REGISTRY_DIR / ".dedup-winners.json"
+# 🔴 Резолв ЛЕНИВЫЙ, на вызове (цикл5 05.08, Р-2 — тот же класс, что чинил f249582
+# в lib/state.py, только в новом файле фичи). Константа, вычисленная на импорте, не
+# видит подмену каталога реестра тестом и пишет в БОЕВОЙ реестр. Сегодня не стреляло
+# только потому, что тест дедупа патчит константу вручную; следующий тест без патча
+# записал бы в ~/Projects/me/встречи/.
+DEDUP_WINNERS_FILE = DEFAULT_REGISTRY_DIR / ".dedup-winners.json"  # для обратной совместимости
+
+
+def dedup_winners_file() -> Path:
+    """Путь к памяти о победителях схлопывания НА МОМЕНТ ВЫЗОВА."""
+    from notary.cli.registry import _resolve_registry_dir
+
+    return _resolve_registry_dir() / ".dedup-winners.json"
 # За сколько до старта выбор победителя перестаёт пересматриваться. Раньше
 # этого момента бот стартовать не мог (runner берёт кандидатов за 5 минут до
 # старта), поэтому смена победителя безопасна и даже полезна — вернулся
@@ -337,7 +349,7 @@ def load_dedup_winners(now: datetime | None = None) -> dict[str, Any]:
     if now is None:
         now = datetime.now(timezone.utc)
     try:
-        raw = json.loads(DEDUP_WINNERS_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(dedup_winners_file().read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
@@ -363,13 +375,14 @@ def load_dedup_winners(now: datetime | None = None) -> dict[str, Any]:
 
 def save_dedup_winners(memory: dict[str, Any]) -> None:
     """Записать память атомарно. Файл вспомогательный — сбой не роняет прогон."""
-    DEDUP_WINNERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=DEDUP_WINNERS_FILE.name + ".",
-                               dir=str(DEDUP_WINNERS_FILE.parent))
+    dwf = dedup_winners_file()
+    dwf.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=dwf.name + ".",
+                               dir=str(dwf.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(memory, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, DEDUP_WINNERS_FILE)
+        os.replace(tmp, dwf)
     except Exception:
         try:
             os.unlink(tmp)

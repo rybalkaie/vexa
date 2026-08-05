@@ -231,6 +231,7 @@ def _run_scheduler(
     try:
         with mock.patch.object(sched, "setup_logging", lambda: None), \
                 mock.patch.object(sched, "DEDUP_WINNERS_FILE", winners_file), \
+                mock.patch.object(sched, "dedup_winners_file", lambda: winners_file), \
                 mock.patch.object(sched, "pause_until", lambda: None), \
                 mock.patch.object(sched, "load_watched", lambda *a, **k: {"watched": list(watched_records)}), \
                 mock.patch.object(sched, "load_rooms", lambda *a, **k: {"rooms": []}), \

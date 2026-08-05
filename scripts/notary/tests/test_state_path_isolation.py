@@ -22,6 +22,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent.parent))
 
 import notary.lib.state as state  # noqa: E402
+import notary.scheduler as sched  # noqa: E402
 
 
 class TestStatePathsResolveLazily(unittest.TestCase):
@@ -60,6 +61,20 @@ class TestStatePathsResolveLazily(unittest.TestCase):
         state.state_acquire("gcal:isolation-must-not-leak")
         after = real.read_text(encoding="utf-8") if real.exists() else None
         self.assertEqual(before, after, "тест записал в БОЕВОЙ файл состояния встреч")
+
+    def test_dedup_winners_path_also_resolves_lazily(self) -> None:
+        """Цикл5 05.08 (Р-2): тот же класс в scheduler.py — память о схлопывании встреч.
+
+        Мутация, которая красит: вернуть в `save_dedup_winners`/`load_dedup_winners`
+        обращение к константе `DEDUP_WINNERS_FILE` вместо `dedup_winners_file()`.
+        """
+        self.assertEqual(sched.dedup_winners_file().parent, Path(self.tmp))
+        real = Path.home() / "Projects" / "me" / "встречи" / ".dedup-winners.json"
+        before = real.read_text(encoding="utf-8") if real.exists() else None
+        sched.save_dedup_winners({"probe": {"event_id": "x"}})
+        self.assertTrue((Path(self.tmp) / ".dedup-winners.json").exists())
+        after = real.read_text(encoding="utf-8") if real.exists() else None
+        self.assertEqual(before, after, "запись ушла в БОЕВОЙ каталог реестра")
 
     def test_second_acquire_within_ttl_is_refused(self) -> None:
         """Барьер работает по существу, а не только по путям (страховка ISS-54)."""
