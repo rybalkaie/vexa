@@ -277,6 +277,33 @@ def extract_meeting_url(event: dict[str, Any]) -> str | None:
     return None
 
 
+def event_ical_uid(event: dict[str, Any] | None) -> str | None:
+    """ISS-54: `iCalUID` события — точный ключ «это одна и та же встреча».
+
+    Зачем. Одно событие, видное в ДВУХ календарях владельца, приезжает двумя
+    разными `id` (боевой случай: выставка СТ-1 27.07 — `evt` в личном календаре
+    и другой `evt` в календаре Anzhee). `iCalUID` (RFC-5545) у копий совпадает —
+    Google сохраняет его при копировании/приглашении между календарями. Ниже по
+    течению этого ключа нет ни у кого: `runner._candidates` ключует `event_id`,
+    `state_acquire` — тоже, поэтому на встречу приходили два бота.
+
+    ВАЖНАЯ ЛОВУШКА: у всех экземпляров ОДНОЙ рекуррентной серии `iCalUID` тоже
+    одинаковый (различаются только `id`). Сам по себе он серию не различает —
+    ключ всегда парный, `iCalUID` + время старта. Ключ без времени выкосил бы
+    всю неделю регулярной встречи, оставив один старт.
+
+    Запрос к API поле не сужает (`fields` мы не передаём), так что оно приезжает
+    само; на всякий случай отсутствие/мусор трактуем как «неизвестно» — тогда
+    работает страховка второго уровня (время старта + URL).
+    """
+    if not isinstance(event, dict):
+        return None
+    raw = event.get("iCalUID")
+    if not isinstance(raw, str):
+        return None
+    return raw.strip() or None
+
+
 def event_start_dt(event: dict[str, Any]) -> datetime | None:
     """Достать datetime начала события (с TZ). None если all-day или нет start."""
     start = event.get("start") or {}

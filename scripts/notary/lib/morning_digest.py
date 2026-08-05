@@ -41,6 +41,7 @@ import os
 import re
 import tempfile
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -86,6 +87,14 @@ HEADER_INSTRUCTION = (
     "актуально/неактуально) и короткий комментарий — бот скорректирует свой учёт."
 )
 
+# ISS-51 (Ф3): шапка ШПАРГАЛОЧНОГО режима (`last-only`) — ДОСЛОВНО черновик владельца
+# из раздела «Скоуп» плана, согласован 29.07. Не переписывать, как и HEADER_INSTRUCTION:
+# весь смысл режима в тоне — справка без обязательства отвечать.
+LAST_ONLY_HEADER = (
+    "Для удобства — задачи и вопросы, которые зафиксировали на прошлой встрече. "
+    "Отвечать не нужно, это шпаргалка к сегодняшней встрече."
+)
+
 TITLE = "Открытые вопросы к встрече"
 # Ф4 (ISS-34/34.3, A7 — текст утверждён владельцем 14.07): нейтральная строка вместо
 # оправдательной «Это не аудит и не спрос…». Подзаголовок PDF «Сверка перед встречей»
@@ -96,6 +105,63 @@ _TONE_LINE = (
 )
 _NO_OWNER_HEADING = "Без ответственного / неразобрано"
 _MINOR_HEADING = "Просто напоминаю (статус не нужен)"
+# ISS-51: в шпаргалке статуса не просят НИ ПО ОДНОМУ пункту, поэтому пометка
+# «(статус не нужен)» у мелочи начинала бы читаться как «а по остальным — нужен».
+_MINOR_HEADING_LAST_ONLY = "Просто напоминаю"
+
+
+# ISS-55 (наследство Ф4): ТА ЖЕ переменная показа времени, что у вечернего блока
+# (`meetings_evening_block.DISPLAY_TZ_ENV`) и у разбора ответа владельца
+# (`meetings_apply_reply.display_tz`). До этого дайджест печатал время жёстко в МСК:
+# про одну и ту же встречу вечер говорил «13:00», а утро — «12:00 МСК».
+# ВАЖНО: переменная влияет ТОЛЬКО на ПОКАЗ. Расписание отправки (09:00 МСК, «не позже
+# чем за час до начала») остаётся в МСК — это правило R10, а не локаль читателя.
+DISPLAY_TZ_ENV = "MEETING_NOTARY_DISPLAY_TZ"
+# Дефолт — МОСКВА, а НЕ дубайская зона соседей. Дайджест печатал время жёстко в МСК с
+# 07.2026; взять чужой дефолт значило бы, что серия-НАКОПЛЕНИЕ меняется на глазах у
+# людей в чате (час разницы + пропавший ярлык «МСК») в фазе, которая обещала «carry не
+# меняется ни в одном месте» (критерий 4 плана). Переменная не задана ни в
+# `.env.notary.example`, ни в юнитах — значит на любом стенде, кроме боевого, поведение
+# уехало бы молча. Задана явно → уважаем её (совпадаем с вечерним блоком, ISS-55).
+DEFAULT_DISPLAY_TZ = "Europe/Moscow"
+# Ярлык зоны рядом со временем. Вечерний блок не пишет ярлык вовсе, но у дайджеста
+# «12:00 МСК» стоит в тексте с 07.2026 и на бою (`MEETING_NOTARY_DISPLAY_TZ=Europe/Moscow`)
+# он верен — оставляем его ровно для Москвы, для любой другой зоны молчим (соврать
+# «МСК» про дубайское время хуже, чем не назвать зону).
+_TZ_LABELS = {"Europe/Moscow": "МСК"}
+
+
+def display_tz():
+    """TZ ПОКАЗА времени встречи — `MEETING_NOTARY_DISPLAY_TZ`, дефолт `Asia/Dubai`.
+
+    Форма — как `meetings_apply_reply.display_tz()` / `meetings_evening_block
+    .resolve_display_tz()`: читаем env НА КАЖДЫЙ вызов (значение не залипает, если
+    демону поменяли окружение на ходу), мусор → мягкий откат на дефолт + warning,
+    нет tzdata вовсе → МСК (прежнее поведение дайджеста, а не UTC: тик всё равно
+    считается в МСК, и показать время в UTC значило бы соврать сильнее).
+    """
+    tz_name = (os.environ.get(DISPLAY_TZ_ENV) or "").strip() or DEFAULT_DISPLAY_TZ
+    try:
+        from zoneinfo import ZoneInfo  # noqa: PLC0415 — stdlib, ленивый как у соседей
+        return ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        if tz_name != DEFAULT_DISPLAY_TZ:
+            logger.warning("[morning-digest] %s=%r не распознан — беру %s",
+                           DISPLAY_TZ_ENV, tz_name, DEFAULT_DISPLAY_TZ)
+        try:
+            from zoneinfo import ZoneInfo  # noqa: PLC0415
+            return ZoneInfo(DEFAULT_DISPLAY_TZ)
+        except Exception:  # noqa: BLE001 — голый контейнер без tzdata
+            logger.error("[morning-digest] нет ни одной таймзоны (%s, %s) — показываю МСК",
+                         tz_name, DEFAULT_DISPLAY_TZ)
+            return MSK
+
+
+def _tz_label(tz) -> str:
+    """Ярлык зоны для строки «встреча в 12:00 МСК». Не Москва → "" (без ярлыка)."""
+    if tz is MSK:
+        return "МСК"
+    return _TZ_LABELS.get(getattr(tz, "key", ""), "")
 
 
 def is_enabled() -> bool:
@@ -215,7 +281,7 @@ def due_meetings_today(
 # ---------------------------------------------------------------------------
 # Что слать: три корзины из существующего учёта висяков
 # ---------------------------------------------------------------------------
-def collect_items(series_dir: Path) -> dict:
+def collect_items(series_dir: Path, *, mode: Optional[str] = None) -> dict:
     """Открытые вопросы серии для дайджеста — ЧИТАЕМ существующий учёт, не заводим свой.
 
     `open`  — значимые ВИСЯЩИЕ: свежий хвост выжимок под наложением sidecar-статусов Ф2
@@ -230,15 +296,44 @@ def collect_items(series_dir: Path) -> dict:
     хвост раскручиваем БЕЗ капа, накладываем статусы, и капим уже ВИСЯЩИЕ. Капнуть до
     наложения статусов нельзя: закрытые задачи в первых N съели бы слоты капа у живых
     висяков, и дайджест молча показал бы огрызок хвоста (при сниженном `OPEN_TASKS_MAX`).
+
+    ISS-51 (Ф3), `mode="last-only"` — ШПАРГАЛКА: значимые берутся из
+    `series_memory.tasks_born_on_last_meeting` — это то, что записано РАЗДЕЛОМ «Задачи»
+    протокола последней встречи, а не весь кумулятивный хвост выжимки (иначе первая же
+    шпаргалка после переключения вывалила бы накопленный ком, РИСК2).
+
+    Почему НЕ по совпадению текста задачи с прошлой выжимкой (как было сделано
+    сначала): модель переписывает формулировки при каждой генерации протокола, ключ
+    задачи между соседними выжимками не совпадает, и весь ком выглядит «рождённым
+    вчера». Замер на боевых сериях: пересечение соседних выжимок 0/16/1/6/0 из ~18–25 —
+    на 2 сериях из 4 фильтр не отсекал НИЧЕГО. Раздел протокола — структурный якорь,
+    переформулировку он переживает.
+
+    Отбор стоит ДО капа: иначе `OPEN_TASKS_MAX` съели бы слоты старыми пунктами, и от
+    прошлой встречи в шпаргалку не попало бы ничего.
+
+    МЕЛОЧЬ («просто напоминаю») в шпаргалку входит целиком (решение владельца 29.07) и
+    по происхождению НЕ фильтруется: она и так живёт ровно одну встречу — берётся из
+    самой свежей выжимки и в протокол (а значит в следующую выжимку) не переезжает.
+    Фильтр по origin отрезал бы повторно поднятую мелочь, у которой origin указывает на
+    более раннюю встречу, — а владелец просил мелочь оставить.
     """
     empty = {"open": [], "minor": []}
+    mode = mode or series_memory.OPEN_QUESTIONS_MODE_CARRY
     try:
         digests = series_memory.list_series_digests(Path(series_dir))
         if not digests:
             return empty
         store = series_memory.load_task_status(Path(series_dir))
         cap = series_memory.open_tasks_max()
-        fresh = series_memory._resolve_open_tasks_raw(digests)
+        if mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY:
+            fresh = series_memory.tasks_born_on_last_meeting(Path(series_dir), digests)
+        else:
+            # `series_dir` включает отсечку «счёт с чистого листа» (решение
+            # владельца 7): серию вернули в накопление — до-переключательный ком
+            # не поднимаем. Обещание бота владельцу и всему чату серии.
+            fresh = series_memory._resolve_open_tasks_raw(
+                digests, series_dir=Path(series_dir))
         hanging = series_memory.merge_open_tasks_with_status(fresh, store).get("open") or []
         minor_all = series_memory._resolve_minor_open_tasks_raw(digests)
         minor = series_memory.merge_open_tasks_with_status(minor_all, store).get("open") or []
@@ -286,6 +381,7 @@ def build_digest_markdown(
     *,
     start_at: Optional[datetime] = None,
     origins: Optional[dict] = None,
+    mode: Optional[str] = None,
 ) -> str:
     """Markdown дайджеста (его же рендерим в PDF существующим генератором).
 
@@ -297,24 +393,42 @@ def build_digest_markdown(
     канонический статус-ярлык «Статус неизвестен — уточнить» (оранжевый в PDF).
     `origins` (`series_memory.origin_dates_for_tasks`) не передан → префикса нет
     (обр. совместимость / прямые вызовы тестов), ярлык статуса ставится всегда.
+
+    ISS-51 (Ф3), `mode="last-only"` — ШПАРГАЛКА. Меняется ровно то, что просил
+    владелец: шапка-инструкция → мягкая `LAST_ONLY_HEADER`, нумерация «N.» → обычные
+    буллеты (номер существует ТОЛЬКО как адрес для ответа статусом — отвечать не
+    просим, значит и номера не нужны), ярлык «Статус неизвестен — уточнить» и
+    origin-даты «от DD.MM.YYYY» сняты (все пункты с ОДНОЙ прошлой встречи, дата у
+    каждого дублировала бы шапку и читалась бы как «висит с…»). Группировка по
+    ответственным и блок мелочи сохранены (решение владельца 29.07).
+    Дефолт параметра — `carry`: прямые вызовы (тесты, ручная отладка) продолжают
+    получать ровно прежний документ.
     """
+    mode = mode or series_memory.OPEN_QUESTIONS_MODE_CARRY
+    last_only = mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY
     hanging = [t for t in (hanging or []) if isinstance(t, str) and t.strip()]
     minor = [t for t in (minor or []) if isinstance(t, str) and t.strip()]
     if not hanging and not minor:
         return ""
     when = ""
     if start_at is not None:
-        when = f" · встреча в {start_at.astimezone(MSK).strftime('%H:%M')} МСК"
+        # ISS-55: время встречи — в зоне ПОКАЗА (та же, что у вечернего блока), не
+        # жёстко в МСК. Ярлык зоны печатаем только когда он правдив (Москва).
+        tz = display_tz()
+        label = _tz_label(tz)
+        when = f" · встреча в {start_at.astimezone(tz).strftime('%H:%M')}"
+        if label:
+            when += f" {label}"
     lines = [
         f"# {TITLE}",
         "",
         f"**{series_display_name(series)}** — {date}{when}",
         "",
-        HEADER_INSTRUCTION,
-        "",
-        _TONE_LINE,
+        LAST_ONLY_HEADER if last_only else HEADER_INSTRUCTION,
         "",
     ]
+    if not last_only:
+        lines += [_TONE_LINE, ""]
     nameless, owned = series_memory.group_open_tasks_by_owner(hanging)
     # Ф3 (REQ 5.1): СКВОЗНОЙ номер висяка 1..N по всем секциям (безымянные → по людям),
     # не рестартится в секции владельца. Порядок обхода ТОЧНО совпадает с
@@ -327,38 +441,50 @@ def build_digest_markdown(
         lines.append("")
         for t in nameless:
             n += 1
-            lines.append(_digest_open_bullet(n, t, t, origins, date))
+            lines.append(f"- {t}" if last_only
+                         else _digest_open_bullet(n, t, t, origins, date))
         lines.append("")
     for owner, items in owned:
         lines.append(f"## {owner}")
         lines.append("")
         for t in items:
             n += 1
-            lines.append(_digest_open_bullet(n, t, f"{owner}: {t}", origins, date))
+            lines.append(f"- {t}" if last_only
+                         else _digest_open_bullet(n, t, f"{owner}: {t}", origins, date))
         lines.append("")
     if minor:
-        lines.append(f"## {_MINOR_HEADING}")
+        lines.append(f"## {_MINOR_HEADING_LAST_ONLY if last_only else _MINOR_HEADING}")
         lines.append("")
-        lines.append(
-            "_Мелочи, статус по ним писать не нужно. Если никто не поднимет их на "
-            "встрече — они снимутся сами._"
-        )
-        lines.append("")
+        if not last_only:
+            lines.append(
+                "_Мелочи, статус по ним писать не нужно. Если никто не поднимет их на "
+                "встрече — они снимутся сами._"
+            )
+            lines.append("")
         for t in minor:
             lines.append(f"- {t}")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_caption(series: str, date: str, hanging: list, minor: list) -> str:
+def build_caption(
+    series: str, date: str, hanging: list, minor: list, *, mode: Optional[str] = None
+) -> str:
     """Подпись к PDF в Telegram. Инструкция владельца ОБЯЗАНА быть здесь, а не только
     внутри PDF: отвечают-то реплаем на ЭТО сообщение, а не на документ (R11). ≤1024
-    символов — лимит caption у Telegram."""
+    символов — лимит caption у Telegram.
+
+    ISS-51: в шпаргалочном режиме вместо инструкции «ответьте статусом» — мягкая
+    шапка владельца. Счётчики оставлены обоим режимам: они сообщают объём, а не
+    требуют отчёта."""
+    mode = mode or series_memory.OPEN_QUESTIONS_MODE_CARRY
     head = f"📋 {TITLE} — {series_display_name(series)}, {date}"
     counts = f"Открытых вопросов: {len(hanging or [])}"
     if minor:
         counts += f" · мелочей «просто напоминаю»: {len(minor)}"
-    text = f"{head}\n{counts}\n\n{HEADER_INSTRUCTION}"
+    header = (LAST_ONLY_HEADER if mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY
+              else HEADER_INSTRUCTION)
+    text = f"{head}\n{counts}\n\n{header}"
     return text[:1024]
 
 
@@ -384,26 +510,74 @@ def load_digest_state(series_dir: Optional[Path]) -> dict:
     return sent if isinstance(sent, dict) else {}
 
 
+def _date_records(state: dict, date: str) -> list:
+    """Все отправки дайджеста за дату: свежая запись + `also` (прежние копии).
+
+    ISS-45 (находка Ф1): у даты может быть НЕСКОЛЬКО отправок — плановая и одна-две
+    переотправки по просьбе. Читатели (идемпотентность, карта message_id → серия)
+    обязаны видеть их ВСЕ, иначе ответ на предыдущее сообщение того же дня перестаёт
+    резолвиться. Старый формат (одна запись без `also`) читается как список из одной.
+    """
+    rec = state.get(date)
+    if not isinstance(rec, dict):
+        return []
+    out = [rec]
+    for prev in rec.get("also") or []:
+        if isinstance(prev, dict):
+            out.append(prev)
+    return out
+
+
 def already_sent(series_dir: Optional[Path], date: str) -> bool:
-    """R13: дайджест этой серии за эту дату уже ушёл? (таймер тикает часто — защита от дубля)."""
-    rec = load_digest_state(series_dir).get(date)
-    return isinstance(rec, dict) and bool(rec.get("message_id"))
+    """R13: ПЛАНОВЫЙ дайджест этой серии за эту дату уже ушёл? (таймер тикает часто).
+
+    ISS-45 (находка Ф1): переотправка по просьбе участника (`force=True`) сюда НЕ
+    засчитывается. Раньше засчитывалась — и человек, попросивший файл в 08:20,
+    отменял этим плановую утреннюю рассылку в 09:00 для всего чата: шпаргалка к
+    встрече просто не приходила, причём молча. Переотправки помечены `forced: true`
+    и для идемпотентности планового тика не существуют.
+    """
+    return any(r.get("message_id") and not r.get("forced")
+               for r in _date_records(load_digest_state(series_dir), date))
 
 
 def record_sent(
-    series_dir: Path, date: str, *, chat_id: int, message_id: int, at: Optional[str] = None
+    series_dir: Path, date: str, *, chat_id: int, message_id: int,
+    at: Optional[str] = None, forced: bool = False, mode: Optional[str] = None,
 ) -> Optional[Path]:
     """Зафиксировать отправку: идемпотентность + якорь для reply-канала. Прунит старьё.
 
     Пишем ПОСЛЕ подтверждённой отправки (message_id пришёл от Telegram) — иначе при
     сбое отправки день пометился бы «уже слали» и дайджест пропал бы совсем.
+
+    ISS-45 (находка Ф1): прежние отправки за ту же дату НЕ затираются, а съезжают в
+    `also`. Затирание стоило двух вещей сразу: (1) плановый дайджест дня пропадал,
+    если утром кто-то попросил переслать (см. `already_sent`); (2) ответы-статусы на
+    ПРЕДЫДУЩЕЕ сообщение дайджеста того же дня переставали резолвиться в серию —
+    `digest_series_for_message` искал по единственному, самому свежему message_id.
     """
     sent = dict(load_digest_state(series_dir))
-    sent[date] = {
+    prev = _date_records(sent, date)
+    rec = {
         "chat_id": int(chat_id),
         "message_id": int(message_id),
         "at": at or datetime.now(timezone.utc).isoformat(),
     }
+    if forced:
+        rec["forced"] = True
+    if mode:
+        # ISS-51: в какОМ РЕЖИМЕ ушёл ЭТОТ документ. Смена режима действует со
+        # следующего дайджеста, но человек отвечает на документ, который УЖЕ у него в
+        # чате: если тот просил статус, а серию с тех пор переключили, «я тут вопросы
+        # не веду» звучит как «бот отказался от собственной просьбы». Помечаем отправку
+        # режимом, чтобы ответить по-человечески (сам статус всё равно не пишем —
+        # задним числом ничего не пересобираем).
+        rec["mode"] = mode
+    if prev:
+        # `also` держит ПЛОСКИЙ список прежних отправок (без вложенных `also`) —
+        # иначе третья отправка дня строила бы матрёшку.
+        rec["also"] = [{k: v for k, v in p.items() if k != "also"} for p in prev]
+    sent[date] = rec
     cutoff = (datetime.now(MSK).date() - timedelta(days=_KEEP_SENT_DAYS)).isoformat()
     sent = {d: r for d, r in sent.items()
             if isinstance(d, str) and (len(d) != 10 or d >= cutoff)}
@@ -417,6 +591,29 @@ def record_sent(
                        type(e).__name__)
         return None
     return digest_state_path(series_dir)
+
+
+def digest_mode_for_message(
+    series_dir: Optional[Path], chat_id: Any, message_id: Any
+) -> Optional[str]:
+    """В каком режиме УШЁЛ дайджест-сообщение (chat_id, message_id). Нет метки → None.
+
+    None означает «не знаю» (документ старше пометки или отправка не наша) — caller
+    обязан трактовать это как «ничего особенного не говорим», а не как `carry`.
+    """
+    if chat_id is None or message_id is None:
+        return None
+    try:
+        cid, mid = int(chat_id), int(message_id)
+    except (TypeError, ValueError):
+        return None
+    state = load_digest_state(series_dir)
+    for date in list(state.keys()):
+        for rec in _date_records(state, date):
+            if rec.get("chat_id") == cid and rec.get("message_id") == mid:
+                m = rec.get("mode")
+                return m if isinstance(m, str) and m else None
+    return None
 
 
 def digest_series_for_message(
@@ -446,11 +643,14 @@ def digest_series_for_message(
         for entry in base.iterdir():
             if not entry.is_dir() or entry.name.startswith((".", "_")):
                 continue
-            for rec in load_digest_state(entry).values():
-                if not isinstance(rec, dict):
-                    continue
-                if rec.get("chat_id") == cid and rec.get("message_id") == mid:
-                    return entry.name
+            state = load_digest_state(entry)
+            for date in list(state.keys()):
+                # ISS-45 (находка Ф1): сверяем со ВСЕМИ отправками даты, включая
+                # переотправки по просьбе — иначе ответ на первое сообщение дня
+                # переставал резолвиться, как только дайджест переслали.
+                for rec in _date_records(state, date):
+                    if rec.get("chat_id") == cid and rec.get("message_id") == mid:
+                        return entry.name
     except OSError as e:
         logger.debug("[morning-digest] скан состояний не удался: %s", type(e).__name__)
     return None
@@ -478,9 +678,26 @@ def resolve_chat_id(series: str) -> Optional[int]:
         return None
 
 
-def _default_sender(chat_id: int, md_text: str, caption: str, date: str) -> Optional[int]:
+def digest_subtitle(date: str, mode: Optional[str] = None) -> str:
+    """Подзаголовок ОБЛОЖКИ PDF. В шпаргалке — мягкий, как и всё остальное.
+
+    «Сверка перед встречей» — рамка отчётности: человек открывает документ, читает на
+    обложке «сверка», а под ней «отвечать не нужно». Режим обязан доезжать до самой
+    верхней строки документа, иначе тон меняется только внутри."""
+    head = ("Справка к встрече"
+            if mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY
+            else "Сверка перед встречей")
+    return f"{head} · {date}"
+
+
+def _default_sender(chat_id: int, md_text: str, caption: str, date: str,
+                    *, mode: Optional[str] = None) -> Optional[int]:
     """Боевая отправка: markdown → PDF (тот же генератор, что у протокола) → sendDocument.
-    Возвращает message_id или None. Тексты задач не логируем — только размеры/коды."""
+    Возвращает message_id или None. Тексты задач не логируем — только размеры/коды.
+
+    `mode` — только keyword и только с дефолтом: контракт инъекции `sender` у тестов и
+    соседних вызовов остаётся четырёхпозиционным (боевой отправитель получает режим
+    через `functools.partial` в `send_series_digest`)."""
     from . import protocol_to_pdf, telegram_api  # noqa: PLC0415
 
     token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
@@ -494,7 +711,7 @@ def _default_sender(chat_id: int, md_text: str, caption: str, date: str) -> Opti
             pdf_path = Path(td) / filename
             protocol_to_pdf.render_pdf_from_markdown(
                 md_text, str(pdf_path), title=TITLE,
-                subtitle=f"Сверка перед встречей · {date}",
+                subtitle=digest_subtitle(date, mode),
             )
             res = telegram_api.send_document(
                 token, chat_id, str(pdf_path), caption=caption, filename=filename,
@@ -563,6 +780,7 @@ def send_series_digest(
     chat_resolver: Optional[Callable[[str], Optional[int]]] = None,
     sender: Optional[Callable[..., Optional[int]]] = None,
     force: bool = False,
+    mode: Optional[str] = None,
 ) -> dict:
     """Собрать и отправить дайджест ОДНОЙ серии. Возвращает счётчики (без текстов).
 
@@ -574,9 +792,17 @@ def send_series_digest(
     `already_sent` — гейт `is_enabled` и запись слепка нумерации сохраняются, чтобы
     ordinal-ответы на переотправленный дайджест резолвились; `record_sent` тоже
     пишется → переотправленный дайджест остаётся отвечабельным (закрытие ответом).
+    Такая отправка помечается `forced` и НЕ отменяет плановый дайджест дня.
+
+    ISS-51 (Ф3): `mode` (`carry` | `last-only`) читается из реестра ОДИН раз на
+    отправку и решает три вещи разом — состав списка, тон документа и наличие слепка
+    нумерации. Инъекция параметром — для тестов и будущих caller'ов; None → реестр.
     """
     series_dir = (Path(root) if root is not None else protocols_root()) / series
-    res: dict = {"series": series, "date": date, "status": "skipped",
+    if mode is None:
+        mode = series_memory.open_questions_mode(series)
+    last_only = mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY
+    res: dict = {"series": series, "date": date, "status": "skipped", "mode": mode,
                  "open": 0, "minor": 0, "reason": None, "message_id": None}
     if not is_enabled():
         # Fail-closed: гейт стоит и здесь, а не только в `run()`. Любой будущий вход
@@ -587,7 +813,7 @@ def send_series_digest(
     if not force and already_sent(series_dir, date):
         res["reason"] = "already"
         return res
-    items = collect_items(series_dir)
+    items = collect_items(series_dir, mode=mode)
     hanging, minor = items["open"], items["minor"]
     res["open"], res["minor"] = len(hanging), len(minor)
     if not hanging and not minor:
@@ -603,8 +829,9 @@ def send_series_digest(
     except Exception as e:  # noqa: BLE001 — origin-даты опциональны
         logger.warning("[morning-digest] origin-даты не собраны (non-fatal): %s", type(e).__name__)
         origins = {}
-    md = build_digest_markdown(series, date, hanging, minor, start_at=start_at, origins=origins)
-    caption = build_caption(series, date, hanging, minor)
+    md = build_digest_markdown(series, date, hanging, minor, start_at=start_at,
+                               origins=origins, mode=mode)
+    caption = build_caption(series, date, hanging, minor, mode=mode)
     if dry_run:
         res["status"] = "dry-run"
         return res
@@ -614,11 +841,15 @@ def send_series_digest(
         res["reason"] = "no-chat"
         return res
     res["chat_id"] = chat_id
-    mid = (sender or _default_sender)(chat_id, md, caption, date)
+    # Режим доезжает до ОБЛОЖКИ PDF — но только у боевого отправителя: инъектированный
+    # `sender` (тесты, соседние вызовы) сохраняет прежний четырёхпозиционный контракт.
+    send = sender or partial(_default_sender, mode=mode)
+    mid = send(chat_id, md, caption, date)
     if not mid:
         res["reason"] = "send-failed"
         return res
-    saved = record_sent(series_dir, date, chat_id=chat_id, message_id=mid)
+    saved = record_sent(series_dir, date, chat_id=chat_id, message_id=mid,
+                        forced=force, mode=mode)
     res["status"] = "sent"
     res["message_id"] = mid
     # Ф3 (A14, Гейт 2 Q1): слепок нумерованного списка висяков ЭТОГО дайджеста, keyed by
@@ -626,14 +857,23 @@ def send_series_digest(
     # номер показа == позиция слепка. Фундамент под ординал-матчинг Ф4 (резолв «первая»
     # против слепка ИМЕННО отвечаемого документа, не live-пересчёта). Best-effort:
     # дайджест уже ушёл, сбой снапшота его не отменяет. НЕ логируем тексты.
-    try:
-        snapshot = [p["key_text"] for p in series_memory.ordered_open_task_positions(hanging)]
-        series_memory.record_open_tasks_snapshot(
-            series_dir, mid, snapshot, surface="digest", date=date, chat_id=chat_id,
-        )
-    except Exception as e:  # noqa: BLE001 — снапшот опционален, доставка уже прошла
-        logger.warning("[morning-digest] снапшот нумерации не записан (non-fatal): %s",
-                       type(e).__name__)
+    #
+    # ISS-51: в шпаргалке слепок НЕ пишем — нумерации в документе нет, отвечать по
+    # номерам не просили, а пустая-но-валидная запись `positions: []` читателем
+    # (`pending_status_reply`) трактуется как «корзина пуста» и глушила бы резолв
+    # ответов на ДРУГИЕ сообщения. Возврат серии в `carry` включает слепок обратно
+    # сам собой — режим читается на каждой отправке (память
+    # [[snapshot-keyed-by-first-send-copies-lack-it]]: без слепка ответы по номерам
+    # не резолвятся, поэтому первый же carry-дайджест обязан его записать).
+    if not last_only:
+        try:
+            snapshot = [p["key_text"] for p in series_memory.ordered_open_task_positions(hanging)]
+            series_memory.record_open_tasks_snapshot(
+                series_dir, mid, snapshot, surface="digest", date=date, chat_id=chat_id,
+            )
+        except Exception as e:  # noqa: BLE001 — снапшот опционален, доставка уже прошла
+            logger.warning("[morning-digest] снапшот нумерации не записан (non-fatal): %s",
+                           type(e).__name__)
     if saved is None:
         # Дайджест УЖЕ ушёл, а идемпотентность не записалась → следующий тик (через
         # 15 мин) отправит его повторно, и так до начала встречи. Отменить отправку
@@ -692,9 +932,10 @@ def run(
             continue
         out.append(res)
         logger.info(
-            "[morning-digest] series=%s date=%s status=%s reason=%s open=%d minor=%d dry_run=%s",
+            "[morning-digest] series=%s date=%s status=%s reason=%s mode=%s open=%d "
+            "minor=%d dry_run=%s",
             res["series"], res["date"], res["status"], res.get("reason"),
-            res["open"], res["minor"], dry_run,
+            res.get("mode"), res["open"], res["minor"], dry_run,
         )
         # Отказ доставки владелец узнаёт сразу, а не через недели «тишины в чате».
         # В dry-run не алертим: это диагностический прогон, ничего не ломалось.

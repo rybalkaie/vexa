@@ -20,9 +20,11 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -31,16 +33,27 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
 from notary.cli.registry import (  # noqa: E402
+    DEFAULT_REGISTRY_DIR,
     load_rooms,
     load_watched,
     pause_until,
     resolve_room_to_url,
 )
 from notary.lib.cron_expand import expand_cron  # noqa: E402
+from notary.lib.meeting_identity import (  # noqa: E402
+    AUTO_RECORD_ID_RE,
+    MATCH_NONE,
+    compare,
+    fingerprint,
+    ical_key,
+    is_owner_named,
+    proof_ru,
+)
 from notary.lib.gcal import (  # noqa: E402
     GCalAPIError,
     GCalAuthError,
     Credentials,
+    event_ical_uid,
     event_start_dt,
     extract_meeting_url,
     get_event,
@@ -61,6 +74,32 @@ LOG_FILE = LOG_DIR / "scheduler.log"
 
 HORIZON_HOURS = 48
 MCP_DEAD_THRESHOLD_HOURS = 1
+
+# ISS-54: id, который бот сгенерировал сам (вечерний блок, `make_record_id`).
+# При схлопывании дубля побеждает запись с человеческим именем: её вёл владелец,
+# и на ней висят привязка чата, разметка company/visibility и режим открытых
+# вопросов. Автоимя — расходный материал. Само правило живёт в
+# `lib/meeting_identity` — ОДНО на планировщик и на реестр (apply-reply брал
+# среди двух живых копий просто первую в файле и называл владельцу не ту).
+AUTO_MEETING_ID_RE = AUTO_RECORD_ID_RE
+
+# ISS-54: кого мы выбрали вести встречу в прошлые тики. Схлопывание жило в
+# памяти одного прогона, и это давало ВТОРОГО бота на ровном месте: если в
+# следующем тике победитель из очереди пропал (календарь его записи не ответил;
+# победитель был разовой записью и погасил себя после старта), выживал
+# проигравший — с другим `event_id`, а на `event_id` ключуются все барьеры ниже
+# по течению (`runner._candidates`, `state_acquire`). Файл маленький, живёт
+# рядом с `.queue.json`, чинится удалением.
+DEDUP_WINNERS_FILE = DEFAULT_REGISTRY_DIR / ".dedup-winners.json"
+# За сколько до старта выбор победителя перестаёт пересматриваться. Раньше
+# этого момента бот стартовать не мог (runner берёт кандидатов за 5 минут до
+# старта), поэтому смена победителя безопасна и даже полезна — вернулся
+# календарь владельца, ведём по его записи. Позже — фиксируем: пересмотр в этот
+# момент и означал бы второго бота.
+WINNER_FREEZE_MINUTES = 30
+# Сколько держим память после старта: разово-погашенный победитель должен ещё
+# гаситься и в следующих тиках, но вечно копить ключи незачем.
+WINNER_MEMORY_KEEP_HOURS = 6
 
 
 def setup_logging() -> None:
@@ -139,6 +178,36 @@ def main() -> int:
     # Сортируем очередь по времени старта.
     queue.sort(key=lambda x: x.get("start_at", ""))
 
+    # ISS-53: «нет» по встрече, которую приносит ЖИВАЯ запись серии из второго
+    # календаря. Fail-open — сбой не имеет права унести очередь целиком.
+    try:
+        queue = drop_rejected_occurrences(queue, items_in_yaml)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Отсев отказных стартов упал (%s) — очередь как есть", e)
+
+    # ISS-54: одно и то же событие, видное в двух календарях, приезжает сюда
+    # двумя элементами с разными meeting_id/event_id — и на встречу приходят два
+    # бота. Схлопываем ДО записи очереди: это последний рубеж, где виден весь
+    # список (барьеры runner-а ключуют event_id/series — у дублей они разные).
+    #
+    # Fail-open. Дедуп — улучшение, а не условие работы: если он падает, очередь
+    # уходит как есть. Два бота на одной встрече неприятны, «бот не пришёл НИ НА
+    # ОДНУ встречу» — катастрофа, и цена ошибки тут несимметрична.
+    memory = load_dedup_winners(started_at)
+    try:
+        queue = dedupe_queue(queue, memory=memory, now=started_at)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Дедуп очереди упал (%s) — пишу очередь как есть", e)
+        logger.warning(
+            "Схлопывание дублей не отработало: если событие видно в двух "
+            "календарях, на встречу приедут два бота. Очередь не тронута."
+        )
+    else:
+        try:
+            save_dedup_winners(memory)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Не смог сохранить память о схлопывании (%s)", e)
+
     write_queue(queue, generated_at=started_at)
     logger.info("Очередь записана: %d стартов", len(queue))
     for it in queue[:10]:
@@ -176,6 +245,345 @@ def main() -> int:
                 )
 
     return 0
+
+
+def _is_owner_named(item: dict[str, Any]) -> bool:
+    return is_owner_named(item.get("meeting_id"))
+
+
+# ISS-53 (шов Ф4↔Ф5): «нет» по конкретной встрече оставляет в реестре мёртвую
+# запись-отказ с приметами (`created_by_rejection`). Планировщик мёртвые записи
+# не раскрывает — и обычно этого хватает. Но если ту же встречу приносит ЖИВАЯ
+# запись (та же встреча видна вторым календарём как экземпляр уже ведомой СЕРИИ),
+# отказ оставался словами: бот приходил, хотя владельцу сказано «не записываю».
+# Гасить саму серию нельзя — «нет» сказано про ОДНУ встречу, а не про серию,
+# поэтому пропускаем ровно этот старт.
+def _rejected_fingerprints(watched_records: list[dict[str, Any]]) -> list:
+    out: list = []
+    for rec in watched_records or []:
+        if not isinstance(rec, dict):
+            continue
+        if not rec.get("created_by_rejection"):
+            continue
+        if rec.get("enabled", True) or rec.get("ignored", False):
+            # Отказ сняли («да» после «нет») либо он дорос до «никогда» —
+            # запись работает по общим правилам, старты гасить не наше дело.
+            continue
+        fp = fingerprint(rec.get("event_start_at"), rec.get("event_url"),
+                         rec.get("ical_uid"))
+        if fp.start and (fp.ical or fp.url):
+            out.append((rec.get("id"), fp))
+    return out
+
+
+def drop_rejected_occurrences(
+    queue: list[dict[str, Any]], watched_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Выкинуть из очереди старты, по которым владелец сказал «нет».
+
+    Сравнение — общей формулой тождества (`compare`, БЕЗ `series_scope`: отказ
+    всегда про один экземпляр, и общий `iCalUID` серии сам по себе старт не
+    гасит — нужно совпадение секунды старта).
+
+    Fail-open, как и весь дедуп очереди: любой сбой → очередь как есть. «Бот
+    пришёл на встречу, от которой отказались» неприятно, «бот не пришёл ни на
+    одну» — катастрофа.
+    """
+    rejected = _rejected_fingerprints(watched_records)
+    if not rejected:
+        return queue
+    kept: list[dict[str, Any]] = []
+    for item in queue:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
+        hit = None
+        for rec_id, rfp in rejected:
+            proof, _conflict = compare(rfp, fp)
+            if proof:
+                hit = (rec_id, proof)
+                break
+        if hit is None:
+            kept.append(item)
+            continue
+        logger.info(
+            "Старт «%s» @ %s не ставлю: по этой встрече владелец сказал «нет» "
+            "(запись отказа «%s», %s). Саму серию веду дальше — отказ был про "
+            "одну встречу",
+            item.get("meeting_id"), item.get("start_at"), hit[0],
+            proof_ru(hit[1], fp),
+        )
+    return kept
+
+
+def _memory_keys(fp) -> list[str]:
+    """Ключи, под которыми группа помнится между тиками (см. DEDUP_WINNERS_FILE).
+
+    Оба уровня сразу: копии могли схлопнуться по точному ключу, а в следующем
+    тике встретиться уже по комнате (или наоборот).
+    """
+    keys: list[str] = []
+    if fp.start:
+        if fp.ical:
+            keys.append("ical\t%s\t%s" % (fp.ical, fp.start))
+        if fp.url:
+            keys.append("room\t%s\t%s" % (fp.url, fp.start))
+    return keys
+
+
+def load_dedup_winners(now: datetime | None = None) -> dict[str, Any]:
+    """Прочитать память о победителях, выкинув всё, что уже отгорело."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        raw = json.loads(DEDUP_WINNERS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Память о схлопывании нечитаема (%s) — начинаю с чистой", e)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    edge = now - timedelta(hours=WINNER_MEMORY_KEEP_HOURS)
+    for key, val in raw.items():
+        if not isinstance(key, str) or not isinstance(val, dict):
+            continue
+        try:
+            start = datetime.fromisoformat(str(val.get("start_at")))
+        except ValueError:
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if start >= edge:
+            out[key] = val
+    return out
+
+
+def save_dedup_winners(memory: dict[str, Any]) -> None:
+    """Записать память атомарно. Файл вспомогательный — сбой не роняет прогон."""
+    DEDUP_WINNERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=DEDUP_WINNERS_FILE.name + ".",
+                               dir=str(DEDUP_WINNERS_FILE.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DEDUP_WINNERS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _remembered(memory: dict[str, Any], fps: list) -> dict[str, Any] | None:
+    for fp in fps:
+        for key in _memory_keys(fp):
+            val = memory.get(key)
+            if isinstance(val, dict) and val.get("event_id"):
+                return val
+    return None
+
+
+def _pick_winner(
+    group: list[dict[str, Any]],
+    remembered: dict[str, Any] | None,
+    frozen: bool,
+) -> tuple[dict[str, Any], str]:
+    """Кого ведём. Возвращает (победитель, почему именно его)."""
+    if frozen and remembered:
+        for it in group:
+            if it.get("event_id") == remembered.get("event_id"):
+                return it, "по ней уже вели в прошлый тик"
+    for it in group:
+        if _is_owner_named(it):
+            # У записи с человеческим именем привязка чата, разметка
+            # company/visibility и режим открытых вопросов. Автоимя вечернего
+            # блока `oneoff-<hash>` — расходный материал.
+            return it, "имя записи дал владелец"
+    return group[0], "первая в реестре"
+
+
+def dedupe_queue(
+    queue: list[dict[str, Any]],
+    *,
+    memory: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """ISS-54: схлопнуть элементы очереди, которые описывают ОДНУ встречу.
+
+    Формула тождества — общая с реестром, живёт в `lib/meeting_identity.py`.
+    Здесь важны три вещи сверх неё.
+
+    1. Совпали комната и секунда старта — схлопываем ВСЕГДА, даже если у
+       событий разные `iCalUID`. Один URL Telemost в одну секунду — это один
+       разговор; два элемента очереди на него означают двух ботов в комнате.
+       Разные точные ключи — не повод пропустить обоих, а повод сказать
+       владельцу: в календаре два разных события, проверь (WARNING в лог).
+    2. Молча не гасим никогда: на каждое схлопывание — строка в scheduler.log
+       с обоими id, обоими календарями и именем победителя.
+    3. Победитель ЗАКРЕПЛЯЕТСЯ между тиками (`memory`). Иначе достаточно, чтобы
+       в следующем тике победитель из очереди пропал, — и на встречу приезжает
+       второй бот под другим `event_id`. Если победитель пропал, а проигравший
+       остался, проигравший наследует `event_id` победителя: на нём ключуются
+       все барьеры ниже по течению.
+
+    Элемент очереди не мутируем: работаем с копиями (функцию тестируют как
+    чистую, и `.queue.json` пишется из возвращённого списка).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    mem = memory if isinstance(memory, dict) else {}
+
+    kept: list[dict[str, Any]] = []
+    kept_fp: list[Any] = []          # приметы выжившего (объединённые по группе)
+    groups: list[list[dict[str, Any]]] = []   # все элементы группы
+    group_fps: list[list[Any]] = []           # их приметы
+    by_start: dict[str, list[int]] = {}       # старт → индексы в kept (линейность)
+
+    for raw in queue:
+        if not isinstance(raw, dict):
+            # Дедуп — не то место, где можно потерять старт: чужой мусор
+            # проносим как есть, разбираться будет тот, кто его положил.
+            logger.warning("В очереди не-словарь (%s) — оставляю как есть",
+                           type(raw).__name__)
+            kept.append(raw)
+            kept_fp.append(fingerprint())
+            groups.append([])
+            group_fps.append([])
+            continue
+
+        item = dict(raw)
+        fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
+
+        twin_idx: int | None = None
+        proof, conflict = MATCH_NONE, False
+        if fp.start is not None:
+            for idx in by_start.get(fp.start, ()):
+                proof, conflict = compare(kept_fp[idx], fp)
+                if proof:
+                    twin_idx = idx
+                    break
+
+        if twin_idx is None:
+            kept.append(item)
+            kept_fp.append(fp)
+            groups.append([item])
+            group_fps.append([fp])
+            if fp.start is not None:
+                by_start.setdefault(fp.start, []).append(len(kept) - 1)
+            continue
+
+        prev = kept[twin_idx]
+        groups[twin_idx].append(item)
+        group_fps[twin_idx].append(fp)
+        if conflict:
+            logger.warning(
+                "В одной комнате в одну и ту же секунду — ДВА РАЗНЫХ события "
+                "календаря: «%s» (%s) и «%s» (%s) @ %s %s. Веду как одну встречу "
+                "(иначе в комнату придут два бота и запишут один разговор), но "
+                "проверь календарь — похоже, событие продублировано",
+                prev.get("meeting_id"), ical_key(prev.get("ical_uid")) or "?",
+                item.get("meeting_id"), fp.ical or "?",
+                item.get("start_at"), item.get("url"),
+            )
+
+        remembered = _remembered(mem, group_fps[twin_idx])
+        frozen = _is_frozen(fp.start, now)
+        winner, why = _pick_winner(groups[twin_idx], remembered, frozen)
+        dropped = [it for it in groups[twin_idx] if it is not winner]
+        logger.info(
+            "Схлопнул дубль встречи (%s): «%s» [%s] и «%s» [%s] @ %s — веду по "
+            "«%s» (%s), второй старт не ставлю (иначе придут два бота)",
+            proof_ru(proof, fp),
+            prev.get("meeting_id"), prev.get("calendar_id") or "?",
+            item.get("meeting_id"), item.get("calendar_id") or "?",
+            item.get("start_at"), winner.get("meeting_id"), why,
+        )
+        # Ключ дубля мог быть известен только у выбывшего — переносим на
+        # победителя, иначе следующий тик не узнает встречу по точному ключу.
+        if not ical_key(winner.get("ical_uid")):
+            for other in dropped:
+                other_ical = ical_key(other.get("ical_uid"))
+                if other_ical:
+                    winner["ical_uid"] = other_ical
+                    break
+        kept[twin_idx] = winner
+        kept_fp[twin_idx] = fingerprint(
+            winner.get("start_at"), winner.get("url"), winner.get("ical_uid"))
+
+    _apply_winner_memory(kept, kept_fp, group_fps, mem, now)
+    return kept
+
+
+def _is_frozen(start_key: str | None, now: datetime) -> bool:
+    """Пора ли держаться за прошлый выбор: до старта меньше окна заморозки."""
+    if not start_key:
+        return False
+    try:
+        start = datetime.fromisoformat(start_key)
+    except ValueError:
+        return False
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return now >= start - timedelta(minutes=WINNER_FREEZE_MINUTES)
+
+
+def _apply_winner_memory(
+    kept: list[dict[str, Any]],
+    kept_fp: list[Any],
+    group_fps: list[list[Any]],
+    memory: dict[str, Any],
+    now: datetime,
+) -> None:
+    """Закрепить победителя и подобрать «осиротевших» проигравших.
+
+    Осиротевший — это выживший элемент, который в прошлые тики был проигравшим,
+    а победитель из очереди исчез (календарь его записи не ответил; победитель
+    был разовой записью и погасил себя после старта). Своего `event_id` ему
+    хватит, чтобы привести ВТОРОГО бота на встречу, где первый уже пишет.
+    Поэтому он наследует `event_id` победителя: на этом ключе стоят барьеры
+    `runner._candidates` и `state_acquire`.
+    """
+    for idx, item in enumerate(kept):
+        if not isinstance(item, dict):
+            continue
+        fp = kept_fp[idx]
+        # Помним группу под ключами ВСЕХ её элементов: копии могли схлопнуться
+        # по точному ключу, приехав из разных комнат, — тогда в следующем тике
+        # выживший узнается по своей комнате.
+        keys = list(dict.fromkeys(
+            [k for member in group_fps[idx] for k in _memory_keys(member)]
+            + _memory_keys(fp)
+        ))
+        if not keys:
+            continue
+        remembered = _remembered(memory, [fp])
+        collapsed_now = len(group_fps[idx]) > 1
+        if (
+            remembered
+            and not collapsed_now
+            and remembered.get("event_id") != item.get("event_id")
+            and _is_frozen(fp.start, now)
+        ):
+            logger.warning(
+                "Встречу @ %s в прошлый тик вели по «%s», сейчас её в очереди "
+                "нет — веду по «%s», но барьер повторного старта оставляю "
+                "прежним (иначе на встречу приедет второй бот)",
+                item.get("start_at"), remembered.get("meeting_id"),
+                item.get("meeting_id"),
+            )
+            item["event_id"] = remembered["event_id"]
+            continue
+        entry = {
+            "event_id": item.get("event_id"),
+            "meeting_id": item.get("meeting_id"),
+            "start_at": fp.start,
+        }
+        for key in keys:
+            memory[key] = entry
 
 
 def _expand_google_calendar(
@@ -332,6 +740,14 @@ def _queue_item(
     else:
         event_id = f"local:{rec['id']}:{start.strftime('%Y%m%dT%H%M')}"
 
+    # ISS-54: точный ключ «одно и то же событие» через все календари. Берём из
+    # самого события; если календарь поля не дал — из записи реестра (его туда
+    # кладёт apply-reply при заведении встречи).
+    ical_uid = event_ical_uid(calendar_event) if calendar_event else None
+    if not ical_uid:
+        raw = rec.get("ical_uid")
+        ical_uid = raw.strip() if isinstance(raw, str) and raw.strip() else None
+
     return {
         "meeting_id": rec["id"],
         "event_id": event_id,
@@ -342,6 +758,10 @@ def _queue_item(
         "expected_participants": rec.get("expected_participants") or [],
         "keep_audio": bool(rec.get("keep_audio", False)),
         "type": rec.get("type", "?"),
+        # Диагностика дублей: без календаря в элементе лог о схлопывании не
+        # говорит владельцу, ИЗ КАКИХ двух календарей приехала одна встреча.
+        "calendar_id": rec.get("calendar_id"),
+        "ical_uid": ical_uid,
     }
 
 

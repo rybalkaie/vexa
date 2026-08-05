@@ -5,6 +5,7 @@ Atomic write via tmp + rename; preserves trailing newline on read.
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import re
 import shutil
@@ -13,6 +14,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("notary.registry")
 
 # pyyaml импортируется ЛЕНИВО внутри `_read_yaml`/`_atomic_write_yaml` (контракт
 # Ф4 §1.2): системный python3 юнит-тестов pyyaml не несёт, а чистые резолверы
@@ -183,6 +186,17 @@ WATCHED_HEADER = """# Реестр отслеживаемых встреч дл�
 #               oneoff — разовая самодостаточная встреча. Проставляй ключевым
 #               сериям вручную; ОТСУТСТВИЕ genre → бот берёт мягкий дефолт
 #               (координация), НЕ форсируя.
+#
+# Ф1 (ISS-51…55): опциональный режим открытых вопросов серии — что бот считает
+# «открытыми вопросами» этой серии:
+#   open_questions_mode: carry | last-only
+#               carry — серия-накопление: незакрытые вопросы переезжают из
+#               встречи во встречу и копятся, пока их не закроют (Директорат:
+#               «висяки не должны теряться»). last-only — справочный режим:
+#               показываем только вопросы последней встречи.
+#               ОТСУТСТВИЕ поля → дефолт last-only (решение владельца 29.07);
+#               неизвестное значение → тот же дефолт + предупреждение в лог
+#               (реестр правят руками, опечатка не должна тихо менять поведение).
 """
 
 
@@ -287,6 +301,31 @@ VALID_VISIBILITY = {"company", "private"}
 # отсутствие (резолв устойчив к ручному мусору).
 VALID_GENRES = {"директорат", "координация", "продукт", "1-на-1", "oneoff"}
 
+# ISS-51…55 Ф1: режим открытых вопросов серии.
+# `carry`     — накопление со статусами (текущее поведение целиком): висяки
+#               переносятся из протокола в протокол, утром приходит дайджест со
+#               статусами и просьбой отчитаться.
+# `last-only` — справочная шпаргалка: к встрече приходит список задач ТОЛЬКО
+#               прошедшей встречи, без статусов и без переноса.
+# Дефолт — `last-only` (решение владельца 3 от 29.07: накопление включается
+# осознанно). Поле ОПЦИОНАЛЬНО и пер-record, резолв на уровень series — как
+# telegram_chat_id. Режим переключается в обе стороны в любой момент
+# (решение владельца 6), поэтому значение читается на каждом обращении.
+VALID_OPEN_QUESTIONS_MODES = {"carry", "last-only"}
+DEFAULT_OPEN_QUESTIONS_MODE = "last-only"
+
+# ISS-51…55, решение владельца 7: возврат серии в накопление начинает счёт С
+# ЧИСТОГО ЛИСТА — вопросы, копившиеся до переключения, не поднимаются. Дата
+# (`YYYY-MM-DD`, пояс выжимок) ставится ТОЛЬКО в момент реального переключения в
+# `carry` командой бота. Пока «чистый лист» был лишь обещанием в тексте
+# подтверждения, он получался ПОБОЧНО — из того, что протокол в шпаргалке идёт
+# без раздела хвоста; стоило переключить туда и обратно, не проведя ни одной
+# встречи, и весь до-переключательный ком возвращался целиком.
+# Поля нет (реестр разложен руками, серия никогда не переключалась) → отсечки
+# нет → прежнее поведение.
+OPEN_QUESTIONS_CARRY_SINCE_FIELD = "open_questions_carry_since"
+_CARRY_SINCE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[str]:
     errors: list[str] = []
@@ -337,6 +376,25 @@ def validate_watched_record(rec: dict[str, Any], rooms: dict[str, Any]) -> list[
     if genre is not None:
         if not isinstance(genre, str) or genre.strip().casefold() not in VALID_GENRES:
             errors.append(f"genre={genre!r}: допустимо {sorted(VALID_GENRES)} или отсутствие")
+    # ISS-51…55 Ф1: open_questions_mode — опционален, валидируем значение если задано.
+    # bool отсекается явно: он подкласс int и .strip() у него нет.
+    oqm = rec.get("open_questions_mode")
+    if oqm is not None:
+        if not isinstance(oqm, str) or oqm.strip().casefold() not in VALID_OPEN_QUESTIONS_MODES:
+            errors.append(
+                f"open_questions_mode={oqm!r}: допустимо "
+                f"{sorted(VALID_OPEN_QUESTIONS_MODES)} или отсутствие"
+            )
+    # Решение владельца 7: отсечка «счёт с чистого листа». Дата или отсутствие;
+    # мусор ловим здесь, потому что читатель его молча игнорирует (нет отсечки =
+    # старое поведение), и без валидации опечатка жила бы в файле незамеченной.
+    since = rec.get(OPEN_QUESTIONS_CARRY_SINCE_FIELD)
+    if since is not None:
+        if not isinstance(since, str) or not _CARRY_SINCE_RE.match(since.strip()):
+            errors.append(
+                f"{OPEN_QUESTIONS_CARRY_SINCE_FIELD}={since!r}: допустима дата "
+                "YYYY-MM-DD или отсутствие"
+            )
     return errors
 
 
@@ -403,6 +461,152 @@ def find_series_bindings(watched: dict[str, Any]) -> list[tuple[Any, int]]:
     return out
 
 
+def series_for_chat(chat_id: Any, watched: dict[str, Any]) -> list[str]:
+    """Серии, привязанные к этому `telegram_chat_id`. Уникальные, в порядке появления.
+
+    ISS-52: бот должен понимать, в чате какой серии он находится, когда контекста
+    реплая нет.
+
+    Выключенные (`enabled: false`) и заглушенные (`ignored: true`) записи
+    пропускаются — тем же правилом, что и в планировщике (`scheduler.py`): чего
+    он больше не ведёт, того для бота уже нет. Иначе ОДНОЙ мёртвой записи в чате
+    хватало бы, чтобы чат навсегда стал «неоднозначным» и ISS-52 в нём молча
+    перестал работать (реальный сценарий: закрыли выставку в общей комнате `@t11`;
+    Ф5 дедупа встреч добавляет второй — задвоенная встреча заводит вторую серию).
+
+    Схлопывание по УНИКАЛЬНЫМ сериям: дубли записей одной серии случаются
+    (ISS-54), и наивный список дал бы «несколько серий» там, где она одна, — то
+    есть лишний переспрос у людей в группе на каждую просьбу. На сегодняшнем
+    боевом реестре дублей нет, схлопывание работает на упреждение.
+
+    Обратный инвариант «один чат → одна серия» реестром НЕ гарантирован (одна
+    комната может обслуживать несколько серий, `@t11` = координация и выставка),
+    поэтому возвращается список, а решение — за вызывателем.
+
+    Ключ схлопывания — `normalize_series_key` (ISS-7): дрейф регистра/пробелов не
+    должен размножать одну серию в две. Возвращается РЕАЛЬНЫЙ slug первой записи.
+    """
+    out: list[str] = []
+    if not isinstance(watched, dict):
+        return out
+    if not (isinstance(chat_id, int) and not isinstance(chat_id, bool)):
+        return out
+    records = watched.get("watched")
+    if not isinstance(records, list):
+        return out
+    seen: set[str] = set()
+    for w in records:
+        if not isinstance(w, dict):
+            continue
+        # Мёртвые записи не дают серию (образец — scheduler.py).
+        if not w.get("enabled", True) or w.get("ignored", False):
+            continue
+        cid = w.get("telegram_chat_id")
+        if not (isinstance(cid, int) and not isinstance(cid, bool)):
+            continue
+        if cid != chat_id:
+            continue
+        ws = w.get("series")
+        if not isinstance(ws, str) or not ws.strip():
+            continue
+        norm = normalize_series_key(ws)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(ws)
+    return out
+
+
+# Уже отругались на этот мусор в open_questions_mode: (ключ серии, тип, repr).
+# Живёт на время процесса — реестр правится руками, и до правки повторять нечего.
+_OQM_WARNED: set = set()
+
+
+def series_open_questions_mode(series: Any, watched: dict[str, Any]) -> str:
+    """Режим открытых вопросов серии: `carry` | `last-only`. Дефолт — `last-only`.
+
+    Резолв тот же, что у `get_telegram_chat_id_for_series` (ISS-7, РИСК4): сначала
+    ТОЧНОЕ совпадение ключа серии, затем нормализованное. Иначе дрейф регистра или
+    кавычек в `meta.series` молча вернул бы серию-накопление в справочный режим, и
+    висяки Директората перестали бы копиться незаметно.
+
+    Пер-record поле, резолв на уровень серии — берётся первое ВАЛИДНОЕ значение
+    среди записей серии (как company/visibility/genre).
+
+    Неизвестное значение → дефолт + предупреждение в лог: реестр правят руками, и
+    опечатка не должна тихо менять поведение серии (образец — scheduler.py про
+    неизвестный `type`). Предупреждение об одном и том же мусоре печатается ОДИН
+    раз на процесс (`_OQM_WARNED`) — иначе одна опечатка сыпалась бы в лог на
+    каждом чтении. Логируются только имя серии и само значение — тексты задач и
+    содержимое встреч сюда не попадают.
+    """
+    if not isinstance(watched, dict):
+        return DEFAULT_OPEN_QUESTIONS_MODE
+    norm = normalize_series_key(series)
+    if not norm:
+        # Не-строка, пустая строка И «нормализованно-пустой» ключ («  », «»»):
+        # после нормализации такой ключ совпал бы с записями, чья series тоже
+        # пуста, — это матч по пустоте, а не по серии. `series_for_chat` от того
+        # же класса ошибок защищён явно, здесь симметрично.
+        return DEFAULT_OPEN_QUESTIONS_MODE
+    records = watched.get("watched")
+    if not isinstance(records, list):
+        return DEFAULT_OPEN_QUESTIONS_MODE
+
+    # Слоты приоритета: (живая запись, точный ключ). Живые записи главнее
+    # мёртвых — как в `series_for_chat` и `scheduler.py`, где `enabled: false` /
+    # `ignored` серию не дают вовсе. Иначе отказная запись прошлой встречи
+    # (их заводит ISS-53) определяла бы режим ЖИВОЙ серии, а владелец в ответ на
+    # «эта серия — накопление» слышал бы «и так в накоплении», пока живая запись
+    # остаётся шпаргалкой. Мёртвые слоты — фолбэк: если живых записей у серии не
+    # осталось совсем, честнее назвать записанный режим, чем дефолт.
+    slots: dict[tuple[bool, bool], str] = {}
+    has_live = False
+    for w in records:
+        if not isinstance(w, dict):
+            continue
+        ws = w.get("series")
+        exact = ws == series
+        if not exact and not (ws is not None and normalize_series_key(ws) == norm):
+            continue
+        live = series_record_is_live(w)
+        has_live = has_live or live
+        slot = (live, exact)
+        if slot in slots:
+            continue  # уже нашли первое валидное значение этого слота
+        raw = w.get("open_questions_mode")
+        if raw is None:
+            continue  # поле не задано у этой записи — смотрим следующую
+        mode: str | None = None
+        if isinstance(raw, str):  # bool не подкласс str — отдельная проверка не нужна
+            cand = raw.strip().casefold()
+            if cand in VALID_OPEN_QUESTIONS_MODES:
+                mode = cand
+        if mode is None:
+            # Дедуп: резолвер зовётся на КАЖДОМ дайджесте/протоколе, а опечатка в
+            # реестре живёт до правки руками — без дедупа одна опечатка засоряла бы
+            # лог ровно тогда, когда его сели читать. Ключ по значению, а не по
+            # объекту: `raw` бывает нехешируемым (список из YAML).
+            warn_key = (norm, type(raw).__name__, repr(raw))
+            if warn_key not in _OQM_WARNED:
+                _OQM_WARNED.add(warn_key)
+                logger.warning(
+                    "Серия %s: неизвестное open_questions_mode=%r — беру дефолт %s",
+                    ws, raw, DEFAULT_OPEN_QUESTIONS_MODE,
+                )
+            continue
+        slots[slot] = mode
+    # Есть хоть одна живая запись → решают ТОЛЬКО живые: мёртвая запись не
+    # определяет поведение серии даже тогда, когда у живой поле не проставлено
+    # (иначе отказная запись прошлой встречи молча включала бы серии режим).
+    # Живых нет совсем → мёртвые как фолбэк: честнее назвать записанный режим.
+    order = ((True, True), (True, False)) if has_live else ((False, True), (False, False))
+    for slot in order:
+        if slot in slots:
+            return slots[slot]
+    return DEFAULT_OPEN_QUESTIONS_MODE
+
+
 def resolve_series_ref(
     ref: str, watched: dict[str, Any], *, display_map: dict[str, str] | None = None
 ) -> str | None:
@@ -422,10 +626,14 @@ def resolve_series_ref(
     ref_s = ref.strip().strip("«»\"'").strip()
     if not ref_s:
         return None
+    # `isinstance(w, dict)` обязателен: реестр правят руками, и одна строка
+    # вместо записи роняла резолв `AttributeError`'ом. В query-ветке команды
+    # режима он летел мимо `try` — человек не получал ответа, а обработка
+    # сообщения обрывалась, и до роутов ниже оно не доходило.
     series_list = [
         w.get("series")
-        for w in watched.get("watched", [])
-        if isinstance(w.get("series"), str) and w.get("series")
+        for w in (watched.get("watched", []) if isinstance(watched, dict) else [])
+        if isinstance(w, dict) and isinstance(w.get("series"), str) and w.get("series")
     ]
     # 1. Точный slug.
     for s in series_list:
@@ -524,6 +732,138 @@ def set_telegram_chat_id_for_series(series: str, chat_id: int, watched: dict[str
             w["telegram_chat_id"] = chat_id
             n += 1
     return n
+
+
+def set_open_questions_mode_for_series(
+    series: str, mode: str, watched: dict[str, Any], *, carry_since: str | None = None
+) -> int:
+    """Ф2 (ISS-51…55): проставляет `open_questions_mode=<mode>` ВСЕМ записям серии.
+
+    Возвращает число обновлённых записей. Caller обязан после этого вызвать
+    `save_watched(watched)` (atomic + flock уже внутри `save_watched`).
+
+    `carry_since` (дата `YYYY-MM-DD`) — отсечка «счёт с чистого листа» решения
+    владельца 7. Ставится ТОЛЬКО вместе с `mode='carry'` и ТОЛЬКО когда серия
+    реально переезжает из шпаргалки в накопление. Повтор команды «режим
+    накопление» по серии, которая и так в накоплении, отсечку НЕ трогает —
+    иначе одна лишняя команда обнуляла бы накопленный хвост (а он живёт только
+    в разделе протокола, и восстановить его нечем).
+
+    КОНВЕНЦИЯ ПОЛЯ (одна на всех, Ф2): единица владения `open_questions_mode` —
+    СЕРИЯ, не запись. Пишем во ВСЕ записи серии (включая выключенные — чтобы
+    записи не разошлись); читаем по ЖИВЫМ записям (`series_record_is_live`), а
+    мёртвые берём только если живых не осталось совсем. Команда бота доводит
+    реестр до этого состояния при каждом вызове, даже если режим «тот же».
+    Исключение — `meeting-watch edit --id`, который правит ОДНУ запись: это
+    ручная дверь для разбора аномалий, и после неё реестр может быть
+    несогласован до следующей команды бота (долг: привести CLI к той же
+    конвенции — файл вне зоны Ф2).
+
+    Почему ВСЕМ записям серии, а не одной: читатель
+    (`series_open_questions_mode`) берёт ПЕРВОЕ валидное значение среди записей
+    серии. Одна серия обычно = несколько записей (несколько встреч/календарей,
+    ISS-54 добавляет дубли). Записав режим в одну запись, мы получили бы
+    read-after-write, зависящий от ПОРЯДКА записей в файле: устаревшее значение
+    в записи выше молча перебило бы только что заданное — владелец увидел бы
+    «✅ принял», а поведение не изменилось. Тот же выбор, что у соседа
+    `set_telegram_chat_id_for_series` (одна привязка на серию — инвариант
+    писателя).
+
+    Матч ключа симметричен чтению (ISS-7, РИСК4): точное `==` ИЛИ нормализованное
+    (`casefold`/пробелы/кавычки). Нормализованно-пустой ключ (`""`, `«»`) не
+    матчит ничего: иначе он совпал бы с записями, чья `series` тоже пуста, — это
+    матч по пустоте, а не по серии.
+
+    `mode` вне `VALID_OPEN_QUESTIONS_MODES` → `ValueError` (в реестр записывается
+    только каноничное значение; мусор в файл не попадает даже при ошибке caller'а).
+    """
+    if not series:
+        return 0
+    if not isinstance(mode, str):
+        raise ValueError(f"mode must be str, got {type(mode).__name__}")
+    canon = mode.strip().casefold()
+    if canon not in VALID_OPEN_QUESTIONS_MODES:
+        raise ValueError(
+            f"mode={mode!r}: допустимо {sorted(VALID_OPEN_QUESTIONS_MODES)}"
+        )
+    if carry_since is not None:
+        if canon != "carry":
+            raise ValueError("carry_since имеет смысл только при mode='carry'")
+        if not isinstance(carry_since, str) or not _CARRY_SINCE_RE.match(carry_since.strip()):
+            raise ValueError(f"carry_since={carry_since!r}: нужна дата YYYY-MM-DD")
+    n = 0
+    for w in series_records(series, watched):
+        w["open_questions_mode"] = canon
+        if carry_since is not None:
+            w[OPEN_QUESTIONS_CARRY_SINCE_FIELD] = carry_since.strip()
+        n += 1
+    return n
+
+
+def series_open_questions_carry_since(series: Any, watched: Any) -> str | None:
+    """Отсечка «счёт с чистого листа» серии (`YYYY-MM-DD`) или None.
+
+    Берём САМУЮ ПОЗДНЮЮ дату среди записей серии, а не первую валидную (как
+    company/visibility/genre): отсечку ставит команда бота сразу во ВСЕ записи,
+    и если одна из них отстала (её добавили позже, реестр правили руками),
+    старая дата не имеет права ослабить последнее решение владельца.
+
+    Мусор и нечитаемую дату игнорируем — «отсечки нет» значит «веду себя как
+    раньше». Это безопасная сторона: лишний хвост обратим, потерянный — нет.
+    """
+    latest: str | None = None
+    for w in series_records(series, watched):
+        raw = w.get(OPEN_QUESTIONS_CARRY_SINCE_FIELD)
+        if not isinstance(raw, str):
+            continue
+        val = raw.strip()
+        if not _CARRY_SINCE_RE.match(val):
+            continue
+        if latest is None or val > latest:
+            latest = val
+    return latest
+
+
+def series_records(series: Any, watched: Any) -> list[dict[str, Any]]:
+    """Все записи серии — тем же матчем ключа, каким читается и пишется поле.
+
+    Ф2: команда режима спрашивает у реестра не только «какой режим сейчас», но и
+    «согласованы ли записи между собой» (самолечение расхождений) и «жива ли
+    серия вообще» (стоит ли писать людям в её чат). Матч ключа обязан быть ОДИН
+    на чтение, запись и эти проверки, иначе они разойдутся молча — корень ISS-7.
+
+    Матч: точное `==` ИЛИ нормализованное (`casefold`/пробелы/кавычки).
+    Нормализованно-пустой ключ (`""`, `«»`, `«  »`) не матчит НИЧЕГО: иначе он
+    совпал бы с записями, чья `series` тоже пуста, — это матч по пустоте.
+    Записи-не-словари (руками правленный YAML) пропускаются.
+    """
+    if not isinstance(watched, dict):
+        return []
+    nseries = normalize_series_key(series)
+    if not nseries:
+        return []
+    records = watched.get("watched")
+    if not isinstance(records, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for w in records:
+        if not isinstance(w, dict):
+            continue
+        ws = w.get("series")
+        if ws == series or (ws is not None and normalize_series_key(ws) == nseries):
+            out.append(w)
+    return out
+
+
+def series_record_is_live(rec: Any) -> bool:
+    """Запись «живая» = бот по ней ходит: не `enabled: false` и не `ignored`.
+
+    Тот же признак, что у `series_for_chat` и `scheduler.py` («мёртвые записи не
+    дают серию»). Вынесен, чтобы у режима и у остального реестра он был один.
+    """
+    if not isinstance(rec, dict):
+        return False
+    return bool(rec.get("enabled", True)) and not rec.get("ignored", False)
 
 
 def pause_until() -> str | None:

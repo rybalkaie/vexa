@@ -194,3 +194,6 @@ tests3/.state-helm
 tests3/.state-*
 
 tests3/.current-stage
+
+# протокол прогонов build-idea — не в продуктовый репозиторий (грабли 05.08: уехал в main и ломал status чужих прогонов)
+.build-idea/

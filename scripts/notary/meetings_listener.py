@@ -893,6 +893,78 @@ def _reply_context_series_digest(cid: int, msg: dict[str, Any]) -> Optional[str]
         return None
 
 
+def _series_named_in_text(
+    text: str, candidates: list[str], display_map: dict[str, str]
+) -> Optional[str]:
+    """Серия, названная СЛОВАМИ прямо в просьбе, — ровно одна из `candidates`.
+
+    ISS-52: когда чат обслуживает несколько серий, единственным выходом был
+    ответ-реплай на протокол — ровно то, от чего фичу и уводили. Второй путь:
+    «пришлите протокол Координация». Сверяем и по slug'у, и по отображаемому
+    имени (slug бывает латиницей, человек пишет по-русски). От русских окончаний
+    защищаемся срезом хвоста: «координация» → «координац» матчит «координации».
+
+    Совпало больше одной серии (или ни одной) → None, вызыватель переспросит:
+    лишний вопрос дешевле, чем чужой протокол в чат. Кандидаты приходят только
+    из привязок ЭТОГО чата, так что выбор ограничен сериями самого чата."""
+    t = (text or "").casefold().replace("ё", "е")
+    hits: list[str] = []
+    for s in candidates:
+        labels = [s]
+        disp = display_map.get(s)
+        if isinstance(disp, str) and disp.strip():
+            labels.append(disp)
+        for label in labels:
+            stems = [
+                tok[:max(5, len(tok) - 2)]
+                for tok in re.split(r"[^0-9a-zа-я]+", label.casefold().replace("ё", "е"))
+                if len(tok) >= 5
+            ]
+            if any(stem in t for stem in stems):
+                hits.append(s)
+                break
+    return hits[0] if len(hits) == 1 else None
+
+
+def _chat_context_series(cid: int, allowed_chat: int) -> tuple[list[str], Optional[str]]:
+    """ISS-52: серии, привязанные к ТЕКУЩЕМУ чату. Фолбэк, когда реплая нет.
+
+    Симптом без этого: человек в группе серии просит «вышли файл с открытыми
+    вопросами», не отвечая на протокол, — и бот не знает, в чате какой серии он
+    находится, хотя привязка чата к серии лежит в реестре.
+
+    Возвращает `(серии, причина_сбоя)`. Список пуст в трёх случаях:
+      • это личка владельца — она не привязана к серии, и вопрос «какую серию»
+        там остаётся законным (иначе бот угадывал бы вместо переспроса);
+      • чат не привязан ни к одной серии;
+      • реестр не прочитался — тогда вторым элементом едет ИМЯ класса ошибки,
+        и вызыватель пишет его в лог (иначе «чат без серии» и «реестр упал»
+        выглядят в журнале одинаково — то есть никак).
+
+    Несколько серий на один чат — законная ситуация (одна комната обслуживает
+    и координацию, и выставку), поэтому список, а решение — за вызывателем.
+
+    Ловим `(Exception, SystemExit)`, а не голый `Exception`: `registry._read_yaml`
+    на не-словаре верхнего уровня делает `raise SystemExit` (CLI-происхождение), а
+    `SystemExit` — потомок `BaseException` и сквозь `except Exception` пролетает
+    насквозь: из роута, из `process_message`, из главного цикла — и гасит процесс
+    ДО `save_offset`. Telegram отдал бы тот же апдейт после рестарта → петля
+    перезапусков всего бота из-за одной кривой правки watched.yaml руками.
+    `BaseException` брать нельзя — проглотили бы KeyboardInterrupt и SIGTERM.
+    """
+    if cid is None or cid == allowed_chat:
+        return [], None
+    try:
+        from notary.cli import registry  # noqa: PLC0415
+        watched = registry.load_watched()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort, listener не валим
+        return [], type(e).__name__
+    try:
+        return registry.series_for_chat(cid, watched), None
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        return [], type(e).__name__
+
+
 # ── ISS-45: переотправка артефакта (протокол / дайджест) по просьбе участника ──
 def _latest_protocol_path(series: str) -> Optional[tuple]:
     """Последний `<date>-protokol.md` серии → (Path, дата). Имена ISO-датой →
@@ -920,6 +992,10 @@ def _resend_protocol(token: str, cid: int, series: str, msg: dict[str, Any]) -> 
     if not found:
         # Протокола ещё нет: встреча прошла, но сборка не завершилась (или это первая
         # встреча серии). Не пугаем «потерялся» — честно про «ещё не готов».
+        # Логируем: этот же ответ приходит и при ДРЕЙФЕ ключа серии (реестр говорит
+        # «Koord», папка на диске «koord») — тогда бот уверенно врёт, что протокола
+        # нет, и без строки в журнале это неотличимо от честного «ещё не собрался».
+        logger.info("[send-artifact] протокол серии %s не найден на диске (чат %s)", series, cid)
         send_message(token, cid, "Протокол этой встречи пока не готов — пришлю, как соберётся.",
                      reply_to=reply_to_id)
         return True
@@ -984,6 +1060,11 @@ def _resend_digest(token: str, cid: int, series: str, msg: dict[str, Any]) -> bo
             pass
         return True
     if reason == "empty":
+        # Логируем: ровно этот ответ бот даёт и при ДРЕЙФЕ ключа серии (реестр
+        # разошёлся с именем папки — корень ISS-7). Тогда людям в группе уверенно
+        # сообщается «вопросов нет», хотя они есть; без строки в журнале отличить
+        # это от честной пустоты нельзя.
+        logger.info("[send-artifact] открытых вопросов по серии %s нет (чат %s)", series, cid)
         send_message(token, cid, "Открытых вопросов по этой встрече сейчас нет — список пуст.",
                      reply_to=reply_to_id)
         return True
@@ -997,39 +1078,151 @@ def _resend_digest(token: str, cid: int, series: str, msg: dict[str, Any]) -> bo
 def maybe_route_to_send_artifact(
     token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
 ) -> bool:
-    """ISS-45: reply-просьба «пришли протокол / открытые вопросы» → переотправить нужный
+    """ISS-45: просьба «пришли протокол / открытые вопросы» → переотправить нужный
     артефакт (вместо глухого «🤔 не понял»). Стоит ПОСЛЕ ack-роута и ДО digest-роута —
-    иначе digest-роут проглотил бы reply на дайджест первым. Узкий детерминированный
-    триггер (глагол отправки + объект); статус-ответ уступаем роутам ниже (не крадём)."""
+    иначе digest-роут проглотил бы reply на дайджест первым.
+
+    ISS-51: понимание просьбы больше не упирается в список глаголов («вышли» боту не
+    понимал, «пришли» понимал) — разбор внутри `send_artifact` стал ИИ-первым под
+    флагом `ENABLE_SEND_ARTIFACT_AI` (дефолт-OFF, регулярка — быстрый путь и офлайн-
+    фолбэк). Защита от перехвата от этого не ослабла, а усилилась: статус-разговор и
+    правки отсекаются ДО разбора (модель на них не зовётся), позиция роута в цепочке
+    прежняя (после ack-, до digest-роута; закреплена тестом позиции).
+
+    РЕМОНТ Ф6. Гейт «не крадём чужое» перестал быть безусловным. Он спрашивает не
+    только «похоже ли это на статус/правку», но и «ЕСТЬ ЛИ КОМУ уступить»: все
+    роуты ниже (digest / mixed / status / шлюз правок) требуют ответа-реплая, а без
+    реплая уступка означает не «сообщение обработает кто-то другой», а «сообщение
+    исчезло молча». Прогон ревью-2: 6 из 10 живых просьб («вышли открытые вопросы,
+    а то я не помню, что там закрыто») гасились именно так — для владельца это
+    неотличимо от исходной жалобы ISS-51.
+
+    Правило теперь:
+      • ЛЮБАЯ правка текста (даже одиночная — «поправь фамилию в протоколе») →
+        уступаем всегда: потерянная правка дороже неприсланного файла (ревью-1 🔴-2,
+        класс инцидента 20.07);
+      • статус-разговор (тем же предикатом `_looks_like_status_talk`, что у Ф3 —
+        шире `detect_status_intent`, ловит и «закрой вопрос по смете») → уступаем,
+        если выполнено ЛЮБОЕ из трёх: человек не просит файл; это реплай (там
+        статус-роут ниже реально возьмётся, и запись статуса важнее переприсылки);
+        статус ДОЛОЖЕН, а не упомянут попутно («пришли протокол — по второй задаче
+        всё сделано» — отчёт, его терять нельзя);
+      • просьба с ПОПУТНЫМ упоминанием статуса и БЕЗ реплая → это просьба
+        («пришли протокол, я не помню, что мы решили»).
+    Каждый отказ пишет строку в журнал (раньше сообщение исчезало без следа)."""
     if cid is None:
         return False
-    if not isinstance(msg.get("reply_to_message"), dict):
-        return False  # нужен контекст серии (на что отвечают)
     text = (msg.get("text") or "").strip()
     if not text:
         return False
     # Серия + surface по тому, на ЧТО ответили (протокол приоритетнее — точный индекс).
-    series = _reply_context_series(cid, msg)
+    is_reply = isinstance(msg.get("reply_to_message"), dict)
+    series = _reply_context_series(cid, msg) if is_reply else None
     surface = "protocol" if series else None
-    if not series:
+    if not series and is_reply:
         series = _reply_context_series_digest(cid, msg)
         surface = "digest" if series else None
+    # ГЕЙТ «не крадём чужое». Всё детерминированно: без сети и без чтения диска.
+    # ISS-51 (риск 4 плана) поднял его ВЫШЕ разбора — разбор стал ИИ-первым и по
+    # определению шире регулярки, а самый надёжный способ не дать модели украсть
+    # статус или правку — не звать её на них вовсе (заодно ноль лишних вызовов).
+    try:
+        from notary.lib import pending_status_reply, send_artifact  # noqa: PLC0415
+        asks = send_artifact.looks_like_request(text)
+        if (send_artifact.looks_like_edit_request(text)
+                or pending_status_reply.looks_edit_heavy(text)):
+            logger.info("[send-artifact] уступаю шлюзу правок (reply=%s): правка текста",
+                        is_reply)
+            return False
+        if _looks_like_status_talk(text) and (
+                is_reply or not asks
+                or not send_artifact.status_mention_is_incidental(text)):
+            logger.info("[send-artifact] уступаю статус-роутам "
+                        "(reply=%s, просьба=%s, статус-попутно=%s)",
+                        is_reply, asks,
+                        send_artifact.status_mention_is_incidental(text))
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    # Дешёвый пред-чек ДО чтения реестра и ДО разбора: только регулярки. Пропустил —
+    # значит фраза в принципе может закончиться отправкой, и дальше не жалко ни YAML,
+    # ни (возможного) вызова модели.
     try:
         from notary.lib import send_artifact  # noqa: PLC0415
-        kind = send_artifact.detect_artifact_request(text, reply_surface=surface)
+        # `allow_bare_file=is_reply`: голый объект «файл/версия/документ» — интент
+        # ТОЛЬКО в ответе на наше сообщение. Без реплая (ISS-52 берёт серию из
+        # привязки чата) такие фразы — обычная переписка людей между собой
+        # («пришли файл с ценами», «дайте актуальную версию договора»), и бот
+        # вываливал бы им в чат PDF протокола встречи.
+        if not send_artifact.may_be_request(
+                text, reply_surface=surface, allow_bare_file=is_reply):
+            return False
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[send-artifact] пред-чек не удался: %s", type(e).__name__)
+        return False
+    # ISS-52: реплая нет или он ничего не дал → определяем серию по САМОМУ ЧАТУ.
+    # Реестр читаем ЗДЕСЬ — после дешёвого пред-чека и ДО дорогого разбора. Так YAML
+    # не парсится на каждом «привет» (площадь отказа реестра не равна групповому
+    # трафику), и одновременно вызов модели не тратится в чате, к которому не
+    # привязана ни одна серия: там исход предрешён кодом (ревью-2 🟡-3).
+    # Surface остаётся None: без реплая нечем разрешить неоднозначное «пришли
+    # файл», и пред-чек такую фразу уже отсёк (`allow_bare_file`).
+    ambiguous_series: list[str] = []
+    if not series:
+        chat_series, err = _chat_context_series(cid, allowed_chat)
+        if err:
+            # Единственный сигнал, что фича отвалилась не по-настоящему, а из-за
+            # реестра: без него «чат не привязан» и «реестр упал» неотличимы.
+            logger.warning("[chat-series] реестр не прочитан (chat=%s): %s", cid, err)
+        if len(chat_series) == 1:
+            series = chat_series[0]
+            logger.info("[chat-series] серия %s определена по привязке чата %s (кандидатов %d)",
+                        series, cid, len(chat_series))
+        elif len(chat_series) > 1:
+            ambiguous_series = chat_series
+    if not series and not ambiguous_series and not is_reply:
+        # Реплая нет и чат ни с одной серией не связан (в том числе личка владельца):
+        # ответить всё равно нечем — молчим и уступаем роутам ниже, ровно как до
+        # ISS-52. Разбор (и возможный вызов модели) тут уже не нужен: исход False
+        # при любом его результате.
+        return False
+    # РАЗБОР: быстрый путь (регулярка ISS-45) + ИИ-ярус под флагом
+    # `ENABLE_SEND_ARTIFACT_AI` (дефолт-OFF) + верификация артефакта кодом.
+    try:
+        from notary.lib import send_artifact  # noqa: PLC0415
+        kind = send_artifact.detect_artifact_request(
+            text, reply_surface=surface, allow_bare_file=is_reply)
     except Exception as e:  # noqa: BLE001
         logger.debug("[send-artifact] детект не удался: %s", type(e).__name__)
         return False
     if not kind:
         return False
-    # Не крадём статус-ответ: явный статус-интент в тексте → уступаем роутам ниже.
-    try:
-        from notary.lib import pending_status_reply  # noqa: PLC0415
-        if pending_status_reply.detect_status_intent(text):
-            return False
-    except Exception:  # noqa: BLE001
-        pass
+    if not series and ambiguous_series:
+        # ISS-52: чат обслуживает несколько серий. Сначала пробуем понять по словам
+        # самой просьбы («пришлите протокол Координация»), и только потом
+        # переспрашиваем — реплай тут не единственный выход.
+        dm = _series_display_map()
+        series = _series_named_in_text(text, ambiguous_series, dm)
+        if series:
+            logger.info("[chat-series] серия %s названа словами в просьбе (чат %s, кандидатов %d)",
+                        series, cid, len(ambiguous_series))
+        else:
+            logger.info("[chat-series] в чате %s несколько серий (%d) — переспрашиваю: %s",
+                        cid, len(ambiguous_series), ", ".join(ambiguous_series))
+            names = ", ".join(f"«{dm.get(s, s)}»" for s in ambiguous_series)
+            example = dm.get(ambiguous_series[0], ambiguous_series[0])
+            send_message(token, cid,
+                         f"В этом чате у меня несколько серий: {names}. "
+                         f"Назовите серию прямо в просьбе — например «пришлите протокол "
+                         f"{example}» — или ответьте на протокол либо дайджест нужной встречи.",
+                         reply_to=msg.get("message_id"))
+            return True
     if not series:
+        if not is_reply:
+            # Страховка: случай «нет реплая и нет серии» отсечён выше, ДО разбора
+            # (там же объяснено почему). Сюда попасть можно только если резолв
+            # серии выше изменят — тогда поведение остаётся прежним: молчим.
+            return False
         send_message(token, cid,
                      "Чтобы прислать файл, ответьте на дайджест или протокол нужной встречи "
                      "— по нему я пойму, о какой серии речь.",
@@ -1131,11 +1324,15 @@ def maybe_route_to_set_chat_command(
     display_map = _series_display_map()
     try:
         watched = load_watched(lock=True)
-    except Exception as e:  # noqa: BLE001
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         # ВАЖНО: load_watched(lock=True) захватывает flock ДО чтения yaml; если
         # сам разбор реестра упал (битый/руками-правленный watched.yaml), лок уже
         # держится и без явного release утечёт — следующая команда смены чата
         # повиснет на flock(LOCK_EX) и встанет весь листенер. Освобождаем явно.
+        # `SystemExit` ловим наравне с Exception: `_read_yaml` на не-словаре
+        # верхнего уровня кидает именно его (CLI-происхождение), а он потомок
+        # BaseException — иначе пролетел бы мимо, унёс листенер И оставил лок
+        # захваченным навсегда. BaseException нельзя: SIGTERM/KeyboardInterrupt.
         try:
             release_watched_lock()
         except Exception:  # noqa: BLE001
@@ -1213,6 +1410,455 @@ def maybe_route_to_set_chat_command(
     logger.info(
         "[set-chat] привязка обновлена: series=%s → chat=%s (записей=%d, by_owner)",
         slug, target_chat, n,
+    )
+    return True
+
+
+# ----- Ф2 (ISS-51…55): переключение режима открытых вопросов серии -----
+
+# Тексты вынесены константами: их читает владелец и люди в группе, и они же
+# проверяются тестами дословно. Формулировки — из плана (пункты 3 и 5 Фазы 2) плюс
+# решение владельца 7 (возврат в накопление начинает счёт с чистого листа) —
+# подтверждение обязано об этом честно сказать, иначе через месяц владельца ждёт
+# сюрприз «а где мои старые вопросы» (РИСК6 плана).
+_OQ_MODE_CONFIRM = {
+    "last-only": (
+        "✅ Принято: серия «{display}» теперь в режиме шпаргалки — с ближайшей "
+        "встречи вопросы копиться не будут. Записанное никуда не делось, я просто "
+        "перестаю его показывать."
+    ),
+    "carry": (
+        "✅ Принято: серия «{display}» теперь в режиме накопления — с ближайшей "
+        "встречи вопросы снова копятся и переносятся из встречи во встречу. Счёт "
+        "идёт с чистого листа: то, что копилось до переключения, я не поднимаю."
+    ),
+}
+
+# Строка в чат самой серии: там сидят люди, у которых иначе висяки молча
+# исчезнут из вида (или наоборот — внезапно вернутся). Пункт 5 плана.
+_OQ_MODE_SERIES_NOTICE = {
+    "last-only": (
+        "⚙️ Формат к следующей встрече меняется: открытые вопросы по этой серии "
+        "больше не копятся — перед встречей пришлю справку по прошлой встрече, "
+        "отвечать на неё не нужно."
+    ),
+    "carry": (
+        "⚙️ Формат к следующей встрече меняется: открытые вопросы по этой серии "
+        "снова копятся и переносятся из встречи во встречу — незакрытые буду "
+        "показывать, пока их не закроют. Счёт начинается заново, старые вопросы "
+        "не поднимаю."
+    ),
+}
+
+_OQ_MODE_STATE = {
+    "carry": (
+        "Серия «{display}» сейчас в режиме накопления: незакрытые вопросы "
+        "переносятся из встречи во встречу, утром прихожу с дайджестом и прошу "
+        "статусы."
+    ),
+    "last-only": (
+        "Серия «{display}» сейчас в режиме шпаргалки: перед встречей присылаю "
+        "только то, что зафиксировали на прошлой, без статусов и без переноса."
+    ),
+}
+
+# Подсказка «как переключить» дописывается ТОЛЬКО владельцу: участнику группы
+# переключать нечего (owner-гейт молча его проигнорирует), и бот, обучающий
+# команде, которая для человека не работает, выглядит сломанным.
+_OQ_MODE_HOWTO = {
+    "carry": " Переключить: «режим шпаргалка».",
+    "last-only": " Переключить: «режим накопление».",
+}
+
+_OQ_MODE_ALREADY = {
+    "carry": "Серия «{display}» и так в режиме накопления — ничего не менял.",
+    "last-only": "Серия «{display}» и так в режиме шпаргалки — ничего не менял.",
+}
+
+# Тот же режим, но в реестре он не был записан явно (или записи серии разошлись
+# между собой) — команду мы всё равно исполняем: записываем режим во все записи.
+# Иначе «выбрано шпаргалкой» и «никто не выбирал» в файле неразличимы, и смена
+# дефолта однажды молча перевернула бы все такие серии.
+_OQ_MODE_ALREADY_FIXED = {
+    "carry": ("Серия «{display}» и так в режиме накопления — записал это явно в "
+              "реестр, формат встреч не меняется, участников не беспокоил."),
+    "last-only": ("Серия «{display}» и так в режиме шпаргалки — записал это явно в "
+                  "реестр, формат встреч не меняется, участников не беспокоил."),
+}
+
+_OQ_MODE_ASK_SERIES = (
+    "🤔 Не понял, о какой серии речь. Напиши «режим шпаргалка <имя серии>» "
+    "(или «режим накопление <имя серии>»), либо дай команду в чате нужной серии."
+)
+
+# Один текст на все беды с файлом реестра. Прежний «Реестр серий занят» врал:
+# он выдаётся не только на занятый лок, но и на битый руками YAML — и владелец
+# уходил «пробовать ещё раз» вместо того, чтобы починить файл.
+_OQ_MODE_REGISTRY_UNREADABLE = (
+    "⚠️ Не смог прочитать реестр серий — режим не поменял. Либо файл сейчас "
+    "занят (попробуй ещё раз), либо watched.yaml повреждён — загляни в него."
+)
+
+
+def _oq_carry_since() -> str:
+    """Дата отсечки «счёт с чистого листа» — сегодня в поясе выжимок серии (МСК).
+
+    Сравнивается с датами выжимок (`<YYYY-MM-DD>-memory.json`), а те датируются
+    встречей по МСК (`morning_digest.MSK`). Считать «сегодня» по UTC или по
+    локальному поясу машины значило бы промахиваться на день в обе стороны —
+    на границе суток отсечка либо срезала бы лишнюю встречу, либо пропускала
+    ком, который обещали не поднимать.
+    """
+    from datetime import timedelta  # noqa: PLC0415 — точечно, как соседи
+
+    return datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+
+
+def _oq_effective_mode(slug: str, watched: dict[str, Any]) -> str:
+    """Режим, в котором бот РЕАЛЬНО себя ведёт по этой серии (ISS-51).
+
+    С буквальным резолвом реестра расходится в двух случаях: поле задано, но не
+    читается (опечатка «карри» — ровно то, что порождает ручная раскладка
+    режимов), либо другая запись серии явно просит накопление. Боевой резолвер
+    (`series_memory.open_questions_mode`) в обоих остаётся в `carry`, чтобы не
+    потерять хвост: он живёт только в разделе протокола, и один протокол без
+    раздела обнуляет его навсегда.
+
+    ОДНА точка на ОБЕ ветки команды. Пока fail-safe висел только на ветке
+    «вопрос», ветка «команда» считала текущий режим по букве реестра: на реестре
+    с опечаткой «режим шпаргалка» рапортовала «и так в режиме шпаргалки — формат
+    встреч не меняется, участников не беспокоил», хотя серия при этом реально
+    переезжала из накопления в справку, а люди в чате оставались не предупреждены.
+
+    Исключения НЕ глотаем: сбой разбора реестра обязан долететь до `except`
+    вызывающей ветки — человек получает ответ, а не тишину.
+    """
+    from notary.cli.registry import (  # noqa: PLC0415
+        series_open_questions_mode, series_records,
+    )
+    from notary.lib import series_memory  # noqa: PLC0415
+
+    mode = series_open_questions_mode(slug, watched)
+    if mode == series_memory.OPEN_QUESTIONS_MODE_LAST_ONLY and \
+            series_memory._explicit_carry_signal(series_records(slug, watched)):
+        return series_memory.OPEN_QUESTIONS_MODE_CARRY
+    return mode
+
+
+def _oq_mode_series_hint(
+    token: str, cid: int, allowed_chat: int, text: str, msg: dict[str, Any],
+    display_map: dict[str, str],
+) -> tuple[Optional[str], bool]:
+    """Какую серию имел в виду владелец: реплай → привязка чата → переспрос.
+
+    Возвращает `(ссылка_на_серию, ответил_ли_уже)`. Второй флаг = True означает,
+    что человеку уже отправлен переспрос и роут должен выйти с True (видимая
+    реакция вместо молчания — R-REPLY).
+
+    Явная ссылка в самой команде разбирается ДО этого хелпера и сюда не доходит:
+    названная серия всегда главнее контекста (владелец в личке переключает чужую
+    серию по имени, и угадывать вместо него нельзя).
+    """
+    series = _reply_context_series(cid, msg) or _reply_context_series_digest(cid, msg)
+    if series:
+        return series, False
+    chat_series, err = _chat_context_series(cid, allowed_chat)
+    if err:
+        # Единственный сигнал, что серия не нашлась не по-настоящему, а из-за
+        # реестра: иначе «чат не привязан» и «реестр упал» в журнале одинаковы.
+        logger.warning("[oq-mode] реестр не прочитан (chat=%s): %s", cid, err)
+    if len(chat_series) == 1:
+        logger.info("[oq-mode] серия %s определена по привязке чата %s",
+                    chat_series[0], cid)
+        return chat_series[0], False
+    if len(chat_series) > 1:
+        named = _series_named_in_text(text, chat_series, display_map)
+        if named:
+            return named, False
+        logger.info("[oq-mode] в чате %s несколько серий (%d) — переспрашиваю",
+                    cid, len(chat_series))
+        names = ", ".join(f"«{display_map.get(s, s)}»" for s in chat_series)
+        example = display_map.get(chat_series[0], chat_series[0])
+        send_message(
+            token, cid,
+            f"В этом чате у меня несколько серий: {names}. Назовите серию прямо в "
+            f"команде — например «режим шпаргалка {example}».",
+            reply_to=msg.get("message_id"),
+        )
+        return None, True
+    return None, False
+
+
+def maybe_route_to_mode_command(
+    token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """Ф2 (ISS-51…55): «режим шпаргалка / режим накопление» и «режим» (показать).
+
+    Стоит СРАЗУ ПОСЛЕ команды смены чата и по тем же причинам: это настройка
+    СЕРИИ, её дают прямо в групповом чате серии (cid != allowed_chat), а шлюз
+    правок ниже прожевал бы любое не-reply сообщение в группе. Порядок роутов
+    ниже не меняется — новый роут только вставлен между двумя существующими.
+
+    Взаимного перехвата с командой смены чата нет: у той обязательна ЦЕЛЬ
+    («сюда» / «в личку» / «в чат N»), у этой сообщение обязано СОВПАСТЬ ЦЕЛИКОМ
+    с одной из форм закрытого списка (`lib/mode_command`).
+
+    Owner-гейт как у `maybe_route_to_set_chat_command`: в группе режим меняет
+    только владелец (его user_id == allowed_chat; в личке chat.id == user.id).
+    Не владелец → False (лог + обычный dispatch), а НЕ отказ-сообщение: бот,
+    читающий нотацию участникам группы, хуже молчания. Вопрос о режиме («режим»)
+    гейта не имеет: он ничего не меняет, а люди в чате — ровно те, кого режим
+    касается.
+
+    Серия не опозналась → в ГРУППЕ роут возвращает False и молчит (сообщение
+    достаётся роутам ниже, список внутренних имён серий в комнату с участниками
+    встреч не попадает НИКОГДА). Видимый отказ со списком известных серий —
+    только в личке владельца, где он этот список и набирает.
+
+    True = распознано и дана ВИДИМАЯ реакция (R-REPLY: подтверждение / переспрос /
+    «не нашёл») — caller выходит. False = не наша команда / не владелец / серия
+    не опознана в групповом чате.
+
+    R9 («Опасная тройка»): тексты сообщений и содержимое встреч НЕ логируем —
+    только серия, режимы и chat_id.
+    """
+    if cid is None:
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+    try:
+        from notary.lib.mode_command import parse_mode_command  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        # WARNING, не debug: уровень листенера — INFO, и на `debug` пропажа
+        # нового модуля (самый вероятный сбой деплоя) осталась бы вообще без
+        # следа в журнале — фича молча мертва.
+        logger.warning("[oq-mode] mode_command import failed: %s", e)
+        return False
+    parsed = parse_mode_command(text)
+    if parsed is None:
+        return False
+
+    from_id = (msg.get("from") or {}).get("id")
+    is_dm = cid == allowed_chat
+    is_owner = is_dm or from_id == allowed_chat
+    # Владелец И в личке — единственное место, где бот вправе назвать внутренние
+    # имена серий (см. `_oq_mode_unresolved`).
+    owner_dm = is_owner and is_dm
+    series_ref = (parsed.series_ref or "").strip()
+    if not is_owner and (parsed.action == "set" or series_ref):
+        # Менять режим может только владелец. Спрашивать про ЧУЖУЮ серию по имени —
+        # тоже: иначе любой посторонний, написавший боту в личку, вытягивал бы
+        # режимы и (через «не нашёл серию») список внутренних имён всех серий.
+        # Вопрос про серию СВОЕГО чата участнику оставлен — режим виден ему и так,
+        # по формату встреч.
+        logger.info(
+            "[oq-mode] не владелец (from=%s chat=%s, action=%s) — команда не применена",
+            from_id, cid, parsed.action,
+        )
+        return False
+
+    msg_id = msg.get("message_id")
+    display_map = _series_display_map()
+    if not series_ref:
+        series_ref, answered = _oq_mode_series_hint(
+            token, cid, allowed_chat, text, msg, display_map)
+        if answered:
+            return True
+        if not series_ref:
+            send_message(token, cid, _OQ_MODE_ASK_SERIES, reply_to=msg_id)
+            return True
+
+    try:
+        from notary.cli.registry import (  # noqa: PLC0415
+            get_telegram_chat_id_for_series, load_watched, release_watched_lock,
+            resolve_series_ref, save_watched, series_record_is_live, series_records,
+            set_open_questions_mode_for_series,
+        )
+        # Текущий режим обе ветки спрашивают у `_oq_effective_mode` (он и импортирует
+        # резолверы) — одним ответом на «вопрос» и на «команду».
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[oq-mode] registry import failed: %s", e)
+        send_message(token, cid, "⚠️ Не смог открыть реестр серий — режим не тронул. "
+                                 "Попробуй ещё раз.", reply_to=msg_id)
+        return True
+
+    # Вопрос о режиме ничего не пишет — читаем БЕЗ flock'а: держать
+    # эксклюзивный лок реестра ради ответа «сейчас шпаргалка» незачем.
+    if parsed.action == "query":
+        try:
+            watched = load_watched()
+        except (Exception, SystemExit) as e:  # noqa: BLE001 — SystemExit из _read_yaml
+            logger.warning("[oq-mode] load_watched (query) упал: %s", type(e).__name__)
+            send_message(token, cid, _OQ_MODE_REGISTRY_UNREADABLE, reply_to=msg_id)
+            return True
+        # Разбор реестра — под тем же `try`, что и загрузка (симметрично
+        # set-ветке): кривая запись в watched.yaml роняла резолв, исключение
+        # улетало из роута, человек не получал НИЧЕГО, а сообщение не доходило
+        # до роутов ниже. Достижимо любым участником группы — query без гейта.
+        try:
+            slug = resolve_series_ref(series_ref, watched, display_map=display_map)
+            if slug is None:
+                return _oq_mode_unresolved(token, cid, msg_id, series_ref, watched,
+                                           owner_dm=owner_dm, action="query")
+            # ISS-51 (Ф3): отвечаем тем режимом, в котором бот РЕАЛЬНО себя ведёт
+            # (fail-safe при опечатке в реестре — см. `_oq_effective_mode`). Тот же
+            # вызов стоит в ветке «команда»: два разных ответа одной команды —
+            # ровно тот шов, на котором она врала про смену формата.
+            mode = _oq_effective_mode(slug, watched)
+            answer = _OQ_MODE_STATE[mode].format(display=display_map.get(slug, slug))
+            if is_owner:
+                answer += _OQ_MODE_HOWTO[mode]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[oq-mode] разбор реестра (query) упал: %s", type(e).__name__)
+            send_message(token, cid, _OQ_MODE_REGISTRY_UNREADABLE, reply_to=msg_id)
+            return True
+        send_message(token, cid, answer, reply_to=msg_id)
+        logger.info("[oq-mode] режим серии %s запрошен: %s (chat=%s)", slug, mode, cid)
+        return True
+
+    # Смена режима — под flock'ом. `load_watched(lock=True)` берёт лок ДО разбора
+    # YAML: если разбор упал (битый реестр правили руками), лок уже держится и без
+    # явного release утечёт — следующая команда повиснет на flock(LOCK_EX) и встанет
+    # весь листенер. `SystemExit` ловим наравне с Exception: `_read_yaml` кидает
+    # именно его, а он потомок BaseException и сквозь `except Exception` пролетел
+    # бы насквозь — унёс процесс ДО save_offset (петля перезапусков бота).
+    try:
+        watched = load_watched(lock=True)
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        try:
+            release_watched_lock()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("[oq-mode] load_watched(lock) упал: %s", type(e).__name__)
+        send_message(token, cid, _OQ_MODE_REGISTRY_UNREADABLE, reply_to=msg_id)
+        return True
+
+    saved = False
+    try:
+        slug = resolve_series_ref(series_ref, watched, display_map=display_map)
+        recs = series_records(slug, watched) if slug else []
+        if not recs:
+            # Пустой `recs` при найденном slug по построению недостижим
+            # (`resolve_series_ref` возвращает только slug, физически лежащий в
+            # watched, а матч ключа у обоих один и тот же — `series_records`).
+            # Обрабатываем как «серию не опознал»: подтвердить запись, которой
+            # не было, хуже, чем переспросить.
+            return _oq_mode_unresolved(token, cid, msg_id, series_ref, watched,
+                                       owner_dm=owner_dm, action="set")
+        display = display_map.get(slug, slug)
+        # Тем же путём, что и ветка «вопрос»: «какой режим сейчас» обязано быть
+        # одним ответом на обе ветки команды, иначе бот рапортует «формат не
+        # меняется», реально переводя серию из накопления в справку.
+        old_mode = _oq_effective_mode(slug, watched)
+        same = old_mode == parsed.mode
+        values = [r.get("open_questions_mode") for r in recs]
+        if same and all(v == parsed.mode for v in values):
+            # Только здесь ничего не пишем: реестр уже говорит ровно то, что
+            # просят, во ВСЕХ записях серии.
+            send_message(token, cid, _OQ_MODE_ALREADY[old_mode].format(display=display),
+                         reply_to=msg_id)
+            logger.info("[oq-mode] серия %s уже в режиме %s во всех записях (%d) — "
+                        "записи нет", slug, old_mode, len(recs))
+            return True
+        # Иначе пишем ВСЕГДА — даже когда режим «тот же». Причины две:
+        #  • первая команда «режим шпаргалка» при дефолте last-only иначе была бы
+        #    немым no-op: в файле не появлялось ничего, и «выбрано» было бы не
+        #    отличить от «никто не выбирал» (на бою поле не проставлено ни у
+        #    одной из 16 серий — смена дефолта молча перевернула бы их все);
+        #  • записи серии могли разойтись между собой, и короткое замыкание
+        #    «и так в этом режиме» до записи означало, что расхождение не
+        #    лечится никогда.
+        # Решение владельца 7: возврат в накопление начинает счёт С ЧИСТОГО
+        # ЛИСТА — ровно это подтверждение обещает владельцу, а строка в чат
+        # серии обещает всем участникам. Обещание было только текстом: «чистый
+        # лист» получался побочно (протокол шпаргалки идёт без раздела хвоста) и
+        # разваливался, если между переключениями не было ни одной встречи.
+        # Отсечку ставим ТОЛЬКО на реальном переезде шпаргалка → накопление:
+        # повтор команды по серии, которая и так в накоплении, хвост не трогает.
+        carry_since = _oq_carry_since() if (not same and parsed.mode == "carry") else None
+        n = set_open_questions_mode_for_series(
+            slug, parsed.mode, watched, carry_since=carry_since)
+        series_chat = get_telegram_chat_id_for_series(slug, watched)
+        series_live = any(series_record_is_live(r) for r in recs)
+        save_watched(watched)
+        saved = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[oq-mode] запись режима упала: %s", type(e).__name__)
+        send_message(token, cid, "⚠️ Не смог сохранить режим серии. Попробуй ещё раз.",
+                     reply_to=msg_id)
+        return True
+    finally:
+        if not saved:
+            try:
+                release_watched_lock()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if same:
+        # Режим не изменился — формат встреч прежний, людям сообщать не о чем.
+        send_message(token, cid,
+                     _OQ_MODE_ALREADY_FIXED[parsed.mode].format(display=display),
+                     reply_to=msg_id)
+        logger.info(
+            "[oq-mode] режим серии %s зафиксирован явно: %s (записей=%d, from=%s, chat=%s)",
+            slug, parsed.mode, n, from_id, cid,
+        )
+        return True
+
+    confirm = _OQ_MODE_CONFIRM[parsed.mode].format(display=display)
+    if series_chat is None:
+        # Честно: предупредить участников физически некуда.
+        confirm += " Чат этой серии не привязан — участников не предупредил."
+    elif not series_live:
+        # Все записи серии выключены (`enabled: false` / `ignored`): встреч по
+        # ней бот не ведёт, и обещать людям в её чате новый формат «к следующей
+        # встрече» нечестно — следующей встречи нет.
+        confirm += (" Серия выключена — встреч по ней я не веду, поэтому людям в её "
+                    "чате ничего не писал.")
+    send_message(token, cid, confirm, reply_to=msg_id)
+    # Строка людям в чат серии — только если это ДРУГОЙ чат: когда команду дали
+    # прямо в чате серии, подтверждение выше уже стоит у них перед глазами и
+    # говорит то же самое, а второе сообщение подряд — просто шум.
+    if series_chat is not None and series_chat != cid and series_live:
+        send_message(token, series_chat, _OQ_MODE_SERIES_NOTICE[parsed.mode])
+    logger.info(
+        "[oq-mode] режим серии %s: %s → %s (записей=%d, from=%s, chat=%s, серия-чат=%s)",
+        slug, old_mode, parsed.mode, n, from_id, cid, series_chat,
+    )
+    return True
+
+
+def _oq_mode_unresolved(
+    token: str, cid: int, msg_id: Any, ref: str, watched: dict[str, Any],
+    *, owner_dm: bool, action: str,
+) -> bool:
+    """Серию не опознали. `True` = ответили человеку, `False` = молча пропускаем.
+
+    Единственное место, где решается, показывать ли список внутренних имён серий.
+    Условие — «владелец И в личке», а не «владелец»: гейт по человеку без гейта
+    по МЕСТУ вываливал 16 внутренних имён (часть с фамилиями людей и названиями
+    компаний) в групповой чат с участниками встреч — достаточно было любой
+    фразы, которую старый парсер принимал за команду.
+
+    В группе не отвечаем вовсе и возвращаем False: если мы не уверены, что это
+    команда, сообщение обязано достаться роутам ниже (правки, статусы), а не
+    съедаться видимым отказом.
+    """
+    logger.info("[oq-mode] серия не опознана (%s, chat=%s, ответили=%s)",
+                action, cid, "да" if owner_dm else "нет")
+    if not owner_dm:
+        return False
+    known = sorted({
+        w.get("series") for w in watched.get("watched", [])
+        if isinstance(w, dict) and isinstance(w.get("series"), str) and w.get("series")
+    })
+    known_str = ", ".join(known) if known else "—"
+    send_message(
+        token, cid,
+        f"🤔 Не нашёл серию «{ref}» в реестре. Известные серии: {known_str}. "
+        "Уточни slug или имя.",
+        reply_to=msg_id,
     )
     return True
 
@@ -1331,6 +1977,93 @@ DIGEST_BATCH_UNPARSED_HINT = (
     "пожалуйста, вторым сообщением — по одной задаче на строку, с задачей и статусом "
     "(«медиаплан — сделано», «расчёт склада — снимаем»)."
 )
+# ISS-51 (Ф3): человек прислал статус в серии-ШПАРГАЛКЕ. Учёта висяков в ней нет —
+# честно говорим это ОДНОЙ строкой и НИЧЕГО не пишем в статус-стор. Молчать нельзя:
+# человек потратил силы на ответ и вправе знать, что отчитываться тут не надо.
+LAST_ONLY_STATUS_REPLY = (
+    "Спасибо 🙏 В этой серии я вопросы не веду — тот список был справкой к встрече, "
+    "статусы по нему не нужны."
+)
+# ISS-51: тот же случай, но человек отвечает на документ, который САМ просил статус
+# (ушёл до переключения серии в справочный режим). Отвечать ему прежней фразой —
+# значит на голубом глазу отречься от собственной просьбы. Признаём это прямо.
+LAST_ONLY_STATUS_REPLY_AFTER_SWITCH = (
+    "Спасибо 🙏 Тот список я присылал ещё со статусами, но с тех пор серию перевели в "
+    "справочный режим — учёт вопросов по ней я больше не веду, отвечать не нужно."
+)
+
+
+# ISS-51 (Ф3): ПОВЕЛИТЕЛЬНЫЙ разговор про учёт вопросов — «закрой первую», «сними все»,
+# «верни задачу 3», «переоткрой». `detect_status_intent` такое НЕ ловит (он ищет
+# УТВЕРЖДЕНИЕ о статусе: «сделано», «неактуально»), поэтому в шпаргалочной серии эти
+# фразы проскакивали мимо гейта в ИИ-разбор — и человек слышал «Не разобрал, про какую
+# задачу речь» вместо обещанной тишины. Регулярка нужна ТОЛЬКО чтобы решить «это про
+# статусы» — статусы всё равно не пишутся (гейт у писателя).
+_STATUS_TALK_RE = re.compile(
+    r"\b(закрой|закройте|закрыть|закрываем|сними|снимите|снять|снимаем|"
+    r"верни|верните|вернуть|откати|откатите|откатить|переоткрой|переоткрыть|"
+    r"отметь|отметьте|пометь|пометьте)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_status_talk(text: str) -> bool:
+    """Похоже ли, что человек говорит про СТАТУСЫ висяков (шире `detect_status_intent`).
+
+    Правки текста протокола сюда НЕ попадают (`looks_edit_heavy` проверяется первым):
+    в шпаргалочной серии правки обязаны работать как раньше, иначе «поправьте фамилию»
+    получило бы в ответ «я тут вопросы не веду»."""
+    if not text:
+        return False
+    try:
+        from notary.lib import pending_status_reply  # noqa: PLC0415
+        if pending_status_reply.looks_edit_heavy(text):
+            return False
+        if pending_status_reply.detect_status_intent(text) is not None:
+            return True
+    except Exception as e:  # noqa: BLE001 — детект best-effort
+        logger.debug("[open-tasks] детект статуса упал: %s", type(e).__name__)
+    return _STATUS_TALK_RE.search(text) is not None
+
+
+def _last_only_digest_reply_text(series: str, msg: dict[str, Any]) -> str:
+    """Какой справочной фразой ответить на статус в шпаргалочной серии.
+
+    Если ОТВЕЧАЕМЫЙ документ ушёл ещё в режиме накопления (метка `mode` в состоянии
+    отправок), человек не «не понял правила» — он выполнил ровно то, о чём его
+    попросил бот. Признаём переключение вслух, иначе бот выглядит как отказавшийся
+    от собственной просьбы. Нет метки (старая отправка) → обычная фраза."""
+    try:
+        from notary.lib import morning_digest, series_memory  # noqa: PLC0415
+        reply_to = msg.get("reply_to_message") or {}
+        prev = morning_digest.digest_mode_for_message(
+            _protokol_root() / series, (msg.get("chat") or {}).get("id"),
+            reply_to.get("message_id"))
+        if prev == series_memory.OPEN_QUESTIONS_MODE_CARRY:
+            return LAST_ONLY_STATUS_REPLY_AFTER_SWITCH
+    except Exception as e:  # noqa: BLE001 — формулировка best-effort, не валим ответ
+        logger.debug("[morning-digest] режим отправки не определён: %s", type(e).__name__)
+    return LAST_ONLY_STATUS_REPLY
+
+
+def _series_open_questions_mode(series: Optional[str]) -> str:
+    """Режим открытых вопросов серии (`carry` | `last-only`) — best-effort.
+
+    Единая точка чтения для статус-роутов listener'а. Сбой чтения реестра →
+    `carry` (внутри `series_memory`): молчать про статус, который на самом деле
+    учитывается, хуже, чем ответить справочной фразой лишний раз.
+    """
+    try:
+        from notary.lib import series_memory  # noqa: PLC0415
+        return series_memory.open_questions_mode(series)
+    except Exception as e:  # noqa: BLE001 — режим best-effort, роут не валим
+        logger.debug("[oq-mode] режим серии %s не прочитан: %s", series, type(e).__name__)
+        return "carry"
+
+
+def _is_last_only_series(series: Optional[str]) -> bool:
+    """Серия-шпаргалка: статус-машина её не трогает (плана Ф3, п. «тишина»)."""
+    return _series_open_questions_mode(series) == "last-only"
 
 
 _OPEN_TASKS_SURFACE_RE = re.compile(
@@ -1607,6 +2340,32 @@ def maybe_route_to_digest_reply(
         text = (msg.get("text") or "").strip()
         if not text:
             return True  # стикер/фото на дайджест — молча жуём, отвечать не на что
+    # ISS-51 (Ф3): серия-шпаргалка — статус-машину не будим ВООБЩЕ. Гейт стоит ВЫШЕ
+    # understand-слоя: тот сам пишет статусы в sidecar, и «сначала разобрать ИИ, потом
+    # решить, что не пишем» означало бы платный вызов ради выброшенного результата.
+    # Статус-маркер есть → отвечаем справочной фразой (человек написал не в пустоту),
+    # реакция без маркера («ок», «спасибо») — молчим, как и в carry.
+    if _is_last_only_series(series):
+        try:
+            from notary.lib import pending_status_reply  # noqa: PLC0415
+            has_status = pending_status_reply.detect_status_intent(text) is not None
+        except Exception as e:  # noqa: BLE001 — детект best-effort
+            logger.debug("[morning-digest] детект статуса упал: %s", type(e).__name__)
+            has_status = False
+        if has_status:
+            send_message(token, chat_id, _last_only_digest_reply_text(series, msg),
+                         reply_to=msg.get("message_id"))
+            logger.info("[morning-digest] серия %s в режиме last-only — статус НЕ пишу "
+                        "(ответил справкой)", series)
+            return True
+        # Статус-маркера нет — реакция («ок», «спасибо»). Молчим и жуём, ТОЧНО как в
+        # накоплении (там ниже такая же ветка). Осознанный остаток: просьбу настройки
+        # («уберите меня из рассылки») в carry ловит understand-слой, здесь он НЕ
+        # запускается — платный разбор в серии, где статусы всё равно заблокированы у
+        # писателя, вернул бы «не разобрал, про какую задачу речь» вместо тишины.
+        logger.info("[morning-digest] серия %s в режиме last-only, reply без статус-"
+                    "маркера → молчим (как в carry)", series)
+        return True
     # Ф3 (watson, НЕС2): understand-слой ДО словарного precheck ниже — иначе настройка
     # серии (R12) / нестандартный статус (R7) молча отсеклись бы `detect_status_intent
     # is None`. Флаг ENABLE_REPLY_UNDERSTAND дефолт-OFF → OFF → прежний путь (совместимость).
@@ -1721,6 +2480,29 @@ def maybe_route_to_pending_status_reply(
     series = _reply_context_series(chat_id, msg)
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
+    # ISS-51 (Ф3): в серии-шпаргалке статусов нет. Сюда доходит только ЧИСТЫЙ статус
+    # (выше отсеяны и «без статус-маркера», и пачки правок), поэтому забираем reply
+    # себе и отвечаем справочной фразой — отдать его шлюзу правок значило бы
+    # перевыпустить протокол из-за слова «сделано».
+    if _is_last_only_series(series):
+        send_message(token, chat_id, LAST_ONLY_STATUS_REPLY, reply_to=msg.get("message_id"))
+        # ISS-51 + класс ISS-33: «расчёт сделан, и в протоколе поправь Иванова на
+        # Петрова» — ОДНО сообщение с двумя намерениями. Статус в шпаргалке никому не
+        # нужен, а правка — нужна, и проглотить reply целиком значит потерять её молча
+        # (сплиттер сюда не помогает: в этом режиме его сознательно не зовём). Признак
+        # правки в тексте → отдаём сообщение шлюзу правок, как это делает накопление с
+        # любым не-статусным reply. Справочную фразу при этом уже сказали: человек
+        # знает, что статусную половину я не веду.
+        try:
+            from notary.lib import pending_status_reply as _psr  # noqa: PLC0415
+            has_edit = bool(_psr._EDIT_MARKER_RE.search(text))
+        except Exception as e:  # noqa: BLE001 — признак best-effort
+            logger.debug("[pending-status] детект правки упал: %s", type(e).__name__)
+            has_edit = False
+        logger.info("[pending-status] серия %s в режиме last-only — статус НЕ пишу, "
+                    "ответил справкой (правка в тексте=%s, chat=%s)",
+                    series, has_edit, chat_id)
+        return not has_edit
     series_dir = _protokol_root() / series
     # Ф4: слепок нумерации ИМЕННО той версии протокола, на которую reply (по message_id) —
     # ординал резолвится против него (Гейт 2 Q1). Нет слепка → None (overlap как до Ф4).
@@ -1789,6 +2571,14 @@ def maybe_route_to_mixed_reply(
     series = _reply_context_series(chat_id, msg)
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
+    # ISS-51 (Ф3): серия-шпаргалка — сплиттер не зовём вовсе (платный LLM ради
+    # статусов, которые всё равно не применим). Отдаём reply ВНИЗ: одиночный статус
+    # заберёт статус-роут и ответит справочной фразой, а reply с правками уйдёт в
+    # шлюз правок, как и в carry, — правка текста протокола от режима не зависит.
+    if _is_last_only_series(series):
+        logger.info("[mixed-reply] серия %s в режиме last-only — сплит не зову "
+                    "(chat=%s)", series, chat_id)
+        return False
     series_dir = _protokol_root() / series
     # Ф4/ISS-39: слепок нумерации отвечаемой версии протокола (по message_id) — ординал
     # резолвится против него (A15), И универсум сплиттера/overlap ограничен им (РИСК2:
@@ -2051,6 +2841,14 @@ def maybe_route_to_reply_understand(
     series = _reply_context_series(chat_id, msg)
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
+    # ISS-51 (Ф3): в серии-шпаргалке СТАТУСНЫЙ reply мимо ИИ — вниз, к детерминированному
+    # роуту: он ответит «вопросы тут не веду». Гейт УЗКИЙ (только статус-маркер): правки
+    # текста и свежие инструкции от режима не зависят и по-прежнему идут через understand.
+    if _is_last_only_series(series):
+        if _looks_like_status_talk(text):
+            logger.info("[understand] серия %s в режиме last-only — статус-reply "
+                        "отдаю детерминированному роуту (chat=%s)", series, chat_id)
+            return False
     series_dir = _protokol_root() / series
     snapshot = _reply_open_tasks_snapshot(series_dir, msg)
     replier = _msg_display_name(msg)
@@ -2170,6 +2968,21 @@ def maybe_route_to_ack_reply(
             return True
     if not text:
         return False  # стикер/фото на наш ack — не канал закрытого ответа
+
+    # ISS-51 (Ф3): ack-роут стоит ПЕРВЫМ из reply-роутов, и до Ф3 гейта режима у него не
+    # было вовсе — в шпаргалочной серии человек слышал «Не нашёл, что откатить —
+    # уточните» и «Ок, ничего не отметил» вместо обещанной справочной фразы. Гейтим
+    # ЗДЕСЬ, а не в `reply_ack`: серия известна из ack-state (`series_dir`), и это
+    # единственная точка, через которую проходят оба ack-сценария (ответ на вопрос
+    # бота и свежая инструкция). Не-статусный ответ («да» на «перевыпустить протокол?»,
+    # правка текста) режимом НЕ трогается — он не про учёт вопросов.
+    _ack_series_dir = state.get("series_dir")
+    _ack_series = Path(_ack_series_dir).name if _ack_series_dir else None
+    if _ack_series and _is_last_only_series(_ack_series) and _looks_like_status_talk(text):
+        send_message(token, chat_id, LAST_ONLY_STATUS_REPLY, reply_to=msg.get("message_id"))
+        logger.info("[ack-reply] серия %s в режиме last-only — статус НЕ трогаю, "
+                    "ответил справкой (chat=%s)", _ack_series, chat_id)
+        return True
 
     # ISS-49 (реальный кейс 24.07): под нашим сообщением может ждать ЗАКРЫТЫЙ вопрос
     # («Закрыть все ваши вопросы?») — тогда это ОТВЕТ на него. А может НЕ ждать (reply на
@@ -2815,6 +3628,15 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     # сообщение в группе. Owner-гейт и узкий триггер — внутри (обычную переписку и
     # команды коррекции не перехватывает).
     if maybe_route_to_set_chat_command(token, cid, allowed_chat, msg):
+        return
+
+    # Ф2 (ISS-51…55): «эта серия — шпаргалка / накопление», «в каком режиме серия?».
+    # СРАЗУ ПОСЛЕ смены чата и по тем же причинам: это настройка СЕРИИ, её дают
+    # прямо в групповом чате (cid != allowed_chat), а шлюз правок ниже прожевал бы
+    # такое сообщение. Порядок остальных роутов не тронут. Команду смены чата этот
+    # роут не крадёт (там обязательна цель «сюда/в личку/в чат N», здесь — слово
+    # режима на месте приказа); owner-гейт и узкий триггер — внутри.
+    if maybe_route_to_mode_command(token, cid, allowed_chat, msg):
         return
 
     # Ф4 (watson, R26/R15): reply человека НА ack/переспрос бота. ПЕРВЫМ из reply-роутов —

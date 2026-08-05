@@ -5,15 +5,24 @@
   • детект интента (глагол отправки + объект; неоднозначное «файл» по surface; мимо-
     статус/правка → None);
   • роут `maybe_route_to_send_artifact`: диспетчеризация protocol/digest, уступка
-    статус-ответу, подсказка при нерезолвнутой серии, не-reply → False;
+    статус-ответу, подсказка при нерезолвнутой серии, «не-reply И чат без серии»
+    → False (после ISS-52 «не-reply» само по себе уже НЕ значит False — резолв по
+    привязке чата покрыт в `test_iss51_mode_registry.py`);
   • `_resend_digest`: зовёт `send_series_digest(force=True)`, пустой список → честная строка.
 
+Герметичность (ремонт Ф6, ревью-2 🟡-2). Тесты этого файла зовут `detect_artifact_request`
+без `answer_fn` и рассчитывают на регулярку. Пока `ENABLE_SEND_ARTIFACT_AI` не выставлен —
+так и есть; но `README.md:133` учит делать `set -a; source .env.notary; set +a`, а
+`.env.notary.example` везёт `ENABLE_SEND_ARTIFACT_AI=1`, и из такой сессии прогон уходил
+в РЕАЛЬНУЮ модель (3 вызова из этого файла). Тест не должен зависеть от окружения
+машины: `setUpModule` чистит переменную и ставит часового на границу процесса.
+
 Запуск:
-    cd ~/Projects/meeting-notary/vexa/scripts/notary
-    ../../../.venv-cli/bin/python -m unittest tests.test_send_artifact -v
+    cd scripts/notary/tests && python3 test_send_artifact.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -23,8 +32,33 @@ _HERE = Path(__file__).resolve().parent
 _SCRIPTS = _HERE.parent.parent
 sys.path.insert(0, str(_SCRIPTS))
 
+from notary.lib import claude_cli  # noqa: E402
 from notary.lib import send_artifact as sa  # noqa: E402
 import notary.meetings_listener as ml  # noqa: E402
+
+_ENV_KEYS = ("ENABLE_SEND_ARTIFACT_AI", "SEND_ARTIFACT_AI_TIMEOUT", "CLAUDE_MIN_TIMEOUT")
+_saved_env: dict = {}
+_cli_sentinel = None
+
+
+def setUpModule():
+    global _cli_sentinel
+    for k in _ENV_KEYS:
+        _saved_env[k] = os.environ.pop(k, None)
+    _cli_sentinel = mock.patch.object(
+        claude_cli, "call_claude_print",
+        side_effect=AssertionError("тест ушёл в реальный claude — это запрещено"))
+    _cli_sentinel.start()
+
+
+def tearDownModule():
+    if _cli_sentinel is not None:
+        _cli_sentinel.stop()
+    for k, v in _saved_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 # ==========================================================================
@@ -152,13 +186,35 @@ class TestRoute(unittest.TestCase):
         self.assertTrue(claimed)
         self.assertTrue(any("ответьте на дайджест" in s.lower() for s in sent))
 
-    def test_not_a_reply_returns_false(self):
-        # не reply → нет контекста серии → False (обычный маршрут)
-        with mock.patch.object(ml, "send_message") as sm_:
+    def test_not_a_reply_and_unbound_chat_returns_false(self):
+        # ISS-52 отменил прежний контракт «не reply → всегда False»: в чате,
+        # ПРИВЯЗАННОМ к серии, просьба теперь срабатывает и без реплая (это
+        # покрыто в test_iss51_mode_registry). Здесь охраняется то, что осталось:
+        # реплая нет И чат ни с одной серией не связан → роут уступает дальше и
+        # молчит, иначе бот отвечал бы на каждую фразу с глаголом отправки в
+        # любой группе, где он просто сидит.
+        with mock.patch.object(ml, "_chat_context_series", return_value=([], None)), \
+             mock.patch.object(ml, "_resend_protocol", return_value=True) as rp_, \
+             mock.patch.object(ml, "send_message") as sm_:
             claimed = ml.maybe_route_to_send_artifact(
-                "tok", self.GROUP, self.GROUP, self._msg("пришли протокол", reply=False))
+                "tok", -100777, self.GROUP, self._msg("пришли протокол", reply=False))
         self.assertFalse(claimed)
+        rp_.assert_not_called()
         sm_.assert_not_called()
+
+    def test_bare_file_needs_a_reply(self):
+        # Голый объект «файл/версия» — интент ТОЛЬКО в ответе на наше сообщение.
+        # Без реплая это обычная переписка людей, а не просьба к боту.
+        self.assertIsNone(
+            sa.detect_artifact_request("скинь файл", allow_bare_file=False))
+        self.assertIsNone(
+            sa.detect_artifact_request("дайте актуальную версию договора",
+                                       allow_bare_file=False))
+        # Однозначные формулировки от параметра не зависят.
+        self.assertEqual(
+            sa.detect_artifact_request("пришли протокол", allow_bare_file=False), "protocol")
+        self.assertEqual(
+            sa.detect_artifact_request("скинь открытые вопросы", allow_bare_file=False), "digest")
 
 
 # ==========================================================================
