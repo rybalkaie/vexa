@@ -1,0 +1,39 @@
+# handoff.md — состояние для следующего окна
+
+Обновлён: 2026-08-05, после коммитов фаз 1 и 4.
+
+## Что сделано (по фактам диффа и коммитов, не по памяти)
+
+| Коммит | Что |
+|---|---|
+| `f7271f0` | **Фаза 1.** Поле `open_questions_mode` (`carry` / `last-only`) в записи реестра + валидация + описание в `WATCHED_HEADER` + поле в `EDITABLE_FIELDS` CLI; резолвер `series_open_questions_mode`; обратный резолв `series_for_chat` (фильтрует выключенные и заглушённые); фолбэк ISS-52 «серия по чату» в `maybe_route_to_send_artifact`. Тесты: 68 + 17. |
+| `52ad7a1` | Артефакты фазы 1 (3 ревью, 4 следа, мутации, ремонт). |
+| `2b8135e` | **Фаза 4.** ISS-53: отказ владельца пишется в реестр, встреча не предлагается снова, различие «нет» / «не предлагай серию», ретеншн 30 дней. ISS-55: время в вопросе и подтверждении из одной переменной. Плюс ремонт по ревью: молчание владельца больше не отказ, нет рапорта «сдвинул/снял» про отклонённую, fail-closed на записи, ретеншн не трогает чужие записи, битый снапшот не роняет ответ. Тесты: 59. |
+| `c0a6bb9` | Артефакты фазы 4 + `plans/follow-ups-open-questions-mode-per-series.md`. |
+
+**В рабочем дереве, НЕ закоммичено:**
+- **Фаза 2** (готова, идут 3 ревью + следы): новый `scripts/notary/lib/mode_command.py` (парсер команды), `set_open_questions_mode_for_series` в `cli/registry.py`, роут `maybe_route_to_mode_command` в `meetings_listener.py`, новый тест `tests/test_iss51_mode_command.py` (57 тестов).
+- **Фаза 5** (исполнитель в работе): `scheduler.py`, `lib/gcal.py`, `meetings_apply_reply.py`, новый `tests/test_iss54_meeting_dedup.py`.
+
+## Чем проверено
+
+- Гейт зоны — `sh .build-idea/open-questions-mode-per-series/gate.sh`. Зелёным считается прогон, где красные файлы — подмножество карантина базовой линии: `test_iss33_mixed_reply_split.py`, `test_phase6_journal.py`, `test_watson_phase4_morning_digest.py`. **Добавился четвёртый кандидат в карантин:** `test_knowledge_content_barrier.py` — падает по стенным часам (порог 3 с) при параллельной нагрузке, к правкам прогона отношения не имеет (проверено `git stash` дважды разными агентами).
+- Артефакты: `artifacts/gate-f1.txt`, отчёты `f1-*`, `f4-*`, `f2-impl.md`.
+- Мутации: фаза 1 — 39 мутантов от трёх агентов, все покрасили; фаза 4 — 39 от двух агентов; фаза 2 — 25 от исполнителя.
+  🔴 **Мутационная проверка врёт без отключения кэша байткода.** Ловили трижды. Надёжно только `PYTHONDONTWRITEBYTECODE=1` + сдвиг mtime; `shutil.rmtree` по `rglob("__pycache__")` пропускает каталоги.
+
+## Следующий шаг (один)
+
+Дождаться четырёх агентов по фазе 2 (три ревью + следопыт) и исполнителя фазы 5 → ремонт фазы 2 батчем → коммит фазы 2 → ревью и следы фазы 5 → ремонт → коммит. Затем фаза 3 (последняя кодовая, файлы `lib/morning_digest.py`, `lib/series_memory.py`, `lib/clarify_worker.py`, `finalize-meeting.py`, `lib/pending_reconciler.py`, роут статус-ответа в `meetings_listener.py`), затем фаза 6 (`lib/send_artifact.py` + листенер), затем фаза 7 (только живой документ и статусы в журнале косяков — деплой и раскладка объявлены невыполнимыми), этап 7 (сквозная проверка по швам свежими агентами), этап 8 (отчёт, `decisions.md`, «что нового»).
+
+## Файлы: что трогать и что НЕ трогать
+
+**Можно:** всё внутри `scripts/notary/` по картам владения фаз; `.build-idea/open-questions-mode-per-series/**`; `plans/follow-ups-*.md` и `whats-new/` в корне рабочего дерева; отметки статуса в файле плана.
+
+**НЕ трогать:** всё вне `scripts/notary/` в самом репозитории; боевой `watched.yaml` (живёт вне рабочего дерева, зеркало — `/Users/ilarybalka/Projects/meeting-notary/.../watched.yaml.vps-mirror`, только чтение); `deploy/`, `systemd/`, прод. Наружу ничего: ни push, ни деплой, ни ssh, ни сообщения живым людям.
+
+**Порядок параллельности (карты владения не должны пересекаться):**
+- Ф2 держит `meetings_listener.py`, `cli/registry.py`, `lib/mode_command.py`;
+- Ф5 держит `scheduler.py`, `lib/gcal.py`, `meetings_apply_reply.py`;
+- Ф3 (не начата) возьмёт `lib/morning_digest.py`, `lib/series_memory.py`, `lib/clarify_worker.py`, `finalize-meeting.py`, `lib/pending_reconciler.py` — с `meetings_listener.py` пересечётся, значит после Ф2;
+- Ф6 (не начата) возьмёт `lib/send_artifact.py` + `meetings_listener.py` — после Ф2 и Ф3.
