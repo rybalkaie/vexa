@@ -5,7 +5,9 @@
   • детект интента (глагол отправки + объект; неоднозначное «файл» по surface; мимо-
     статус/правка → None);
   • роут `maybe_route_to_send_artifact`: диспетчеризация protocol/digest, уступка
-    статус-ответу, подсказка при нерезолвнутой серии, не-reply → False;
+    статус-ответу, подсказка при нерезолвнутой серии, «не-reply И чат без серии»
+    → False (после ISS-52 «не-reply» само по себе уже НЕ значит False — резолв по
+    привязке чата покрыт в `test_iss51_mode_registry.py`);
   • `_resend_digest`: зовёт `send_series_digest(force=True)`, пустой список → честная строка.
 
 Запуск:
@@ -152,13 +154,35 @@ class TestRoute(unittest.TestCase):
         self.assertTrue(claimed)
         self.assertTrue(any("ответьте на дайджест" in s.lower() for s in sent))
 
-    def test_not_a_reply_returns_false(self):
-        # не reply → нет контекста серии → False (обычный маршрут)
-        with mock.patch.object(ml, "send_message") as sm_:
+    def test_not_a_reply_and_unbound_chat_returns_false(self):
+        # ISS-52 отменил прежний контракт «не reply → всегда False»: в чате,
+        # ПРИВЯЗАННОМ к серии, просьба теперь срабатывает и без реплая (это
+        # покрыто в test_iss51_mode_registry). Здесь охраняется то, что осталось:
+        # реплая нет И чат ни с одной серией не связан → роут уступает дальше и
+        # молчит, иначе бот отвечал бы на каждую фразу с глаголом отправки в
+        # любой группе, где он просто сидит.
+        with mock.patch.object(ml, "_chat_context_series", return_value=([], None)), \
+             mock.patch.object(ml, "_resend_protocol", return_value=True) as rp_, \
+             mock.patch.object(ml, "send_message") as sm_:
             claimed = ml.maybe_route_to_send_artifact(
-                "tok", self.GROUP, self.GROUP, self._msg("пришли протокол", reply=False))
+                "tok", -100777, self.GROUP, self._msg("пришли протокол", reply=False))
         self.assertFalse(claimed)
+        rp_.assert_not_called()
         sm_.assert_not_called()
+
+    def test_bare_file_needs_a_reply(self):
+        # Голый объект «файл/версия» — интент ТОЛЬКО в ответе на наше сообщение.
+        # Без реплая это обычная переписка людей, а не просьба к боту.
+        self.assertIsNone(
+            sa.detect_artifact_request("скинь файл", allow_bare_file=False))
+        self.assertIsNone(
+            sa.detect_artifact_request("дайте актуальную версию договора",
+                                       allow_bare_file=False))
+        # Однозначные формулировки от параметра не зависят.
+        self.assertEqual(
+            sa.detect_artifact_request("пришли протокол", allow_bare_file=False), "protocol")
+        self.assertEqual(
+            sa.detect_artifact_request("скинь открытые вопросы", allow_bare_file=False), "digest")
 
 
 # ==========================================================================

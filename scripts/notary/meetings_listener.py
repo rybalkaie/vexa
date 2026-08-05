@@ -893,6 +893,78 @@ def _reply_context_series_digest(cid: int, msg: dict[str, Any]) -> Optional[str]
         return None
 
 
+def _series_named_in_text(
+    text: str, candidates: list[str], display_map: dict[str, str]
+) -> Optional[str]:
+    """Серия, названная СЛОВАМИ прямо в просьбе, — ровно одна из `candidates`.
+
+    ISS-52: когда чат обслуживает несколько серий, единственным выходом был
+    ответ-реплай на протокол — ровно то, от чего фичу и уводили. Второй путь:
+    «пришлите протокол Координация». Сверяем и по slug'у, и по отображаемому
+    имени (slug бывает латиницей, человек пишет по-русски). От русских окончаний
+    защищаемся срезом хвоста: «координация» → «координац» матчит «координации».
+
+    Совпало больше одной серии (или ни одной) → None, вызыватель переспросит:
+    лишний вопрос дешевле, чем чужой протокол в чат. Кандидаты приходят только
+    из привязок ЭТОГО чата, так что выбор ограничен сериями самого чата."""
+    t = (text or "").casefold().replace("ё", "е")
+    hits: list[str] = []
+    for s in candidates:
+        labels = [s]
+        disp = display_map.get(s)
+        if isinstance(disp, str) and disp.strip():
+            labels.append(disp)
+        for label in labels:
+            stems = [
+                tok[:max(5, len(tok) - 2)]
+                for tok in re.split(r"[^0-9a-zа-я]+", label.casefold().replace("ё", "е"))
+                if len(tok) >= 5
+            ]
+            if any(stem in t for stem in stems):
+                hits.append(s)
+                break
+    return hits[0] if len(hits) == 1 else None
+
+
+def _chat_context_series(cid: int, allowed_chat: int) -> tuple[list[str], Optional[str]]:
+    """ISS-52: серии, привязанные к ТЕКУЩЕМУ чату. Фолбэк, когда реплая нет.
+
+    Симптом без этого: человек в группе серии просит «вышли файл с открытыми
+    вопросами», не отвечая на протокол, — и бот не знает, в чате какой серии он
+    находится, хотя привязка чата к серии лежит в реестре.
+
+    Возвращает `(серии, причина_сбоя)`. Список пуст в трёх случаях:
+      • это личка владельца — она не привязана к серии, и вопрос «какую серию»
+        там остаётся законным (иначе бот угадывал бы вместо переспроса);
+      • чат не привязан ни к одной серии;
+      • реестр не прочитался — тогда вторым элементом едет ИМЯ класса ошибки,
+        и вызыватель пишет его в лог (иначе «чат без серии» и «реестр упал»
+        выглядят в журнале одинаково — то есть никак).
+
+    Несколько серий на один чат — законная ситуация (одна комната обслуживает
+    и координацию, и выставку), поэтому список, а решение — за вызывателем.
+
+    Ловим `(Exception, SystemExit)`, а не голый `Exception`: `registry._read_yaml`
+    на не-словаре верхнего уровня делает `raise SystemExit` (CLI-происхождение), а
+    `SystemExit` — потомок `BaseException` и сквозь `except Exception` пролетает
+    насквозь: из роута, из `process_message`, из главного цикла — и гасит процесс
+    ДО `save_offset`. Telegram отдал бы тот же апдейт после рестарта → петля
+    перезапусков всего бота из-за одной кривой правки watched.yaml руками.
+    `BaseException` брать нельзя — проглотили бы KeyboardInterrupt и SIGTERM.
+    """
+    if cid is None or cid == allowed_chat:
+        return [], None
+    try:
+        from notary.cli import registry  # noqa: PLC0415
+        watched = registry.load_watched()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort, listener не валим
+        return [], type(e).__name__
+    try:
+        return registry.series_for_chat(cid, watched), None
+    except (Exception, SystemExit) as e:  # noqa: BLE001
+        return [], type(e).__name__
+
+
 # ── ISS-45: переотправка артефакта (протокол / дайджест) по просьбе участника ──
 def _latest_protocol_path(series: str) -> Optional[tuple]:
     """Последний `<date>-protokol.md` серии → (Path, дата). Имена ISO-датой →
@@ -920,6 +992,10 @@ def _resend_protocol(token: str, cid: int, series: str, msg: dict[str, Any]) -> 
     if not found:
         # Протокола ещё нет: встреча прошла, но сборка не завершилась (или это первая
         # встреча серии). Не пугаем «потерялся» — честно про «ещё не готов».
+        # Логируем: этот же ответ приходит и при ДРЕЙФЕ ключа серии (реестр говорит
+        # «Koord», папка на диске «koord») — тогда бот уверенно врёт, что протокола
+        # нет, и без строки в журнале это неотличимо от честного «ещё не собрался».
+        logger.info("[send-artifact] протокол серии %s не найден на диске (чат %s)", series, cid)
         send_message(token, cid, "Протокол этой встречи пока не готов — пришлю, как соберётся.",
                      reply_to=reply_to_id)
         return True
@@ -984,6 +1060,11 @@ def _resend_digest(token: str, cid: int, series: str, msg: dict[str, Any]) -> bo
             pass
         return True
     if reason == "empty":
+        # Логируем: ровно этот ответ бот даёт и при ДРЕЙФЕ ключа серии (реестр
+        # разошёлся с именем папки — корень ISS-7). Тогда людям в группе уверенно
+        # сообщается «вопросов нет», хотя они есть; без строки в журнале отличить
+        # это от честной пустоты нельзя.
+        logger.info("[send-artifact] открытых вопросов по серии %s нет (чат %s)", series, cid)
         send_message(token, cid, "Открытых вопросов по этой встрече сейчас нет — список пуст.",
                      reply_to=reply_to_id)
         return True
@@ -1003,20 +1084,25 @@ def maybe_route_to_send_artifact(
     триггер (глагол отправки + объект); статус-ответ уступаем роутам ниже (не крадём)."""
     if cid is None:
         return False
-    if not isinstance(msg.get("reply_to_message"), dict):
-        return False  # нужен контекст серии (на что отвечают)
     text = (msg.get("text") or "").strip()
     if not text:
         return False
     # Серия + surface по тому, на ЧТО ответили (протокол приоритетнее — точный индекс).
-    series = _reply_context_series(cid, msg)
+    is_reply = isinstance(msg.get("reply_to_message"), dict)
+    series = _reply_context_series(cid, msg) if is_reply else None
     surface = "protocol" if series else None
-    if not series:
+    if not series and is_reply:
         series = _reply_context_series_digest(cid, msg)
         surface = "digest" if series else None
     try:
         from notary.lib import send_artifact  # noqa: PLC0415
-        kind = send_artifact.detect_artifact_request(text, reply_surface=surface)
+        # `allow_bare_file=is_reply`: голый объект «файл/версия/документ» — интент
+        # ТОЛЬКО в ответе на наше сообщение. Без реплая (ISS-52 берёт серию из
+        # привязки чата) такие фразы — обычная переписка людей между собой
+        # («пришли файл с ценами», «дайте актуальную версию договора»), и бот
+        # вываливал бы им в чат PDF протокола встречи.
+        kind = send_artifact.detect_artifact_request(
+            text, reply_surface=surface, allow_bare_file=is_reply)
     except Exception as e:  # noqa: BLE001
         logger.debug("[send-artifact] детект не удался: %s", type(e).__name__)
         return False
@@ -1029,7 +1115,53 @@ def maybe_route_to_send_artifact(
             return False
     except Exception:  # noqa: BLE001
         pass
+    # ISS-52: реплая нет или он ничего не дал → определяем серию по САМОМУ ЧАТУ.
+    # Реестр читаем ЗДЕСЬ, а не на входе роута: к этой строке уже известно, что
+    # это просьба об артефакте и не статус-ответ, — иначе YAML парсился бы на
+    # каждом «привет» в каждой группе, и площадь отказа реестра была бы равна
+    # всему групповому трафику.
+    # Surface остаётся None: без реплая нечем разрешить неоднозначное «пришли
+    # файл», и детект выше такую фразу уже отсёк (`allow_bare_file`).
+    ambiguous_series: list[str] = []
     if not series:
+        chat_series, err = _chat_context_series(cid, allowed_chat)
+        if err:
+            # Единственный сигнал, что фича отвалилась не по-настоящему, а из-за
+            # реестра: без него «чат не привязан» и «реестр упал» неотличимы.
+            logger.warning("[chat-series] реестр не прочитан (chat=%s): %s", cid, err)
+        if len(chat_series) == 1:
+            series = chat_series[0]
+            logger.info("[chat-series] серия %s определена по привязке чата %s (кандидатов %d)",
+                        series, cid, len(chat_series))
+        elif len(chat_series) > 1:
+            ambiguous_series = chat_series
+    if not series and ambiguous_series:
+        # ISS-52: чат обслуживает несколько серий. Сначала пробуем понять по словам
+        # самой просьбы («пришлите протокол Координация»), и только потом
+        # переспрашиваем — реплай тут не единственный выход.
+        dm = _series_display_map()
+        series = _series_named_in_text(text, ambiguous_series, dm)
+        if series:
+            logger.info("[chat-series] серия %s названа словами в просьбе (чат %s, кандидатов %d)",
+                        series, cid, len(ambiguous_series))
+        else:
+            logger.info("[chat-series] в чате %s несколько серий (%d) — переспрашиваю: %s",
+                        cid, len(ambiguous_series), ", ".join(ambiguous_series))
+            names = ", ".join(f"«{dm.get(s, s)}»" for s in ambiguous_series)
+            example = dm.get(ambiguous_series[0], ambiguous_series[0])
+            send_message(token, cid,
+                         f"В этом чате у меня несколько серий: {names}. "
+                         f"Назовите серию прямо в просьбе — например «пришлите протокол "
+                         f"{example}» — или ответьте на протокол либо дайджест нужной встречи.",
+                         reply_to=msg.get("message_id"))
+            return True
+    if not series:
+        if not is_reply:
+            # Реплая нет и чат ни с одной серией не связан (в том числе личка
+            # владельца): молчим и уступаем роутам ниже — ровно как до ISS-52.
+            # Иначе бот отвечал бы подсказкой на любую фразу с глаголом отправки
+            # в каждой группе, где он просто сидит.
+            return False
         send_message(token, cid,
                      "Чтобы прислать файл, ответьте на дайджест или протокол нужной встречи "
                      "— по нему я пойму, о какой серии речь.",
@@ -1131,11 +1263,15 @@ def maybe_route_to_set_chat_command(
     display_map = _series_display_map()
     try:
         watched = load_watched(lock=True)
-    except Exception as e:  # noqa: BLE001
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         # ВАЖНО: load_watched(lock=True) захватывает flock ДО чтения yaml; если
         # сам разбор реестра упал (битый/руками-правленный watched.yaml), лок уже
         # держится и без явного release утечёт — следующая команда смены чата
         # повиснет на flock(LOCK_EX) и встанет весь листенер. Освобождаем явно.
+        # `SystemExit` ловим наравне с Exception: `_read_yaml` на не-словаре
+        # верхнего уровня кидает именно его (CLI-происхождение), а он потомок
+        # BaseException — иначе пролетел бы мимо, унёс листенер И оставил лок
+        # захваченным навсегда. BaseException нельзя: SIGTERM/KeyboardInterrupt.
         try:
             release_watched_lock()
         except Exception:  # noqa: BLE001

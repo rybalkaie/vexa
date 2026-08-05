@@ -47,13 +47,24 @@ _OBJ_FILE = re.compile(r"(файл\w*|верси\w*|актуальн\w*\s+вер
 
 
 def detect_artifact_request(
-    text: Optional[str], *, reply_surface: Optional[str] = None
+    text: Optional[str], *, reply_surface: Optional[str] = None,
+    allow_bare_file: bool = True,
 ) -> Optional[str]:
     """Что просят переслать: `"protocol"` | `"digest"` | `None`.
 
     `reply_surface` (`"protocol"`|`"digest"`|`None`) — на ЧТО отвечает человек;
     разрешает неоднозначное «пришли файл». Возвращаем интент ТОЛЬКО при связке
-    «глагол отправки + объект» — иначе None (статус/правку не перехватываем)."""
+    «глагол отправки + объект» — иначе None (статус/правку не перехватываем).
+
+    `allow_bare_file` — можно ли вообще считать интентом ГОЛЫЙ объект
+    «файл/версия» (без слова «протокол» и без дайджест-формулировки). Ветка
+    голого объекта проектировалась под reply: контекст ответа и разрешал
+    двусмысленность. Когда серия пришла НЕ из реплая, а из привязки чата
+    (ISS-52), разрешать нечем, и «пришли файл с ценами» / «дайте актуальную
+    версию договора» — обычная рабочая переписка людей между собой, а не
+    просьба к боту. Поэтому вызыватель передаёт `allow_bare_file=is_reply`:
+    без реплая голый объект даёт None, а однозначные («протокол», открытые
+    вопросы/дайджест) работают как раньше."""
     t = (text or "").replace("ё", "е").replace("Ё", "Е")
     if not _SEND_VERB.search(t):
         return None
@@ -66,7 +77,7 @@ def detect_artifact_request(
     if dig and prot:
         # Оба явно названы — по контексту ответа, иначе протокол (главный документ).
         return reply_surface if reply_surface in ("protocol", "digest") else "protocol"
-    if _OBJ_FILE.search(t):
+    if allow_bare_file and _OBJ_FILE.search(t):
         # Голый «файл» — по тому, на что отвечают.
         return reply_surface if reply_surface in ("protocol", "digest") else "protocol"
     return None
