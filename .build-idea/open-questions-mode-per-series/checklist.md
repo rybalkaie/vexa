@@ -123,6 +123,6 @@
 
 - [ ] Отчёт «как было / как стало» → .build-idea/open-questions-mode-per-series/report.md
 - [ ] Лист решений владельцу → .build-idea/open-questions-mode-per-series/decisions.md
-- [ ] Файл долгов → plans/follow-ups-open-questions-mode-per-series.md
-- [ ] «Что нового» для сотрудников → whats-new/2026-08-04-open-questions-mode-per-series.md
-- [ ] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
+- [x] Файл долгов → plans/follow-ups-open-questions-mode-per-series.md
+- [x] «Что нового» для сотрудников → whats-new/2026-08-05-open-questions-mode-per-series.md
+- [x] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
