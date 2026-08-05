@@ -19,18 +19,19 @@
 
 ## Фаза 1. Режим в реестре, чтение и знание своей серии
 
-- [ ] Поле open_questions_mode + валидация, неизвестное → дефолт last-only + предупреждение в лог
-- [ ] Хелпер series_open_questions_mode с нормализацией ключа (ISS-7)
-- [ ] ISS-52: фолбэк резолва серии по chat_id текущего чата (одна → молча, несколько → переспрос)
-- [ ] Тесты фазы написаны и зелёные
-- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f1.txt
-- [ ] След 1: прошёл путь как пользователь → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
-- [ ] След 2: невалидные входы каждого перехода перечислены → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
-- [ ] След 3: грепнул, где ещё этот же класс → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
-- [ ] След 4: мерил на боевых объёмах → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
-- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f1-reviews.md
-- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f1-mutation.md
-- [ ] Коммит фазы поимённо
+- [x] Поле open_questions_mode + валидация, неизвестное → дефолт last-only + предупреждение в лог → .build-idea/open-questions-mode-per-series/artifacts/f1-repair.md
+- [x] Хелпер series_open_questions_mode с нормализацией ключа (ISS-7) → .build-idea/open-questions-mode-per-series/artifacts/f1-diff.txt
+- [x] ISS-52: фолбэк резолва серии по chat_id текущего чата (одна → молча, несколько → переспрос) → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [x] Тесты фазы написаны и зелёные → .build-idea/open-questions-mode-per-series/artifacts/gate-f1.txt
+- [x] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f1.txt
+- [x] След 1: прошёл путь как пользователь → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [x] След 2: невалидные входы каждого перехода перечислены → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [x] След 3: грепнул, где ещё этот же класс → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [x] След 4: мерил на боевых объёмах → .build-idea/open-questions-mode-per-series/artifacts/f1-traces.md
+- [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f1-review-1.md
+- [x] Ревью 2 и 3 фазы 1 → .build-idea/open-questions-mode-per-series/artifacts/f1-review-3.md
+- [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f1-mutation.md
+- [x] Коммит фазы поимённо → f7271f0
 
 ## Фаза 2. Переключение режима командой боту
 
