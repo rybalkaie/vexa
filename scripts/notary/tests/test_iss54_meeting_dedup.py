@@ -72,6 +72,20 @@ os.environ["MEETING_NOTARY_LOG_DIR"] = _TMP_ROOT
 os.environ["MEETING_NOTARY_STATE_DIR"] = _TMP_ROOT
 atexit.register(shutil.rmtree, _TMP_ROOT, True)
 
+def setUpModule() -> None:
+    """Переустановить env ПЕРЕД тестами этого модуля.
+
+    Строки выше выполняются на ИМПОРТЕ, а в общем прогоне (`unittest discover`)
+    после нас импортируются другие тест-модули — и каждый ставит env под себя.
+    К моменту запуска наших тестов там мог бы оказаться чужой каталог. Пути
+    состояния резолвятся лениво (`lib/state.py`), поэтому решает значение env
+    в момент ВЫЗОВА, а не импорта.
+    """
+    os.environ["MEETING_NOTARY_REGISTRY_DIR"] = _TMP_ROOT
+    os.environ["MEETING_NOTARY_LOG_DIR"] = _TMP_ROOT
+    os.environ["MEETING_NOTARY_STATE_DIR"] = _TMP_ROOT
+
+
 import notary.lib.gcal as gcal  # noqa: E402
 import notary.lib.meeting_identity as mid  # noqa: E402
 import notary.lib.state as state  # noqa: E402

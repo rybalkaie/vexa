@@ -25,9 +25,38 @@ sys.path.insert(0, str(THIS_DIR.parent.parent))  # для notary.cli.registry
 
 from notary.cli.registry import DEFAULT_REGISTRY_DIR  # noqa: E402
 
+# 🔴 Пути резолвятся ЛЕНИВО, на вызове, а не на импорте (приёмка 05.08.2026).
+# Было: константы вычислялись при импорте модуля, поэтому `MEETING_NOTARY_REGISTRY_DIR`,
+# выставленная тестом ПОСЛЕ первого импорта `lib.state` соседним модулем, уже не
+# действовала — и `state_acquire()` в тестах писала фиктивные `event_id` в БОЕВОЙ
+# `.state.json`. Записи живут 12 часов (STATE_TTL_HOURS) и роняли следующий полный прогон;
+# на сервере тот же механизм заблокировал бы НАСТОЯЩУЮ встречу — барьер «встреча уже
+# стартовала» сработал бы на мусоре, и бот молча не пришёл бы (зеркальный отказ к ISS-54).
+# Константы ниже оставлены для обратной совместимости (значение на момент импорта), но
+# внутри модуля НЕ используются — все обращения идут через функции.
 QUEUE_FILE = DEFAULT_REGISTRY_DIR / ".queue.json"
 STATE_FILE = DEFAULT_REGISTRY_DIR / ".state.json"
 LAST_SUCCESS_FILE = DEFAULT_REGISTRY_DIR / ".scheduler-last-success"
+
+
+def _registry_dir() -> Path:
+    """Каталог реестра НА МОМЕНТ ВЫЗОВА (env главнее всего, как и в cli.registry)."""
+    from notary.cli.registry import _resolve_registry_dir
+
+    return _resolve_registry_dir()
+
+
+def queue_file() -> Path:
+    return _registry_dir() / ".queue.json"
+
+
+def state_file() -> Path:
+    return _registry_dir() / ".state.json"
+
+
+def last_success_file() -> Path:
+    return _registry_dir() / ".scheduler-last-success"
+
 
 STATE_TTL_HOURS = 12
 
@@ -74,7 +103,7 @@ def read_queue() -> list[dict[str, Any]]:
       'type': 'google-calendar'|'manual'|'one-off',
     }
     """
-    data = _read_json(QUEUE_FILE)
+    data = _read_json(queue_file())
     if not isinstance(data, dict):
         return []
     items = data.get("items")
@@ -84,7 +113,7 @@ def read_queue() -> list[dict[str, Any]]:
 def write_queue(items: list[dict[str, Any]], *, generated_at: datetime | None = None) -> None:
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
-    _atomic_write_json(QUEUE_FILE, {
+    _atomic_write_json(queue_file(), {
         "generated_at": generated_at.isoformat(),
         "items": items,
     })
@@ -93,14 +122,14 @@ def write_queue(items: list[dict[str, Any]], *, generated_at: datetime | None = 
 # ---------- State (идемпотентность) ----------
 
 def read_state() -> dict[str, str]:
-    data = _read_json(STATE_FILE)
+    data = _read_json(state_file())
     if not isinstance(data, dict):
         return {}
     return {k: v for k, v in data.items() if isinstance(v, str)}
 
 
 def write_state(state: dict[str, str]) -> None:
-    _atomic_write_json(STATE_FILE, state)
+    _atomic_write_json(state_file(), state)
 
 
 def state_acquire(event_id: str, *, now: datetime | None = None) -> bool:
@@ -111,8 +140,9 @@ def state_acquire(event_id: str, *, now: datetime | None = None) -> bool:
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = STATE_FILE.parent / (f".{STATE_FILE.name}.lock")
+    sf = state_file()
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = sf.parent / (f".{sf.name}.lock")
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -156,14 +186,16 @@ def state_acquire(event_id: str, *, now: datetime | None = None) -> bool:
 def write_last_success(ts: datetime | None = None) -> None:
     if ts is None:
         ts = datetime.now(timezone.utc)
-    LAST_SUCCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LAST_SUCCESS_FILE.write_text(ts.isoformat() + "\n", encoding="utf-8")
+    lsf = last_success_file()
+    lsf.parent.mkdir(parents=True, exist_ok=True)
+    lsf.write_text(ts.isoformat() + "\n", encoding="utf-8")
 
 
 def read_last_success() -> datetime | None:
-    if not LAST_SUCCESS_FILE.exists():
+    lsf = last_success_file()
+    if not lsf.exists():
         return None
-    raw = LAST_SUCCESS_FILE.read_text(encoding="utf-8").strip()
+    raw = lsf.read_text(encoding="utf-8").strip()
     if not raw:
         return None
     try:
