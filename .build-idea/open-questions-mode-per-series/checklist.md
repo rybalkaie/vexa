@@ -81,16 +81,16 @@
 
 ## Фаза 5. ISS-54
 
-- [ ] Приёмочные тесты зоны написаны ПЕРВЫМИ (сторожа не было — находка Н2)
-- [ ] iCalUID протянут от календарного слоя до записи реестра (находка Н1)
-- [ ] Дедуп при записи в реестр по iCalUID, пара «время старта + URL» страховкой
-- [ ] Дедуп в scheduler по (url, start) + лог о схлопывании
-- [ ] Разовая чистка боевого дубля
-- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f5.txt
-- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f5-traces.md
-- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f5-reviews.md
-- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f5-mutation.md
-- [ ] Коммит фазы поимённо
+- [x] Приёмочные тесты зоны написаны ПЕРВЫМИ (сторожа не было — находка Н2) → .build-idea/open-questions-mode-per-series/artifacts/f5-impl.md
+- [x] iCalUID протянут от календарного слоя до записи реестра (находка Н1) → .build-idea/open-questions-mode-per-series/artifacts/f5-impl.md
+- [x] Дедуп при записи в реестр по iCalUID, пара «время старта + URL» страховкой → .build-idea/open-questions-mode-per-series/artifacts/f5-repair.md
+- [x] Дедуп в scheduler по (url, start) + лог о схлопывании → .build-idea/open-questions-mode-per-series/artifacts/f5-repair.md
+- [x] SKIP/MANUAL: боевые данные вне рабочего дерева, правка запрещена условиями прогона — в файле долгов
+- [x] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/f5-repair.md
+- [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f5-traces.md
+- [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f5-review-1.md
+- [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f5-mutation.md
+- [x] Коммит фазы поимённо → 1836d3b
 
 ## Фаза 6. ISS-51
 
