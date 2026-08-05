@@ -35,17 +35,17 @@
 
 ## Фаза 2. Переключение режима командой боту
 
-- [ ] Узкий детерминированный триггер обеих сторон + форма с явным именем серии
-- [ ] Owner-гейт по образцу set_chat
-- [ ] Видимое подтверждение владельцу
-- [ ] Команда «в каком режиме эта серия?»
-- [ ] Строка в чат серии о смене формата
-- [ ] Тесты фазы написаны и зелёные
-- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f2.txt
-- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f2-traces.md
-- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f2-reviews.md
-- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f2-mutation.md
-- [ ] Коммит фазы поимённо
+- [x] Узкий детерминированный триггер обеих сторон + форма с явным именем серии → .build-idea/open-questions-mode-per-series/artifacts/f2-repair.md
+- [x] Owner-гейт по образцу set_chat → .build-idea/open-questions-mode-per-series/artifacts/f2-review-1.md
+- [x] Видимое подтверждение владельцу → .build-idea/open-questions-mode-per-series/artifacts/f2-repair.md
+- [x] Команда «в каком режиме эта серия?» → .build-idea/open-questions-mode-per-series/artifacts/f2-impl.md
+- [x] Строка в чат серии о смене формата → .build-idea/open-questions-mode-per-series/artifacts/f2-traces.md
+- [x] Тесты фазы написаны и зелёные (81) → .build-idea/open-questions-mode-per-series/artifacts/gate-f2.txt
+- [x] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f2.txt
+- [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f2-traces.md
+- [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f2-review-1.md
+- [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f2-mutation.md
+- [x] Коммит фазы поимённо → d1c6a78
 
 ## Фаза 3. Поведение справочного режима
 
