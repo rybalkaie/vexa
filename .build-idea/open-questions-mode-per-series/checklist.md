@@ -49,21 +49,21 @@
 
 ## Фаза 3. Поведение справочного режима
 
-- [ ] Дайджест last-only: источник — задачи, рождённые на последней прошедшей встрече
-- [ ] Мелочь входит, группировка по ответственным сохранена, формат доставки прежний
-- [ ] Убран запрос статусов: инструкция, нумерация, регистрация снапшота
-- [ ] Мягкая подпись-шапка
-- [ ] Гейт хвоста в ОБОИХ call-site (finalize + clarify_worker)
-- [ ] Проверено, что пропуск блока не ломает commit_pending_shown / record_open_tasks_snapshot
-- [ ] Ночной сверщик и напоминания пропускают last-only
-- [ ] Reply со статусом в шпаргалке: ответ-объяснение, в стор ничего не пишется
-- [ ] При возврате в carry первый дайджест снова регистрирует снапшот
-- [ ] Тесты фазы написаны и зелёные
-- [ ] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/gate-f3.txt
-- [ ] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f3-traces.md
-- [ ] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f3-reviews.md
-- [ ] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f3-mutation.md
-- [ ] Коммит фазы поимённо
+- [x] Дайджест last-only: источник — задачи, рождённые на последней прошедшей встрече → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Мелочь входит, группировка по ответственным сохранена, формат доставки прежний → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Убран запрос статусов: инструкция, нумерация, регистрация снапшота → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Мягкая подпись-шапка → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Гейт хвоста в ОБОИХ call-site (finalize + clarify_worker) → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Проверено, что пропуск блока не ломает commit_pending_shown / record_open_tasks_snapshot → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Ночной сверщик и напоминания пропускают last-only → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Reply со статусом в шпаргалке: ответ-объяснение, в стор ничего не пишется → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] При возврате в carry первый дайджест снова регистрирует снапшот → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Тесты фазы написаны и зелёные → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Гейт зоны зелёный после фазы → .build-idea/open-questions-mode-per-series/artifacts/f3-repair.md
+- [x] Четыре следа фазы → .build-idea/open-questions-mode-per-series/artifacts/f3-traces.md
+- [x] Три независимых ревью по дифу → .build-idea/open-questions-mode-per-series/artifacts/f3-review-1.md
+- [x] Мутация внесена не автором и покрасила гейт → .build-idea/open-questions-mode-per-series/artifacts/f3-mutation.md
+- [x] Коммит фазы поимённо → 67b1060
 
 ## Фаза 4. ISS-53 + ISS-55
 
