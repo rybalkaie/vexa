@@ -79,7 +79,8 @@ MEETING_KEYWORDS = [
 # Локальная TZ для отображения. Илья живёт в Дубае, но регулярно в Москве —
 # override через env MEETING_NOTARY_DISPLAY_TZ. Полный фикс «брать TZ из самого
 # события календаря» см. в plans/2026-05-27-tz-iz-sobytiya.md.
-DISPLAY_TZ = ZoneInfo(os.environ.get("MEETING_NOTARY_DISPLAY_TZ", "Asia/Dubai"))
+DISPLAY_TZ_ENV = "MEETING_NOTARY_DISPLAY_TZ"
+DEFAULT_DISPLAY_TZ = "Asia/Dubai"
 
 STATE_DIR = Path(os.path.expanduser(
     os.environ.get("MEETING_NOTARY_STATE_DIR") or "~/.local/state"
@@ -102,6 +103,49 @@ def setup_logging() -> None:
 
 
 logger = logging.getLogger("meetings-evening-block")
+
+
+def resolve_display_tz(name: str | None = None) -> ZoneInfo | timezone:
+    """TZ отображения — мягко, как у `meetings_apply_reply.display_tz()`.
+
+    Раньше здесь стоял голый `ZoneInfo(os.environ.get(...))` на уровне модуля:
+    пустая или мусорная `MEETING_NOTARY_DISPLAY_TZ` роняла ВЕСЬ вечерний блок
+    прямо на импорте — владелец не получал ни списка встреч, ни ошибки. Вторая
+    половина той же пары (apply-reply) при этом молча откатывалась на дефолт.
+    Обе двери обязаны вести себя одинаково: откат + предупреждение.
+    """
+    raw = name if name is not None else os.environ.get(DISPLAY_TZ_ENV)
+    tz_name = (raw or "").strip() or DEFAULT_DISPLAY_TZ
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        if tz_name != DEFAULT_DISPLAY_TZ:
+            logger.warning("%s=%r не распознан — беру %s", DISPLAY_TZ_ENV, tz_name, DEFAULT_DISPLAY_TZ)
+        try:
+            return ZoneInfo(DEFAULT_DISPLAY_TZ)
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "не найдена ни одна таймзона (%s и дефолт %s) — показываю время в UTC",
+                tz_name, DEFAULT_DISPLAY_TZ,
+            )
+            return timezone.utc
+
+
+DISPLAY_TZ = resolve_display_tz()
+
+
+def is_recorded(rec: dict[str, Any] | None) -> bool:
+    """Мы РЕАЛЬНО пишем эту встречу? (а не просто знаем о ней)
+
+    В реестре лежат три разных вида записей, и индекс `index_watched` их не
+    различает намеренно — на этом держится ISS-53 («нет» = встреча известна,
+    больше не предлагаем). Но разделы «🔄 Перенесённые (запись сдвинул)» и
+    «❌ Отменённые (запись снял)» — это отчёт о НАШЕЙ работе, и в них имеет
+    право попадать только то, что бот действительно пишет: `enabled=true`.
+    Иначе бот рапортует «снял запись» про встречу, которую владелец сам
+    запретил записывать, — сразу после обещания «больше не спрошу».
+    """
+    return rec is not None and bool(rec.get("enabled", True))
 
 
 def looks_like_meeting(event: dict[str, Any]) -> tuple[bool, str | None]:
@@ -136,6 +180,21 @@ def index_watched(watched: list[dict[str, Any]]) -> dict[tuple[str, str], dict[s
         if ev_id:
             idx[(cid, ev_id)] = rec
     return idx
+
+
+def find_in_watched(
+    idx: dict[tuple[str, str], dict[str, Any]],
+    calendar_id: str,
+    event_id: str,
+    recurring_event_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Найти запись реестра под этот инстанс: сначала по серии, потом по экземпляру."""
+    rec = None
+    if recurring_event_id:
+        rec = idx.get((calendar_id, recurring_event_id))
+    if rec is None:
+        rec = idx.get((calendar_id, event_id))
+    return rec
 
 
 def collect_calendar_ids(watched: list[dict[str, Any]]) -> list[str]:
@@ -317,12 +376,10 @@ def main() -> int:
         cid = c["calendar_id"]
 
         # Проверяем матч с реестром — сначала по recurring_event_id, потом по event_id.
-        rec = None
-        if recurring:
-            rec = watched_idx.get((cid, recurring))
-        if rec is None:
-            rec = watched_idx.get((cid, eid))
-
+        # `enabled` тут НЕ смотрим намеренно: «известна» ≠ «пишем». На этом стоит
+        # ISS-53 — отказ владельца («нет») лежит в реестре как выключенная запись
+        # именно затем, чтобы встреча больше не предлагалась.
+        rec = find_in_watched(watched_idx, cid, eid, recurring)
         if rec is not None:
             # уже знаем эту встречу — пропускаем
             continue
@@ -353,12 +410,7 @@ def main() -> int:
             continue
         # Только для тех, что в реестре (нас интересует переезд именно отслеживаемых).
         recurring = evt.get("recurringEventId")
-        rec = None
-        if recurring:
-            rec = watched_idx.get((cid, recurring))
-        if rec is None:
-            rec = watched_idx.get((cid, eid))
-        if rec is None:
+        if find_in_watched(watched_idx, cid, eid, recurring) is None:
             continue
         cur_start_by_eid[(cid, eid)] = start.isoformat()
 
@@ -368,6 +420,13 @@ def main() -> int:
         series = info.get("series")
         recurring = info.get("recurring_event_id")
         if not cid or not prev_start:
+            continue
+        # ISS-53: запись-отказ (`enabled=false`) лежит в реестре только затем,
+        # чтобы встречу больше не предлагать. Мы её НЕ пишем — значит и
+        # «сдвинул запись» / «снял запись» по ней рапортовать нельзя. Кэш
+        # `known` мог набрать такие инстансы раньше, поэтому фильтруем здесь,
+        # на чтении, а не только при записи кэша ниже.
+        if not is_recorded(find_in_watched(watched_idx, cid, eid_key, recurring)):
             continue
         key = (cid, eid_key)
         if key in cur_start_by_eid:
@@ -405,7 +464,9 @@ def main() -> int:
                     "start_at_iso": prev_start,
                 })
 
-    # 5. Обновляем кэш known: только из *отслеживаемых* инстансов (которые сейчас видим).
+    # 5. Обновляем кэш known: только из *записываемых* инстансов (которые сейчас видим).
+    #    Отказы и «глушилки» серий (`enabled=false`) сюда не попадают — из этого
+    #    кэша растут разделы «Перенесённые» и «Отменённые», см. is_recorded().
     new_known: dict[str, dict[str, Any]] = {}
     for cid, evt in all_events:
         eid = evt.get("id")
@@ -415,12 +476,8 @@ def main() -> int:
         if not start:
             continue
         recurring = evt.get("recurringEventId")
-        rec = None
-        if recurring:
-            rec = watched_idx.get((cid, recurring))
-        if rec is None:
-            rec = watched_idx.get((cid, eid))
-        if rec is None:
+        rec = find_in_watched(watched_idx, cid, eid, recurring)
+        if not is_recorded(rec):
             continue
         new_known[eid] = {
             "calendar_id": cid,
@@ -501,6 +558,11 @@ def main() -> int:
     if new_items:
         snapshot = {
             "shown_date": started_at.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d"),
+            # ISS-55: TZ, в которой владельцу нарисовано время вопроса. Едет
+            # вместе с вопросом, потому что ответ применяет ДРУГОЙ процесс
+            # (subprocess листенера) со своим окружением: разъедутся юниты —
+            # подтверждение всё равно покажет тот же час, что и вопрос.
+            "shown_tz": str(DISPLAY_TZ),
             "source": "meetings-evening-block",
             "items": [{
                 "n": it["n"],
