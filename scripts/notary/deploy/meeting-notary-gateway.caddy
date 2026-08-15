@@ -1,0 +1,48 @@
+# Caddy: единственная дверь снаружи к шлюзу Ватсона (Ф9).
+#
+# Шлюз слушает 127.0.0.1:8789 и наружу не смотрит: Bearer обязан ходить только
+# по TLS. Caddy берёт сертификат сам (Let's Encrypt) — отдельного шага нет.
+#
+# Куда класть на VPS: /etc/caddy/Caddyfile (или conf.d, если он подключён
+# директивой `import`). После правки: `sudo caddy validate --config /etc/caddy/Caddyfile`
+# → `sudo systemctl reload caddy`. Порт 80 нужен открытым для выдачи сертификата.
+#
+# 🔴 Конфигурация Caddy не покрыта `make deploy-notary` — это ручной шаг владельца
+# (см. README рядом, раздел «долг на деплой»).
+
+watson.anzhee.ru {
+	encode gzip
+
+	# Заголовки. HSTS — потому что снаружи тут ходит секрет и ничего кроме.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Тело больше килобайтов наряда не нужно никому: лимит стоит и в самом шлюзе
+	# (64 КиБ), здесь — второй рубеж, чтобы толстое тело не доехало даже до него.
+	request_body {
+		max_size 128KB
+	}
+
+	reverse_proxy 127.0.0.1:8789 {
+		# Шлюз локальный: таймауты короткие, зависший запрос не должен держать
+		# соединение до бесконечности.
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+	}
+
+	log {
+		output file /var/log/caddy/watson-gateway.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+		# 🔴 Тела запросов и ответов в лог не пишем НИКОГДА: там имена участников
+		# и текст протокола. В логе только метод, путь, код, размер.
+		format json
+	}
+}

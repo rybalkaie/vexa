@@ -1,0 +1,66 @@
+[Unit]
+Description=meeting-notary шлюз команд портала → Ватсон (Ф9, R7.1/R7.2/R12.5/R12.6)
+Documentation=https://github.com/rybalkaie/vexa
+Documentation=file:///srv/meeting-notary/vexa/scripts/notary/docs/gateway-contract.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev
+Group=dev
+WorkingDirectory=/srv/meeting-notary/vexa
+Environment=PYTHONPATH=scripts
+Environment=HOME=/home/dev
+
+# ── Пути состояния ─────────────────────────────────────────────────────────
+# Заданы ЯВНО, а не через `EnvironmentFile=/srv/meeting-notary/.env.notary`.
+# Причина: .env.notary несёт годовой CLAUDE_CODE_OAUTH_TOKEN и токен Telegram-бота,
+# а шлюз — единственная служба Ватсона, до которой достаёт интернет (через Caddy).
+# Тащить в неё секреты, которыми она не пользуется, незачем.
+# 🔴 Шлюз НЕ аутентифицируется к Claude вовсе: он транспорт. `claude setup-token`
+# и `/login` на этой машине запрещены — один аккаунт в двух домашних папках
+# выбивает сам себя за 1–3 дня и молча убивает все службы (инциденты 26.06, 17.07).
+# ⚠️ Значения продублированы из .env.notary. Поменял их там — поменяй и здесь,
+# иначе шлюз будет отдавать протоколы из вчерашней папки и молчать об этом.
+Environment=MEETING_NOTARY_REGISTRY_DIR=/srv/meeting-notary/registry
+Environment=MEETING_NOTARY_PROTOCOLS_DIR=/home/dev/meeting-notary/_tmp/protocols
+Environment=MEETING_NOTARY_ARCHIVE_DIR=/srv/meeting-notary/protocols
+
+# ── Секрет ─────────────────────────────────────────────────────────────────
+# Только MEETING_NOTARY_GATEWAY_TOKEN (≥32 знака). Файл создаётся на VPS руками,
+# права 600 dev:dev, в репозиторий не попадает НИКОГДА. Пока файла нет — шлюз
+# поднимется и будет отвечать 503 всем (fail-closed), а не «пускать всех».
+EnvironmentFile=-/srv/meeting-notary/.env.gateway
+
+ExecStart=/home/dev/meeting-notary/venv/bin/python /srv/meeting-notary/vexa/scripts/notary/gateway.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Nice=10
+
+# ── Потолки ────────────────────────────────────────────────────────────────
+# Шлюз — 15-й юнит на машине с 2 vCPU, где transcription-service круглосуточно
+# держит ~1,9 ГБ. Под давлением памяти ядро убивает «самого жирного», поэтому
+# потолок здесь обязателен: утечка в шлюзе не имеет права стоить записи встречи.
+MemoryHigh=128M
+MemoryMax=192M
+CPUQuota=40%
+TasksMax=64
+
+# ── Ограничение прав ───────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Реестр нарядов и рабочая папка протоколов — единственное, что шлюз пишет/читает.
+ReadWritePaths=/srv/meeting-notary/registry
+ReadOnlyPaths=/srv/meeting-notary/protocols
+
+[Install]
+WantedBy=multi-user.target
