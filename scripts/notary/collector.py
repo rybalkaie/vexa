@@ -233,6 +233,13 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         logger.exception("watchdog упал (не фатально для collector): %s", e)
 
+    # Ф10c (R13.3): очередь доставки разбирается ПЕРВЫМ делом и БЕЗУСЛОВНО.
+    # Ниже у тика четыре ранних `return 0` (нет meta, ssh не ответил, список
+    # пуст) — поставь разбор только в конце, и результат, положенный в очередь
+    # перед рестартом, ждал бы СЛЕДУЮЩЕЙ ЗАПИСАННОЙ ВСТРЕЧИ. Ровно так теряются
+    # результаты в выходные.
+    _portal_delivery_tick()
+
     # 1. Все *.meta.json — потенциальные кандидаты. Ранее `list_cmd` отсеивал
     # уже-финализированные через `[[ -f $VPS_PROTOCOLS/<sid>.md ]]`. Это
     # работало только для legacy-кейса (плоский <sid>.md в корне protocols),
@@ -285,6 +292,9 @@ def main() -> int:
         if running:
             logger.info("Скип %s — бот ещё в звонке (контейнер %s)", sid, running)
             continue
+        # Ф10c: удержание исходников ставим ДО финализации — она сама сносит
+        # копии из `_failed/` после успешного разбора.
+        _portal_note_recording(sid, meta)
         # Idempotency-guard (Ф1-доработки 29.05): если meta.delivered непустой,
         # протокол уже доставлен — finalize запускать НЕ нужно. Также
         # пробуем убрать WAV, если он ещё на диске (cleanup отложенный из
@@ -303,6 +313,10 @@ def main() -> int:
     # в одном subprocess).
     if LOCAL_FINALIZE:
         _pickup_orphans()
+    # Ф10c (R13.3): очередь доставки в портал разбирается КАЖДЫЙ тик и
+    # независимо от того, была ли в этом тике новая встреча — иначе результат,
+    # положенный в очередь перед рестартом, ждал бы следующей записи.
+    _portal_delivery_tick()
     return 0
 
 
@@ -730,6 +744,212 @@ def _run_watchdog(now: datetime | None = None) -> None:
                        name, series, reason, killed)
 
 
+def _portal_sources_held(sid: str, meta: dict | None = None) -> bool:
+    """Ф10c (R13.4): держим ли исходники этой встречи до подтверждения портала.
+
+    🔴 ЕДИНСТВЕННЫЙ гейт удаления, и он FAIL-CLOSED: сбой чтения удержания
+    отвечает «держим». Удаление WAV необратимо, а цена ошибки несимметрична —
+    лишний файл на диске чинится одной командой, стёртая запись разговора не
+    чинится ничем (класс инцидента 17.07: «протокол ушёл в Telegram → WAV
+    удалён → портал лежал → результат потерян»).
+
+    При `ENABLE_PORTAL_ORDERS=OFF` всегда False — поведение владельца на его
+    личных сериях остаётся буква в букву сегодняшним.
+    """
+    try:
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return False
+        held = portal_delivery.is_held(sid)
+        # Маркер рядом с WAV — договорённость с метельщиком из systemd (он bash
+        # и JSON-удержание прочитать не может). Синхронизируем в ОБЕ стороны:
+        # забытый маркер запретил бы метельщику вечно, и `<sid>.txt`/`<sid>.meta.json`
+        # остались бы на диске навсегда после удаления самого WAV.
+        portal_delivery.sync_wav_marker(((meta or {}).get("files") or {}).get("wav"), sid)
+        return held
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Удержание исходников не прочитано (%s) — WAV сохраняю (fail-closed)",
+            type(e).__name__,
+        )
+        return True
+
+
+def _portal_order_for(sid: str, meta: dict | None) -> dict | None:
+    """Наряд портала, которому принадлежит эта запись. None — личная серия.
+
+    🔴 None здесь ОБЫЧНОЕ ДЕЛО: сегодня все встречи владельца — личные серии, и
+    ветка «наряда нет» обязана работать ровно как до Ф10c. Ни алерта, ни
+    предупреждения тут быть не должно.
+    """
+    if not isinstance(meta, dict):
+        return None
+    try:
+        from notary.lib import orders as orders_lib  # noqa: PLC0415
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return None
+        return orders_lib.find_order_for_recording(
+            room_url=meta.get("meetingUrl"),
+            started_at=meta.get("startTs"),
+            session_uid=sid,
+        )
+    except Exception as e:  # noqa: BLE001 — реестр не читается → работаем как без нарядов
+        logger.warning("Наряд для записи не резолвится (%s)", type(e).__name__)
+        return None
+
+
+def _portal_note_recording(sid: str, meta: dict | None) -> None:
+    """Ф10c: встреча порталовая → удерживаем её исходники ДО подтверждения.
+
+    Удержание ставится РАНЬШЕ финализации, а не после доставки. Причина
+    буквальная: первым исходники удаляет не портал и не Telegram, а сам
+    конвейер — `finalize` сносит копии из `_failed/` сразу после успешного
+    разбора, а этот же collector сносит WAV сразу после Telegram. Поставь
+    удержание позже — удерживать будет нечего.
+    """
+    try:
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        order = portal_delivery.hold_if_portal(
+            sid,
+            room_url=(meta or {}).get("meetingUrl"),
+            started_at=(meta or {}).get("startTs"),
+        )
+        if order is None:
+            return
+        portal_delivery.sync_wav_marker(((meta or {}).get("files") or {}).get("wav"), sid)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Удержание исходников не поставлено (%s)", type(e).__name__)
+
+
+def _portal_enqueue_result(
+    session_uid: str,
+    meta: dict,
+    finalize_result: dict,
+    *,
+    transcript_path: Path | None,
+    protocol_path: Path | None,
+    delivery_status: str | None,
+) -> None:
+    """Ф10c (R7.5): результат встречи → durable-очередь доставки в портал.
+
+    Тело собирается ЗДЕСЬ, потому что только здесь одновременно известны все
+    семь вещей, которые ждёт портал: протокол, версия, задачи, транскрипт,
+    участники, факт доставки в Telegram и длительность.
+
+    Сбой записи в очередь — это НЕ «ну и ладно»: результат в этот момент ещё
+    нигде, кроме диска бота, и исходники сотрёт следующий тик. Поэтому при
+    отказе очереди удержание остаётся стоять, а владельцу уходит алерт.
+    """
+    order = _portal_order_for(session_uid, meta)
+    if order is None:
+        return
+    try:
+        from notary.lib import portal_delivery, portal_ingest  # noqa: PLC0415
+
+        order_id = str(order.get("id") or "")
+        # Удержание могло не встать раньше (наряд появился уже после старта
+        # обработки) — ставим до записи в очередь, а не после.
+        portal_delivery.hold(session_uid, order_id=order_id)
+
+        def _read(path: Path | None) -> str:
+            if not path:
+                return ""
+            try:
+                return Path(path).read_text(encoding="utf-8")
+            except OSError:
+                return ""
+
+        payload = portal_ingest.build_payload(
+            order_id=order_id,
+            meeting_id=order.get("meeting_id"),
+            version=1,
+            company=order.get("company"),
+            session_uid=session_uid,
+            protocol_md=_read(protocol_path),
+            transcript_text=_read(transcript_path),
+            # 🔴 НЕ `finalize_result["tasks_extracted"]`. Там СЧЁТЧИКИ
+            # (`{"ilia": 0, "others": 0, …}`, finalize-meeting.py:1397), а
+            # портал ждёт список объектов `{title, assignee, due}` и на словарь
+            # ответил бы 422 — то есть отказом НАВСЕГДА и алертом владельцу на
+            # каждой порталовой встрече. Машиночитаемого списка задач у бота
+            # сегодня нет вовсе: задачи живут разделом внутри протокола, и
+            # разбирает их портал из `protocol_md`. Пустой список — честное
+            # «структурированных задач не передаю», а не потеря данных.
+            tasks=[],
+            participants=(meta.get("participants") or []),
+            expected_participants=(meta.get("expectedParticipants") or []),
+            started_at=meta.get("startTs"),
+            ended_at=meta.get("endTs"),
+            duration_seconds=meta.get("durationS"),
+            telegram_delivery={"status": delivery_status or "unknown"},
+            order_status=order.get("status"),
+        )
+        portal_delivery.enqueue(
+            order_id=order_id,
+            meeting_id=order.get("meeting_id"),
+            version=1,
+            session_uid=session_uid,
+            company=order.get("company"),
+            payload=payload,
+            sources={
+                "wav": (meta.get("files") or {}).get("wav"),
+                "transcript_dir": VPS_TRANSCRIPTS,
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "Результат встречи %s НЕ попал в очередь доставки (%s) — исходники "
+            "удерживаются, доставку надо повторить руками", session_uid, type(e).__name__,
+        )
+        push(
+            f"🔴 Результат встречи не попал в очередь доставки на портал "
+            f"({type(e).__name__}). Запись и транскрипт НЕ удалены — ничего не потеряно, "
+            f"но на портал результат сам не доедет.",
+            dedupe_key=f"portal-enqueue-fail:{session_uid}",
+        )
+
+
+def _portal_report_purged(sid: str) -> None:
+    """Ф10c: сказать порталу, что исходники этой встречи физически удалены.
+
+    ACK доказывает, что портал ПРИНЯЛ результат, и ничего не говорит о том, что
+    бот стёр WAV. Без отдельного отчёта панель «Запись» навсегда застревает на
+    «ждём отчёта бота» (R7.9, R5.12). Отчёт идёт через ту же durable-очередь:
+    портал может лежать и в эту минуту, а исходников уже нет — восстановить
+    состояние «удалено» будет нечем.
+    """
+    try:
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        portal_delivery.report_sources_purged(sid)
+    except Exception as e:  # noqa: BLE001 — файл уже удалён, ронять тик нельзя
+        logger.warning("Отчёт об уборке исходников не поставлен (%s)", type(e).__name__)
+
+
+def _portal_delivery_tick() -> None:
+    """Ф10c (R13.3): разобрать очередь доставки. Зовётся КАЖДЫЙ тик.
+
+    Именно это делает доставку живучей к рестарту: состояние лежит на диске, и
+    любой следующий тик — хоть после перезапуска службы, хоть после перезагрузки
+    машины — продолжает ровно с того места. Ничего «в памяти процесса» здесь нет
+    by design.
+    """
+    try:
+        from notary.lib import portal_delivery, portal_ingest  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return
+        stats = portal_ingest.drain()
+        if any(stats.values()):
+            logger.info("Очередь доставки в портал: %s", stats)
+    except Exception as e:  # noqa: BLE001 — доставка не имеет права ронять сбор встреч
+        logger.warning("Тик доставки в портал упал (%s) — записи не тронуты", type(e).__name__)
+
+
 def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
     """Удаляет WAV, если delivery УЖЕ подтверждена И WAV ещё на диске.
 
@@ -739,9 +959,18 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
       2. Перепрогон с другого хоста: meta.delivered есть, но WAV не убрался.
 
     keepAudio / keep_audio в meta — пропускаем cleanup (как и раньше).
+
+    Ф10c: третье условие — портал подтвердил приём результата (или встреча
+    вообще не порталовая). Доставка в Telegram больше не даёт права стирать
+    исходники в одиночку.
     """
     if meta.get("keepAudio") or meta.get("keep_audio"):
         logger.info("WAV cleanup skip (sid=%s) — keep_audio=true", sid)
+        return
+    if _portal_sources_held(sid, meta):
+        logger.info(
+            "WAV сохранён (sid=%s): результат ещё не подтверждён порталом (R13.4)", sid,
+        )
         return
     wav_path = (meta.get("files") or {}).get("wav")
     if not wav_path:
@@ -776,6 +1005,7 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
     try:
         p.unlink()
         logger.info("WAV удалён после доставки (sid=%s, path=%s)", sid, wav_path)
+        _portal_report_purged(sid)
     except OSError as e:
         logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
 
@@ -1228,6 +1458,23 @@ def _do_finalize_and_collect(session_uid: str) -> None:
         if series_from_finalize:
             _sync_series_memory(finalize_protocol_path, target_md, session_uid)
 
+    # 2.6. Ф10c (R7.5/R13.3): результат — в durable-очередь доставки в портал.
+    # СТРОГО перед блоком чистки ниже: удаление исходников гейтится удержанием,
+    # которое ставит именно эта запись в очередь. Порядок наоборот означал бы
+    # окно, в котором WAV уже стёрт, а результат ещё нигде.
+    if md_placed:
+        _portal_enqueue_result(
+            session_uid,
+            _read_meta_obj(session_uid) or {},
+            finalize_result,
+            transcript_path=target_md,
+            protocol_path=(
+                Path(finalize_protocol_path).parent / f"{date_str}-protokol.md"
+                if finalize_protocol_path else None
+            ),
+            delivery_status=delivery_status,
+        )
+
     # 3. WAV cleanup (Ф1-доработки 29.05). Удаляем WAV ТОЛЬКО когда оба
     # условия выполнены:
     #   (а) `.md` лежит в MEETINGS_DIR (`md_placed=True`);
@@ -1254,6 +1501,14 @@ def _do_finalize_and_collect(session_uid: str) -> None:
             session_uid, delivery_status, sorted(success_statuses),
         )
         return
+    # Ф10c (R13.4): доставка в Telegram больше не единственный получатель. Пока
+    # портал не подтвердил приём — исходники не трогаем.
+    if _portal_sources_held(session_uid, meta_obj):
+        logger.info(
+            "WAV сохранён (sid=%s): результат ещё не подтверждён порталом (R13.4)",
+            session_uid,
+        )
+        return
     wav_path = (meta_obj.get("files") or {}).get("wav")
     if wav_path and Path(wav_path).exists():
         try:
@@ -1262,6 +1517,7 @@ def _do_finalize_and_collect(session_uid: str) -> None:
                 "WAV удалён после успешной доставки (sid=%s, delivery=%s, path=%s)",
                 session_uid, delivery_status, wav_path,
             )
+            _portal_report_purged(session_uid)
         except OSError as e:
             logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
 

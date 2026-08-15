@@ -403,6 +403,37 @@ def _failed_dir() -> Path:
     return Path(os.environ.get("MEETING_NOTARY_FAILED_DIR") or "/srv/meeting-notary/_failed")
 
 
+def _keep_sources_until_portal_ack(session_uid: str, meta: dict) -> bool:
+    """Ф10c (R13.4): держим ли исходники этой встречи до подтверждения портала.
+
+    🔴 FAIL-CLOSED: любая неопределённость отвечает «держим». Удаление здесь
+    необратимо — копия в `_failed/` остаётся единственной, оригинал из `_tmp/`
+    снесён ещё на стэше.
+
+    Не порталовая встреча (личная серия владельца) или `ENABLE_PORTAL_ORDERS=OFF`
+    → False, и весь блок ведёт себя ровно как до Ф10c.
+    """
+    try:
+        from lib import portal_delivery  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return False
+        # Наряд мог быть ещё не связан с этой сессией (ретрай запускает не
+        # collector, а таймер) — резолвим и ставим удержание здесь же.
+        portal_delivery.hold_if_portal(
+            session_uid,
+            room_url=(meta or {}).get("meetingUrl"),
+            started_at=(meta or {}).get("startTs"),
+        )
+        return portal_delivery.is_held(session_uid)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("finalize-meeting").warning(
+            "[portal] удержание исходников не прочитано (%s) — файлы оставляю",
+            type(e).__name__,
+        )
+        return True
+
+
 def _push_telegram(message: str, *, silent: bool = False) -> None:
     """Тонкая обёртка над `/srv/meeting-notary/bin/tg-send` (он сам читает .env.notary).
 
@@ -1903,7 +1934,21 @@ def main() -> int:
                 attempts_count = json.loads(state_path.read_text(encoding="utf-8")).get("attempts")
             except Exception:
                 pass
+        # 🔴 Ф10c (R13.4). Копия в `_failed/` — ЕДИНСТВЕННЫЙ оставшийся исходник:
+        # оригинал из `_tmp/` снёс `_stash_into_failed` ещё при сбое STT. Пока
+        # результат не подтверждён порталом, аудио отсюда не удаляем. Ретрай при
+        # этом всё равно останавливается — уносим `retry-state`, а WAV и meta
+        # остаются лежать до ACK. Не порталовая встреча (личная серия владельца)
+        # → `_keep_sources_until_portal_ack` вернёт False и всё пойдёт как до Ф10c.
+        _hold_sources = _keep_sources_until_portal_ack(session_uid, meta)
         for f in sid_files:
+            if _hold_sources and f.suffix.lower() in (".wav", ".json") \
+                    and not f.name.endswith(".retry-state.json"):
+                log.info(
+                    "[portal] %s оставлен в _failed/: результат ещё не подтверждён порталом",
+                    f.name,
+                )
+                continue
             try:
                 f.unlink()
             except OSError:

@@ -823,6 +823,106 @@ def leave_now(
     return _mutate(_apply)
 
 
+def attach_run(
+    order_id: str,
+    *,
+    session_uid: str,
+    launched_at: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Ф10c: записать в наряд, что по нему поднялся бот (`run`).
+
+    Зачем отдельным полем, а не выводом из имён файлов: у бота и у планировщика
+    РАЗНЫЕ идентификаторы сессии и они не связаны — `runner._safe_session_uid`
+    даёт `auto-<meeting>-<start>`, а сам бот пишет файлы под
+    `<дата>-<connectionId|tm-…>` (`recording.ts:649`). Связать результат с
+    нарядом «по имени файла» физически нельзя, поэтому связь ведётся здесь.
+
+    Версию наряда НЕ трогаем: это отметка исполнения, а не правка встречи, и
+    поднимать `version` значило бы отдать порталу ложный «кто-то изменил
+    встречу» на ровном месте (оптимистичная блокировка `expected_version`).
+    """
+    stamp = _now_iso(launched_at)
+    target_id = str(order_id)
+    sid = str(session_uid or "").strip()
+    if not sid:
+        return None
+
+    def _apply(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        orders = state.setdefault("orders", {})
+        existing = orders.get(target_id)
+        if not isinstance(existing, dict):
+            return None
+        merged = dict(existing)
+        merged["run"] = {"session_uid": sid, "launched_at": stamp}
+        merged["updated_at"] = stamp
+        orders[target_id] = merged
+        return dict(merged)
+
+    return _mutate(_apply)
+
+
+#: Окно, в котором запись считается «той самой встречей» наряда. Слева щедро
+#: (бот заходит заранее, а перенос на пару минут — рядовое дело), справа —
+#: длительность встречи плюс запас на овертайм: совещания заканчиваются позже
+#: плана чаще, чем раньше.
+MATCH_BEFORE_MINUTES = 30
+MATCH_AFTER_MINUTES = 120
+
+
+def find_order_for_recording(
+    *,
+    room_url: Optional[str],
+    started_at: Any,
+    session_uid: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Чей это результат: наряд портала или личная серия владельца (None).
+
+    🔴 `None` — ОБЫЧНЫЙ ИСХОД, а не ошибка: личные серии владельца нарядов не
+    имеют и в портал не едут. Ветка «наряда нет» обязана вести себя ровно как
+    сегодня, поэтому здесь нет ни предупреждений, ни алертов.
+
+    Сопоставление в два шага:
+
+      1. **По отметке запуска** (`run.session_uid`, `attach_run`) — точный ключ,
+         если бот поднимал планировщик и наряд об этом знает.
+      2. **По комнате и времени** — запасной путь для случаев, когда отметки нет
+         (наряд поставили, пока бот уже сидел; выкатка посреди встречи; ручной
+         прогон). Комната сравнивается ХЕШЕМ хоста и пути (`room_key`), то есть
+         строго; время — окном вокруг старта наряда, иначе вчерашняя встреча в
+         той же переговорке присвоила бы себе сегодняшний результат.
+
+    Отменённые и завершённые наряды тоже участвуют: разговор УЖЕ записан, и
+    терять результат из-за того, что встречу отменили постфактум, нельзя.
+    """
+    sid = str(session_uid or "").strip()
+    started = _parse_dt(started_at)
+    key = room_key(room_url) if (room_url or "").strip() else ""
+    best: Optional[Dict[str, Any]] = None
+    best_delta: Optional[timedelta] = None
+    for order in _read_raw().get("orders", {}).values():
+        if not isinstance(order, dict):
+            continue
+        run = order.get("run")
+        if sid and isinstance(run, dict) and str(run.get("session_uid") or "") == sid:
+            return dict(order)
+        if not key or started is None:
+            continue
+        if order.get("room_key") != key:
+            continue
+        order_start = _parse_dt(order.get("start_at"))
+        if order_start is None:
+            continue
+        duration = max(1, int(order.get("duration_minutes") or DEFAULT_DURATION_MINUTES))
+        if started < order_start - timedelta(minutes=MATCH_BEFORE_MINUTES):
+            continue
+        if started > order_start + timedelta(minutes=duration + MATCH_AFTER_MINUTES):
+            continue
+        delta = abs(started - order_start)
+        if best_delta is None or delta < best_delta:
+            best, best_delta = dict(order), delta
+    return best
+
+
 def active_orders_overlapping(
     start: datetime, duration_minutes: int, *, exclude_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:

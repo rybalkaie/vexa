@@ -256,6 +256,7 @@ def main(now: datetime | None = None) -> int:
         # (общий now не даёт коллизии redis-канала команд, У2 цикла Ф3).
         launched_ok = _launch_bot(cand, now, seq=len(launched_series))
         if launched_ok:
+            _remember_portal_run(cand, now)
             launched_series.add(series)
             running_count += 1  # учитываем в лимите для следующих кандидатов тика
             waited_reason = str((wl.get(skey) or {}).get("reason") or "")
@@ -608,6 +609,36 @@ _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 def _safe_session_uid(meeting_id: str, start_at: str) -> str:
     raw_start = start_at.replace(":", "").replace("-", "").replace("+", "p").replace("T", "T")
     return f"auto-{meeting_id}-{_SAFE_ID_RE.sub('_', raw_start)}"
+
+
+def _remember_portal_run(item: dict[str, Any], now: datetime) -> None:
+    """Ф10c: пометить в наряде, что по нему поднялся бот.
+
+    Без этой отметки результат встречи невозможно связать с нарядом надёжно:
+    имя сессии у планировщика (`auto-…`) и у самого бота (`<дата>-tm-…`) —
+    РАЗНЫЕ и ничем не связаны (`recording.ts:649`). Отметка — единственный
+    точный ключ; всё остальное сопоставление идёт эвристикой «комната + время».
+
+    Best-effort и только для нарядов: сбой реестра не имеет права уронить
+    запуск бота, который уже состоялся. Личные серии владельца сюда не
+    доходят (`order_id` у них нет) — их поведение не меняется ни на шаг.
+    """
+    order_id = item.get("order_id")
+    if not order_id:
+        return
+    try:
+        from notary.lib import orders as orders_lib  # noqa: PLC0415
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return
+        session_uid = _safe_session_uid(item["meeting_id"], item["start_at"])
+        orders_lib.attach_run(str(order_id), session_uid=session_uid, launched_at=now)
+    except Exception as e:  # noqa: BLE001 — бот уже запущен, ронять тик нельзя
+        logger.warning(
+            "Отметка исполнения наряда %s не записана (%s) — результат свяжется "
+            "по комнате и времени", order_id, type(e).__name__,
+        )
 
 
 def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
