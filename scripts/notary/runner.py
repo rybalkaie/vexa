@@ -45,9 +45,11 @@ from notary.cli.registry import (  # noqa: E402
     save_watched,
 )
 from notary.lib.notify import push  # noqa: E402
+from notary.lib import late_join, portal_queue, slots, waitlist  # noqa: E402
 from notary.lib.state import (  # noqa: E402
     read_queue,
     read_state,
+    start_key,
     state_acquire,
 )
 
@@ -82,6 +84,10 @@ STARTED_GRACE_MIN = 1  # запускаем и если start_at уже наст
 # в collector.py.
 NOTARIUS_NAME_PREFIX = "vexa-notarius-"
 SERIES_LABEL = "meeting-notary.series"
+# Ф10b: ключ комнаты (хэш, не ссылка — в метке контейнера приглашению не место).
+# Нужен, чтобы «зайти сейчас» в комнату, где уже идёт запись другой серии, не
+# приводило второго бота на тот же разговор.
+ROOM_LABEL = "meeting-notary.room"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -101,6 +107,13 @@ def _env_int(name: str, default: int) -> int:
 # Тонкая настройка через env (на случай разовой тройной накладки встреч).
 MAX_CONCURRENT_BOTS = _env_int("MEETING_NOTARY_MAX_CONCURRENT_BOTS", 2)
 
+# Ф10b: то же число, но НА МОМЕНТ ВЫЗОВА и из одного места на весь проект
+# (`lib/slots.py`). Константа выше вычисляется на импорте и остаётся для
+# обратной совместимости; шлюз считает свободные слоты той же функцией, иначе
+# портал обещал бы слот, которого у runner'а нет.
+def max_concurrent_bots() -> int:
+    return slots.max_concurrent_bots()
+
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -118,22 +131,44 @@ def setup_logging() -> None:
 logger = logging.getLogger("runner")
 
 
-def main() -> int:
+def main(now: datetime | None = None) -> int:
+    # `now` параметром — чтобы тик можно было прогнать в пробе по минутам
+    # (перенос встречи, освобождение слота). На бою вызывается без аргумента.
     setup_logging()
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     pu = pause_until()
     if pu:
         logger.debug("Пауза до %s — тик пропущен", pu)
         return 0
 
     queue = read_queue()
+    # Ф10b: разовые наряды «зайти сейчас» читаются НАПРЯМУЮ из реестра — очередь
+    # перестраивается раз в 15 минут, а кнопка обязана поднимать бота минутами.
+    # При `ENABLE_PORTAL_ORDERS=OFF` возвращает очередь как есть, диска не касаясь.
+    queue = _with_immediate_orders(queue, now)
+
+    # Ф10b: очередь ожидания. Старт, пропущенный по занятости или лимиту, не
+    # выпадает из окна навсегда — он ждёт свободного слота до конца встречи.
+    # Этим же закрывается ISS-57: перенос даёт НОВЫЙ ключ старта, тот упирается в
+    # живого бота той же серии, ложится в ожидание и исполняется, как только
+    # старый бот вышел.
+    #
+    # 🔴 Разбор ожидания идёт ДО выхода по пустой очереди. Иначе отмена
+    # ЕДИНСТВЕННОЙ встречи оставляла бы ждущий старт в файле навсегда — и через
+    # час владелец получал бы «не записал» про встречу, которую сам же отменил.
+    wl, wl_changed, waiting_keys = _waitlist_tick(queue, now)
+
     if not queue:
         logger.info("tick: очередь пуста")
+        if wl_changed:
+            _waitlist_save(wl)
         return 0
 
-    candidates = _candidates(queue, now)
+    candidates = _candidates(queue, now, waiting=waiting_keys)
     if not candidates:
         logger.info("tick: %d в очереди, ни одного в окне старта", len(queue))
+        if wl_changed:
+            _waitlist_save(wl)
         return 0
     logger.info("Кандидатов на старт: %d", len(candidates))
 
@@ -151,12 +186,28 @@ def main() -> int:
     snapshot = _running_bots_snapshot()
     running_count = int(snapshot.get("total") or 0)
     launched_series: set[str] = set()
+    limit = max_concurrent_bots()
 
     for cand in candidates:
         series = str(cand.get("series") or cand["meeting_id"])
         start_at = cand.get("start_at")
+        skey = start_key(cand)
+        if _room_busy(cand, snapshot):
+            # «Зайти сейчас» в комнату, где уже пишет бот: не второй бот, а
+            # сообщение о том, что запись уже идёт. В ожидание НЕ ставим —
+            # ждать тут нечего, разговор уже записывается.
+            logger.info(
+                "Разовый наряд %s не поднимаю: в этой комнате уже идёт запись",
+                cand.get("order_id") or cand.get("meeting_id"),
+            )
+            push(
+                f"Бот в этой комнате уже пишет — второго не поднимаю "
+                f"(«{series}», запрос {start_at}).",
+                dedupe_key=f"join-now-busy:{skey}",
+            )
+            continue
         action, reason = _concurrency_decision(
-            series, snapshot, launched_series, running_count, MAX_CONCURRENT_BOTS,
+            series, snapshot, launched_series, running_count, limit,
         )
         if action != "launch":
             # REQ 3.3 — пропуск старта с ПРИЧИНОЙ. dedupe_key по событию (а не по
@@ -164,19 +215,40 @@ def main() -> int:
             # глушится на 6ч, но пропуск ДРУГОЙ встречи всегда доходит. State НЕ
             # занимаем — если лимит освободится в окне старта, следующий тик
             # попробует снова.
-            push(
-                f"Не записал «{series}» (start {start_at}): {reason}.",
-                dedupe_key=f"start-skip:{action}:{cand.get('event_id')}",
-            )
+            #
+            # Ф10b: и не только «в окне старта». Пропущенный старт кладётся в
+            # очередь ожидания до конца встречи; освободился слот — бот заходит с
+            # опозданием, и опоздание подписывается в протоколе.
+            if waitlist.is_enabled():
+                wl_changed = waitlist.defer(wl, skey, cand, reason=action, now=now) or wl_changed
+            waiting_entry = wl.get(skey) if waitlist.is_enabled() else None
+            if waiting_entry:
+                until = str(waiting_entry.get("deadline_at") or "")[11:16]
+                text = (
+                    f"Пока не записал «{series}» (start {start_at}): {reason}. "
+                    f"Жду свободный слот до {until} — освободится, зайду с "
+                    f"опозданием (это будет написано в протоколе)."
+                )
+            else:
+                text = f"Не записал «{series}» (start {start_at}): {reason}."
+            # 🔴 Ключ глушилки — по СТАРТУ, а не по событию: у перенесённой
+            # встречи `event_id` тот же, и сообщение про НОВОЕ время утонуло бы в
+            # шестичасовом окне, поставленном сообщением про старое (тот же класс
+            # дефекта, что чинил ISS-57 в ключе идемпотентности).
+            push(text, dedupe_key=f"start-skip:{action}:{skey}")
             logger.warning("Старт %s пропущен (%s): %s", cand.get("meeting_id"), action, reason)
             continue
 
         # State-файл идемпотентности: атомарный acquire ТОЛЬКО перед реальным
         # запуском (пропуски по занятости/лимиту state не занимают).
-        if not state_acquire(cand["event_id"], now=now):
+        #
+        # 🔴 Ключ — `event_id` + МИНУТА старта (ISS-57): перенос встречи обязан
+        # дать НОВЫЙ старт, а повторный тик по тому же старту — не дать. Голый
+        # `event_id` проверяется как переходный щит выкатки (см. `state_acquire`).
+        if not state_acquire(skey, legacy_key=cand.get("event_id"), now=now):
             logger.info(
-                "event_id=%s уже стартовал недавно — пропуск (повторный тик или ручной run)",
-                cand["event_id"],
+                "старт %s уже отработан недавно — пропуск (повторный тик или ручной run)",
+                skey,
             )
             continue
 
@@ -186,21 +258,143 @@ def main() -> int:
         if launched_ok:
             launched_series.add(series)
             running_count += 1  # учитываем в лимите для следующих кандидатов тика
+            waited_reason = str((wl.get(skey) or {}).get("reason") or "")
+            wl_changed = waitlist.forget(wl, skey) or wl_changed
+            _mark_if_late(cand, now, reason=waited_reason)
             if cand.get("type") == "one-off":
                 _auto_disable_one_off(cand["meeting_id"])
         elif cand.get("type") == "one-off":
             logger.info(
                 "auto-disable пропущен: one-off %s не стартовал успешно (rc!=0) — "
                 "запись остаётся enabled. ПРЕДУПРЕЖДЕНИЕ: state-файл уже занял "
-                "event_id на 12ч TTL — повторный запуск ЭТОГО event_id блокируется. "
+                "ЭТОТ СТАРТ (event_id + минута старта) на 12ч TTL — повторный "
+                "запуск того же старта блокируется; перенос встречи даст новый ключ. "
                 "Чтобы попробовать снова в окне старта: почисти `.state.json` руками.",
                 cand["meeting_id"],
             )
+    if wl_changed:
+        _waitlist_save(wl)
     return 0
 
 
-def _candidates(queue: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+def _with_immediate_orders(
+    queue: list[dict[str, Any]], now: datetime
+) -> list[dict[str, Any]]:
+    """Добавить в ПАМЯТИ тика разовые наряды «зайти сейчас» (Ф10b).
+
+    Очередь на диске не трогаем: второй писатель `.queue.json` в проекте
+    запрещён. Дубля не даёт ключ старта — он тот же, что у элемента очереди,
+    который позже положит планировщик.
+    """
+    try:
+        extra = portal_queue.due_immediate_items(now)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Разовые наряды не прочитаны (%s) — тик без них", type(e).__name__)
+        return queue
+    if not extra:
+        return queue
+    known = {start_key(it) for it in queue if isinstance(it, dict)}
+    merged = list(queue)
+    for item in extra:
+        if start_key(item) in known:
+            continue
+        logger.info(
+            "Разовый наряд «зайти сейчас» %s взят напрямую из реестра (start %s)",
+            item.get("order_id"), item.get("start_at"),
+        )
+        merged.append(item)
+    return merged
+
+
+def _waitlist_tick(
+    queue: list[dict[str, Any]], now: datetime
+) -> tuple[dict[str, Any], bool, set]:
+    """Разобрать очередь ожидания на этом тике: (состояние, изменилось, ждущие).
+
+    Fail-open: сбой очереди ожидания не имеет права остановить запуск ботов.
+    """
+    if not waitlist.is_enabled():
+        return {}, False, set()
+    try:
+        wl = waitlist.load()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Очередь ожидания не прочитана (%s) — тик без неё", type(e).__name__)
+        return {}, False, set()
+    if not wl:
+        return wl, False, set()
+    changed = False
+    queue_keys = {start_key(it) for it in queue if isinstance(it, dict)}
+    waiting, expired, dropped = waitlist.plan(wl, queue_keys, now)
+    for key, entry in expired:
+        # Тихо забыть — значит соврать: владелец решил, что встречу записывают.
+        push(
+            "Не записал «%s» (start %s): свободного слота у бота так и не "
+            "появилось до конца встречи." % (entry.get("series"), entry.get("start_at")),
+            dedupe_key="waitlist-expired:%s" % key,
+        )
+        logger.warning(
+            "Старт %s снят с ожидания: дедлайн %s прошёл, слот не освободился",
+            key, entry.get("deadline_at"),
+        )
+        wl.pop(key, None)
+        changed = True
+    for key, entry in dropped:
+        logger.info(
+            "Старт %s снят с ожидания: его больше нет в очереди (отмена или перенос)",
+            key,
+        )
+        wl.pop(key, None)
+        changed = True
+    return wl, changed, set(waiting)
+
+
+def _waitlist_save(wl: dict[str, Any]) -> None:
+    try:
+        waitlist.save(wl)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Очередь ожидания не сохранена (%s)", type(e).__name__)
+
+
+def _mark_if_late(item: dict[str, Any], now: datetime, *, reason: str) -> None:
+    """Отметить поздний заход, чтобы он был ПОДПИСАН в протоколе (Ф10b).
+
+    Опоздание бывает только у старта, который ждал слот или перезашёл после
+    переноса: в обычном окне (5 мин до / 1 мин после) минут опоздания нет.
+    """
+    late = waitlist.late_minutes(item, now)
+    if late <= 0:
+        return
+    series = str(item.get("series") or item.get("meeting_id") or "")
+    late_join.mark(
+        series,
+        item.get("start_at"),
+        joined_at=now,
+        late_minutes=late,
+        reason=reason or "late_start",
+    )
+    logger.warning(
+        "Бот зашёл на «%s» с опозданием на %d мин (плановый старт %s, причина %s) — "
+        "отметка уйдёт в протокол",
+        series, late, item.get("start_at"), reason or "late_start",
+    )
+
+
+def _immediate_due(item: dict[str, Any], delta_min: float) -> bool:
+    """Разовый наряд «зайти сейчас» годен к запуску шире обычного окна.
+
+    Причина — цена тика планировщика: наряд появляется в `.queue.json` до 15
+    минут спустя, и в окно «1 минута после старта» уже не попадает.
+    """
+    if not item.get("immediate"):
+        return False
+    return -portal_queue.IMMEDIATE_DUE_MINUTES <= delta_min <= START_WINDOW_MIN
+
+
+def _candidates(
+    queue: list[dict[str, Any]], now: datetime, *, waiting: Any = ()
+) -> list[dict[str, Any]]:
     state = read_state()
+    waiting = set(waiting or ())
     out: list[dict[str, Any]] = []
     for item in queue:
         raw = item.get("start_at")
@@ -215,13 +409,19 @@ def _candidates(queue: list[dict[str, Any]], now: datetime) -> list[dict[str, An
         delta_min = (start - now).total_seconds() / 60.0
         if delta_min > START_WINDOW_MIN:
             continue
+        skey = start_key(item)
         if delta_min < -STARTED_GRACE_MIN:
-            continue
-        if item.get("event_id") in state:
+            # Ф10b: старт, который ЖДЁТ свободного слота, из окна не выпадает —
+            # ради него весь механизм и заведён. Остальные опоздавшие — как было.
+            if skey not in waiting and not _immediate_due(item, delta_min):
+                continue
+        if skey in state or item.get("event_id") in state:
             # Если в state, но за более чем 12 часов до — state_acquire отпустит
             # (TTL); здесь мы только грубо отсеиваем, окончательное решение —
             # внутри state_acquire(). Но для лога сразу логирнем.
-            logger.debug("event_id=%s уже есть в state — кандидатом не считаем", item.get("event_id"))
+            # Голый `event_id` проверяется как переходный щит выкатки ISS-57:
+            # записи старого формата живут в `.state.json` до 12 часов.
+            logger.debug("старт %s уже есть в state — кандидатом не считаем", skey)
             continue
         # Не одобряем папку серии: создаст runner после успешного start.
         out.append(item)
@@ -244,10 +444,14 @@ def _running_bots_snapshot() -> dict[str, Any]:
     collector): ancestor ловил и ручные/dev-боты того же образа, а главное —
     был БУЛЕВЫМ глобальным гейтом без разбивки по сериям (корень бага 03.06).
     """
-    fmt = '{{.Names}}\t{{.Label "' + SERIES_LABEL + '"}}'
+    fmt = ('{{.Names}}\t{{.Label "' + SERIES_LABEL + '"}}'
+           '\t{{.Label "' + ROOM_LABEL + '"}}')
     by_series: dict[str, list[str]] = {}
+    by_room: dict[str, list[str]] = {}
     unlabeled: list[str] = []
-    snap: dict[str, Any] = {"by_series": by_series, "unlabeled": unlabeled, "total": 0}
+    snap: dict[str, Any] = {
+        "by_series": by_series, "by_room": by_room, "unlabeled": unlabeled, "total": 0,
+    }
     if LOCAL_DOCKER:
         cmd = ["docker", "ps", "--filter", f"name={NOTARIUS_NAME_PREFIX}", "--format", fmt]
     else:
@@ -267,9 +471,10 @@ def _running_bots_snapshot() -> dict[str, Any]:
     for line in (out.stdout or "").splitlines():
         if not line.strip():
             continue
-        name, _, series = line.partition("\t")
-        name = name.strip()
-        series = series.strip()
+        parts = line.split("\t")
+        name = parts[0].strip() if parts else ""
+        series = parts[1].strip() if len(parts) > 1 else ""
+        room = parts[2].strip() if len(parts) > 2 else ""
         if not name:
             continue
         total += 1
@@ -277,8 +482,38 @@ def _running_bots_snapshot() -> dict[str, Any]:
             by_series.setdefault(series, []).append(name)
         else:
             unlabeled.append(name)
+        # Ф10b: комната отдельным ключом — «зайти сейчас» в комнату, где уже
+        # пишет бот ДРУГОЙ серии, не имеет права привести второго. Legacy-
+        # контейнеры (до Ф10b) метки не несут и сюда просто не попадают.
+        if room:
+            by_room.setdefault(room, []).append(name)
     snap["total"] = total
     return snap
+
+
+def _room_label_value(url: Any) -> str:
+    """Ключ комнаты для метки контейнера. Пусто — если посчитать нечем."""
+    try:
+        from notary.lib.orders import room_key  # noqa: PLC0415
+
+        return room_key(str(url or "")) if url else ""
+    except Exception:  # noqa: BLE001 — метка вспомогательная, запуск важнее
+        return ""
+
+
+def _room_busy(item: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    """В этой комнате уже пишет бот (любой серии)?
+
+    Спрашивается ТОЛЬКО про разовое «зайти сейчас». Для расписания это было бы
+    вредно: серия каждый день ходит в одну и ту же переговорку, и зависший бот
+    вчерашней встречи блокировал бы сегодняшнюю. А вот кнопка «подключить
+    сейчас», нажатая по комнате идущей встречи, — это ровно второй бот на один
+    разговор.
+    """
+    if not item.get("immediate"):
+        return False
+    key = _room_label_value(item.get("url"))
+    return bool(key) and bool((snapshot.get("by_room") or {}).get(key))
 
 
 def _concurrency_decision(
@@ -411,6 +646,20 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
         series_chat_id = get_telegram_chat_id_for_series(series, load_watched())
     except Exception as e:  # noqa: BLE001
         logger.warning("Не смог резолвить chat_id серии %s (не критично): %s", series, e)
+    # Ф10b: у порталовой встречи серии в `watched.yaml` нет — чат приезжает с
+    # нарядом. В `.queue.json` его НЕ дублируем: очередь это производный артефакт,
+    # который переписывается раз в 15 минут, и копия приватного идентификатора в
+    # ней жила бы своей жизнью. Источник истины по доставке один — реестр нарядов.
+    if series_chat_id is None and item.get("order_id"):
+        try:
+            from notary.lib import orders as orders_lib  # noqa: PLC0415
+
+            order = orders_lib.get_order(str(item["order_id"]))
+            chat = (order or {}).get("telegram_chat_id")
+            if isinstance(chat, int) and not isinstance(chat, bool):
+                series_chat_id = chat
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Чат наряда не резолвится (не критично): %s", type(e).__name__)
 
     # Создаём целевую папку серии. На маке — мак-путь, на VPS (LOCAL_DOCKER=1)
     # папка не нужна: collector кладёт .md в /srv/meeting-notary/protocols/<series>,
@@ -463,6 +712,12 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
         "meeting-notary.series": series,
         "meeting-notary.sessionUid": session_uid,
     }
+    # Ф10b: ключ комнаты в метку (хэш хоста+пути, не сама ссылка). По нему
+    # следующий тик видит «в этой комнате уже пишут» — иначе кнопка «подключить
+    # сейчас» по комнате идущей встречи привела бы ВТОРОГО бота на тот же разговор.
+    room_hash = _room_label_value(url)
+    if room_hash:
+        labels[ROOM_LABEL] = room_hash
 
     if LOCAL_DOCKER:
         label_args: list[str] = []

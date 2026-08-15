@@ -106,10 +106,16 @@ def max_body_bytes() -> int:
 def max_concurrent_bots() -> int:
     """Тот же потолок, что у runner'а (`MEETING_NOTARY_MAX_CONCURRENT_BOTS`).
 
-    Читаем ту же переменную, а не свою: две константы «сколько ботов разом» в
-    двух файлах разъезжаются, и портал начал бы обещать слот, которого нет.
+    Ф10b: значение считает ОДНА функция на весь проект (`lib/slots.py`) — две
+    константы «сколько ботов разом» в двух файлах разъезжаются, и портал начал
+    бы обещать слот, которого нет.
     """
-    return _env_int("MEETING_NOTARY_MAX_CONCURRENT_BOTS", 2)
+    try:
+        from notary.lib import slots  # noqa: PLC0415
+
+        return slots.max_concurrent_bots()
+    except Exception:  # noqa: BLE001
+        return _env_int("MEETING_NOTARY_MAX_CONCURRENT_BOTS", 2)
 
 
 def resolve_token() -> Tuple[Optional[str], Optional[str]]:
@@ -868,7 +874,13 @@ class _Handler(BaseHTTPRequestHandler):
         """«В это время бот занят» — ПРИ ПОСТАНОВКЕ наряда, а не молчание до встречи.
 
         Подсказка, не запрет: окончательное решение принимает планировщик в
-        момент старта (Ф10b), а портал показывает предупреждение в форме.
+        момент старта, а портал показывает предупреждение в форме сразу.
+
+        🔴 Ф10b: считаются ОБА источника занятости — наряды портала И очередь
+        планировщика (личные серии владельца). До этого шлюз видел только
+        наряды и обещал порталу свободный слот в час, когда у владельца уже
+        стоят две встречи. Потолок ОБЩИЙ на обе компании: он про ядра машины, а
+        не про права компании (см. `lib/slots.py`).
         """
         limit = max_concurrent_bots()
         try:
@@ -876,28 +888,20 @@ class _Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return {"limit": limit, "known": False}
         try:
-            overlapping = orders_lib.active_orders_overlapping(
+            from notary.lib import slots  # noqa: PLC0415
+
+            hint = slots.occupancy(
                 start,
                 int(order.get("duration_minutes") or orders_lib.DEFAULT_DURATION_MINUTES),
-                exclude_id=order.get("id"),
+                exclude_order_id=order.get("id"),
             )
         except Exception as exc:  # noqa: BLE001
             # Подсказка о занятости — не повод потерять уже принятый наряд:
             # ответ уходит без неё, а не 500-й со стектрейсом.
             return {"limit": limit, "known": False, "error": type(exc).__name__}
-        busy = len(overlapping)
-        return {
-            "limit": limit,
-            "known": True,
-            "overlapping_orders": busy,
-            "free_slots": max(0, limit - busy),
-            "warning": (
-                None
-                if busy < limit
-                else "в это время уже запланировано %d записей при потолке %d — "
-                "бот может не прийти на эту встречу" % (busy, limit)
-            ),
-        }
+        # `overlapping_orders` оставлен для клиента портала, написанного по Ф9.
+        hint["overlapping_orders"] = int(hint.get("busy") or 0)
+        return hint
 
     def _protocol(self, query: Dict[str, List[str]]) -> None:
         meeting_id = (query.get("meeting_id") or [""])[0].strip()

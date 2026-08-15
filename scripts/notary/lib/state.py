@@ -61,6 +61,52 @@ def last_success_file() -> Path:
 STATE_TTL_HOURS = 12
 
 
+# ---------- ключ идемпотентности старта (ISS-57) ----------
+#
+# 🔴 БЫЛО: ключом «этот старт уже отработан» был ГОЛЫЙ `event_id`. У экземпляра
+# рекуррентного события Google Calendar `event_id` завязан на `originalStartTime`
+# и при ПЕРЕНОСЕ встречи НЕ МЕНЯЕТСЯ. Итог (инцидент 05.08.2026, ISS-57): очередь
+# знала новое время, а повторный запуск был заблокирован дедупом — бот сидел в
+# комнате по старому времени, вышел по «никто не пришёл» ровно в минуту нового
+# старта, встречу не записал.
+#
+# СТАЛО: ключ = `event_id` + МИНУТА старта в UTC. Перенос = другой ключ = новый
+# старт разрешён. Повторный тик по ТОМУ ЖЕ старту по-прежнему отбивается (минута
+# та же). Нормализация в UTC обязательна: `10:00+03:00` и `07:00Z` — один и тот
+# же старт, и разные ключи означали бы ДВУХ ботов на одну встречу.
+def normalized_start_key(raw: Any) -> str:
+    """Минута старта в UTC (`YYYYMMDDTHHMM`) или `''`, если разобрать нечем."""
+    if isinstance(raw, datetime):
+        dt: datetime | None = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+    else:
+        dt = None
+    if dt is None:
+        # Неразбираемое время НЕ схлопываем в общий ключ: два разных мусорных
+        # старта одного события иначе слились бы в один и второй молча пропал.
+        return ("raw:" + str(raw).strip())[:64] if raw else ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M")
+
+
+def start_key(item: Any) -> str:
+    """Ключ идемпотентности элемента очереди: `<event_id>@<минута старта UTC>`.
+
+    Без `start_at` (битый элемент) вырождается в голый `event_id` — то есть в
+    прежнее поведение, а не в «ключ пустой, пускай стартует что угодно».
+    """
+    if not isinstance(item, dict):
+        return ""
+    event_id = str(item.get("event_id") or "")
+    minute = normalized_start_key(item.get("start_at"))
+    return "%s@%s" % (event_id, minute) if minute else event_id
+
+
 def _read_json(path: Path) -> Any:
     if not path.exists():
         return None
@@ -132,11 +178,34 @@ def write_state(state: dict[str, str]) -> None:
     _atomic_write_json(state_file(), state)
 
 
-def state_acquire(event_id: str, *, now: datetime | None = None) -> bool:
-    """Атомарно: если за последние STATE_TTL_HOURS event_id уже стартовал — вернуть False.
+def _is_fresh(state: dict[str, str], key: str, now: datetime) -> bool:
+    """Ключ занят и ещё не отгорел по TTL."""
+    prev = state.get(key)
+    if not prev:
+        return False
+    try:
+        prev_dt = datetime.fromisoformat(prev)
+    except ValueError:
+        return False
+    if prev_dt.tzinfo is None:
+        prev_dt = prev_dt.replace(tzinfo=timezone.utc)
+    return (now - prev_dt) < timedelta(hours=STATE_TTL_HOURS)
+
+
+def state_acquire(
+    event_id: str, *, now: datetime | None = None, legacy_key: str | None = None
+) -> bool:
+    """Атомарно: если за последние STATE_TTL_HOURS ключ уже стартовал — вернуть False.
 
     Иначе записать started_at = now и вернуть True. Используется runner-ом
     перед запуском бота.
+
+    `legacy_key` — ПЕРЕХОДНЫЙ щит выкатки ISS-57. До неё ключом был голый
+    `event_id`; на живой машине в `.state.json` такие записи лежат до 12 часов.
+    Без проверки старого ключа первый же тик после выкатки счёл бы уже
+    стартовавшую встречу «новым» ключом и привёл в комнату ВТОРОГО бота. Старый
+    ключ только ЧИТАЕТСЯ и никогда не пишется: новые записи всегда композитные,
+    и через TTL щит перестаёт что-либо значить сам собой.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -147,18 +216,10 @@ def state_acquire(event_id: str, *, now: datetime | None = None) -> bool:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         state = read_state()
-        prev = state.get(event_id)
-        if prev:
-            try:
-                prev_dt = datetime.fromisoformat(prev)
-            except ValueError:
-                prev_dt = None
-            if prev_dt:
-                if prev_dt.tzinfo is None:
-                    prev_dt = prev_dt.replace(tzinfo=timezone.utc)
-                age = now - prev_dt
-                if age < timedelta(hours=STATE_TTL_HOURS):
-                    return False
+        if _is_fresh(state, event_id, now):
+            return False
+        if legacy_key and legacy_key != event_id and _is_fresh(state, legacy_key, now):
+            return False
         # Заодно прибрать stale-записи.
         cleaned: dict[str, str] = {}
         for k, v in state.items():

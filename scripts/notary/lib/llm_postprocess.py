@@ -2156,8 +2156,31 @@ def regenerate_protocol_for_meeting(
         series_memory=series_memory,
         open_tasks=open_tasks,
     )
+    protocol_text = _sign_late_join(protocol_text, enriched_meta)
     _atomic_write_text(protocol_path, protocol_text)
     return protocol_path
+
+
+def _sign_late_join(text: str, meeting_meta: dict) -> str:
+    """Ф10b: подписать протокол, если бот зашёл на встречу с опозданием.
+
+    Опоздание случается, когда все слоты одновременных записей были заняты и
+    старт ждал свободного (`lib/waitlist.py`), либо когда встречу перенесли и бот
+    перезашёл. Первых минут разговора в записи тогда физически нет, и протокол
+    обязан это сказать — иначе он выглядит как протокол встречи, которая так и
+    началась.
+
+    Нет отметки → текст возвращается БАЙТ В БАЙТ. Любой сбой → тоже: подпись не
+    имеет права стоить протокола.
+    """
+    try:
+        from notary.lib import late_join  # noqa: PLC0415
+
+        return late_join.sign(
+            text, (meeting_meta or {}).get("series"), (meeting_meta or {}).get("date")
+        )
+    except Exception:  # noqa: BLE001
+        return text
 
 
 def _is_finalize_best_of_2_enabled() -> bool:
@@ -5102,6 +5125,10 @@ def apply_correction(
                     method_text=method_text,
                     meeting_sid=meeting_sid,
                 )
+                # Ф10b: полная пересборка не имеет права стереть отметку о том,
+                # что бот зашёл с опозданием, — факт встречи от правки текста не
+                # меняется. Подпись идемпотентна.
+                new_text = _sign_late_join(new_text, meeting_meta_for_regen)
             except ProtocolGenerationError as e:
                 return {
                     "status": "error",

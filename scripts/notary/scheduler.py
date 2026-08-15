@@ -61,6 +61,7 @@ from notary.lib.gcal import (  # noqa: E402
     load_credentials,
 )
 from notary.lib.notify import push  # noqa: E402
+from notary.lib import portal_queue  # noqa: E402
 from notary.lib.state import (  # noqa: E402
     read_last_success,
     write_last_success,
@@ -187,7 +188,28 @@ def main() -> int:
         except Exception as e:
             logger.exception("Не смог раскрыть запись %s: %s", rec.get("id"), e)
 
-    # Сортируем очередь по времени старта.
+    # Ф10b: наряды портала — НАРАВНЕ с реестром серий, в ту же очередь, теми же
+    # правилами дедупа. Отдельной очереди у портала нет by design: две правды о
+    # том, кого записывать, означают двух ботов в комнате.
+    #
+    # 🔴 За выключателем `ENABLE_PORTAL_ORDERS` (дефолт OFF): при OFF
+    # `items_for_queue` возвращает [] ДО обращения к диску, и очередь владельца
+    # получается ровно такой же, какой была до этой фазы.
+    #
+    # Fail-open: сбой на стороне нарядов не имеет права унести личные серии.
+    try:
+        portal_items = portal_queue.items_for_queue(started_at, horizon_end)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Раскрытие нарядов портала упало (%s) — очередь без них", e)
+        portal_items = []
+    if portal_items:
+        logger.info("Нарядов портала в очереди: %d", len(portal_items))
+        queue.extend(portal_items)
+
+    # Сортируем очередь по времени старта. Сортировка СТАБИЛЬНА: при равном
+    # старте личная серия владельца остаётся раньше наряда портала, и при
+    # схлопывании дубля (одна комната, одна секунда) побеждает она — у неё
+    # привязка чата, разметка компании и режим открытых вопросов.
     queue.sort(key=lambda x: x.get("start_at", ""))
 
     # ISS-53: «нет» по встрече, которую приносит ЖИВАЯ запись серии из второго
@@ -522,6 +544,20 @@ def dedupe_queue(
                 other_ical = ical_key(other.get("ical_uid"))
                 if other_ical:
                     winner["ical_uid"] = other_ical
+                    break
+        # Ф10b: ту же встречу могли принести И личная серия владельца, И наряд
+        # портала. Победила серия — связь с нарядом обязана переехать на неё,
+        # иначе портал никогда не узнает, что его встречу записали (наряд навсегда
+        # остался бы «ждущим», а результат ушёл бы только в Telegram владельца).
+        if not winner.get("order_id"):
+            for other in dropped:
+                if other.get("order_id"):
+                    winner["order_id"] = other["order_id"]
+                    logger.info(
+                        "Дубль встречи пришёл и нарядом портала (%s) — веду по "
+                        "личной серии «%s», связь с нарядом сохраняю",
+                        other.get("order_id"), winner.get("meeting_id"),
+                    )
                     break
         kept[twin_idx] = winner
         kept_fp[twin_idx] = fingerprint(
