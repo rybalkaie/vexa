@@ -75,6 +75,26 @@ def is_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def _is_direct_chat(chat_id, allowed_chat) -> bool:
+    """Ф10a: «это личка доверенного лица?». Было: `chat_id == allowed_chat`.
+
+    Шлюз правок — ВТОРОЙ читатель этого вопроса после листенера, и разъехаться им
+    нельзя: листенер решает, доводить ли сообщение до шлюза, а шлюз — применять ли
+    allowlist авторов. Ответь они по-разному — в одном чате правку и приняли бы, и
+    отбили. Поэтому оба спрашивают ОДНУ функцию `identity.is_direct_chat`.
+
+    Фолбэк при недоехавшем модуле — буквально старое сравнение: сломанная выкатка
+    даёт вчерашнее поведение, а не потерю правок.
+    """
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+
+        return identity.is_direct_chat(chat_id, allowed_chat)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[identity] модуль недоступен (%s) — старое сравнение", type(e).__name__)
+        return chat_id == allowed_chat
+
+
 def series_allowlist_enabled() -> bool:
     """Гейт FB8 `ENABLE_FEEDBACK_ALLOWLIST` (дефолт OFF; `1/true/yes/on` → ON).
 
@@ -882,7 +902,7 @@ def route_feedback_reply(
         # же закрывает вектор Ф6: дропнутая правка не дойдёт до handle_feedback_reply →
         # (sweep → reissue_one) → record_learning_from_edits, т.е. rogue НЕ станет
         # персистентным выученным термом (FB7×Ф6).
-        if chat_id != allowed_chat and not author_allowed(from_user, meeting):
+        if not _is_direct_chat(chat_id, allowed_chat) and not author_allowed(from_user, meeting):
             logger.info(
                 "[feedback] автор вне allowlist — пропуск (chat=%s series=%s uid=%s)",
                 chat_id, meeting.get("series"), from_user.get("id"),
@@ -899,7 +919,7 @@ def route_feedback_reply(
             # и в группе. Автор в DM = владелец, allowlist-гейт уже пропустил по
             # chat_id == allowed_chat. Голос-реплай на clarify-сообщение 🎙 (НЕ
             # доставленный протокол) сюда не доходит: meeting=None → старый flow.
-            if chat_id == allowed_chat and not has_voice:
+            if _is_direct_chat(chat_id, allowed_chat) and not has_voice:
                 return False
             if has_voice:
                 # FM-13: кап правок в окне — ПЕРЕД транскрипцией (Groq = деньги).
@@ -942,7 +962,7 @@ def route_feedback_reply(
         return True
 
     # Не reply на наш протокол.
-    if chat_id == allowed_chat:
+    if _is_direct_chat(chat_id, allowed_chat):
         return False  # DM — отдаём существующим flow (📅 / 🎙 / команды)
     logger.info(
         "[feedback] не reply на протокол — пропуск (chat=%s is_reply=%s)",

@@ -439,8 +439,22 @@ def _is_authorized_sender(from_user: dict, allowed_chat_id: Optional[int]) -> bo
         return True
     sender_id = from_user.get("id") if isinstance(from_user, dict) else None
     try:
-        return int(sender_id) == int(allowed_chat_id)
+        numeric = int(sender_id)
     except (TypeError, ValueError):
+        return False
+    if numeric == int(allowed_chat_id):
+        return True
+    # Ф10a: владелец — больше не единственный допустимый отправитель. Спрашиваем
+    # ТУ ЖЕ функцию, что листенер и шлюз правок (`identity.may_command`), чтобы у
+    # трёх читателей не разъехалась трактовка «этому можно». При
+    # `ENABLE_PORTAL_ORDERS=OFF` она возвращает False, и строка выше остаётся
+    # единственным «да» — то есть прежнее поведение буква в букву.
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+
+        return identity.may_command(None, numeric, int(allowed_chat_id))
+    except Exception as e:  # noqa: BLE001 — модуль не доехал → прежний ответ
+        logger.warning("[identity] модуль недоступен (%s) — только владелец", type(e).__name__)
         return False
 
 

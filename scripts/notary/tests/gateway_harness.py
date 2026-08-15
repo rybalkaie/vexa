@@ -42,7 +42,25 @@ ISOLATED_ENV = (
     "MEETING_NOTARY_GATEWAY_MAX_BODY",
     "MEETING_NOTARY_GATEWAY_ROOM_HOSTS",
     "MEETING_NOTARY_MAX_CONCURRENT_BOTS",
+    # Ф10a: аварийный выключатель нарядов. Без него в списке проба, включившая
+    # флаг, протекала бы на соседние — и «зелёный сьют» перестал бы что-либо
+    # доказывать про положение выключателя.
+    "ENABLE_PORTAL_ORDERS",
 )
+
+
+def _reset_identity_cache() -> None:
+    """Ф10a: memo слоя идентичности не должно переживать смену каталога реестра.
+
+    Кэш живых нарядов ключуется путём+mtime, но каталог у каждой пробы свой и
+    создаётся заново — без сброса первая проба могла бы «увидеть» наряды второй.
+    """
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+
+        identity.reset_cache()
+    except Exception:  # noqa: BLE001 — модуля нет → и кэша нет
+        pass
 
 
 class EnvSandbox:
@@ -62,6 +80,12 @@ class EnvSandbox:
         os.environ["MEETING_NOTARY_ARCHIVE_DIR"] = str(self.protocols_dir)
         os.environ["MEETING_NOTARY_LOG_DIR"] = str(self.root / "logs")
         os.environ.pop("MEETING_NOTARY_GATEWAY_TOKEN_FILE", None)
+        # Ф10a: выключатель нарядов сбрасываем В OFF на входе, а не «как в
+        # окружении». Проба обязана проверять ИЗВЕСТНОЕ положение флага; иначе
+        # сьют, зелёный на машине разработчика, краснел бы на VPS, где флаг
+        # включат. Кому нужен ON — включает сам.
+        os.environ.pop("ENABLE_PORTAL_ORDERS", None)
+        _reset_identity_cache()
         if token is None:
             os.environ.pop("MEETING_NOTARY_GATEWAY_TOKEN", None)
         else:
@@ -73,6 +97,7 @@ class EnvSandbox:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+        _reset_identity_cache()
         shutil.rmtree(self.root, ignore_errors=True)
 
 

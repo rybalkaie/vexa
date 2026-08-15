@@ -491,28 +491,73 @@ def validate_order_payload(
         else:
             out["telegram_chat_id"] = chat_id
 
-    # --- владелец наряда (задел Ф10a: «чей это наряд») ---
+    # --- владелец наряда: «ЧЕЙ это наряд» (Ф10a, R7.10) ---
+    #
+    # При `ENABLE_PORTAL_ORDERS=OFF` поле необязательно — ровно как приехало из
+    # Ф9: выключатель обязан возвращать вчерашнее поведение целиком, включая
+    # строгость валидатора. При ON — обязательно: наряд без владельца
+    # маршрутизировать некуда (кому слать протокол, чьи правки принимать), а
+    # «считать владельцем Илью по умолчанию» отдало бы чужие встречи ему.
+    #
+    # Уже лежащие на диске безвладельческие наряды Ф9 это НЕ ломает: строгость
+    # стоит на ВХОДЕ (новая постановка), а чтение старых живёт в
+    # `lib/identity.order_owner` — оно их читает и просто не наделяет правами.
     owner = payload.get("owner")
-    if owner is not None:
-        if not isinstance(owner, dict):
-            errors.append(_err("owner", "invalid", "владелец — объект"))
-        else:
-            clean: Dict[str, Any] = {}
-            uid = owner.get("portal_user_id")
-            if isinstance(uid, str) and uid.strip():
-                clean["portal_user_id"] = uid.strip()[:128]
-            name = owner.get("name")
-            if isinstance(name, str) and name.strip():
-                clean["name"] = name.strip()[:_MAX_TITLE_LEN]
-            tg = owner.get("telegram_user_id")
-            if isinstance(tg, int) and not isinstance(tg, bool):
-                clean["telegram_user_id"] = tg
-            out["owner"] = clean
+    owner_required = _owner_required()
+    if owner is None:
+        if owner_required:
+            errors.append(
+                _err(
+                    "owner",
+                    "required",
+                    "владелец наряда обязателен: без него неизвестно, кому слать "
+                    "протокол и чьи правки принимать",
+                )
+            )
+    elif not isinstance(owner, dict):
+        errors.append(_err("owner", "invalid", "владелец — объект"))
+    else:
+        clean: Dict[str, Any] = {}
+        uid = owner.get("portal_user_id")
+        if isinstance(uid, str) and uid.strip():
+            clean["portal_user_id"] = uid.strip()[:128]
+        elif owner_required:
+            errors.append(
+                _err(
+                    "owner.portal_user_id",
+                    "required",
+                    "нужен идентификатор сотрудника портала — по имени наряд не "
+                    "связать ни с человеком, ни с его телеграм-аккаунтом",
+                )
+            )
+        name = owner.get("name")
+        if isinstance(name, str) and name.strip():
+            clean["name"] = name.strip()[:_MAX_TITLE_LEN]
+        tg = owner.get("telegram_user_id")
+        if isinstance(tg, int) and not isinstance(tg, bool):
+            clean["telegram_user_id"] = tg
+        out["owner"] = clean
 
     keep_audio = payload.get("keep_audio")
     out["keep_audio"] = bool(keep_audio) if keep_audio is not None else False
 
     return out, errors
+
+
+def _owner_required() -> bool:
+    """Обязателен ли владелец у НОВОГО наряда — вопрос к аварийному выключателю.
+
+    Импорт ленивый и защищённый: `lib.identity` читает `lib.orders` обратно (для
+    живых нарядов), и жёсткий импорт на уровне модуля свёл бы их в цикл. Модуль
+    не доехал при выкатке → считаем OFF, то есть поведение Ф9: реестр продолжает
+    принимать наряды, а не встаёт целиком.
+    """
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+
+        return identity.is_enabled()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _slug_from_meeting_id(meeting_id: str) -> str:

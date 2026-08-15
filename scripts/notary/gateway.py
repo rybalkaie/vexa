@@ -333,6 +333,15 @@ def bindings_status() -> Dict[str, Any]:
 def activity_status(now: Optional[datetime] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     out: Dict[str, Any] = {"max_concurrent_bots": max_concurrent_bots()}
+    # Ф10a: положение аварийного выключателя — наружу. Иначе «наряды не
+    # исполняются» и «фича выключена» с портала выглядят одинаково, а разбирать
+    # это придётся по логам на VPS.
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+
+        out["portal_orders_enabled"] = identity.is_enabled()
+    except Exception:  # noqa: BLE001
+        out["portal_orders_enabled"] = False
     try:
         from notary.lib import state as state_lib
 
@@ -644,12 +653,47 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(200, {"ok": True, "order": order})
 
+    def _cross_company_errors(self, payload: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Ф10a/R12.12: наряд одной компании на серию, размеченную другой.
+
+        Молча принять — значит увести протокол Anzhee в чат МПервого: ровно та
+        утечка между компаниями, которую требование и запрещает. Проверка живёт за
+        `ENABLE_PORTAL_ORDERS`: при OFF шлюз обязан вести себя ровно как Ф9.
+        Неразмеченная серия конфликтом НЕ считается — иначе половина живых серий
+        стала бы «конфликтом» на ровном месте.
+        """
+        try:
+            from notary.lib import identity  # noqa: PLC0415
+
+            if not identity.is_enabled():
+                return []
+            from notary.cli.registry import load_watched  # noqa: PLC0415
+
+            other = identity.order_company_conflict(payload, load_watched())
+        except Exception as exc:  # noqa: BLE001 — реестр недоступен → не утверждаем конфликт
+            logger.warning("[orders] проверка компании серии не выполнена: %s", type(exc).__name__)
+            return []
+        if not other:
+            return []
+        return [
+            {
+                "field": "company",
+                "code": "company_mismatch",
+                "message": (
+                    "серия %s размечена компанией %s, а наряд пришёл от %s — "
+                    "протокол ушёл бы в чужой чат"
+                    % (payload.get("series"), other, payload.get("company"))
+                ),
+            }
+        ]
+
     def _order_create(self) -> None:
         body, ok = self._read_json_body()
         if not ok:
             return
         now = datetime.now(timezone.utc)
         payload, errors = orders_lib.validate_order_payload(body, now=now)
+        errors = errors + self._cross_company_errors(payload)
         if errors:
             self._error(422, "validation_failed", "наряд не принят", errors=errors)
             return
@@ -713,6 +757,7 @@ class _Handler(BaseHTTPRequestHandler):
         payload, errors = orders_lib.validate_order_payload(
             merged_input, now=now, check_start_in_past="start_at" in body
         )
+        errors = errors + self._cross_company_errors(payload)
         if errors:
             self._error(422, "validation_failed", "правка наряда не принята", errors=errors)
             return
@@ -768,6 +813,7 @@ class _Handler(BaseHTTPRequestHandler):
         payload, errors = orders_lib.validate_order_payload(
             body, kind=orders_lib.KIND_IMMEDIATE, now=now
         )
+        errors = errors + self._cross_company_errors(payload)
         if errors:
             self._error(422, "validation_failed", "наряд не принят", errors=errors)
             return

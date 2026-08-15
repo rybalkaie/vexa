@@ -926,6 +926,53 @@ def _series_named_in_text(
     return hits[0] if len(hits) == 1 else None
 
 
+# ── Ф10a: «кто это и можно ли ему» спрашиваем у слоя идентичности ──────────
+#
+# Раньше на этот вопрос отвечал скаляр `allowed_chat` прямым сравнением в двух
+# десятках мест. Пока пользователь один, это работало; наряд от другого
+# сотрудника ломает трактовку сразу во всех. Теперь ответ даёт `lib/identity`, а
+# скаляр — лишь один из его источников.
+#
+# Обёртки нужны ради ОДНОГО: фолбэк на случай, когда модуль не доехал при
+# выкатке. Фолбэк — буквально старое выражение, поэтому сломанная выкатка даёт
+# вчерашнее поведение, а не мёртвого бота. Импорт ленивый (конвенция листенера);
+# после первого раза это поиск в `sys.modules`.
+
+
+def _is_direct_chat(cid: Optional[int], allowed_chat: Optional[int]) -> bool:
+    """«Это личка доверенного лица?» Было: `cid == allowed_chat`."""
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+        return identity.is_direct_chat(cid, allowed_chat)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[identity] модуль недоступен (%s) — старое сравнение", type(e).__name__)
+        return cid == allowed_chat
+
+
+def _may_command(
+    cid: Optional[int], from_id: Optional[int], allowed_chat: Optional[int]
+) -> bool:
+    """«Этому можно командовать сериями?» Было: `is_dm or from_id == allowed_chat`."""
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+        return identity.may_command(cid, from_id, allowed_chat)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[identity] модуль недоступен (%s) — старое сравнение", type(e).__name__)
+        return cid == allowed_chat or from_id == allowed_chat
+
+
+def _dm_target(
+    cid: Optional[int], from_id: Optional[int], allowed_chat: Optional[int]
+) -> Optional[int]:
+    """Куда значит «в личку» ДЛЯ ЭТОГО человека. Было: всегда `allowed_chat`."""
+    try:
+        from notary.lib import identity  # noqa: PLC0415
+        return identity.dm_target(cid, from_id, allowed_chat)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[identity] модуль недоступен (%s) — старое сравнение", type(e).__name__)
+        return allowed_chat
+
+
 def _chat_context_series(cid: int, allowed_chat: int) -> tuple[list[str], Optional[str]]:
     """ISS-52: серии, привязанные к ТЕКУЩЕМУ чату. Фолбэк, когда реплая нет.
 
@@ -952,7 +999,7 @@ def _chat_context_series(cid: int, allowed_chat: int) -> tuple[list[str], Option
     перезапусков всего бота из-за одной кривой правки watched.yaml руками.
     `BaseException` брать нельзя — проглотили бы KeyboardInterrupt и SIGTERM.
     """
-    if cid is None or cid == allowed_chat:
+    if cid is None or _is_direct_chat(cid, allowed_chat):
         return [], None
     try:
         from notary.cli import registry  # noqa: PLC0415
@@ -1265,10 +1312,11 @@ def maybe_route_to_set_chat_command(
     if parsed is None or parsed.kind != "set_chat":
         return False
 
-    # Owner-гейт: в группе — только владелец (его user_id == allowed_chat).
+    # Owner-гейт. Ф10a: вопрос «а можно ли ему» задаём слою идентичности, а не
+    # скаляру — при `ENABLE_PORTAL_ORDERS=OFF` ответ буква в букву прежний
+    # (владелец в личке ИЛИ он же в группе).
     from_id = (msg.get("from") or {}).get("id")
-    is_dm = cid == allowed_chat
-    if not is_dm and from_id != allowed_chat:
+    if not _may_command(cid, from_id, allowed_chat):
         logger.info(
             "[set-chat] не владелец (from=%s chat=%s) — команда смены чата пропущена",
             from_id, cid,
@@ -1281,7 +1329,10 @@ def maybe_route_to_set_chat_command(
     if parsed.target == "here":
         target_chat: Optional[int] = cid
     elif parsed.target == "dm":
-        target_chat = allowed_chat
+        # Ф10a: «в личку» — в личку ТОГО, КТО КОМАНДУЕТ. При OFF это всегда
+        # `allowed_chat` (владелец — единственный, кто сюда доходит); при ON у
+        # сотрудника это его личка, иначе его протокол уехал бы Илье.
+        target_chat = _dm_target(cid, from_id, allowed_chat)
     else:
         try:
             target_chat = int(parsed.target)
@@ -1396,7 +1447,7 @@ def maybe_route_to_set_chat_command(
                 pass
 
     display = display_map.get(slug, slug)
-    if parsed.target == "dm" or target_chat == allowed_chat:
+    if parsed.target == "dm" or target_chat == _dm_target(cid, from_id, allowed_chat):
         where = "в личку"
     elif parsed.target == "here" or target_chat == cid:
         where = "в этот чат"
@@ -1684,10 +1735,13 @@ def maybe_route_to_mode_command(
         return False
 
     from_id = (msg.get("from") or {}).get("id")
-    is_dm = cid == allowed_chat
-    is_owner = is_dm or from_id == allowed_chat
-    # Владелец И в личке — единственное место, где бот вправе назвать внутренние
-    # имена серий (см. `_oq_mode_unresolved`).
+    # Ф10a: оба вопроса — слою идентичности. `is_dm` (это ЛИЧКА?) и `is_owner`
+    # (этому МОЖНО?) раньше отвечал один скаляр; это разные вопросы, и на наряде
+    # другого сотрудника ответы расходятся.
+    is_dm = _is_direct_chat(cid, allowed_chat)
+    is_owner = _may_command(cid, from_id, allowed_chat)
+    # Доверенное лицо И в личке — единственное место, где бот вправе назвать
+    # внутренние имена серий (см. `_oq_mode_unresolved`).
     owner_dm = is_owner and is_dm
     series_ref = (parsed.series_ref or "").strip()
     if not is_owner and (parsed.action == "set" or series_ref):
@@ -1983,7 +2037,7 @@ def maybe_route_to_feedback_reply(token: str, chat_id: int, allowed_chat: int, m
     # МЕТАДАННЫЕ приёма (R9: без текста реплая) — чтобы «спросил, а не реагирует» был
     # виден в логе: видно, что reply дошёл и забрал ли его шлюз правок.
     reply_to_mid = (msg.get("reply_to_message") or {}).get("message_id")
-    is_dm = chat_id == allowed_chat
+    is_dm = _is_direct_chat(chat_id, allowed_chat)  # Ф10a
     try:
         claimed = feedback_worker.route_feedback_reply(token, chat_id, msg, allowed_chat=allowed_chat)
     except Exception as e:  # noqa: BLE001
@@ -3213,8 +3267,11 @@ def process_callback_query(token: str, allowed_chat: int, cbq: dict[str, Any]) -
     msg = cbq.get("message") or {}
     chat = msg.get("chat") or {}
     cid = chat.get("id")
-    if cid is not None and cid != allowed_chat:
-        logger.info("skip callback: chat_id=%s ≠ allowed=%s", cid, allowed_chat)
+    # Ф10a: гейт про ЧАТ, а не про человека — спрашиваем слой идентичности.
+    # При OFF ответ прежний: обслуживается только личка владельца.
+    from_id = (cbq.get("from") or {}).get("id")
+    if cid is not None and not _is_direct_chat(cid, allowed_chat):
+        logger.info("skip callback: chat_id=%s не обслуживается (from=%s)", cid, from_id)
         return
     pending_root = _clarify_pending_root()
     if pending_root is None:
@@ -3757,8 +3814,11 @@ def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     if maybe_route_to_feedback_reply(token, cid, allowed_chat, msg):
         return
 
-    if cid != allowed_chat:
-        logger.info("skip: chat_id=%s ≠ allowed=%s", cid, allowed_chat)
+    # Ф10a: DM-гейт спрашивает слой идентичности («этот чат обслуживается?»), а не
+    # сравнивает со скаляром. При `ENABLE_PORTAL_ORDERS=OFF` — буквально прежнее
+    # `cid != allowed_chat`; при ON личка сотрудника-заказчика тоже обслуживается.
+    if not _is_direct_chat(cid, allowed_chat):
+        logger.info("skip: chat_id=%s не обслуживается", cid)
         return
 
     # Ф4 (REQ 4.1): голосовой ответ. Скачиваем `.oga`, транскрибируем и
