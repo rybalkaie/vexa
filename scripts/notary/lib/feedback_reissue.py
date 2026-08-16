@@ -501,6 +501,37 @@ def _default_ack_sender(text: str) -> bool:
 # Перевыпуск одной встречи
 # --------------------------------------------------------------------------
 
+#: 🔴 ОДНО определение «новая версия применена» на весь перевыпуск. Кто спрашивает
+#: «успешно ли», спрашивает `_version_applied`, а не пишет свой набор статусов:
+#: три независимых набора уже разъезжались (удаление записи, авто-словарь и —
+#: незамеченным — запись протокола на диск против постановки версии в портал).
+#:   • `sent`              — доставлено в Telegram;
+#:   • `not-delivered-yet` — доставлять в Telegram НЕКУДА или ещё рано (маршрут
+#:                           «только портал» / grace-окно первичной доставки).
+#:                           Протокол пересобран, и он — канон.
+VERSION_APPLIED_STATUSES = ("sent", "not-delivered-yet")
+
+
+def _version_applied(res: Any) -> bool:
+    """Стала ли перевыпущенная версия канонической (диск + лента версий портала)."""
+    return isinstance(res, dict) and res.get("status") in VERSION_APPLIED_STATUSES
+
+
+def _meeting_is_owners_own(meta: Optional[dict]) -> bool:
+    """Личная ли это встреча владельца портала (наряда нет).
+
+    Fail-closed: реестр не прочитался / модуль недоступен → считаем ЧУЖОЙ. Всё,
+    что этой функцией гейтится, уходит лично владельцу, а чужое ему уходить не
+    должно даже когда мы не уверены.
+    """
+    try:
+        from . import delivery_route  # noqa: PLC0415
+
+        return bool(delivery_route.route_for_meeting(meta or {}).is_owner_legacy)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _default_generate(transcript_path: Path, meeting_meta: dict, meeting_sid: Optional[str]) -> str:
     lp = _lp()
     transcript_md = Path(transcript_path).read_text(encoding="utf-8")
@@ -1080,10 +1111,20 @@ def reissue_one(
         if not isinstance(res, dict):
             return {"status": "error", "error": "redeliver returned non-dict"}
 
-        # Диск трогаем ТОЛЬКО когда новая версия реально доставлена (status=="sent"):
+        # Диск трогаем, когда новая версия СТАЛА КАНОНИЧЕСКОЙ (`_version_applied`):
         # архив прежней версии + перезапись протокола (+ Ф4б: коммит remapped транскрипта).
-        # На любом не-sent (error/skipped/not-delivered-yet/disabled) файлы не трогаем.
-        if res.get("status") == "sent":
+        # На error/skipped/disabled файлы не трогаем.
+        #
+        # 🔴 `sent` — НЕ синоним «применено». У встречи с маршрутом «только
+        # портал» телеграмной доставки нет вовсе (`not-delivered-yet`), и завязка
+        # на `sent` означала: протокол на диске остаётся ПРЕЖНИМ, а очередь
+        # портала читает его с диска → в ленту версий уезжает v2, побайтно равная
+        # v1. Человек видел «правка принята», получал версию без правки, и статус
+        # был терминальным — ни ретрая, ни алерта. Ровно та же беда у встречи,
+        # первичная доставка которой ещё впереди (grace-окно): её правка
+        # терялась целиком. Множество успешных статусов теперь ОДНО и с именем —
+        # третьего толкования не заведётся.
+        if _version_applied(res):
             # Ф4б: коммит remapped транскрипта — чтобы исправленное авторство пережило
             # будущие перевыпуски (протокол всегда генерится из транскрипта).
             if transcript_changed:
@@ -1179,7 +1220,12 @@ def reissue_one(
                 # tg-send в тестах не дёргается. У каждой строки фактический scope из
                 # записи (РАЗМ1). После отправки помечаем озвученными → не дублируем в
                 # вечернем дайджесте и в следующем раунде (R16-дедуп). Best-effort.
-                if classify_enabled:
+                # 🔴 Подтверждение уходит ВЛАДЕЛЬЦУ ПОРТАЛА (`push_via_notarius`),
+                # поэтому по ЧУЖОЙ встрече его слать нельзя: в нём выученные
+                # термины чужой компании. Раньше эта ветка до порталовых встреч
+                # просто не доходила (гейт был `sent`), теперь доходит — значит
+                # ограничение нужно явное, а не по счастливой случайности.
+                if classify_enabled and _meeting_is_owners_own(meta):
                     try:
                         from . import feedback_learning  # noqa: PLC0415
                         ack_text, ack_ids = feedback_learning.format_reissue_ack(
@@ -1198,7 +1244,9 @@ def reissue_one(
                 patch_telemetry.record_tier(tier, patch_attempted=patch_attempted, root=root)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[reissue] телеметрия ярусов не записана (non-fatal): %s", e)
-            if patch_attempted and tier == "regen":
+            # Уведомление — единственное здесь, что требует ЧАТА: без него слать
+            # некуда (маршрут «только портал» / доставка ещё впереди).
+            if patch_attempted and tier == "regen" and res.get("chat_id") is not None:
                 try:
                     notify_fn(res.get("chat_id"), state.get("feedback_id"))
                 except Exception as e:  # noqa: BLE001
@@ -1210,14 +1258,14 @@ def reissue_one(
         # появлялась вовсе: «правка из Telegram и правка с портала попадают в
         # одну ленту версий» было бы неправдой.
         #
-        # 🔴 Условие — «протокол на диске ПЕРЕСОБРАН», а не «ушёл в Telegram».
-        # У встречи с маршрутом «только портал» телеграмной доставки нет вовсе
-        # (`not-delivered-yet`), и завязка на `sent` означала бы, что правки
-        # именно этих встреч до портала не доезжают никогда.
+        # 🔴 Условие — «протокол на диске ПЕРЕСОБРАН», а не «ушёл в Telegram», и
+        # это ТОТ ЖЕ `_version_applied`, что решает про запись на диск: очередь
+        # читает протокол с диска, поэтому два разных ответа на один вопрос
+        # означали бы v2, побайтно равную v1.
         #
         # Best-effort и последним: перевыпуск уже состоялся, сбой очереди не
         # имеет права его откатить.
-        if res.get("status") in ("sent", "not-delivered-yet"):
+        if _version_applied(res):
             try:
                 _enqueue_portal_revision(state, meta, protocol_path, transcript_path)
             except Exception as e:  # noqa: BLE001
@@ -1240,17 +1288,27 @@ def reissue_one(
 # --------------------------------------------------------------------------
 
 
-def _next_portal_version(order_id: str) -> int:
+def _next_portal_version(order_id: str, *, meta: Optional[dict] = None) -> int:
     """Номер следующей версии результата для портала.
 
     Считаем по УЖЕ поставленным в очередь ключам `<наряд>#v<N>`: первая доставка
-    делает v1 (`collector`), каждый перевыпуск — следующий номер. Держать счётчик
-    отдельным файлом не нужно и вредно — он разъехался бы с очередью после
-    любого ручного вмешательства, а очередь на диске и есть источник истины.
+    делает v1 (`collector`), каждый перевыпуск — следующий номер.
+
+    🔴 Очередь — НЕ единственный источник. Доставленные элементы из неё убирают
+    (метельщик, ручная чистка), и счёт по одной только очереди после уборки
+    начинался бы заново: номер повторялся, а `enqueue` на занятый ключ молча
+    отдаёт `created=False` — новая версия исчезала бы без следа. Поэтому高-water
+    отметка дублируется в meta встречи (`portal_version`), которая живёт столько
+    же, сколько сама встреча. Плюс страховка ниже: занятый ключ пропускаем.
     """
     from . import portal_delivery  # noqa: PLC0415
 
     highest = 0
+    if isinstance(meta, dict):
+        try:
+            highest = max(highest, int(meta.get("portal_version") or 0))
+        except (TypeError, ValueError):
+            highest = highest
     for item in portal_delivery.list_items():
         if not isinstance(item, dict) or str(item.get("order_id") or "") != order_id:
             continue
@@ -1258,7 +1316,37 @@ def _next_portal_version(order_id: str) -> int:
             highest = max(highest, int(item.get("version") or 0))
         except (TypeError, ValueError):
             continue
-    return highest + 1 if highest else 2
+    version = highest + 1 if highest else 2
+    # Ключ занят (очередь видит не всё, что лежит на диске) — берём следующий
+    # свободный, а не пишем в чужой: `enqueue` вернул бы created=False и версия
+    # пропала бы молча.
+    while portal_delivery.item_path(portal_delivery.delivery_key(order_id, version)).exists():
+        version += 1
+    return version
+
+
+def _remember_portal_version(state: dict, meta: Optional[dict], version: int) -> None:
+    """Запомнить номер версии в meta встречи — переживает уборку очереди.
+
+    Best-effort: версия уже поставлена в очередь, и сбой записи метки не имеет
+    права её откатить. Пишем ровно одно скалярное поле.
+    """
+    path = state.get("meta_path") if isinstance(state, dict) else None
+    if not path or not isinstance(meta, dict):
+        return
+    try:
+        p = Path(path)
+        on_disk = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(on_disk, dict):
+            return
+        if int(on_disk.get("portal_version") or 0) >= int(version):
+            return
+        on_disk["portal_version"] = int(version)
+        meta["portal_version"] = int(version)
+        _lp()._atomic_write_text(p, json.dumps(on_disk, ensure_ascii=False, indent=2))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[reissue] метка версии портала не записана (non-fatal): %s",
+                       type(e).__name__)
 
 
 def _enqueue_portal_revision(
@@ -1273,16 +1361,27 @@ def _enqueue_portal_revision(
 
     if not portal_delivery.is_enabled():
         return None
-    order = delivery_route.order_for_meeting(
-        meta or {}, session_uid=(meta or {}).get("sessionUid")
-    )
+    try:
+        order = delivery_route.order_for_meeting(
+            meta or {}, session_uid=(meta or {}).get("sessionUid")
+        )
+    except delivery_route.RegistryUnavailable:
+        # 🔴 Не «наряда нет» (тогда ветка молча возвращает None и это нормально),
+        # а «реестр не прочитан»: чья это встреча — не выяснено. Портал новую
+        # версию не получит, и это обязано быть видно в журнале ошибкой, иначе
+        # человек будет ждать версию, которой никто не поставил.
+        logger.error(
+            "[reissue] 🔴 версия НЕ поставлена в очередь портала: реестр нарядов "
+            "не прочитан, чья это встреча — не выяснено"
+        )
+        return None
     if order is None:
         return None
     order_id = str(order.get("id") or "")
     if not order_id:
         return None
     session_uid = str((meta or {}).get("sessionUid") or "")
-    version = _next_portal_version(order_id)
+    version = _next_portal_version(order_id, meta=meta)
 
     def _read(path: Optional[Path]) -> str:
         try:
@@ -1299,6 +1398,12 @@ def _enqueue_portal_revision(
         session_uid=session_uid,
         protocol_md=_read(protocol_path),
         transcript_text=_read(transcript_path),
+        # Пустой список — то же самое, что шлёт первая доставка (`collector`):
+        # машиночитаемых задач у бота нет, портал разбирает их из `protocol_md`.
+        # ⚠️ Ловушка на будущее: как только бот НАУЧИТСЯ отдавать задачи списком,
+        # перевыпуск с `[]` сотрёт задачи встречи, если портал трактует пустой
+        # массив как «задач нет». Меняем поле — правим ОБА места разом (см.
+        # `docs/gateway-contract.md`, раздел про `tasks`).
         tasks=[],
         participants=(meta or {}).get("participants") or [],
         expected_participants=(meta or {}).get("expectedParticipants") or [],
@@ -1319,6 +1424,14 @@ def _enqueue_portal_revision(
         payload=payload,
         sources={},
     )
+    if not created:
+        # Ключ занят — значит номер версии всё-таки повторился, и payload
+        # молча не записан. Такое обязано быть видно.
+        logger.error(
+            "[reissue] 🔴 версия %d встречи %s НЕ записана: ключ %s уже занят",
+            version, order_id, key,
+        )
+    _remember_portal_version(state, meta, version)
     logger.info(
         "[reissue] версия %d встречи %s поставлена в очередь портала (%s, новая=%s)",
         version, order_id, key, created,
@@ -1539,30 +1652,39 @@ def _rescue_unapplied_edits(
     lost = [e for e in (claimed.get("edits") or []) if isinstance(e, dict)]
     if not lost or not isinstance(cur, dict):
         return 0
-    # Перечитываем СВЕЖИЙ state (единый писатель — главный поток, но безопаснее).
-    fresh = feedback_state.read_state(fid, root=root)
-    if not isinstance(fresh, dict) or fresh.get("status") not in ("collecting", "ready_for_reissue"):
-        return 0  # другой раунд не в собирающем состоянии — не вмешиваемся
-    existing = fresh.setdefault("edits", [])
-    have_tmids = {e.get("tg_message_id") for e in existing if isinstance(e, dict)}
-    have_eids = {e.get("edit_id") for e in existing if isinstance(e, dict)}
-    rescued: list = []
-    for e in lost:
-        tm = e.get("tg_message_id")
-        eid = e.get("edit_id")
-        if (tm is not None and tm in have_tmids) or (eid is not None and eid in have_eids):
-            continue  # уже есть в текущем раунде (дедуп) — не дублируем
-        rescued.append(e)
-    if not rescued:
+
+    # Перечитываем СВЕЖИЙ state под замком окна: спасение правок — тоже
+    # read→изменить→write, а писателей у окна два процесса (листенер и шлюз).
+    saved: dict = {}
+
+    def _rescue(fresh: Optional[dict]) -> Optional[dict]:
+        if not isinstance(fresh, dict) or fresh.get("status") not in ("collecting", "ready_for_reissue"):
+            return None  # другой раунд не в собирающем состоянии — не вмешиваемся
+        existing = fresh.setdefault("edits", [])
+        have_tmids = {e.get("tg_message_id") for e in existing if isinstance(e, dict)}
+        have_eids = {e.get("edit_id") for e in existing if isinstance(e, dict)}
+        rescued: list = []
+        for e in lost:
+            tm = e.get("tg_message_id")
+            eid = e.get("edit_id")
+            if (tm is not None and tm in have_tmids) or (eid is not None and eid in have_eids):
+                continue  # уже есть в текущем раунде (дедуп) — не дублируем
+            rescued.append(e)
+        if not rescued:
+            return None
+        fresh["edits"] = rescued + existing  # старые правки впереди (раньше по времени)
+        saved["n"], saved["round"] = len(rescued), fresh.get("round")
+        return fresh
+
+    feedback_state.mutate(fid, _rescue, root=root)
+    if not saved.get("n"):
         return 0
-    fresh["edits"] = rescued + existing  # старые правки впереди (раньше по времени)
-    feedback_state.write_state(fresh, root=root)
     logger.warning(
         "[reissue] спасено %d неприменённых правок упавшего раунда fid=%s round=%s → "
         "текущий раунд %s (без потери после провала перевыпуска)",
-        len(rescued), fid, claimed.get("round"), fresh.get("round"),
+        saved["n"], fid, claimed.get("round"), saved.get("round"),
     )
-    return len(rescued)
+    return int(saved["n"])
 
 
 def finalize_reissue(
@@ -1583,39 +1705,46 @@ def finalize_reissue(
     base_attempts = int(claimed.get("reissue_attempts") or 0)
     status = (res or {}).get("status")
 
-    cur = feedback_state.read_state(fid, root=root)
-    still_reissuing = bool(cur) and cur.get("status") == "reissuing"
+    # 🔴 Проверка «статус всё ещё reissuing» и запись нового статуса — ОДНОЙ
+    # транзакцией под замком окна. Между ними влезает правка из другого процесса
+    # (шлюз портала), и тогда мы затираем только что открытый ею раунд.
+    seen: dict = {}
+
+    def _finish(new_status: str, extra: dict):
+        def _apply(cur: Optional[dict]) -> Optional[dict]:
+            seen["cur"] = cur
+            if not (isinstance(cur, dict) and cur.get("status") == "reissuing"):
+                return None
+            cur["status"] = new_status
+            cur.update(extra)
+            seen["done"] = True
+            return cur
+
+        feedback_state.mutate(fid, _apply, root=root)
+        return bool(seen.get("done"))
 
     if status in _TERMINAL_OK:
-        if still_reissuing:
-            new_mids = (res.get("message_ids") if isinstance(res, dict) else None) \
-                or claimed.get("protocol_message_ids") or []
-            feedback_state.mark_status(
-                fid, "dormant", root=root,
-                extra={
-                    "last_reissue_at": feedback_state.now_iso(),
-                    "last_reissue_status": status,
-                    "reissue_attempts": 0,
-                    "protocol_message_ids": list(new_mids),
-                },
-            )
+        new_mids = (res.get("message_ids") if isinstance(res, dict) else None) \
+            or claimed.get("protocol_message_ids") or []
+        _finish("dormant", {
+            "last_reissue_at": feedback_state.now_iso(),
+            "last_reissue_status": status,
+            "reissue_attempts": 0,
+            "protocol_message_ids": list(new_mids),
+        })
         logger.info("[reissue] fid=%s перевыпущен status=%s round=%s",
                     fid, status, claimed.get("round"))
     else:
-        if still_reissuing:
-            feedback_state.mark_status(
-                fid, "ready_for_reissue", root=root,
-                extra={
-                    "reissue_attempts": base_attempts + 1,
-                    "last_reissue_error": str((res or {}).get("error"))[:300],
-                },
-            )
-        else:
+        still_reissuing = _finish("ready_for_reissue", {
+            "reissue_attempts": base_attempts + 1,
+            "last_reissue_error": str((res or {}).get("error"))[:300],
+        })
+        if not still_reissuing:
             # Провал перевыпуска, а статус уже НЕ reissuing → конкурентный reply
             # открыл новый раунд, пока генерация падала (У1, только async-путь).
             # Правки упавшего раунда не доставлены и выпали из state — спасаем их в
             # текущий раунд, иначе тихая потеря коррекций участника.
-            _rescue_unapplied_edits(fid, claimed, cur, root=root)
+            _rescue_unapplied_edits(fid, claimed, seen.get("cur"), root=root)
         logger.warning(
             "[reissue] fid=%s перевыпуск не удался status=%s err=%s (attempt %d/%d)",
             fid, status, (res or {}).get("error"), base_attempts + 1,

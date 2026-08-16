@@ -67,6 +67,8 @@ FLAG = identity.ENABLE_ENV
 ROOM_A = "https://telemost.yandex.ru/j/11111111111111"
 ROOM_B = "https://telemost.yandex.ru/j/22222222222222"
 
+BOT_ID = 7654321             # id нотариус-бота (= префикс токена)
+BOT_TOKEN = "%d:test-token" % BOT_ID
 OWNER_CHAT = 100500          # личка Ильи (TELEGRAM_NOTARIUS_CHAT_ID)
 PETROV_TG = 777001           # сотрудник Anzhee
 SIDOROV_TG = 777002          # сотрудник МПервого
@@ -358,6 +360,93 @@ class TestCompanyNeverLost(_Base):
         self.assertEqual(route.reason, delivery_route.REASON_NO_COMPANY)
         self.assertIsNone(route.chat_id)
 
+    def test_learned_terms_block_is_asked_for_the_meetings_company(self):
+        """🔴 Ремонт Ж3: выученные правила берутся по компании ВСТРЕЧИ.
+
+        Блок выученных терминов — это ДАННЫЕ в промпте генерации протокола,
+        рядом с глоссарием. Его звали без `company=`, и компанию он выводил сам:
+        перебором оргструктур ВСЕХ компаний с выбором первого совпадения. Для
+        встречи МПервого, чей slug нашёлся в оргструктуре Anzhee, это означало
+        чужие правила в сборке — то самое, что фаза объявляет закрытым.
+        """
+        from notary.lib import feedback_learning
+        from notary.lib import llm_postprocess as lp
+
+        meta = {"series": "koordinatsiya", "date": "2026-08-20", "company": "mpfirst",
+                "order": {"id": "portal:x", "company": "mpfirst"}}
+        seen: Dict[str, Any] = {}
+
+        def _spy(series, *, company=None, root=None):
+            seen["series"], seen["company"] = series, company
+            return ""
+
+        with mock.patch.object(feedback_learning, "format_learned_terms_block", _spy):
+            lp._format_protocol_user_prompt("транскрипт", meta)
+        self.assertEqual(seen.get("series"), "koordinatsiya")
+        self.assertEqual(seen.get("company"), "mpfirst",
+                         "блок выученного собирается без компании встречи")
+
+    def test_stamp_is_written_to_disk_not_only_to_memory(self):
+        """🔴 Ремонт Ж2: штамп наряда обязан лечь в meta НА ДИСКЕ.
+
+        Судим БЛОК штампа, а не файл целиком: один законный `_atomic_write_json`
+        в другой ветке (id STT-задачи, границы речи) освободил бы весь файл, а
+        именно эти ветки при повторной финализации и не срабатывают. Без записи
+        на диск: правка с портала без `session_uid` не находит встречу (404),
+        компания снова угадывается по slug'у, маршрут резолвится по комнате и
+        времени, которые у старой встречи уже не сходятся.
+        """
+        source = (_NOTARY / "finalize-meeting.py").read_text(encoding="utf-8")
+        anchor = source.find("_delivery_route.stamp_meta(")
+        self.assertNotEqual(anchor, -1, "штамп наряда пропал из finalize")
+        block = source[anchor:anchor + 1200]
+        self.assertIn("_atomic_write_json(args.meta_json, meta)", block,
+                      "штамп наряда остаётся только в памяти процесса")
+
+    def test_portal_edit_without_session_uid_relies_on_the_stamp(self):
+        """Правка с портала находит встречу по штампу — и только по нему."""
+        order = self.put_order(
+            meeting_id="mtg-stamp", company="anzhee", room=ROOM_A,
+            owner_tg=PETROV_TG, portal_user_id="42", series="koordinatsiya",
+        )
+        self.write_delivered_meta(
+            series="koordinatsiya", date="2026-08-20", chat_id=GROUP_ANZHEE,
+            sid="sid-stamp", order=order,
+        )
+        found = feedback_worker.find_meeting_by_order(
+            "mtg-stamp", session_uid=None, roots=[self.protocols])
+        self.assertIsNotNone(found, "без session_uid встреча ищется штампом наряда")
+
+        # Тот же meta БЕЗ штампа (как было, пока штамп не доезжал до диска).
+        (self.protocols / "koordinatsiya" / "meta.json").write_text(
+            json.dumps({"series": "koordinatsiya", "date": "2026-08-20",
+                        "sessionUid": "sid-stamp"}, ensure_ascii=False),
+            encoding="utf-8")
+        self.assertIsNone(
+            feedback_worker.find_meeting_by_order(
+                "mtg-stamp", session_uid=None, roots=[self.protocols]),
+            "проба ничего не доказывает: встреча находится и без штампа")
+
+    def test_ambiguous_slug_yields_no_company_instead_of_the_first_hit(self):
+        """Slug есть в оргструктурах двух компаний → компания НЕ выбирается."""
+        from notary.lib import context_knowledge
+
+        self.addCleanup(context_knowledge.reset_org_slugs_cache)
+        with mock.patch.object(context_knowledge, "known_companies",
+                               return_value=["anzhee", "mpfirst"]):
+            context_knowledge.reset_org_slugs_cache()
+            with mock.patch.object(context_knowledge, "load_org_structure",
+                                   side_effect=lambda c: {"koordinatsiya": []}):
+                self.assertIsNone(context_knowledge.company_for_series("koordinatsiya"))
+            # Одна компания — ответ прежний.
+            context_knowledge.reset_org_slugs_cache()
+            with mock.patch.object(
+                context_knowledge, "load_org_structure",
+                side_effect=lambda c: {"koordinatsiya": []} if c == "anzhee" else {},
+            ):
+                self.assertEqual(
+                    context_knowledge.company_for_series("koordinatsiya"), "anzhee")
+
     def test_series_chat_of_another_company_is_not_a_target(self):
         """Серия размечена чужой компанией → её групповой чат адресатом не станет."""
         order = self.put_order(
@@ -432,6 +521,100 @@ class TestNoOwnerFallbackForOrders(_Base):
         self.assertIn("portal-only", source[i:i + 200])
 
 
+class TestRegistryUnreadableNeverFallsToOwner(_Base):
+    """🔴 Ремонт Б1: «наряда нет» и «реестр не прочитался» — РАЗНЫЕ ответы.
+
+    Первое означает личную встречу владельца и законно уходит ему в личку.
+    Второе означает «чья это встреча — не выяснено», и склеивание их в один
+    ответ отправляло протокол сотрудника ЧУЖОЙ компании в личку владельца
+    портала PDF-вложением — с записью `sent` в журнале. Окно реальное: реестр
+    пишется через `os.replace` под flock, а читатель идёт без замка (плюс
+    инцидент 12.08.2026 с правами файла).
+    """
+
+    def _order_and_meta(self):
+        order = self.put_order(
+            meeting_id="mtg-reg", company="mpfirst", room=ROOM_B,
+            owner_tg=SIDOROV_TG, portal_user_id="43", delivery="dm",
+            series="mpfirst-sync",
+        )
+        # Meta БЕЗ штампа: именно так она выглядит при повторной финализации.
+        meta = {
+            "series": "mpfirst-sync", "date": "2026-08-20", "sessionUid": "sid-reg",
+            "meetingUrl": order["room_url"], "startTs": order["start_at"],
+        }
+        return order, meta
+
+    def test_order_lookup_raises_instead_of_pretending_there_is_no_order(self):
+        _, meta = self._order_and_meta()
+        with mock.patch.object(orders_lib, "find_order_for_recording",
+                               side_effect=OSError("реестр недоступен")):
+            with self.assertRaises(delivery_route.RegistryUnavailable):
+                delivery_route.order_for_meeting(meta, session_uid="sid-reg")
+
+    def test_route_is_blocked_not_owner(self):
+        _, meta = self._order_and_meta()
+        with mock.patch.object(orders_lib, "find_order_for_recording",
+                               side_effect=OSError("реестр недоступен")):
+            route = delivery_route.route_for_meeting(meta, session_uid="sid-reg")
+        self.assertTrue(route.blocked, route)
+        self.assertFalse(route.is_owner_legacy,
+                         "сбой чтения реестра снова выдаёт себя за «наряда нет»")
+        self.assertIsNone(route.chat_id)
+        self.assertEqual(route.reason, delivery_route.REASON_REGISTRY_ERROR)
+
+    def test_delivery_sends_nothing_and_status_is_not_success(self):
+        """Главное: PDF не уходит НИКОМУ, и доставка не считается законченной."""
+        from notary.lib import llm_postprocess as lp
+
+        _, meta = self._order_and_meta()
+        sent: List[Any] = []
+        with mock.patch.object(orders_lib, "find_order_for_recording",
+                               side_effect=OSError("реестр недоступен")):
+            with mock.patch.object(lp, "telegram_api") as tg:
+                tg.send_document.side_effect = lambda token, chat_id, *a, **kw: (
+                    sent.append(chat_id) or {"message_id": 1})
+                tg.send_message.side_effect = lambda token, chat_id, *a, **kw: (
+                    sent.append(chat_id) or {"message_id": 2})
+                res = lp.deliver_protocol(
+                    meeting_meta=dict(meta), protocol_text="# Протокол\n\nтело",
+                    meeting_sid="sid-reg",
+                )
+        self.assertEqual(sent, [], "при нечитаемом реестре протокол кому-то ушёл")
+        self.assertNotIn(OWNER_CHAT, sent)
+        self.assertIsNone(res.get("chat_id"))
+        # Не «успех»: WAV и исходники держатся, следующий проход повторит.
+        self.assertNotIn(res.get("status"), ("sent", "skipped", "portal-only"), res)
+
+    def test_clarify_question_is_not_asked_to_anyone(self):
+        """Уточнение несёт кусок расшифровки — при неизвестном хозяине не задаём."""
+        _, meta = self._order_and_meta()
+        with mock.patch.object(orders_lib, "find_order_for_recording",
+                               side_effect=OSError("реестр недоступен")):
+            self.assertIsNone(
+                delivery_route.clarify_chat_for_meeting(meta, session_uid="sid-reg"))
+
+    def test_owner_is_not_organizer_of_unresolved_meeting(self):
+        """Право выносить дословную речь на нерезолвнутой встрече не выдаётся."""
+        _, meta = self._order_and_meta()
+        with mock.patch.object(orders_lib, "find_order_for_recording",
+                               side_effect=OSError("реестр недоступен")):
+            self.assertFalse(
+                quote_policy.is_organizer(OWNER_CHAT, meta, owner_chat=OWNER_CHAT,
+                                          session_uid="sid-reg"))
+
+    def test_order_without_telegram_does_not_make_owner_organizer(self):
+        """Наряд есть, телеграм сотрудника не привязан → организатора НЕТ."""
+        order = self.put_order(
+            meeting_id="mtg-noorg", company="anzhee", room=ROOM_A,
+            owner_tg=None, portal_user_id="44",
+        )
+        meta = self.meta_for(order, sid="sid-noorg")
+        self.assertFalse(
+            quote_policy.is_organizer(OWNER_CHAT, meta, owner_chat=OWNER_CHAT),
+            "владелец портала стал организатором чужой встречи")
+
+
 class TestClarifyGoesToPerson(_Base):
     """Уточнения по спикерам несут расшифровку — только в личку, только своему."""
 
@@ -459,6 +642,32 @@ class TestClarifyGoesToPerson(_Base):
     def test_owner_meeting_asks_in_env_chat_as_before(self):
         meta = {"series": "lichnaya", "date": "2026-08-20"}
         self.assertEqual(delivery_route.clarify_chat_for_meeting(meta), OWNER_CHAT)
+
+    def test_employee_can_actually_answer_the_question(self):
+        """🔴 Ремонт Ж1: спросили сотрудника — обязаны принять его ОТВЕТ.
+
+        Вопрос уходит в личку сотрудника и несёт кусок расшифровки. Ответ
+        кнопкой листенер проверял через `_is_direct_chat`, а тот у наряда с
+        `delivery: dm` отвечал «чат не обслуживается»: адрес лички выводится из
+        `owner.telegram_user_id`, а сравнение шло только с пустым
+        `order.telegram_chat_id`. Человек видел вопрос, жал кнопку — и ничего не
+        происходило, в протоколе навсегда «Говорящий 2».
+        """
+        order = self.put_order(
+            meeting_id="mtg-ans", company="anzhee", room=ROOM_A,
+            owner_tg=PETROV_TG, portal_user_id="42", delivery="dm",
+        )
+        meta = self.meta_for(order, sid="sid-ans")
+        self.assertEqual(delivery_route.clarify_chat_for_meeting(meta), PETROV_TG)
+        # Ответ КНОПКОЙ (тот же гейт, что в `process_callback_query`).
+        self.assertTrue(
+            identity.is_direct_chat(PETROV_TG, OWNER_CHAT),
+            "личка сотрудника не обслуживается — нажатие кнопки будет пропущено")
+        # Ответ ТЕКСТОМ (DM-гейт `process_message`).
+        self.assertTrue(identity.may_command(PETROV_TG, PETROV_TG, OWNER_CHAT))
+        # Чужая личка обслуживаемой не становится.
+        self.assertFalse(identity.is_direct_chat(SIDOROV_TG, OWNER_CHAT))
+        self.assertFalse(identity.is_direct_chat(GROUP_ANZHEE, OWNER_CHAT))
 
 
 class TestEditWindows(_Base):
@@ -552,6 +761,76 @@ class TestEditAfterMonth(_Base):
         )
         self.assertEqual(summary["kind"], "first")
         self.assertEqual(summary["edits_count"], 1)
+
+    def test_reply_past_the_cutoff_gets_an_answer_not_silence(self):
+        """🔴 Ремонт Ж5: за 45 днями бот отвечает отказом, а не молчит.
+
+        Порог оставлен (индекс режется 45 днями ради скорости), но реплай на
+        протокол старше порога раньше проваливался в ветку «не наш реплай» и в
+        ГРУППОВОМ чате дропался молча: участник отвечал на протокол и не получал
+        ничего вовсе. Отсечка идёт по mtime файла, так что «45 дней» наступают и
+        для встречи, которую просто давно не трогали.
+        """
+        self.write_delivered_meta(
+            series="koordinatsiya", date="2026-06-01", chat_id=GROUP_ANZHEE,
+            message_id=888, sid="sid-ancient", age_days=60,
+        )
+        os.environ["ENABLE_FEEDBACK_EDITS"] = "1"
+        sent: List[Any] = []
+        claimed = feedback_worker.route_feedback_reply(
+            BOT_TOKEN, GROUP_ANZHEE,
+            {"message_id": 12, "text": "поправь цифру",
+             "from": {"id": PETROV_TG, "first_name": "Пётр"},
+             "reply_to_message": {"message_id": 888,
+                                  "from": {"id": BOT_ID, "is_bot": True}}},
+            allowed_chat=OWNER_CHAT, root=self.feedback,
+            send=lambda token, cid, text, **kw: sent.append((cid, text)),
+        )
+        self.assertTrue(claimed)
+        self.assertEqual(len(sent), 1, "реплай на старый протокол дропнут молча")
+        self.assertEqual(sent[0][0], GROUP_ANZHEE)
+        self.assertIn("45", sent[0][1])
+
+    def test_reply_to_something_else_is_still_ignored(self):
+        """Ответ не на протокол — прежний молчаливый пропуск, без болтовни."""
+        os.environ["ENABLE_FEEDBACK_EDITS"] = "1"
+        sent: List[Any] = []
+        claimed = feedback_worker.route_feedback_reply(
+            BOT_TOKEN, GROUP_ANZHEE,
+            {"message_id": 13, "text": "ага",
+             "from": {"id": PETROV_TG},
+             "reply_to_message": {"message_id": 424242,
+                                  "from": {"id": BOT_ID, "is_bot": True}}},
+            allowed_chat=OWNER_CHAT, root=self.feedback,
+            send=lambda *a, **kw: sent.append(a),
+        )
+        self.assertTrue(claimed)
+        self.assertEqual(sent, [])
+
+    def test_reply_to_a_human_does_not_scan_the_archive(self):
+        """🔴 Дорогой скан не запускается на обычной болтовне в группе.
+
+        Реплай человека человеку — самое частое сообщение в групповом чате.
+        Скан архива без отсечки по возрасту обходит все каталоги протоколов;
+        поставить его на такой реплай означало бы дисковый обход на каждую
+        реплику (замер: полный сьют с 91 с вырос до 654 с).
+        """
+        os.environ["ENABLE_FEEDBACK_EDITS"] = "1"
+        calls: List[Any] = []
+        with mock.patch.object(feedback_worker, "find_delivered_protocol",
+                               side_effect=lambda *a, **kw: calls.append(kw) or None):
+            feedback_worker.route_feedback_reply(
+                BOT_TOKEN, GROUP_ANZHEE,
+                {"message_id": 14, "text": "согласен",
+                 "from": {"id": PETROV_TG},
+                 "reply_to_message": {"message_id": 99,
+                                      "from": {"id": SIDOROV_TG, "is_bot": False}}},
+                allowed_chat=OWNER_CHAT, root=self.feedback,
+                send=lambda *a, **kw: None,
+            )
+        self.assertEqual(
+            [c for c in calls if "max_age_days" in c and c["max_age_days"] is None], [],
+            "скан архива без отсечки запущен на реплае человеку")
 
     def test_carry_since_untouched(self):
         """Отсечка памяти серии — не наша фаза, механизм на месте."""
@@ -770,6 +1049,223 @@ class TestOneVersionFeed(_Base):
             feedback_worker.SOURCE_TELEGRAM)
 
 
+class TestPortalOnlyEditReachesPortal(_Base):
+    """🔴 Ремонт Б2: правка встречи «только портал» доезжает до ленты версий.
+
+    Путь целиком: наряд без привязанного телеграма (маршрут `portal_only`) →
+    правка с портала → закрытие окна → `reissue_one` с НАСТОЯЩИМ redeliver →
+    протокол на диске → очередь портала. Раньше запись на диск гейтилась
+    статусом `sent`, а постановка версии — «`sent` или `not-delivered-yet`»:
+    очередь читала протокол С ДИСКА, и человек получал v2, побайтно равную v1.
+    Статус при этом терминальный — ни ретрая, ни алерта.
+    """
+
+    PROTO_OLD = "# Протокол\n\n## Решения\n- отгрузка 131 под досмотром\n"
+    PROTO_NEW = "# Протокол\n\n## Решения\n- отгрузка 131 на доставке\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["ENABLE_PORTAL_DELIVERY"] = "1"
+        self.order = self.put_order(
+            meeting_id="mtg-po", company="anzhee", room=ROOM_A,
+            owner_tg=None, portal_user_id="77", series="koordinatsiya",
+        )
+        self.assertTrue(delivery_route.resolve(self.order).portal_only)
+        self.series_dir = self.protocols / "koordinatsiya"
+        self.series_dir.mkdir(parents=True, exist_ok=True)
+        (self.series_dir / "2026-08-20.md").write_text(
+            "**[00:00] Ольга:** про 131\n", encoding="utf-8")
+        self.protocol_path = self.series_dir / "2026-08-20-protokol.md"
+        self.protocol_path.write_text(self.PROTO_OLD, encoding="utf-8")
+        # delivered пуст — в Telegram не уходило ничего (маршрут «только портал»).
+        self.write_delivered_meta(
+            series="koordinatsiya", date="2026-08-20", chat_id=None,
+            sid="sid-po", order=self.order,
+        )
+
+    def tearDown(self) -> None:
+        os.environ.pop("ENABLE_PORTAL_DELIVERY", None)
+        super().tearDown()
+
+    def test_edit_lands_in_protocol_and_in_portal_v2(self):
+        from notary.lib import feedback_reissue, portal_delivery
+
+        portal_delivery.enqueue(
+            order_id=str(self.order["id"]), meeting_id="mtg-po", version=1,
+            session_uid="sid-po", company="anzhee",
+            payload={"protocol_md": self.PROTO_OLD}, sources={},
+        )
+        summary = feedback_worker.apply_portal_edit(
+            meeting_id="mtg-po", text="131 не под досмотром, а на доставке",
+            author="Ольга Иванова", portal_user_id="77", session_uid="sid-po",
+            root=self.feedback, roots=[self.protocols],
+        )
+        state = feedback_state.read_state(summary["feedback_id"], root=self.feedback)
+        state["status"] = "reissuing"
+        feedback_state.write_state(state, root=self.feedback)
+
+        res = feedback_reissue.reissue_one(
+            state, root=self.feedback,
+            generate_fn=lambda tp, mm, sid: self.PROTO_NEW,
+            # redeliver_fn НАСТОЯЩИЙ: у встречи нет доставки → not-delivered-yet.
+        )
+        self.assertEqual(res.get("status"), "not-delivered-yet", res)
+        self.assertEqual(self.protocol_path.read_text(encoding="utf-8"), self.PROTO_NEW,
+                         "протокол на диске не пересобран — портал отдаст старый текст")
+
+        items = [i for i in portal_delivery.list_items()
+                 if str(i.get("order_id")) == str(self.order["id"])]
+        v2 = [i for i in items if i.get("version") == 2]
+        self.assertTrue(v2, "версии 2 в очереди портала нет вовсе: %s" % items)
+        body = (v2[0].get("payload") or {}).get("protocol_md", "")
+        self.assertIn("на доставке", body, "в ленту версий уехала копия v1")
+        self.assertNotEqual(body.strip(), self.PROTO_OLD.strip())
+
+    def test_version_number_is_not_reused_when_queue_was_cleaned(self):
+        """Уборка каталога очереди не должна давать повтор номера версии.
+
+        `_next_portal_version` считает по содержимому очереди: после уборки
+        (метельщик, ручная чистка) счёт начинался бы заново, а `enqueue` на
+        занятый ключ молча отдаёт `created=False` — новая версия исчезала бы.
+        """
+        import shutil as _shutil
+
+        from notary.lib import feedback_reissue, portal_delivery
+
+        meta_path = self.protocols / "koordinatsiya" / "meta.json"
+        state = {"edits": [], "meta_path": str(meta_path)}
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        key = feedback_reissue._enqueue_portal_revision(
+            state, meta, self.protocol_path, self.series_dir / "2026-08-20.md")
+        self.assertIsNotNone(key)
+        v_first = [i for i in portal_delivery.list_items() if i.get("key") == key][0]["version"]
+
+        # Доставленные элементы убрали (метельщик / руки) — очередь пуста.
+        _shutil.rmtree(portal_delivery.items_dir(), ignore_errors=True)
+        self.assertEqual(portal_delivery.list_items(), [])
+
+        self.protocol_path.write_text(self.PROTO_NEW, encoding="utf-8")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        key2 = feedback_reissue._enqueue_portal_revision(
+            state, meta, self.protocol_path, self.series_dir / "2026-08-20.md")
+        self.assertNotEqual(key2, key, "после уборки очереди номер версии повторился")
+        second = [i for i in portal_delivery.list_items() if i.get("key") == key2]
+        self.assertTrue(second, "вторая версия не попала в очередь")
+        self.assertGreater(second[0].get("version"), v_first)
+        self.assertIn("на доставке", (second[0].get("payload") or {}).get("protocol_md", ""))
+
+
+class TestConcurrentEditWriters(_Base):
+    """🔴 Ремонт Б4: у окна правок ДВА писателя из разных процессов.
+
+    Листенер (реплай в чат) и шлюз (правка с экрана портала) делают один и тот
+    же read→изменить→write. `write_state` пишет объект целиком, поэтому без
+    межпроцессного замка правка, записавшаяся первой, затирается целиком: человек
+    получил «✅ Замечание принял», а правки в новой версии нет.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.order = self.put_order(
+            meeting_id="mtg-race", company="anzhee", room=ROOM_A,
+            owner_tg=PETROV_TG, portal_user_id="42", delivery="group",
+            chat_id=GROUP_ANZHEE, series="koordinatsiya",
+        )
+        self.write_delivered_meta(
+            series="koordinatsiya", date="2026-08-20", chat_id=GROUP_ANZHEE,
+            sid="sid-race", order=self.order,
+        )
+
+    def test_two_simultaneous_edits_both_survive(self):
+        import threading
+        import time
+
+        real_apply = feedback_worker.apply_edit
+        slow_done = threading.Event()
+
+        def slow_first(*args, **kwargs):
+            """Первая правка «думает» внутри транзакции — окно для второй."""
+            if not slow_done.is_set():
+                slow_done.set()
+                time.sleep(0.4)
+            return real_apply(*args, **kwargs)
+
+        def portal_edit(edit_id: str, text: str):
+            feedback_worker.apply_portal_edit(
+                meeting_id="mtg-race", text=text, author="Ольга Иванова",
+                portal_user_id="42", session_uid="sid-race", edit_id=edit_id,
+                root=self.feedback, roots=[self.protocols],
+            )
+
+        with mock.patch.object(feedback_worker, "apply_edit", side_effect=slow_first):
+            first = threading.Thread(target=portal_edit, args=("e-1", "первая правка"))
+            first.start()
+            self.assertTrue(slow_done.wait(2.0), "первая правка не начала транзакцию")
+            time.sleep(0.05)
+            portal_edit("e-2", "вторая правка")
+            first.join(5.0)
+
+        states = feedback_state.list_states(root=self.feedback)
+        self.assertEqual(len(states), 1, states)
+        ids = [e.get("edit_id") for e in states[0].get("edits") or []]
+        self.assertEqual(sorted(ids), ["e-1", "e-2"],
+                         "одна из двух одновременных правок затёрта: %s" % ids)
+
+    def test_claim_for_reissue_is_not_undone_by_a_concurrent_edit(self):
+        """Конкурентная правка не возвращает заклеймленный раунд в `collecting`."""
+        summary = feedback_worker.apply_portal_edit(
+            meeting_id="mtg-race", text="правка раунда 1", author="Ольга",
+            portal_user_id="42", session_uid="sid-race", edit_id="e-r1",
+            root=self.feedback, roots=[self.protocols],
+        )
+        fid = summary["feedback_id"]
+        feedback_state.mark_status(fid, "ready_for_reissue", root=self.feedback)
+        claimed = feedback_state.claim_for_reissue(fid, root=self.feedback)
+        self.assertIsNotNone(claimed)
+        feedback_worker.apply_portal_edit(
+            meeting_id="mtg-race", text="правка пришла в момент перевыпуска",
+            author="Ольга", portal_user_id="42", session_uid="sid-race",
+            edit_id="e-r2", root=self.feedback, roots=[self.protocols],
+        )
+        fresh = feedback_state.read_state(fid, root=self.feedback)
+        self.assertEqual(fresh.get("round"), 2,
+                         "правка в момент перевыпуска не открыла новый раунд")
+        self.assertEqual([e.get("edit_id") for e in fresh.get("edits") or []], ["e-r2"])
+
+    def test_raw_write_over_someone_elses_edit_is_refused_loudly(self):
+        """Запись мимо `mutate` не затирает чужую правку МОЛЧА.
+
+        Замок закрывает наш код, но низкоуровневая пара `read_state` +
+        `write_state` остаётся доступной, и однажды её так и позовут. Тогда
+        сравнение `updated_at` ловит потерю: лучше громкий отказ, чем правка,
+        исчезнувшая после «✅ принял».
+        """
+        summary = feedback_worker.apply_portal_edit(
+            meeting_id="mtg-race", text="первая", author="Ольга",
+            portal_user_id="42", session_uid="sid-race", edit_id="e-a",
+            root=self.feedback, roots=[self.protocols],
+        )
+        fid = summary["feedback_id"]
+        stale = feedback_state.read_state(fid, root=self.feedback)
+        # Кто-то другой успел записать своё.
+        feedback_state.mark_status(fid, "ready_for_reissue", root=self.feedback)
+        stale["edits"] = []
+        with self.assertRaises(feedback_state.ConcurrentWrite):
+            feedback_state.write_state(stale, root=self.feedback)
+        fresh = feedback_state.read_state(fid, root=self.feedback)
+        self.assertEqual([e.get("edit_id") for e in fresh.get("edits") or []], ["e-a"])
+
+    def test_state_module_writes_only_through_the_lock(self):
+        """Греп-сторож: read_state+write_state подряд вне `mutate` — снова гонка."""
+        for name in ("feedback_worker.py", "feedback_reissue.py"):
+            source = (_NOTARY / "lib" / name).read_text(encoding="utf-8")
+            self.assertNotIn(
+                "feedback_state.write_state(", source,
+                "%s пишет состояние мимо feedback_state.mutate() — "
+                "второй процесс затрёт правку" % name)
+
+
 class TestInvalidInputs(_Base):
     """Невалидные входы каждого перехода — списком."""
 
@@ -953,6 +1449,111 @@ class TestLazyRegistryPaths(_Base):
     def test_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             registry_mod.NO_SUCH_FILE  # noqa: B018
+
+
+class TestGatewayUnitDeclaresEnv(unittest.TestCase):
+    """🔴 Ремонт Б3: юнит шлюза объявляет ВСЁ, что читает код его ручек.
+
+    Юнит намеренно не грузит `.env.notary` (там секреты, которыми шлюз не
+    пользуется) и перечисляет переменные руками. Значит любой новый
+    `os.environ.get` в цепочке ручки — это тихий уход на ДЕФОЛТ ИЗ КОДА, а
+    дефолты писались под листенер: `/opt/meeting-notary/_feedback_edits`
+    принадлежит root, процесс под `dev` падает на записи, и КАЖДАЯ правка
+    теряется без ack (инцидент 2026-06-08 — тогда это стоило всех правок за
+    период). Через новую ручку Ф10d тот же дефолт вернулся, поэтому сторож
+    сверяет юнит с кодом, а не с памятью человека.
+
+    Проба судит ФУНКЦИИ цепочки? Нет — модули целиком, и это намеренно: шлюз
+    импортирует их целиком, и любой их путь может выполниться в его процессе.
+    """
+
+    #: Модули, код которых выполняется В ПРОЦЕССЕ ШЛЮЗА (цепочка ручек).
+    CHAIN = (
+        "gateway.py",
+        "lib/feedback_worker.py",
+        "lib/feedback_state.py",
+        "lib/delivery_route.py",
+        "lib/identity.py",
+        "lib/orders.py",
+        "lib/quote_policy.py",
+        "lib/paths.py",
+        "cli/registry.py",
+    )
+
+    #: Переменные, которых у шлюза быть НЕ должно, с причиной. Список закрытый:
+    #: добавляешь сюда — объясняешь, почему процесс переживёт дефолт.
+    EXEMPT = {
+        # Секреты: шлюз не ходит ни в Telegram, ни в Claude — он транспорт.
+        "TELEGRAM_NOTARIUS_CHAT_ID": "шлюз не пишет в Telegram",
+        "TELEGRAM_CHAT_ID": "legacy-алиас того же",
+        "TELEGRAM_NOTARIUS_BOT_TOKEN": "шлюз не пишет в Telegram",
+        "MEETING_NOTARY_GATEWAY_TOKEN": "приходит из EnvironmentFile .env.gateway",
+        "MEETING_NOTARY_GATEWAY_TOKEN_FILE": "альтернатива тому же секрету",
+        # Необязательные тюнинги с безопасным дефолтом.
+        "MEETING_NOTARY_GATEWAY_HOST": "дефолт 127.0.0.1 — то, что нужно за Caddy",
+        "MEETING_NOTARY_GATEWAY_PORT": "дефолт 8789 совпадает с конфигом Caddy",
+        "MEETING_NOTARY_GATEWAY_ROOM_HOSTS": "дефолт — список хостов в коде",
+        "MEETING_NOTARY_PEOPLE_MD": "канонизация ФИО не нужна правке с портала",
+        "ENABLE_FEEDBACK_ALLOWLIST": "аллоулист телеграм-аккаунтов, у портала свой автор",
+        "FEEDBACK_ALLOWLIST_USER_IDS": "то же",
+        "MEETING_NOTARY_ARCHIVE_DIR": "долговечный архив пишет collector, не шлюз",
+        "MEETING_NOTARY_GATEWAY_MAX_BODY": "дефолт 64 КиБ — потолок тела запроса, свой у шлюза",
+        "MEETING_NOTARY_GATEWAY_SCHEDULER_STALE_MINUTES": "порог «планировщик молчит», дефолт в коде",
+    }
+
+    _ENV_RE = __import__("re").compile(
+        r"""os\.(?:environ\.get|getenv)\(\s*["']([A-Z][A-Z0-9_]{3,})["']"""
+    )
+
+    def _unit_text(self) -> str:
+        return (_NOTARY / "deploy" / "meeting-notary-gateway.service").read_text(encoding="utf-8")
+
+    def test_every_env_read_by_the_chain_is_declared(self):
+        unit = self._unit_text()
+        declared = set(__import__("re").findall(r"^Environment=([A-Z0-9_]+)=", unit,
+                                                __import__("re").M))
+        missing = {}
+        for rel in self.CHAIN:
+            source = (_NOTARY / rel).read_text(encoding="utf-8")
+            for name in self._ENV_RE.findall(source):
+                if name in declared or name in self.EXEMPT:
+                    continue
+                missing.setdefault(name, []).append(rel)
+        # Косвенные чтения через хелперы (`_env_int("FEEDBACK_WINDOW_MIN", …)`).
+        helper_re = __import__("re").compile(r"""_env(?:_int|_flag)?\(\s*["']([A-Z][A-Z0-9_]{3,})["']""")
+        for rel in self.CHAIN:
+            source = (_NOTARY / rel).read_text(encoding="utf-8")
+            for name in helper_re.findall(source):
+                if name in declared or name in self.EXEMPT:
+                    continue
+                missing.setdefault(name, []).append(rel)
+        self.assertEqual(
+            missing, {},
+            "юнит шлюза не объявляет переменные, которые читает его код — "
+            "процесс уйдёт на дефолты из кода (те самые /opt-пути): %s" % missing,
+        )
+
+    def test_feedback_dir_is_writable_by_the_unit(self):
+        """Каталог окна правок обязан быть и объявлен, и в ReadWritePaths."""
+        unit = self._unit_text()
+        m = __import__("re").search(r"^Environment=MEETING_NOTARY_FEEDBACK_DIR=(\S+)",
+                                    unit, __import__("re").M)
+        self.assertIsNotNone(m, "юнит не задаёт каталог правок — вернётся дефолт /opt")
+        path = m.group(1)
+        self.assertNotIn("/opt/", path,
+                         "каталог правок снова в /opt (root) — правки будут теряться")
+        rw = __import__("re").findall(r"^ReadWritePaths=(\S+)", unit, __import__("re").M)
+        self.assertTrue(
+            any(path == p or path.startswith(p.rstrip("/") + "/") for p in rw),
+            "каталог правок %s не в ReadWritePaths: %s" % (path, rw),
+        )
+
+    def test_portal_orders_flag_is_on_or_organizer_is_never_recognised(self):
+        unit = self._unit_text()
+        self.assertIn("Environment=ENABLE_PORTAL_ORDERS=1", unit,
+                      "без флага нарядов организатор правки с портала не опознаётся")
+        self.assertIn("Environment=ENABLE_FEEDBACK_EDITS=1", unit,
+                      "без флага правок ручка отвечает «приём правок выключен»")
 
 
 class TestScale(_Base):

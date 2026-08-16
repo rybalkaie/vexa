@@ -54,6 +54,13 @@ MODE_DM = "dm"
 MODE_GROUP = "group"
 #: В Telegram не уходит ничего — результат живёт только на портале.
 MODE_PORTAL_ONLY = "portal_only"
+#: 🔴 НЕ ВЫЯСНИЛИ, ЧЬЯ ЭТО ВСТРЕЧА (реестр нарядов не прочитался). Не «наряда
+#: нет»: адресата не знаем вовсе, поэтому не уходит НИКУДА — ни в Telegram, ни в
+#: портал (компанию мы тоже не знаем, а портал раскладывает результат по ней).
+#: Отдельный режим нужен именно потому, что «нет наряда» и «не смогли прочитать»
+#: раньше склеивались в один ответ, и второй исход означал чужой протокол в личке
+#: владельца портала.
+MODE_BLOCKED = "blocked"
 
 #: Что портал вправе попросить полем `delivery` наряда.
 REQUESTABLE_MODES = (MODE_DM, MODE_GROUP, MODE_PORTAL_ONLY)
@@ -69,6 +76,19 @@ REASON_DM_UNKNOWN = "dm_unknown"
 REASON_GROUP_UNKNOWN = "group_unknown"
 REASON_NO_TARGET = "no_target"
 REASON_COMPANY_MISMATCH = "company_mismatch"
+REASON_REGISTRY_ERROR = "registry_error"
+
+
+class RegistryUnavailable(RuntimeError):
+    """Реестр нарядов не прочитался — «чей это результат» НЕ ВЫЯСНЕНО.
+
+    Отличается от «наряда нет» (`None`) намеренно: молча свести их к одному
+    ответу означает отдать протокол сотрудника чужой компании в личку владельца
+    портала, потому что «наряда нет» = личная встреча владельца. Ровно этот
+    инцидент фаза и закрывает, а окно для него на VPS реальное: `orders._mutate`
+    пишет реестр через `os.replace` под `flock`, читатель идёт без замка, плюс
+    права файла уже один раз ломались (инцидент 12.08.2026).
+    """
 
 
 def is_enabled() -> bool:
@@ -108,6 +128,11 @@ class Route:
         return self.mode == MODE_PORTAL_ONLY
 
     @property
+    def blocked(self) -> bool:
+        """Чья встреча — не выяснено. Доставлять нельзя НИКУДА, это не «нет наряда»."""
+        return self.mode == MODE_BLOCKED
+
+    @property
     def telegram_status(self) -> str:
         """Что сказать порталу в `telegram_delivery.status`, если не отправляли."""
         return "skipped" if self.portal_only else "unknown"
@@ -124,6 +149,8 @@ class Route:
 
 
 OWNER_ROUTE = Route(mode=MODE_OWNER, reason=REASON_NO_ORDER)
+#: Реестр не прочитался. Ни чата, ни компании — доставки нет вовсе.
+BLOCKED_ROUTE = Route(mode=MODE_BLOCKED, reason=REASON_REGISTRY_ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +337,22 @@ def order_for_meeting(
     Тот же двухшаговый поиск, что у `collector._portal_order_for` (по отметке
     запуска, иначе по комнате и времени) — и та же трактовка None: это ОБЫЧНЫЙ
     исход, а не сбой. При выключателе OFF диск не трогается вовсе.
+
+    🔴 Сбой чтения реестра — НЕ `None`, а `RegistryUnavailable`. «Наряда нет»
+    означает «личная встреча владельца, шли ему», и подменять этим ответом
+    «не смогли выяснить» нельзя: цена ошибки — чужой протокол в чужой личке.
     """
     if not isinstance(meeting_meta, dict):
         return None
+    # Штамп в meta — тот же источник истины, что для `route_for_meeting`: наряд
+    # уже выяснен один раз в начале обработки. Идти за ним в реестр повторно —
+    # значит зависеть от того, что комната и время всё ещё сходятся, а у старой
+    # встречи (правка через месяц) они не сходятся: наряд из реестра уже убран
+    # или сдвинут. Именно из-за этого перевыпуск порталовой встречи не находил
+    # свой наряд и версия не ставилась в очередь вовсе.
+    stamped = meeting_meta.get("order")
+    if isinstance(stamped, dict) and stamped:
+        return stamped
     try:
         from notary.lib import identity  # noqa: PLC0415
 
@@ -325,9 +365,14 @@ def order_for_meeting(
             started_at=meeting_meta.get("startTs"),
             session_uid=session_uid or meeting_meta.get("sessionUid"),
         )
-    except Exception as e:  # noqa: BLE001 — реестр не читается → работаем как без нарядов
-        logger.warning("[route] наряд для записи не резолвится (%s)", type(e).__name__)
-        return None
+    except Exception as e:  # noqa: BLE001 — любой сбой чтения = «не выяснили»
+        logger.error(
+            "[route] 🔴 РЕЕСТР НАРЯДОВ НЕ ПРОЧИТАН (%s) — чья это встреча, "
+            "НЕ ВЫЯСНЕНО. Доставка остановлена: отправить «раз наряда нет, значит "
+            "владельцу» здесь означало бы чужой протокол в чужой личке",
+            type(e).__name__,
+        )
+        raise RegistryUnavailable(type(e).__name__) from e
 
 
 def route_for_meeting(
@@ -351,7 +396,13 @@ def route_for_meeting(
         stamped = meeting_meta.get("order")
         if isinstance(stamped, dict) and stamped:
             return resolve(stamped, watched=watched)
-    order = order_for_meeting(meeting_meta, session_uid=session_uid)
+    try:
+        order = order_for_meeting(meeting_meta, session_uid=session_uid)
+    except RegistryUnavailable:
+        # 🔴 Fail-closed. Реестр не прочитан → адресат не выведен → результат не
+        # уходит никуда, а вызывающий обязан НЕ считать это законченной
+        # доставкой (статус не терминальный, следующий проход повторит).
+        return BLOCKED_ROUTE
     if order is None:
         return OWNER_ROUTE
     return resolve(order, watched=watched)
@@ -409,6 +460,9 @@ def clarify_chat_for_meeting(
     * Наряд портала → личка владельца наряда. Не привязана → None: вопрос не
       задаётся вовсе. Спросить «в общий чат» нельзя (кусок расшифровки), спросить
       Илью — тоже (чужая встреча, и ответить он всё равно не сможет).
+    * Реестр не прочитался (`MODE_BLOCKED`) → None по той же причине: кому
+      принадлежит кусок расшифровки, мы не знаем, а «спросим владельца портала»
+      здесь означало бы выдать ему фрагмент чужого разговора.
     """
     route = route_for_meeting(meeting_meta, session_uid=session_uid)
     if route.is_owner_legacy:

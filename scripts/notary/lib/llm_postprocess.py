@@ -1504,7 +1504,17 @@ def _format_protocol_user_prompt(
     try:
         from . import feedback_learning  # noqa: PLC0415  (lazy: избегаем цикла импорта)
 
-        lb = feedback_learning.format_learned_terms_block(meeting_meta.get("series"))
+        # 🔴 Компанию передаём ЯВНО — тем же резолвером, что и остальной сборке
+        # (`series_markup.company_for_meeting`: наряд портала бьёт угадывание по
+        # slug'у). Без неё `format_learned_terms_block` выводит компанию сам —
+        # перебором оргструктур ВСЕХ компаний с выбором первого совпадения, и
+        # тогда в промпт генерации протокола МПервого подмешиваются выученные
+        # правила Anzhee. Глоссарий рядом уже ходит по компании; это второй,
+        # незамеченный канал того же — блок-ДАННЫЕ едет в тот же промпт.
+        lb = feedback_learning.format_learned_terms_block(
+            meeting_meta.get("series"),
+            company=series_markup.company_for_meeting(meeting_meta),
+        )
         if lb.strip():
             learned_block = "\n\n" + lb.strip()
     except Exception:  # noqa: BLE001  (самообучение не должно ронять генерацию)
@@ -4381,6 +4391,30 @@ def deliver_protocol(
 
     # Шаг 1: chat_id из явного аргумента / наряда / meta / watched.yaml.
     chat_id = target_chat_id
+    if chat_id is None and route is not None and route.blocked:
+        # 🔴 Реестр нарядов не прочитался: чья это встреча — НЕ ВЫЯСНЕНО. Ни в
+        # чей чат не отправляем, включая личку владельца портала: «наряда нет»
+        # (его личная встреча) и «не смогли выяснить» — разные ответы, и
+        # склеивание их в один и было тем самым инцидентом с чужим протоколом.
+        # Статус НЕ входит в успешные (`collector.success_statuses`) → WAV
+        # остаётся, исходники держатся, следующий проход повторит доставку,
+        # когда реестр снова читается.
+        # Явно переданный `target_chat_id` эту ветку не задевает: там адресата
+        # назвал человек (legacy-ответ владельца «доставить сюда»), а не наш
+        # молчаливый фолбэк — именно фолбэк и запрещён.
+        logger.error(
+            "[delivery] meeting=%s 🔴 доставка ОСТАНОВЛЕНА: реестр нарядов не "
+            "прочитан, адресат не выведен (%s). Ничего никуда не отправлено",
+            meeting_sid or "?", route.reason,
+        )
+        return {
+            "status": "blocked",
+            "chat_id": None,
+            "message_ids": [],
+            "parts_count": 0,
+            "error": "registry unavailable: recipient unknown",
+            "route": route.as_dict(),
+        }
     if chat_id is None and route is not None and not route.is_owner_legacy:
         if route.portal_only:
             # 🔴 Ни в какой чат. Не «раз адресата нет, отправим владельцу

@@ -257,6 +257,14 @@ _INDEX_CACHE: dict[str, Any] = {"built_at": 0.0, "roots": None, "index": {}}
 _INDEX_TTL_S = 15.0
 _DEFAULT_MAX_AGE_DAYS = 45
 
+#: Ответ на правку к встрече старше окна поиска. Молчать здесь нельзя: человек
+#: ответил на протокол в общем чате и вправе знать, что правка НЕ принята.
+TOO_OLD_MSG = (
+    "Эту встречу я уже не правлю: она старше %d дней и ушла в архив, новую "
+    "версию протокола по ней бот не выпустит. Если поправить всё-таки нужно — "
+    "напишите организатору встречи, он поднимет запись." % _DEFAULT_MAX_AGE_DAYS
+)
+
 
 def find_delivered_protocol(
     chat_id: Any,
@@ -792,10 +800,30 @@ def handle_feedback_reply(
 
     edit = _build_edit(edit_msg, author, now, is_organizer=organizer)
 
-    state = feedback_state.read_state(fid, root=root)
-    prior_status = state.get("status") if isinstance(state, dict) else None
-    prior_edits = len(state.get("edits") or []) if isinstance(state, dict) else 0
-    new_state, kind = apply_edit(state, edit=edit, meeting=meeting, win_min=win, max_min=mx, now=now)
+    # 🔴 Тот же межпроцессный замок, что у правки с портала (шлюз — отдельный
+    # процесс): read→apply→write одной транзакцией, иначе две правки в одну
+    # минуту затирают друг друга. Ack и логи — уже вне замка, они держать его не
+    # обязаны (сеть Telegram под flock'ом заблокировала бы шлюз на секунды).
+    txn: dict = {}
+
+    def _apply(cur: Optional[dict]) -> Optional[dict]:
+        txn["prior_status"] = cur.get("status") if isinstance(cur, dict) else None
+        txn["prior_edits"] = len(cur.get("edits") or []) if isinstance(cur, dict) else 0
+        st, k = apply_edit(cur, edit=edit, meeting=meeting, win_min=win, max_min=mx, now=now)
+        txn["state"], txn["kind"] = st, k
+        if k in ("dup", "capped"):
+            return None  # состояние не менялось — не пишем
+        if immediate:
+            # FB-now: правка + «делай сразу» — закрываем окно немедленно
+            # (deadline=now), ближайший sweep (≤30с) переведёт в
+            # ready_for_reissue → перевыпуск. Правим ДО записи, под замком.
+            st["deadline_at"] = _iso(now)
+            st["hard_deadline_at"] = _iso(now)
+        return st
+
+    feedback_state.mutate(fid, _apply, root=root)
+    new_state, kind = txn.get("state") or {}, txn.get("kind")
+    prior_status, prior_edits = txn.get("prior_status"), txn.get("prior_edits") or 0
 
     # Н1 (race Ф3/Ф4): новый раунд поверх ЕЩЁ НЕ заклеймленного ready_for_reissue
     # затёр бы несъеденные правки прошлого раунда. Ф4 закрывает это claim'ом
@@ -830,13 +858,6 @@ def handle_feedback_reply(
         )
         return new_state
 
-    if immediate:
-        # FB-now: правка + «делай сразу» — закрываем окно немедленно (deadline=now),
-        # ближайший sweep (≤30с) переведёт в ready_for_reissue → перевыпуск.
-        new_state["deadline_at"] = _iso(now)
-        new_state["hard_deadline_at"] = _iso(now)
-
-    feedback_state.write_state(new_state, root=root)
     if immediate:
         text = ack_immediate(author)
     else:
@@ -997,20 +1018,33 @@ def apply_portal_edit(
         "is_organizer": bool(organizer),
     }
 
-    state = feedback_state.read_state(fid, root=root)
-    # Дедуп по `edit_id`: портал вправе повторить запрос после таймаута сети, и
-    # повтор не должен ни задвоить правку, ни сдвинуть окно ещё на 20 минут.
-    if isinstance(state, dict) and state.get("status") == "collecting":
-        if any(
-            isinstance(e, dict) and e.get("edit_id") == edit["edit_id"]
-            for e in (state.get("edits") or [])
-        ):
-            return _portal_edit_summary(state, fid, kind="dup")
+    # 🔴 Чтение, дедуп, применение и запись — ОДНОЙ транзакцией под межпроцессным
+    # замком. Второй писатель этого окна (listener с правкой реплаем) живёт в
+    # ДРУГОМ процессе: без замка правка, записавшаяся первой, затирается целиком —
+    # `write_state` пишет объект, а не поле, — и человек, получивший «✅ принял»,
+    # своей правки в новой версии не находит.
+    outcome: dict = {}
 
-    new_state, kind = apply_edit(
-        state, edit=edit, meeting=meeting,
-        win_min=window_min(), max_min=max_window_min(), now=now,
-    )
+    def _apply(state: Optional[dict]) -> Optional[dict]:
+        # Дедуп по `edit_id`: портал вправе повторить запрос после таймаута сети, и
+        # повтор не должен ни задвоить правку, ни сдвинуть окно ещё на 20 минут.
+        if isinstance(state, dict) and state.get("status") == "collecting":
+            if any(
+                isinstance(e, dict) and e.get("edit_id") == edit["edit_id"]
+                for e in (state.get("edits") or [])
+            ):
+                outcome["state"], outcome["kind"] = state, "dup"
+                return None
+        new_state, kind = apply_edit(
+            state, edit=edit, meeting=meeting,
+            win_min=window_min(), max_min=max_window_min(), now=now,
+        )
+        outcome["state"], outcome["kind"] = new_state, kind
+        # capped/dup состояние не меняют — писать нечего.
+        return None if kind in ("capped", "dup") else new_state
+
+    feedback_state.mutate(fid, _apply, root=root)
+    new_state, kind = outcome.get("state") or {}, outcome.get("kind")
     if kind == "capped":
         raise PortalEditError(
             "window_full",
@@ -1020,7 +1054,6 @@ def apply_portal_edit(
     if kind == "dup":
         return _portal_edit_summary(new_state, fid, kind="dup")
 
-    feedback_state.write_state(new_state, root=root)
     logger.info(
         "[feedback] правка с портала записана fid=%s round=%s kind=%s edits=%d deadline=%s",
         fid, new_state.get("round"), kind, len(new_state.get("edits", [])),
@@ -1082,11 +1115,23 @@ def _flush_collecting_round(
     Если есть открытый раунд с правками — выставляем deadline=now (ближайший sweep
     перевыпустит). Если правок нет/раунд не collecting — ack «нечего перевыпускать».
     """
-    state = feedback_state.read_state(fid, root=root)
-    if isinstance(state, dict) and state.get("status") == "collecting" and (state.get("edits") or []):
-        state["deadline_at"] = _iso(now)
-        state["hard_deadline_at"] = _iso(now)
-        feedback_state.write_state(state, root=root)
+    # Под тем же замком, что и приём правок: без него «делай сразу», приехавшее
+    # одновременно с правкой из другого процесса, откатило бы её (пишем объект
+    # целиком тем, что прочитали до неё).
+    flushed: dict = {}
+
+    def _flush(cur: Optional[dict]) -> Optional[dict]:
+        flushed["state"] = cur
+        if not (isinstance(cur, dict) and cur.get("status") == "collecting" and (cur.get("edits") or [])):
+            return None
+        cur["deadline_at"] = _iso(now)
+        cur["hard_deadline_at"] = _iso(now)
+        flushed["done"] = True
+        return cur
+
+    feedback_state.mutate(fid, _flush, root=root)
+    state = flushed.get("state")
+    if flushed.get("done"):
         text = ack_flush(author)
         logger.info(
             "[feedback] флэш-команда «делай сразу» — окно закрыто немедленно fid=%s edits=%d",
@@ -1157,6 +1202,29 @@ def _window_at_cap(meeting: dict, root: Optional[Path]) -> bool:
     if not isinstance(state, dict) or state.get("status") != "collecting":
         return False
     return len(state.get("edits") or []) >= max_edits_per_window()
+
+
+def _is_reply_to_our_bot(token: str, reply_to: Any) -> bool:
+    """Ответили ли на сообщение ЭТОГО бота (id бота = префикс токена).
+
+    🔴 Условие дорогое, поэтому узкое. Скан архива без отсечки по возрасту —
+    полный обход каталогов протоколов (потолок 5000 файлов, без кэша). Ставить
+    его на КАЖДЫЙ неопознанный реплай нельзя: в групповом чате люди отвечают
+    друг другу постоянно, и бот уходил бы в обход диска на каждую такую реплику
+    (замер: сьют замедлился с 91 до 654 с, потому что скан доставал живой архив
+    владельца). Реплай на сообщение бота, которое мы не узнали, — событие
+    редкое, вот его и разбираем.
+    """
+    if not isinstance(reply_to, dict) or reply_to.get("message_id") is None:
+        return False
+    author = reply_to.get("from")
+    if not isinstance(author, dict) or not author.get("is_bot"):
+        return False
+    try:
+        bot_id = int(str(token or "").split(":", 1)[0])
+    except (TypeError, ValueError):
+        return False
+    return author.get("id") == bot_id
 
 
 def route_feedback_reply(
@@ -1264,6 +1332,38 @@ def route_feedback_reply(
         except Exception as e:  # noqa: BLE001
             logger.exception("[feedback] handle_feedback_reply упал: %s", e)
         return True
+
+    # 🔴 Правка на встречу СТАРШЕ окна поиска (`_DEFAULT_MAX_AGE_DAYS`) — не
+    # «не наш реплай», а «наш, но не нашли». Индекс режется 45 днями ради
+    # скорости (иначе каждый реплай сканирует весь архив), и порог остаётся, но
+    # МОЛЧАНИЕ — нет: в групповом чате человек отвечал на протокол и не получал
+    # ровно ничего. Второй проход без отсечки делаем только когда первый
+    # промахнулся: ложных срабатываний он не даёт (совпадение по паре
+    # chat_id+message_id из `meta.delivered`), а стоит один скан — на редком
+    # событии «ответ на старый протокол».
+    if _is_reply_to_our_bot(token, reply_to):
+        try:
+            stale = find_delivered_protocol(
+                chat_id, reply_to.get("message_id"),
+                max_age_days=None, use_cache=False,
+            )
+        except Exception as e:  # noqa: BLE001 — скан архива не должен ронять роут
+            logger.warning("[feedback] скан архива без отсечки упал: %s", type(e).__name__)
+            stale = None
+        if stale is not None:
+            logger.info(
+                "[feedback] реплай на протокол старше %d дней (series=%s date=%s) — "
+                "отвечаю отказом вместо молчания",
+                _DEFAULT_MAX_AGE_DAYS, stale.get("series"), stale.get("date"),
+            )
+            try:
+                (send or telegram_api.send_message)(
+                    token, chat_id, TOO_OLD_MSG,
+                    reply_to_message_id=msg.get("message_id"),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[feedback] ответ «встреча старая» не ушёл: %s", e)
+            return True
 
     # Не reply на наш протокол.
     if _is_direct_chat(chat_id, allowed_chat):

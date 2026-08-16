@@ -5,6 +5,12 @@
 `tempfile.mkstemp + os.rename` (как `clarify_state`), чтобы listener не прочитал
 полузаписанный JSON.
 
+🔴 ПИСАТЕЛЕЙ ДВА ПРОЦЕССА (с Ф10d): listener (правки реплаем, sweep, claim) и
+шлюз (правки с портала). Атомарности `rename` для этого мало — она защищает от
+полузаписи, но не от «прочитали оба, записали по очереди, первый затёрт».
+Поэтому read→изменить→write идёт ТОЛЬКО через `mutate()`/`locked()` (flock на
+`.<fid>.lock`), как в реестре нарядов `orders._mutate`.
+
 Каталог СВОЙ (не `_pending_clarification/`) — env `MEETING_NOTARY_FEEDBACK_DIR`,
 дефолт `/opt/meeting-notary/_feedback_edits` (VPS) или мак-путь. Изоляция
 намеренная: clarify/delivery sweep'ы глобают `_pending_clarification/` и не должны
@@ -66,6 +72,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -73,7 +81,7 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -144,12 +152,119 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def write_state(state: dict, *, root: Optional[Path] = None) -> Path:
-    """Атомарно записывает state-файл (`tempfile + os.rename`, fsync). Возвращает Path."""
+@contextlib.contextmanager
+def locked(feedback_id: str, *, root: Optional[Path] = None) -> Iterator[None]:
+    """Межпроцессный замок на ОДНО окно правок (`flock` на `.<fid>.lock`).
+
+    🔴 Писателей больше не один. Раньше здесь стояло «единственный писатель —
+    listener (один процесс)», и атомарность `rename` этого хватало. Ф10d завела
+    ВТОРОГО: ручка правок с портала живёт в процессе ШЛЮЗА и делает тот же
+    read→изменить→write. Без замка правка реплаем и правка с экрана в одну минуту
+    затирают друг друга целиком (`write_state` пишет объект, а не поле), а
+    конкурентная правка возвращает уже заклеймленный `reissuing` обратно в
+    `collecting` — и раунд перевыпускается дважды.
+
+    Замок — отдельный файл рядом (не сам state): state пересоздаётся `rename`'ом,
+    и flock на нём держался бы за уже удалённый inode. Тот же приём, что у
+    `orders._mutate` и у листа ожидания.
+    """
+    root = root or resolve_feedback_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / (".%s.lock" % _validate_feedback_id(feedback_id))
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def mutate(
+    feedback_id: str,
+    fn: Callable[[Optional[dict]], Optional[dict]],
+    *,
+    root: Optional[Path] = None,
+) -> Optional[dict]:
+    """Единственная дверь «прочитать → изменить → записать» окна правок.
+
+    Под замком читает текущее состояние, отдаёт его `fn` и записывает то, что
+    `fn` вернула. `fn` вернула None → не пишем ничего (правку не приняли).
+    Возвращает записанное состояние (или None).
+
+    Кто меняет окно правок — обязан идти сюда, а не звать `read_state` +
+    `write_state` подряд: между ними влезает второй процесс.
+    """
+    with locked(feedback_id, root=root):
+        current = read_state(feedback_id, root=root)
+        new_state = fn(current)
+        if new_state is None:
+            return None
+        write_state(new_state, root=root, under_lock=True)
+        return new_state
+
+
+class ConcurrentWrite(RuntimeError):
+    """Состояние под руками изменил кто-то ещё — запись затёрла бы его правку."""
+
+
+def _on_disk_rev(target: Path) -> Optional[int]:
+    """Номер ревизии того, что сейчас лежит на диске (None — файла нет/битый).
+
+    Считаем ревизии, а не метки времени: `updated_at` идёт с точностью до
+    СЕКУНДЫ, и две записи в одну секунду выглядели бы одинаковыми — то есть
+    защита не сработала бы ровно в том случае, ради которого сделана (две
+    правки в одну минуту). Поле ленивое: у состояний до этой правки его нет,
+    первая же запись его заводит.
+    """
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return int(data.get("rev")) if data.get("rev") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def write_state(state: dict, *, root: Optional[Path] = None, under_lock: bool = False) -> Path:
+    """Атомарно записывает state-файл (`tempfile + os.rename`, fsync). Возвращает Path.
+
+    🔴 ПРОВЕРКА НА ЗАТИРАНИЕ (оптимистичная блокировка). Пишем объект ЦЕЛИКОМ,
+    поэтому запись состояния, прочитанного ДО чужой правки, стирает её без следа:
+    человек получил «✅ принял», а правки в новой версии нет. Замок (`mutate`)
+    закрывает это для нашего кода, но низкоуровневый `read_state`+`write_state`
+    остаётся доступен — и однажды кто-нибудь его так и позовёт. Поэтому сверяем
+    `updated_at`: у прочитанного «мимо» замка он разойдётся с диском, и мы
+    поднимаем `ConcurrentWrite` вместо тихой потери. Лечится переводом вызова на
+    `mutate()`.
+
+    `under_lock=True` ставит ТОЛЬКО `mutate` — там конкуренцию держит flock, а
+    состояние внутри транзакции может быть собрано с нуля (новый раунд поверх
+    `reissuing`), то есть законно без метки.
+    """
     feedback_id = _validate_feedback_id(state.get("feedback_id", ""))
     root = root or resolve_feedback_dir()
     root.mkdir(parents=True, exist_ok=True)
     target = root / f"{feedback_id}{STATE_SUFFIX}"
+    disk_rev = _on_disk_rev(target) if target.exists() else None
+    if not under_lock and target.exists():
+        seen_rev = state.get("rev")
+        # `seen_rev is None` при ревизованном файле — это «состояние собрали с
+        # нуля, пока файл уже был»: ровно первый ход гонки (читатель пришёл,
+        # когда файла ещё не было, а записать успел позже). Битый JSON на диске
+        # (`disk_rev is None`) перезаписывать МОЖНО — это починка, а не затирание.
+        if disk_rev is not None and disk_rev != seen_rev:
+            raise ConcurrentWrite(
+                "состояние %s изменилось под руками (ревизия на диске %s, у нас "
+                "%s) — запись затёрла бы чужую правку; читай и меняй через "
+                "feedback_state.mutate()" % (feedback_id, disk_rev, seen_rev)
+            )
+    state["rev"] = (disk_rev or 0) + 1
     state["updated_at"] = now_iso()
 
     fd, tmp = tempfile.mkstemp(prefix=f".{feedback_id}.", suffix=".json.tmp", dir=str(root))
@@ -216,14 +331,16 @@ def mark_status(
     """Обновляет статус (атомарно). Возвращает новый state или None если файла нет."""
     if new_status not in VALID_STATUSES:
         raise ValueError(f"unknown status: {new_status!r}")
-    state = read_state(feedback_id, root=root)
-    if state is None:
-        return None
-    state["status"] = new_status
-    if extra:
-        state.update(extra)
-    write_state(state, root=root)
-    return state
+
+    def _apply(state: Optional[dict]) -> Optional[dict]:
+        if state is None:
+            return None
+        state["status"] = new_status
+        if extra:
+            state.update(extra)
+        return state
+
+    return mutate(feedback_id, _apply, root=root)
 
 
 def claim_for_reissue(feedback_id: str, *, root: Optional[Path] = None) -> Optional[dict]:
@@ -240,16 +357,21 @@ def claim_for_reissue(feedback_id: str, *, root: Optional[Path] = None) -> Optio
     следующий раунд. Без claim reply в окне между `ready_for_reissue` и
     перевыпуском затирал бы несъеденные edits (`_new_round_state`).
 
-    Модель конкуренции: единственный писатель — listener (один процесс); атомарность
-    обеспечивает rename в `write_state` (как и весь остальной feedback_state).
+    Модель конкуренции: писателей ДВА процесса — listener (реплаи, sweep) и шлюз
+    (правки с портала). Проверка статуса и запись claim'а идут под межпроцессным
+    замком (`locked`), иначе правка с портала, приехавшая между чтением и
+    записью, вернула бы статус в `collecting` со старым списком — и раунд ушёл бы
+    в перевыпуск дважды.
     """
-    state = read_state(feedback_id, root=root)
-    if state is None or state.get("status") != "ready_for_reissue":
-        return None
-    state["status"] = "reissuing"
-    state["reissue_claimed_at"] = now_iso()
-    write_state(state, root=root)
-    return state
+
+    def _claim(state: Optional[dict]) -> Optional[dict]:
+        if state is None or state.get("status") != "ready_for_reissue":
+            return None
+        state["status"] = "reissuing"
+        state["reissue_claimed_at"] = now_iso()
+        return state
+
+    return mutate(feedback_id, _claim, root=root)
 
 
 def _parse_iso(ts: Optional[str]) -> Optional[datetime]:

@@ -258,16 +258,33 @@ def _owner_by_telegram_id(user_id: Optional[int]) -> Optional[Tuple[OrderOwner, 
 
 
 def _order_for_chat(chat_id: Optional[int]) -> Optional[Tuple[OrderOwner, Dict[str, Any]]]:
-    """Первый живой наряд, чей чат доставки = этот чат."""
+    """Первый живой наряд, чей чат доставки = этот чат.
+
+    🔴 Личка сотрудника — тоже его чат. У наряда с `delivery: dm` поле
+    `telegram_chat_id` пустое (адрес выводится из `owner.telegram_user_id`), и
+    сравнение только по нему отвечало «чат не обслуживается» на личку человека,
+    которому бот сам же и написал. Следствие было тихим и злым: бот задавал
+    сотруднику уточнение «кто говорил во фрагменте…» С КУСКОМ РАСШИФРОВКИ и
+    предлагал нажать кнопку — а нажатие не обрабатывалось вовсе, и в протоколе
+    навсегда оставался «Говорящий 2».
+
+    В Telegram id ЛИЧНОГО чата равен id пользователя — на этом же равенстве
+    построен `Principal.is_direct` (`chat_id == dm_chat_id`), так что второе
+    сравнение не расширяет доверие, а лишь перестаёт терять его при `delivery:
+    dm`. Групповые чаты сюда попасть не могут: их id отрицательные.
+    """
     if chat_id is None or isinstance(chat_id, bool):
         return None
+    fallback: Optional[Tuple[OrderOwner, Dict[str, Any]]] = None
     for order in _active_orders():
-        if order.get("telegram_chat_id") != chat_id:
-            continue
         owner = order_owner(order)
-        if owner is not None:
+        if owner is None:
+            continue
+        if order.get("telegram_chat_id") == chat_id:
             return owner, order
-    return None
+        if fallback is None and owner.telegram_user_id == chat_id:
+            fallback = (owner, order)
+    return fallback
 
 
 # ---------------------------------------------------------------------------

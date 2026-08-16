@@ -4,8 +4,11 @@
   - 1.4  Правка авторства реплаем → перевыпуск с верным авторством через
          ДЕТЕРМИНИРОВАННЫЙ remap спикер→имя ДО регенерации (НЕ LLM-правкой-данными).
          Своп-безопасно (Илья↔Михаил). Авторская правка не уходит в LLM-блок и не
-         отравляет term/meaning-обучение. Ретрай-безопасно (remap коммитится на диск
-         только при доставке).
+         отравляет term/meaning-обучение. Ретрай-безопасно: remap коммитится на
+         диск, когда новая версия СТАЛА КАНОНИЧЕСКОЙ (`sent` либо
+         `not-delivered-yet` — слать в Telegram некуда/ещё рано), и НЕ коммитится
+         при реальном сбое доставки (`error`/`skipped`), иначе ретрай свопнул бы
+         имена второй раз.
   - 1.2  Исправленное сопоставление спикер→имя живёт на серию: `speaker_mapping` в
          `build_digest` → `resolve_speaker_anchor` → якорь в `map_all` через
          валидацию строгим vocative (человеческое закрепление бьёт догадку Ф4а;
@@ -518,7 +521,15 @@ class TestReissueAuthorshipRemap(unittest.TestCase):
         self.assertNotIn("это не Илья", texts)
 
     def test_retry_safe_no_double_swap_on_delivery_failure(self):
-        """Доставка упала → транскрипт НЕ тронут; ретрай применяет своп РОВНО раз."""
+        """Доставка УПАЛА → транскрипт НЕ тронут; ретрай применяет своп РОВНО раз.
+
+        Ремонт Ф10d/Б2: «упала» — это `error`/`skipped`, а НЕ `not-delivered-yet`.
+        Последнее означает «в Telegram слать некуда/ещё рано» (маршрут «только
+        портал» или grace-окно первичной доставки), и там версия как раз
+        КАНОНИЧЕСКАЯ — см. `test_portal_only_commits_remap_and_protocol`. Раньше
+        этот тест брал `not-delivered-yet` как удобный «не-sent», и вместе с ним
+        код считал, что правку порталовой встречи можно не записывать на диск.
+        """
         gen_seen = []
 
         def fake_gen(gen_path, meeting_meta, sid):
@@ -526,13 +537,13 @@ class TestReissueAuthorshipRemap(unittest.TestCase):
             return "#протоколвстречи\n\n**Участники:** Илья, Михаил\n\n## 1) Т\n\n▪️ Новое.\n"
 
         st = self._state([{"author": "Илья", "text": "это не Илья, а Михаил"}])
-        # 1-й проход: доставка не прошла (not-delivered-yet) → диск не трогаем.
+        # 1-й проход: доставка реально упала (Telegram лёг) → диск не трогаем.
         res1 = fr.reissue_one(
             st, root=self.root, generate_fn=fake_gen,
-            redeliver_fn=lambda *a, **k: {"status": "not-delivered-yet"},
+            redeliver_fn=lambda *a, **k: {"status": "error", "error": "telegram 502"},
             save_version_fn=lambda p: p,
         )
-        self.assertEqual(res1["status"], "not-delivered-yet")
+        self.assertEqual(res1["status"], "error")
         self.assertEqual(self.transcript_path.read_text(encoding="utf-8"), TRANSCRIPT_INVERTED)
         # 2-й проход (ретрай): доставка прошла → своп применён ОДИН раз (из оригинала).
         res2 = fr.reissue_one(
@@ -546,6 +557,30 @@ class TestReissueAuthorshipRemap(unittest.TestCase):
         self.assertIn("**[00:12] Илья:** Палетное хранение занято на треть.", on_disk)
         # Оба генератора видели один и тот же свопнутый вход (детерминизм, не двойной своп).
         self.assertEqual(gen_seen[0], gen_seen[1])
+
+    def test_portal_only_commits_remap_and_protocol(self):
+        """`not-delivered-yet` → и протокол, и remapped транскрипт НА ДИСКЕ.
+
+        Это встреча с маршрутом «только портал» (телеграмного адресата нет вовсе)
+        либо встреча в grace-окне первичной доставки. Гейт `sent` оставлял диск
+        нетронутым: очередь портала читает протокол С ДИСКА, значит в ленту
+        версий уезжала v2, побайтно равная v1 — правка «принята» и потеряна.
+        А следующий раунд регенерировал бы протокол из НЕ-remapped транскрипта,
+        то есть исправленное авторство отваливалось бы ещё раз.
+        """
+        new_protocol = "#протоколвстречи\n\n**Участники:** Илья, Михаил\n\n## 1) Т\n\n▪️ Новое.\n"
+        res = fr.reissue_one(
+            self._state([{"author": "Илья", "text": "это не Илья, а Михаил"}]),
+            root=self.root,
+            generate_fn=lambda gp, mm, sid: new_protocol,
+            redeliver_fn=lambda *a, **k: {"status": "not-delivered-yet"},
+            save_version_fn=lambda p: p,
+        )
+        self.assertEqual(res["status"], "not-delivered-yet")
+        self.assertEqual(self.protocol_path.read_text(encoding="utf-8"), new_protocol)
+        on_disk = self.transcript_path.read_text(encoding="utf-8")
+        self.assertIn("**[00:00] Михаил:** Начнём со склада.", on_disk)
+        self.assertIn("**[00:12] Илья:** Палетное хранение занято на треть.", on_disk)
 
     def test_no_remap_tmp_left_behind(self):
         """Временный remap-файл не остаётся в папке серии после перевыпуска."""

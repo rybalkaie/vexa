@@ -41,6 +41,33 @@ systemctl status meeting-notary-gateway
 Зависимостей сверх стандартной библиотеки у самого шлюза нет; `pyyaml` (для `/status`)
 и headless-chromium (для `?format=pdf`) уже стоят в `/home/dev/meeting-notary/venv`.
 
+### 2а. 🔴 Юнит ОБНОВЛЁН (правка приёмки Ф10d) — переставить обязательно
+
+Ручка правок с портала (`POST /protocol/edit`) живёт в процессе шлюза и пишет то же
+окно правок, что листенер. Юнит намеренно не грузит `.env.notary`, поэтому раньше
+процесс уходил на **дефолты из кода** — а дефолт каталога правок это
+`/opt/meeting-notary/_feedback_edits`, каталог root'а. Под `dev` запись падает, и
+**каждая правка теряется без ack** — ровно инцидент 2026-06-08, только через новую
+дверь. В юнит добавлены `MEETING_NOTARY_FEEDBACK_DIR`, `TELEMOST_PROTOCOL_DIR`,
+`MEETING_NOTARY_DELIVERED_ROOTS`, `ENABLE_PORTAL_ORDERS`, `ENABLE_FEEDBACK_EDITS`,
+`ENABLE_QUOTE_POLICY`, окна правок, `MEETING_NOTARY_LOG_DIR`,
+`MEETING_NOTARY_MAX_CONCURRENT_BOTS` и `ReadWritePaths` на каталог правок.
+
+Перед `daemon-reload`:
+
+```bash
+# каталоги должны существовать и принадлежать dev — иначе запись упадёт молча
+sudo -u dev mkdir -p /home/dev/meeting-notary/_tmp/_feedback_edits /home/dev/meeting-notary/logs
+sudo -u dev test -w /home/dev/meeting-notary/_tmp/_feedback_edits && echo "каталог правок писабелен"
+```
+
+⚠️ Значения путей и окон **продублированы** из `.env.notary` — правишь там, правь и в
+юните. Сторож `test_gateway_unit_declares_env` сверяет список переменных юнита с
+реальными `os.environ.get` в коде ручек и краснеет, если появилась необъявленная.
+
+⚠️ `MEETING_NOTARY_MAX_CONCURRENT_BOTS=2` в юните шлюза обязан совпадать со значением
+у runner'а: разъедется — портал будет обещать слот, которого нет.
+
 ## 3. Caddy + DNS
 
 1. A-запись `watson.anzhee.ru` → IP VPS (авто-TLS требует, чтобы имя резолвилось

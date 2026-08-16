@@ -23,9 +23,44 @@ Environment=HOME=/home/dev
 # выбивает сам себя за 1–3 дня и молча убивает все службы (инциденты 26.06, 17.07).
 # ⚠️ Значения продублированы из .env.notary. Поменял их там — поменяй и здесь,
 # иначе шлюз будет отдавать протоколы из вчерашней папки и молчать об этом.
+# 🔴 ЗДЕСЬ ОБЯЗАН БЫТЬ КАЖДЫЙ ПУТЬ/ФЛАГ, КОТОРЫЙ ЧИТАЕТ КОД РУЧЕК ШЛЮЗА. Не
+# объявил — процесс берёт дефолт из кода, а дефолты писались под листенер
+# (`/opt/...`, куда `dev` писать не может). Ровно так в июне потерялись ВСЕ
+# правки: листенер падал с PermissionError на дефолте `/opt/meeting-notary/
+# _feedback_edits` (инцидент 2026-06-08). Сторож `test_gateway_unit_declares_env`
+# сверяет этот список с реальными `os.environ.get` в цепочке ручек.
 Environment=MEETING_NOTARY_REGISTRY_DIR=/srv/meeting-notary/registry
 Environment=MEETING_NOTARY_PROTOCOLS_DIR=/home/dev/meeting-notary/_tmp/protocols
 Environment=MEETING_NOTARY_ARCHIVE_DIR=/srv/meeting-notary/protocols
+
+# ── Ф10d: правка протокола С ПОРТАЛА (POST /protocol/edit) ─────────────────
+# Ручка кладёт правку в ТО ЖЕ окно, что реплай в чате, — значит ей нужны те же
+# каталоги, что листенеру, а не «свои». Разъедутся — правка с экрана и правка
+# реплаем попадут в РАЗНЫЕ окна, и встреча выпустит две версии, каждую без
+# правок другой стороны.
+Environment=MEETING_NOTARY_FEEDBACK_DIR=/home/dev/meeting-notary/_tmp/_feedback_edits
+Environment=TELEMOST_PROTOCOL_DIR=/home/dev/meeting-notary/_tmp/protocols
+Environment=MEETING_NOTARY_DELIVERED_ROOTS=/home/dev/meeting-notary/_tmp/transcripts:/home/dev/meeting-notary/_tmp/protocols:/srv/meeting-notary/protocols
+# Без этого флага `_portal_author_is_organizer` всегда False: наряд не читается,
+# организатор не опознаётся НИ У ОДНОЙ правки с портала, и правило цитирования
+# отбивает даже автора встречи.
+Environment=ENABLE_PORTAL_ORDERS=1
+Environment=ENABLE_FEEDBACK_EDITS=1
+Environment=ENABLE_QUOTE_POLICY=1
+# Окна сбора правок — те же значения, что у листенера (20 мин от последней,
+# потолок 2 ч от первой). Разъедутся — человек увидит на портале одно время
+# выхода новой версии, а получит другое.
+Environment=FEEDBACK_WINDOW_MIN=20
+Environment=FEEDBACK_MAX_WINDOW_MIN=120
+Environment=FEEDBACK_MAX_EDITS_PER_WINDOW=30
+# Файловый журнал шлюза. Дефолт в коде — мак-путь `~/Library/Logs/...`, на VPS
+# это молча создаёт мусорный каталог в /home/dev и прячет журнал не там, где его
+# ищут (`journalctl` при этом работает — потому и не замечали).
+Environment=MEETING_NOTARY_LOG_DIR=/home/dev/meeting-notary/logs
+# Потолок одновременных записей — ОБЩИЙ с runner'ом. Разъедется — портал
+# пообещает слот, которого нет (ровно то, что Ф10b чинила «честным лимитом»).
+# Меняешь тут — меняй и в юните runner'а/в .env.notary.
+Environment=MEETING_NOTARY_MAX_CONCURRENT_BOTS=2
 
 # ── Секрет ─────────────────────────────────────────────────────────────────
 # Только MEETING_NOTARY_GATEWAY_TOKEN (≥32 знака). Файл создаётся на VPS руками,
@@ -58,8 +93,17 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# Реестр нарядов и рабочая папка протоколов — единственное, что шлюз пишет/читает.
+# Реестр нарядов, окно правок и рабочая папка протоколов — то, что шлюз пишет.
+# 🔴 `_feedback_edits` обязан быть ЗДЕСЬ и быть writable: ручка правок пишет
+# состояние окна (`feedback_state.write_state`) и берёт flock на `.<fid>.lock`.
+# Нет пути в списке → ProtectSystem=full отдаёт EROFS, и каждая правка с портала
+# теряется без внятной ошибки — тот же класс отказа, что инцидент 2026-06-08.
 ReadWritePaths=/srv/meeting-notary/registry
+ReadWritePaths=/home/dev/meeting-notary/_tmp/_feedback_edits
+ReadWritePaths=/home/dev/meeting-notary/logs
+# Протоколы шлюз только ЧИТАЕТ (отдаёт по запросу портала, ищет встречу правки).
+ReadOnlyPaths=/home/dev/meeting-notary/_tmp/protocols
+ReadOnlyPaths=/home/dev/meeting-notary/_tmp/transcripts
 ReadOnlyPaths=/srv/meeting-notary/protocols
 
 [Install]

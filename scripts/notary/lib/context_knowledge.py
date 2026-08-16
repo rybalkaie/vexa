@@ -43,7 +43,7 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, NamedTuple, Optional, TypedDict
+from typing import Any, Iterator, NamedTuple, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -2107,19 +2107,66 @@ def is_name_inactive(name: Optional[str], company: Optional[str]) -> bool:
     return n in inactive_person_names(company)
 
 
+#: Кэш «какие серии есть в оргструктуре компании», ключ — (путь, mtime_ns, размер).
+#: Нужен потому, что проверка однозначности читает оргструктуры ВСЕХ компаний, а
+#: не останавливается на первом совпадении: без кэша каждый вызов парсил бы YAML
+#: по числу компаний (замер: +20 с на одном тест-модуле). Ключ по mtime+размеру —
+#: файл изменили, кэш промахнулся сам, ручной инвалидации нет.
+_ORG_SLUGS_CACHE: dict[str, tuple[Any, frozenset]] = {}
+
+
+def reset_org_slugs_cache() -> None:
+    """Сбросить кэш slug'ов оргструктур. Для проб, подменяющих оргструктуру."""
+    _ORG_SLUGS_CACHE.clear()
+
+
+def _org_slugs_cached(company: Optional[str]) -> frozenset:
+    """Множество slug'ов серий в оргструктуре компании (кэшируется по mtime)."""
+    kdir = knowledge_dir(company)
+    if not kdir:
+        return frozenset()
+    path = Path(kdir) / ORG_STRUCTURE_FILE
+    try:
+        st = path.stat()
+        stamp: Any = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = (str(path), None, None)
+    cached = _ORG_SLUGS_CACHE.get(str(company))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    slugs = frozenset(load_org_structure(company))
+    _ORG_SLUGS_CACHE[str(company)] = (stamp, slugs)
+    return slugs
+
+
 def company_for_series(series_slug: Optional[str]) -> Optional[str]:
     """Компания серии по её slug — поиск slug по оргструктурам всех компаний.
 
     До Ф6 (поле `company` в разметке серии) это единственный источник привязки
-    серии к компании. Slug уникален (папка серии) → первое совпадение корректно.
-    Нет совпадения / нет YAML → None (вызыватель уходит в fallback на встроенное).
+    серии к компании. Нет совпадения / нет YAML → None (вызыватель уходит в
+    fallback на встроенное).
+
+    🔴 СОВПАДЕНИЕ ДОЛЖНО БЫТЬ ЕДИНСТВЕННЫМ. Раньше здесь бралось ПЕРВОЕ, на
+    основании «slug уникален (папка серии)». Уникален он в пределах ОДНОГО
+    реестра, а оргструктур несколько — по одной на компанию, и заводят их разные
+    люди. Совпал `koordinatsiya` в обеих — и знание чужой компании (глоссарий,
+    выученные правила, свидетельства из чатов) молча уезжало в промпт сборки
+    протокола. Двусмысленность — это НЕ ответ: возвращаем None и говорим об этом
+    в журнал, дальше вызыватель работает без company-слоя, а не на чужом.
     """
     if not series_slug or not str(series_slug).strip():
         return None
     slug = str(series_slug).strip()
-    for company in known_companies():
-        if slug in load_org_structure(company):
-            return company
+    hits = [c for c in known_companies() if slug in _org_slugs_cached(c)]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        logger.warning(
+            "[context] серия %r есть в оргструктурах нескольких компаний (%s) — "
+            "компанию НЕ выбираю: угадать здесь означает подмешать в сборку "
+            "знание чужой компании. Разметь серию полем `company` в watched.yaml",
+            slug, ", ".join(sorted(hits)),
+        )
     return None
 
 
