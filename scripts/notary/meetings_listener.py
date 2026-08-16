@@ -3736,9 +3736,132 @@ def _job_apply_reply(
     send_message(token, chat_id, text, reply_to=msg_id)
 
 
+def maybe_route_to_bind_command(
+    token: str, cid: Optional[int], allowed_chat: int, msg: dict[str, Any]
+) -> bool:
+    """Ф12 (R8.1–R8.6): привязка сотрудника кодом и привязка группы `/привязать`.
+
+    🔴 ЭТОТ РОУТ — ЕДИНСТВЕННОЕ МЕСТО, ГДЕ БОТ ГОВОРИТ С ЧЕЛОВЕКОМ, КОТОРОГО
+    ЕЩЁ НЕ ЗНАЕТ. Все остальные роуты либо требуют владельца, либо работают в
+    обслуживаемом чате; здесь наоборот — приходит незнакомец и заявляет, кто он.
+    Отсюда три правила, каждое из которых снимает свою дыру:
+
+      1. РЕШАЕТ ПОРТАЛ, А НЕ БОТ. Бот не знает ни срока кода, ни счётчика
+         попыток, ни того, чей это код: он передаёт и печатает ответ. Иначе у
+         идентичности стало бы два источника правды, и расходились бы они молча.
+
+      2. OWNER-ГЕЙТА ЗДЕСЬ НЕТ — И ЭТО ГЛАВНОЕ ОТЛИЧИЕ ОТ СОСЕДНИХ
+         `maybe_route_to_set_chat_command` / `maybe_route_to_mode_command`.
+         Требование R8.6 просит, чтобы группу привязывал ЛЮБОЙ сотрудник, а не
+         владелец бота: иначе подключение снова становится задачей одного
+         человека, ради ухода от которой фаза и делалась. Замена гейта не
+         «ничего», а ПРИВЯЗКА: портал заводит группу, только если отправитель
+         уже опознан как сотрудник (`not-linked` — отказ). «Любой сотрудник» ≠
+         «любой, кто нашёл бота».
+
+      3. МОЛЧИМ, ЕСЛИ ЭТО НЕ КОМАНДА. Возврат `False` пропускает сообщение
+         дальше по конвейеру — бот, отвечающий «не понял» на каждую реплику в
+         группе, хуже молчащего.
+
+    ⚠️ PRIVACY MODE. У бота включён privacy mode (решение владельца 05.08): в
+    группе он видит только реплаи на себя, упоминания и слэш-команды, причём
+    командой Telegram считает `/` + ЛАТИНИЦУ. Кириллическое `/привязать` под это
+    определение не подходит и может до бота не доехать — поэтому разбор
+    принимает и `/bind`. Какая форма доедет на живом сервере, проверяется только
+    боем; долг записан в плане фазы.
+    """
+    if cid is None:
+        return False
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return False
+
+    try:
+        from notary.lib.bind_command import parse_bind_command  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        # 🔴 warning, НЕ debug: уровень логгера листенера — INFO, и на debug
+        # пропажа модуля осталась бы без следа, то есть фича молча мертва.
+        logger.warning("[bind] разбор недоступен (%s)", type(e).__name__)
+        return False
+
+    is_dm = _is_direct_chat(cid, allowed_chat)
+    parsed = parse_bind_command(text, direct=is_dm)
+    if parsed is None:
+        return False
+
+    from_id = (msg.get("from") or {}).get("id")
+    if not isinstance(from_id, int):
+        # Без отправителя привязывать некого: портал считает попытки именно по
+        # нему. Канальные посты (`from` пуст) сюда и попадают.
+        return False
+
+    if parsed.kind == "start":
+        send_message(token, cid, BIND_START_REPLY)
+        return True
+
+    try:
+        from notary.lib import portal_link  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[bind] клиент портала недоступен (%s)", type(e).__name__)
+        send_message(token, cid, BIND_UNAVAILABLE_REPLY)
+        return True
+
+    if parsed.kind == "code":
+        username = (msg.get("from") or {}).get("username")
+        result = portal_link.submit_code(
+            telegram_user_id=from_id,
+            telegram_username=username if isinstance(username, str) else None,
+            code=parsed.value or "",
+        )
+        # 🔴 КОД В ЖУРНАЛ НЕ ПИШЕТСЯ НИКОГДА — ни целиком, ни частью. Это пароль
+        # на пятнадцать минут, а лог листенера лежит файлом на диске VPS.
+        # Числовой отправитель здесь тоже не пишем: рядом с исходом привязки эта
+        # пара означает «кто именно сейчас подключает себе протоколы».
+        logger.info("[bind] код: исход=%s", result.outcome or result.error or "?")
+        send_message(token, cid, result.reply or portal_link.UNAVAILABLE_REPLY)
+        return True
+
+    # parsed.kind == "group"
+    title = (msg.get("chat") or {}).get("title") or ""
+    result = portal_link.submit_group(
+        telegram_chat_id=cid,
+        title=title if isinstance(title, str) else "",
+        member_count=None,
+        telegram_user_id=from_id,
+        organization=parsed.value,
+    )
+    logger.info("[bind] группа: исход=%s", result.outcome or result.error or "?")
+    send_message(token, cid, result.reply or portal_link.UNAVAILABLE_REPLY)
+    return True
+
+
+#: Ответ на `/start` — единственный текст привязки, который живёт в боте.
+#: Остальные приходят от портала (см. врезку `lib/portal_link.py`): этот нужен
+#: ДО любого похода в сеть, потому что человек ещё ничего не прислал.
+BIND_START_REPLY = (
+    "Привет! Я Ватсон — записываю встречи и присылаю протоколы.\n\n"
+    "Чтобы я понял, кто вы, откройте на портале «Встречи → Ватсон», "
+    "возьмите код из шести цифр и пришлите его мне сюда одним сообщением."
+)
+
+#: Когда до портала не достучаться — а сказать что-то надо.
+BIND_UNAVAILABLE_REPLY = (
+    "Портал сейчас не отвечает — не могу проверить. Попробуйте ещё раз через пару минут."
+)
+
+
 def process_message(token: str, allowed_chat: int, msg: dict[str, Any]) -> None:
     chat = msg.get("chat") or {}
     cid = chat.get("id")
+
+    # Ф12 (R8.1–R8.6): привязка сотрудника и групп. ПЕРВЫМ РОУТОМ и обязательно
+    # ДО DM-гейта ниже: `/привязать` приходит из ГРУППЫ, которую бот сегодня не
+    # обслуживает вовсе (её и надо привязать), а код — из лички человека,
+    # которого бот ещё не знает. Оба сообщения DM-гейт отбросил бы молча.
+    # Триггер узкий (слэш-команда либо ровно шесть цифр в личке), обычную
+    # переписку и команды коррекции роут не перехватывает.
+    if maybe_route_to_bind_command(token, cid, allowed_chat, msg):
+        return
 
     # ISS-7/REQ 7.4: команда смены чата серии «серию X шли сюда/в личку/в чат N».
     # ДО шлюза правок и DM-гейта — команду владелец может дать прямо в целевой
