@@ -1357,14 +1357,58 @@ class TestInvalidInputs(_Base):
 
 
 class TestPortalOff(_Base):
-    """🔴 `ENABLE_PORTAL_ORDERS=OFF` возвращает сегодняшнее поведение целиком."""
+    """🔴 `ENABLE_PORTAL_ORDERS=OFF` возвращает сегодняшнее поведение — там, где
+    оно есть. У порталового наряда вчерашнего поведения нет: он деградирует в
+    «только портал», а не в личку владельца бота (ремонт ШОВ-С9)."""
 
     flag_default = None
 
-    def test_route_is_owner_legacy_even_with_stamped_meta(self):
-        stamped = {"id": "portal:x", "company": "mpfirst",
-                   "owner": {"portal_user_id": "43", "telegram_user_id": SIDOROV_TG}}
-        route = delivery_route.route_for_meeting({"order": stamped, "series": "s"})
+    def _stamped(self) -> Dict[str, Any]:
+        return {"id": "portal:x", "company": "mpfirst",
+                "owner": {"portal_user_id": "43", "telegram_user_id": SIDOROV_TG}}
+
+    def test_stamped_portal_order_degrades_to_portal_only_not_owner(self):
+        """🔴 ЧТО ЛОМАЛОСЬ. Аварийный выключатель отдавал отштампованному наряду
+        `MODE_OWNER` — а это «личная серия владельца бота», то есть протокол
+        ЧУЖОЙ КОМПАНИИ уезжал в личный чат одного человека. Прежняя проба это
+        поведение и закрепляла: она требовала `is_owner_legacy`.
+
+        У наряда портала вчерашнего поведения не существует — вчера его не было
+        вовсе. Единственная честная деградация — «только портал».
+        """
+        route = delivery_route.route_for_meeting({"order": self._stamped(), "series": "s"})
+        self.assertFalse(route.is_owner_legacy,
+                         "выключатель увёл протокол компании в личку владельца бота")
+        self.assertTrue(route.portal_only, route)
+        self.assertIsNone(route.chat_id)
+        self.assertEqual(route.reason, delivery_route.REASON_FLAG_OFF)
+        # Компания сохранена: портал раскладывает результат по ней.
+        self.assertEqual(route.company, "mpfirst")
+
+    def test_flag_off_sends_nothing_to_telegram_for_a_portal_order(self):
+        """Сквозная половина: не «маршрут другой», а НИ ОДНОГО сообщения."""
+        from notary.lib import llm_postprocess as lp
+
+        meta = {"sessionUid": "sid-off", "series": "s", "date": "2026-08-20",
+                "order": self._stamped()}
+        sent: List[Any] = []
+        with mock.patch.object(lp, "telegram_api") as tg:
+            tg.send_document.side_effect = lambda *a, **kw: sent.append(a)
+            tg.send_message.side_effect = lambda *a, **kw: sent.append(a)
+            res = lp.deliver_protocol(
+                meeting_meta=meta, protocol_text="# П\n\nтело", meeting_sid="sid-off",
+            )
+        self.assertEqual(sent, [], "при выключателе OFF протокол наряда ушёл в Telegram")
+        self.assertEqual(res.get("status"), "portal-only", res)
+
+    def test_flag_off_asks_no_clarification_about_someone_elses_meeting(self):
+        """Уточнение несёт кусок расшифровки — при аварийном OFF оно не задаётся."""
+        self.assertIsNone(
+            delivery_route.clarify_chat_for_meeting({"order": self._stamped(), "series": "s"}))
+
+    def test_owner_personal_series_still_legacy(self):
+        """Личные серии владельца выключателем не задеты: штампа у них нет."""
+        route = delivery_route.route_for_meeting({"series": "lichnaya"})
         self.assertTrue(route.is_owner_legacy)
 
     def test_no_disk_access_when_off(self):
