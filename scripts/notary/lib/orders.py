@@ -491,6 +491,36 @@ def validate_order_payload(
         else:
             out["telegram_chat_id"] = chat_id
 
+    # --- маршрут доставки: «кому уходит протокол» (Ф10d, R7.10) ---
+    #
+    # Поле необязательное: не прислали — бот выбирает сам (группа, если чат
+    # привязан, иначе личка владельца наряда, иначе только портал). Прислали
+    # мусор — 422, а не «поняли как смогли»: «отправь в личку» и «отправь в
+    # группу» отличаются кругом читателей, и угадывать здесь нечего.
+    #
+    # 🔴 `dm` без привязанного телеграма сотрудника и `group` без чата
+    # ОТБИВАТЬ НЕЛЬЗЯ: привязка появляется на экране «Ватсон» (Ф12) уже ПОСЛЕ
+    # постановки наряда, и отказ означал бы «встречу не записать, пока не
+    # подключишь телеграм». Такой наряд принимается, а на доставке честно
+    # деградирует в «только портал» — см. `lib/delivery_route.py`.
+    delivery = payload.get("delivery")
+    if delivery is not None:
+        from notary.lib import delivery_route  # noqa: PLC0415
+
+        if not isinstance(delivery, str) or delivery.strip().lower() not in (
+            delivery_route.REQUESTABLE_MODES
+        ):
+            errors.append(
+                _err(
+                    "delivery",
+                    "unknown",
+                    "маршрут доставки — одно из: %s"
+                    % ", ".join(delivery_route.REQUESTABLE_MODES),
+                )
+            )
+        else:
+            out["delivery"] = delivery.strip().lower()
+
     # --- владелец наряда: «ЧЕЙ это наряд» (Ф10a, R7.10) ---
     #
     # При `ENABLE_PORTAL_ORDERS=OFF` поле необязательно — ровно как приехало из

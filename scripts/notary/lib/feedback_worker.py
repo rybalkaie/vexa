@@ -109,6 +109,20 @@ def series_allowlist_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+#: Ф10d (R6.3): откуда приехала правка. Одна лента версий, два входа.
+SOURCE_TELEGRAM = "telegram"
+SOURCE_PORTAL = "portal"
+
+
+def edit_source(edit: Any) -> str:
+    """Источник правки. Нет поля (правки до Ф10d) → Telegram: другого не было."""
+    if isinstance(edit, dict):
+        raw = edit.get("source")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lower()
+    return SOURCE_TELEGRAM
+
+
 def max_edits_per_window() -> int:
     """FM-13: кап числа правок в одном окне сбора (env `FEEDBACK_MAX_EDITS_PER_WINDOW`).
 
@@ -641,10 +655,12 @@ def apply_edit(
 # Точка входа шлюза (IO) — вызывается из meetings_listener
 # --------------------------------------------------------------------------
 
-def _build_edit(msg: dict, author: str, now: datetime) -> dict:
+def _build_edit(
+    msg: dict, author: str, now: datetime, *, is_organizer: Optional[bool] = None
+) -> dict:
     from_user = msg.get("from") or {}
     reply_to = msg.get("reply_to_message") or {}
-    return {
+    edit = {
         "edit_id": f"e-{msg.get('message_id')}",
         "tg_message_id": msg.get("message_id"),
         "reply_to_message_id": reply_to.get("message_id"),
@@ -652,7 +668,63 @@ def _build_edit(msg: dict, author: str, now: datetime) -> dict:
         "author": author,
         "text": (msg.get("text") or "").strip(),
         "at": _iso(now),
+        # Ф10d (R6.3): откуда правка. Портал показывает это строкой в истории
+        # версий («Telegram, Михаил Саргин»), и без поля обе ленты сливаются в
+        # одну безымянную. Значения — `telegram` / `portal`.
+        "source": SOURCE_TELEGRAM,
     }
+    if is_organizer is not None:
+        # Ф10d (R13.2): организатор ли автор. Пишем в саму правку, а не считаем
+        # на перевыпуске: к моменту сборки наряд может быть уже снят, а вопрос
+        # «кому было можно» решается в момент, когда правку принимали.
+        edit["is_organizer"] = bool(is_organizer)
+    return edit
+
+
+def _is_organizer_author(user_id: Any, meeting: Optional[dict]) -> bool:
+    """Ф10d (R13.2): автор правки — организатор ЭТОЙ встречи?
+
+    Личная серия владельца (наряда нет) → организатор он, и ответ тот же, что
+    давало бы старое сравнение со скаляром. Порталовая встреча → организатор тот,
+    чей наряд.
+
+    Модуль не доехал при выкатке → считаем ДА. Fail-open здесь сознателен: цена
+    ошибки «пропустили правку, которую могли отбить» несравнима с ценой «бот
+    перестал принимать правки владельца, потому что не импортировался модуль».
+    """
+    try:
+        from notary.lib import quote_policy  # noqa: PLC0415
+
+        meta = (meeting or {}).get("meta") if isinstance(meeting, dict) else None
+        return quote_policy.is_organizer(
+            user_id,
+            meta if isinstance(meta, dict) else {},
+            owner_chat=_owner_chat_id(),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[feedback] роль автора не определена (%s) — считаю организатором",
+                       type(e).__name__)
+        return True
+
+
+def _owner_chat_id() -> Optional[int]:
+    raw = (os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID") or "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _quote_verdict(text: Optional[str], *, is_organizer: bool):
+    """Вердикт правила цитирования или None, если модуль недоступен (fail-open)."""
+    try:
+        from notary.lib import quote_policy  # noqa: PLC0415
+
+        return quote_policy.check_edit(text, is_organizer=is_organizer)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[feedback] правило цитирования недоступно (%s) — пропускаю",
+                       type(e).__name__)
+        return None
 
 
 def handle_feedback_reply(
@@ -700,7 +772,25 @@ def handle_feedback_reply(
         )
 
     edit_msg = msg if residual == raw_text else {**msg, "text": residual}
-    edit = _build_edit(edit_msg, author, now)
+
+    # Ф10d (R13.2): правка от НЕ-организатора не выносит расшифровку в протокол.
+    # Гейт стоит ДО записи в окно — иначе отклонённая правка всё равно уехала бы
+    # в перевыпуск. Организатор проверяется по наряду встречи; наряда нет
+    # (личная серия) → организатор владелец портала, и его правки идут как вчера.
+    organizer = _is_organizer_author(from_user.get("id"), meeting)
+    verdict = _quote_verdict(residual, is_organizer=organizer)
+    if verdict is not None and not verdict.allowed:
+        logger.info(
+            "[feedback] правка отклонена (%s): автор не организатор, требует цитат "
+            "(fid=%s chat=%s)", verdict.code, fid, chat_id,
+        )
+        try:
+            send(token, chat_id, verdict.message, reply_to_message_id=msg.get("message_id"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[feedback] объяснение отказа не ушло (non-fatal): %s", e)
+        return feedback_state.read_state(fid, root=root) or {}
+
+    edit = _build_edit(edit_msg, author, now, is_organizer=organizer)
 
     state = feedback_state.read_state(fid, root=root)
     prior_status = state.get("status") if isinstance(state, dict) else None
@@ -760,6 +850,220 @@ def handle_feedback_reply(
         fid, new_state.get("round"), kind, author, len(new_state.get("edits", [])), new_state.get("deadline_at"), immediate,
     )
     return new_state
+
+
+# --------------------------------------------------------------------------
+# Ф10d (R6.2/R6.3/R6.7/R13.2): правка С ПОРТАЛА — второй вход в ТУ ЖЕ ленту
+# --------------------------------------------------------------------------
+#
+# 🔴 Механизм НЕ дублируется. Правка с портала кладётся в тот же файл состояния,
+# в то же окно и по тем же правилам, что правка реплаем: 20 минут от последней,
+# потолок 2 часа от первой, перевыпуск одной новой версией. Отличается ровно два
+# поля — `source: "portal"` и автор (сотрудник портала, а не телеграм-профиль).
+# Заведи здесь второе окно — и встреча, которую правят с двух сторон, выпустила
+# бы две версии, каждая без правок другой стороны.
+
+
+class PortalEditError(RuntimeError):
+    """Правку с портала принять нельзя. `code` уходит порталу, текст — человеку."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def find_meeting_by_order(
+    meeting_id: str,
+    *,
+    session_uid: Optional[str] = None,
+    roots: Optional[list[Path]] = None,
+) -> Optional[dict]:
+    """Встреча наряда: {series, date, chat_id, meta_path, message_ids, meta}.
+
+    🔴 БЕЗ ОТСЕЧКИ ПО ДАВНОСТИ (R6.7). Телеграмный поиск строит индекс по
+    `meta.delivered` и режет его 45 днями — там это защита от сканирования всего
+    архива на каждый реплай. Здесь резать нечего: портал называет КОНКРЕТНУЮ
+    встречу по идентификатору, двусмысленности нет, и «встреча слишком старая»
+    не должно быть ответом ни через месяц, ни через полгода.
+
+    `chat_id` берётся из последней записи `delivered` — тот же, что вернул бы
+    телеграмный поиск. Совпадение обязательно: от него зависит `feedback_id`, то
+    есть попадут ли правка с портала и правка реплаем в ОДНО окно.
+    """
+    wanted_order = ""
+    try:
+        from notary.lib import orders as orders_lib  # noqa: PLC0415
+
+        wanted_order = orders_lib.order_id_for_meeting(str(meeting_id or ""))
+    except Exception:  # noqa: BLE001 — модуль нарядов недоступен → ищем по сессии
+        wanted_order = ""
+    sid = str(session_uid or "").strip()
+    if not sid and not wanted_order:
+        return None
+    for root in (roots if roots is not None else _delivered_roots()):
+        if not root.is_dir():
+            continue
+        for mp in _iter_meta_files(root, None):
+            meta = _read_json(mp)
+            if meta is None:
+                continue
+            hit = bool(sid) and str(meta.get("sessionUid") or "") == sid
+            if not hit and wanted_order:
+                stamped = meta.get("order")
+                hit = (
+                    isinstance(stamped, dict)
+                    and str(stamped.get("id") or "") == wanted_order
+                )
+            if not hit:
+                continue
+            recs = _normalize_delivered(meta.get("delivered"))
+            chat_id = None
+            for rec in reversed(recs):
+                if rec.get("message_ids") and rec.get("chat_id") is not None:
+                    try:
+                        chat_id = int(rec["chat_id"])
+                    except (TypeError, ValueError):
+                        chat_id = None
+                    break
+            return {
+                "series": meta.get("series"),
+                "date": meta.get("date") or (meta.get("startTs") or "")[:10],
+                "chat_id": chat_id,
+                "meta_path": str(mp),
+                "message_ids": [],
+                "meta": meta,
+            }
+    return None
+
+
+def apply_portal_edit(
+    *,
+    meeting_id: str,
+    text: str,
+    author: str,
+    portal_user_id: Optional[str] = None,
+    session_uid: Optional[str] = None,
+    edit_id: Optional[str] = None,
+    root: Optional[Path] = None,
+    now: Optional[datetime] = None,
+    roots: Optional[list[Path]] = None,
+) -> dict:
+    """Записать правку с портала в общее окно. Возвращает сводку для ответа портала.
+
+    Бросает `PortalEditError`, если правку принять нельзя: встречи нет, текст
+    пуст, окно переполнено, правило цитирования отбило.
+
+    Ack в Telegram отсюда НЕ шлётся: правку сделали на портале, и подтверждение
+    человек видит там же. Второе подтверждение в чужой чат было бы шумом.
+    """
+    if not is_enabled():
+        raise PortalEditError("edits_disabled", "приём правок выключен (ENABLE_FEEDBACK_EDITS)")
+    body = (text or "").strip()
+    if not body:
+        raise PortalEditError("empty", "текст правки пуст")
+
+    root = root or feedback_state.resolve_feedback_dir()
+    now = now or datetime.now(timezone.utc)
+    meeting = find_meeting_by_order(meeting_id, session_uid=session_uid, roots=roots)
+    if meeting is None:
+        raise PortalEditError(
+            "meeting_not_found",
+            "встреча не найдена: протокол этой встречи бот ещё не собирал",
+        )
+
+    organizer = _portal_author_is_organizer(portal_user_id, meeting)
+    verdict = _quote_verdict(body, is_organizer=organizer)
+    if verdict is not None and not verdict.allowed:
+        logger.info(
+            "[feedback] правка с портала отклонена (%s): автор не организатор",
+            verdict.code,
+        )
+        raise PortalEditError(verdict.code, verdict.message)
+
+    fid = feedback_state.build_feedback_id(
+        meeting.get("series"), meeting.get("date"), meeting.get("chat_id")
+    )
+    edit = {
+        "edit_id": str(edit_id or "p-%s" % int(now.timestamp() * 1000)),
+        "tg_message_id": None,
+        "reply_to_message_id": None,
+        "from_user_id": None,
+        "portal_user_id": portal_user_id,
+        "author": (author or "участник").strip()[:120],
+        "text": body,
+        "at": _iso(now),
+        "source": SOURCE_PORTAL,
+        "is_organizer": bool(organizer),
+    }
+
+    state = feedback_state.read_state(fid, root=root)
+    # Дедуп по `edit_id`: портал вправе повторить запрос после таймаута сети, и
+    # повтор не должен ни задвоить правку, ни сдвинуть окно ещё на 20 минут.
+    if isinstance(state, dict) and state.get("status") == "collecting":
+        if any(
+            isinstance(e, dict) and e.get("edit_id") == edit["edit_id"]
+            for e in (state.get("edits") or [])
+        ):
+            return _portal_edit_summary(state, fid, kind="dup")
+
+    new_state, kind = apply_edit(
+        state, edit=edit, meeting=meeting,
+        win_min=window_min(), max_min=max_window_min(), now=now,
+    )
+    if kind == "capped":
+        raise PortalEditError(
+            "window_full",
+            "в этом окне уже собрано максимум правок — они выйдут одной версией, "
+            "после неё можно прислать следующие",
+        )
+    if kind == "dup":
+        return _portal_edit_summary(new_state, fid, kind="dup")
+
+    feedback_state.write_state(new_state, root=root)
+    logger.info(
+        "[feedback] правка с портала записана fid=%s round=%s kind=%s edits=%d deadline=%s",
+        fid, new_state.get("round"), kind, len(new_state.get("edits", [])),
+        new_state.get("deadline_at"),
+    )
+    return _portal_edit_summary(new_state, fid, kind=kind)
+
+
+def _portal_edit_summary(state: dict, fid: str, *, kind: str) -> dict:
+    """Что портал показывает человеку: когда выйдет новая версия и сколько правок."""
+    return {
+        "feedback_id": fid,
+        "kind": kind,
+        "round": state.get("round"),
+        "edits_count": len(state.get("edits") or []),
+        "window_min": state.get("window_min"),
+        "max_window_min": state.get("max_window_min"),
+        "deadline_at": state.get("deadline_at"),
+        "hard_deadline_at": state.get("hard_deadline_at"),
+        "status": state.get("status"),
+    }
+
+
+def _portal_author_is_organizer(portal_user_id: Optional[str], meeting: dict) -> bool:
+    """Организатор ли этот сотрудник портала для этой встречи (R13.2).
+
+    Сверяем `portal_user_id` с владельцем наряда. Наряда у встречи нет (личная
+    серия владельца) — правка с портала по ней невозможна: она туда и не
+    попадает. Fail-closed: не смогли доказать, что организатор → НЕ организатор.
+    Это обратная сторона fail-open в телеграмной ветке, и она такая нарочно:
+    там мы рискуем не отбить правку владельца, здесь — вынести расшифровку.
+    """
+    uid = str(portal_user_id or "").strip()
+    if not uid:
+        return False
+    try:
+        from notary.lib import delivery_route  # noqa: PLC0415
+
+        route = delivery_route.route_for_meeting((meeting or {}).get("meta") or {})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[feedback] маршрут встречи не резолвится (%s)", type(e).__name__)
+        return False
+    return bool(route.portal_user_id) and route.portal_user_id == uid
 
 
 def _flush_collecting_round(

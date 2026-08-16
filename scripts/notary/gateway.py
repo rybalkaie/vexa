@@ -566,6 +566,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._join_now()
         if path == "/orders/leave-now":
             return self._leave_now()
+        if path == "/protocol/edit":
+            return self._protocol_edit()
         if path.startswith("/orders/"):
             self._error(
                 405, "method_not_allowed", "изменение наряда — PUT, снятие — DELETE"
@@ -869,6 +871,85 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         self._send(200, {"ok": True, "order": order}, note=order["id"])
+
+    #: Потолок текста правки. Больше — почти наверняка вставленный кусок
+    #: документа, а не замечание; модели он всё равно урезается до 2000 знаков
+    #: (`feedback_reissue.sanitize_edit_text`), так что принимать мегабайт и
+    #: молча выбрасывать хвост было бы враньём порталу.
+    MAX_EDIT_TEXT = 4000
+
+    def _protocol_edit(self) -> None:
+        """Ф10d (R6.2/R6.3): правка протокола С ПОРТАЛА — в ТО ЖЕ окно, что реплай.
+
+        Своего окна у портала нет by design: встреча, которую правят и в чате, и
+        на экране, обязана выпустить ОДНУ следующую версию с обеими правками.
+        Поэтому ручка ничего не решает сама — она валидирует тело и передаёт
+        правку тому же механизму, что принимает реплаи.
+
+        Ответ несёт `deadline_at` и `hard_deadline_at`: портал показывает
+        человеку «новая версия выйдет примерно тогда-то», а не «принято» в
+        пустоту (критерий Ф8 «поле правки с показом окна перевыпуска»).
+        """
+        body, ok = self._read_json_body()
+        if not ok:
+            return
+        if not isinstance(body, dict):
+            self._error(400, "not_an_object", "тело запроса должно быть объектом JSON")
+            return
+        meeting_id = body.get("meeting_id")
+        if not isinstance(meeting_id, str) or not meeting_id.strip():
+            self._error(400, "meeting_id_required", "нужен идентификатор встречи портала")
+            return
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            self._error(400, "text_required", "текст правки обязателен")
+            return
+        if len(text) > self.MAX_EDIT_TEXT:
+            self._error(
+                413, "text_too_long",
+                "текст правки длиннее %d знаков" % self.MAX_EDIT_TEXT,
+            )
+            return
+        author = body.get("author")
+        portal_user_id = body.get("portal_user_id")
+        if not isinstance(portal_user_id, str) or not portal_user_id.strip():
+            # 🔴 Без автора правку принимать нельзя: от него зависит и подпись в
+            # ленте версий, и право расширять цитирование (R13.2). «Неизвестный
+            # участник» здесь означал бы «любой участник — организатор».
+            self._error(
+                400, "portal_user_id_required",
+                "нужен идентификатор автора правки на портале",
+            )
+            return
+        try:
+            from notary.lib import feedback_worker  # noqa: PLC0415
+
+            summary = feedback_worker.apply_portal_edit(
+                meeting_id=meeting_id.strip(),
+                text=text,
+                author=author if isinstance(author, str) else "",
+                portal_user_id=portal_user_id.strip(),
+                session_uid=body.get("session_uid")
+                if isinstance(body.get("session_uid"), str)
+                else None,
+                edit_id=body.get("edit_id") if isinstance(body.get("edit_id"), str) else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — разбираем по типу ниже
+            code = getattr(exc, "code", "")
+            message = getattr(exc, "message", "") or str(exc)
+            if not code:
+                logger.warning("[gateway] правка с портала упала (%s)", type(exc).__name__)
+                self._error(503, "edit_unavailable", "правку принять не удалось")
+                return
+            status = {
+                "meeting_not_found": 404,
+                "empty": 400,
+                "window_full": 429,
+                "edits_disabled": 503,
+            }.get(code, 422)
+            self._error(status, code, message)
+            return
+        self._send(200, {"ok": True, "edit": summary}, note=meeting_id.strip())
 
     def _capacity_hint(self, order: Dict[str, Any]) -> Dict[str, Any]:
         """«В это время бот занят» — ПРИ ПОСТАНОВКЕ наряда, а не молчание до встречи.

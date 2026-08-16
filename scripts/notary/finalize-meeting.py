@@ -737,6 +737,31 @@ def main() -> int:
         return 2
 
     session_uid = meta.get("sessionUid") or "unknown"
+
+    # Ф10d: ЧЬЯ это встреча — спрашиваем ОДИН раз, здесь, и штампуем в meta.
+    #
+    # Дальше вниз по конвейеру вопрос «какая это компания» задаётся ещё четыре
+    # раза, ДВУМЯ разными резолверами, и все они угадывают её по slug'у серии.
+    # Наряд знает точный ответ (компания у него обязательное поле), но раньше
+    # никуда его не передавал. Штамп делает наряд источником истины для всей
+    # обработки: сборки протокола, критика, кросс-фона, доставки и уточнений.
+    #
+    # Наряда нет (личная серия владельца) → в meta ничего не появляется, и всё
+    # ниже работает буква в букву как до Ф10d. При `ENABLE_PORTAL_ORDERS=OFF`
+    # реестр нарядов даже не читается.
+    try:
+        from lib import delivery_route as _delivery_route  # noqa: PLC0415
+
+        _order = _delivery_route.stamp_meta(meta, session_uid=session_uid)
+        if _order is not None:
+            log.info(
+                "[route] встреча %s принадлежит наряду %s (компания %s)",
+                session_uid, _order.get("id"), meta.get("company"),
+            )
+    except Exception as e:  # noqa: BLE001 — маршрут опционален, встреча важнее
+        log.warning("[route] наряд не отштампован (%s) — работаю как без нарядов",
+                    type(e).__name__)
+
     # Защита от орфана series=null (2026-06-08): если series пуст, протокол уйдёт
     # в legacy-fallback (`<date>-<sid>.md` без серии) → не подхватит telegram_chat_id
     # серии → доставится в личку вместо группы. Корень обычно в боте (Zod-strip
@@ -1108,7 +1133,14 @@ def main() -> int:
     # R18/R4: справочник людей компании серии — неактивные имена не подставляем
     # автором (LLM-добивка) и не путаем тёзку (дизамбигуация). Graceful: нет
     # company/YAML → пусто (поведение как до R18).
-    _company = context_knowledge.company_for_series(meta.get("series"))
+    # Ф10d: компания наряда (штамп в meta) первична. Раньше здесь стоял ЧИСТО
+    # оргструктурный резолвер — он не смотрит разметку `watched.yaml` вовсе, и на
+    # порталовой встрече мог выдать чужую компанию (первое совпадение slug'а среди
+    # всех оргструктур). Справочник людей и durable-факты исправлений — company-
+    # scoped, то есть цена ошибки здесь — чужие имена в чужом протоколе.
+    _company = (meta.get("company") or "").strip().lower() or None
+    if _company is None:
+        _company = context_knowledge.company_for_series(meta.get("series"))
     inactive_names = context_knowledge.inactive_person_names(_company)
     # Ф2 (R6/R10): durable company-факты исправлений ПОВЕРХ ростера серии. Выученная
     # правка «сервис→Саргин» перекрывает устаревший YAML-ростер и держится на ВСЕХ
@@ -1576,6 +1608,7 @@ def main() -> int:
                 meeting_sid=session_uid,
                 rewrite=True,
                 series=meta.get("series"),  # Ф3 (УПУ1): → компания → справка критику
+                company=meta.get("company"),  # Ф10d: компания наряда > угадывания по slug
                 # R3: ⚠️ «авторство под вопросом, поправьте» для тёзка-подстановок
                 # (system-applied, входит в content-hash). Паритет в clarify_worker.
                 extra_findings=build_authorship_uncertainty_findings(uncertain_names),
@@ -1844,7 +1877,8 @@ def main() -> int:
     # Гейт DISABLE_AUTO_VOCAB обрабатывается внутри propose(). До готовности
     # applier'а (Шаг 8.3) кандидаты только логируются и складываются в stash —
     # держи DISABLE_AUTO_VOCAB=1 в проде, пока applier не задеплоен.
-    if delivery_result.get("status") in {"sent", "skipped"} and md_path.is_file():
+    # Ф10d: `portal-only` — доставка состоялась (в портал), словарь учим как обычно.
+    if delivery_result.get("status") in {"sent", "skipped", "portal-only"} and md_path.is_file():
         try:
             from notary.auto_vocab import llm_proposer  # noqa: PLC0415
             proposer_meta = dict(meta)

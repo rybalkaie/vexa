@@ -825,6 +825,25 @@ def _portal_note_recording(sid: str, meta: dict | None) -> None:
         logger.warning("Удержание исходников не поставлено (%s)", type(e).__name__)
 
 
+def _telegram_delivery_note(order: dict | None, delivery_status: str | None) -> dict:
+    """Ф10d: что сказать порталу про доставку в Telegram — статус И маршрут.
+
+    Без маршрута панель «Доставка» может показать только «пропущено», и человек
+    не поймёт, это поломка или так задумано. С маршрутом она говорит «ушло в
+    группу серии» / «только на портал: телеграм сотрудника не привязан».
+    """
+    note: dict = {"status": delivery_status or "unknown"}
+    try:
+        from notary.lib import delivery_route  # noqa: PLC0415
+
+        route = delivery_route.resolve(order)
+        note["mode"] = route.mode
+        note["reason"] = route.reason
+    except Exception as e:  # noqa: BLE001 — маршрут опционален, статус важнее
+        logger.warning("Маршрут доставки не резолвится (%s)", type(e).__name__)
+    return note
+
+
 def _portal_enqueue_result(
     session_uid: str,
     meta: dict,
@@ -885,7 +904,10 @@ def _portal_enqueue_result(
             started_at=meta.get("startTs"),
             ended_at=meta.get("endTs"),
             duration_seconds=meta.get("durationS"),
-            telegram_delivery={"status": delivery_status or "unknown"},
+            # Ф10d: панели «Доставка» мало слова «skipped» — ей нужно сказать
+            # человеку ПОЧЕМУ. `mode`/`reason` отвечают на это машинно:
+            # «только портал, потому что телеграм сотрудника не привязан».
+            telegram_delivery=_telegram_delivery_note(order, delivery_status),
             order_status=order.get("status"),
         )
         portal_delivery.enqueue(
@@ -1483,7 +1505,12 @@ def _do_finalize_and_collect(session_uid: str) -> None:
     # это легитимный успех. Для статусов «asked»/«error»/«disabled» WAV
     # остаётся — даст возможность безболезненно перепрогнать finalize после
     # ответа Ильи / починки токена / включения флага.
-    success_statuses = {"sent", "skipped"}
+    # Ф10d: `portal-only` — ЗАКОНЧЕННАЯ доставка, а не сбой. У встречи с
+    # маршрутом «только портал» телеграмного адресата нет by design, и
+    # держать из-за этого WAV «на шанс перепрогона» означало бы копить записи
+    # вечно (свободного места на машине 25 ГБ из 75). Исходники всё равно
+    # защищены удержанием до ACK портала — проверка ниже.
+    success_statuses = {"sent", "skipped", "portal-only"}
     meta_obj = _read_meta_obj(session_uid) or {}
     keep_audio_flag = bool(meta_obj.get("keepAudio") or meta_obj.get("keep_audio"))
     if keep_audio_flag:

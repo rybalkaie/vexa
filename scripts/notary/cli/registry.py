@@ -49,9 +49,71 @@ def _resolve_registry_dir() -> Path:
 
 
 DEFAULT_REGISTRY_DIR = _resolve_registry_dir()
-ROOMS_FILE = DEFAULT_REGISTRY_DIR / "rooms.yaml"
-WATCHED_FILE = DEFAULT_REGISTRY_DIR / "watched.yaml"
-PAUSE_FILE = DEFAULT_REGISTRY_DIR / ".pause-until"
+
+# 🔴 ФУ-П1 (Ф10d): пути реестра резолвятся ЛЕНИВО, а не на импорте модуля.
+#
+# ЧТО БЫЛО. `ROOMS_FILE`/`WATCHED_FILE`/`PAUSE_FILE` были константами, вычисленными
+# в момент `import`. Любая проба, выставившая `MEETING_NOTARY_REGISTRY_DIR` ПОСЛЕ
+# импорта (а он случается транзитивно — `lib.identity` тянет `cli.registry`),
+# читала и правила ЖИВОЙ реестр владельца в `~/Projects/me/встречи`. Обходили это
+# тремя `mock.patch.object` в каждом наборе проб (`test_orders_ph10b.py:110-112`,
+# `test_portal_delivery_ph10c.py:204-206`) — то есть заплатой в КАЖДОЙ пробе, и
+# любая новая проба, забывшая заплату, снова била в боевой файл. Тот же класс
+# дефекта чинили лениво уже дважды: `.state.json` планировщика (f249582) и память
+# дедупа (40a6934). Это третий и последний из известных.
+#
+# ЧТО СТАЛО. Резолверы `rooms_file()`/`watched_file()`/`pause_file()` спрашивают
+# окружение в момент ОБРАЩЕНИЯ. Имена-константы остались доступны снаружи через
+# `__getattr__` модуля (PEP 562) — старые вызыватели (`cli/meeting_rooms.py`,
+# `cli/meeting_watch.py`, `tools/set-telegram-chat-id.py`) и уже написанные пробы
+# с `mock.patch.object` продолжают работать без правок. Заплата пробы по-прежнему
+# ВЫИГРЫВАЕТ: резолвер сначала смотрит в `globals()`, где патч и оседает.
+
+
+def registry_dir() -> Path:
+    """Каталог реестра ПРЯМО СЕЙЧАС (env читается на каждом обращении)."""
+    return _resolve_registry_dir()
+
+
+def _resolved(name: str, filename: str) -> Path:
+    """Путь `name`: заплата пробы (если модулю её поставили) → ленивый резолв.
+
+    `globals().get(name)` не находит ничего в обычной жизни — константы в
+    `__dict__` модуля больше нет. Она появляется там ровно тогда, когда проба
+    сделала `mock.patch.object(registry, name, ...)`, и тогда обязана выиграть:
+    иначе патч перестал бы действовать и пробы старых фаз ушли бы в боевой файл.
+    """
+    patched = globals().get(name)
+    if patched is not None:
+        return Path(patched)
+    return registry_dir() / filename
+
+
+def rooms_file() -> Path:
+    return _resolved("ROOMS_FILE", "rooms.yaml")
+
+
+def watched_file() -> Path:
+    return _resolved("WATCHED_FILE", "watched.yaml")
+
+
+def pause_file() -> Path:
+    return _resolved("PAUSE_FILE", ".pause-until")
+
+
+_LAZY_PATHS = {
+    "ROOMS_FILE": rooms_file,
+    "WATCHED_FILE": watched_file,
+    "PAUSE_FILE": pause_file,
+}
+
+
+def __getattr__(name: str) -> Any:  # PEP 562 — только для отсутствующих имён
+    resolver = _LAZY_PATHS.get(name)
+    if resolver is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return resolver()
+
 
 ROOM_REF_RE = re.compile(r"^@([a-z0-9][a-z0-9_-]*)$")
 TELEMOST_HOST = "telemost.yandex.ru"
@@ -202,38 +264,38 @@ WATCHED_HEADER = """# Реестр отслеживаемых встреч дл�
 
 def load_rooms(lock: bool = False) -> dict[str, Any]:
     if lock:
-        _acquire_lock(ROOMS_FILE)
-    return _read_yaml(ROOMS_FILE, "rooms")
+        _acquire_lock(rooms_file())
+    return _read_yaml(rooms_file(), "rooms")
 
 
 def save_rooms(data: dict[str, Any]) -> None:
     try:
-        _atomic_write_yaml(ROOMS_FILE, data, ROOMS_HEADER)
+        _atomic_write_yaml(rooms_file(), data, ROOMS_HEADER)
     finally:
-        _release_lock(ROOMS_FILE)
+        _release_lock(rooms_file())
 
 
 def release_rooms_lock() -> None:
     """Release rooms lock explicitly (call in finally when save_rooms wasn't reached)."""
-    _release_lock(ROOMS_FILE)
+    _release_lock(rooms_file())
 
 
 def load_watched(lock: bool = False) -> dict[str, Any]:
     if lock:
-        _acquire_lock(WATCHED_FILE)
-    return _read_yaml(WATCHED_FILE, "watched")
+        _acquire_lock(watched_file())
+    return _read_yaml(watched_file(), "watched")
 
 
 def save_watched(data: dict[str, Any]) -> None:
     try:
-        _atomic_write_yaml(WATCHED_FILE, data, WATCHED_HEADER)
+        _atomic_write_yaml(watched_file(), data, WATCHED_HEADER)
     finally:
-        _release_lock(WATCHED_FILE)
+        _release_lock(watched_file())
 
 
 def release_watched_lock() -> None:
     """Release watched lock explicitly (call in finally when save_watched wasn't reached)."""
-    _release_lock(WATCHED_FILE)
+    _release_lock(watched_file())
 
 
 def find_room(name: str, rooms: dict[str, Any]) -> dict[str, Any] | None:
@@ -868,9 +930,9 @@ def series_record_is_live(rec: Any) -> bool:
 
 def pause_until() -> str | None:
     """Return ISO datetime if pause is active and not yet expired; else None (and clean stale file)."""
-    if not PAUSE_FILE.exists():
+    if not pause_file().exists():
         return None
-    raw = PAUSE_FILE.read_text(encoding="utf-8").strip()
+    raw = pause_file().read_text(encoding="utf-8").strip()
     if not raw:
         return None
     try:
@@ -881,7 +943,7 @@ def pause_until() -> str | None:
         until = until.replace(tzinfo=timezone.utc)
     if until <= datetime.now(timezone.utc):
         try:
-            PAUSE_FILE.unlink()
+            pause_file().unlink()
         except FileNotFoundError:
             pass
         return None

@@ -1085,6 +1085,8 @@ class TestContractShape(_Base):
         "transcript", "tasks",
         "participants", "expected_participants", "started_at", "ended_at",
         "duration_seconds", "late_join_minutes", "telegram_delivery", "generated_at",
+        # Ф10d (R6.3): откуда версия и кто правил — лента версий портала.
+        "revision_of", "edits",
     }
 
     def _payload(self) -> Dict[str, Any]:

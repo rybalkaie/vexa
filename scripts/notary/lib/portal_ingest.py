@@ -162,6 +162,8 @@ def build_payload(
     order_status: Optional[str] = None,
     late_join_minutes: Optional[int] = None,
     generated_at: Optional[str] = None,
+    revision_of: Optional[int] = None,
+    edits: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Тело `POST /api/meetings/notary/ingest`. Только snake_case.
 
@@ -199,6 +201,29 @@ def build_payload(
         # Факт доставки в Telegram — чтобы панель «Доставка» на портале говорила
         # «ушло туда-то», а не «неизвестно».
         "telegram_delivery": telegram_delivery or {"status": "unknown"},
+        # Ф10d (R6.3): ОТКУДА эта версия. `revision_of` — номер версии, которую
+        # она заменяет (у первой доставки None); `edits` — кто и откуда правил.
+        # Ровно это портал печатает строкой в истории изменений: «Telegram,
+        # Михаил Саргин» против «Портал, Ольга Иванова». Без полей обе ленты
+        # слились бы в одну безымянную, и требование «в истории видно источник»
+        # выполнить было бы нечем.
+        #
+        # 🔴 ТЕКСТА ПРАВКИ ЗДЕСЬ НЕТ by design. Содержание правки уже уехало в
+        # `protocol_md` — применённым. Дублировать его отдельным полем значит
+        # положить в ленту версий сырую реплику участника, которую портал будет
+        # хранить и показывать; ленте достаточно «кто, откуда, когда».
+        "revision_of": revision_of,
+        "edits": [
+            {
+                "source": e.get("source") or "telegram",
+                "author": str(e.get("author") or "")[:120],
+                "portal_user_id": e.get("portal_user_id"),
+                "at": e.get("at"),
+                "is_organizer": e.get("is_organizer"),
+            }
+            for e in (edits or [])[:PORTAL_LIST_MAX]
+            if isinstance(e, dict)
+        ],
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
     }
 

@@ -892,6 +892,42 @@ def _is_clarify_enabled() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def _clarify_target_chat(meeting_meta: Any, meeting_id: Optional[str] = None) -> Optional[int]:
+    """Ф10d: КОМУ задавать уточнение по этой встрече («кто говорил», сколько задач).
+
+    ЧТО БЫЛО: во всех четырёх местах уточнений чат читался прямо из окружения —
+    `TELEGRAM_NOTARIUS_CHAT_ID or TELEGRAM_CHAT_ID`, — то есть был один жёстко
+    заданный адресат на весь бот. Для порталовой встречи это чужой человек: он
+    получает кусок ЧУЖОЙ расшифровки и не может на него ответить.
+
+    ЧТО СТАЛО: адресата называет маршрут встречи (`lib/delivery_route.py`).
+    Личная серия владельца → то же окружение, буква в букву. Наряд портала →
+    ЛИЧКА владельца наряда, и никогда групповой чат: в вопросе цитата из
+    расшифровки, а расшифровка участникам не выносится (R13.2).
+
+    None → уточнение не задаётся вовсе (адресата нет). Это честный исход:
+    в протоколе останется «Говорящий 2», зато чужая расшифровка никуда не уйдёт.
+    """
+    try:
+        from notary.lib import delivery_route  # noqa: PLC0415
+
+        return delivery_route.clarify_chat_for_meeting(
+            meeting_meta if isinstance(meeting_meta, dict) else {},
+            session_uid=meeting_id,
+        )
+    except Exception as e:  # noqa: BLE001 — модуль не доехал → вчерашнее поведение
+        logger.warning("[clarify] маршрут не резолвится (%s) — окружение", type(e).__name__)
+        raw = (
+            os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
+            or os.environ.get("TELEGRAM_CHAT_ID")
+            or ""
+        ).strip()
+        try:
+            return int(raw) if raw else None
+        except ValueError:
+            return None
+
+
 def clarify_speakers_via_telegram(
     meeting_id: str,
     turns: list[AlignedTurn],
@@ -991,22 +1027,14 @@ def clarify_speakers_via_telegram(
     # тот же токен, что у meetings_listener'а (он же шлёт вечерний блок 📅
     # и принимает Reply на него; clarify-callback'и идут к нему же).
     bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
-    chat_id_raw = (
-        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
-        or os.environ.get("TELEGRAM_CHAT_ID")
-        or ""
-    ).strip()
-    if not bot_token or not chat_id_raw:
+    # Ф10d: адресата называет маршрут встречи, а не жёстко заданное окружение.
+    chat_id = _clarify_target_chat(meta, meeting_id)
+    if not bot_token or chat_id is None:
         logger.warning(
             "[clarify] meeting=%s low-conf clusters=%d, "
-            "но TELEGRAM_NOTARIUS_BOT_TOKEN/TELEGRAM_(NOTARIUS_)CHAT_ID не заданы — пропуск",
+            "но токен бота не задан / адресата уточнений нет — пропуск",
             meeting_id, len(unclear),
         )
-        return None
-    try:
-        chat_id = int(chat_id_raw)
-    except ValueError:
-        logger.warning("[clarify] meeting=%s TELEGRAM_CHAT_ID не число: %r", meeting_id, chat_id_raw)
         return None
 
     # name_pool: те же имена, что для map_speaker_names, плюс уже разрешённые
@@ -1831,10 +1859,11 @@ def generate_protocol(
     if timeout is None:
         timeout = PROTOCOL_GEN_TIMEOUT
 
-    # Ф6 (E6): компания встречи — разметка `watched.yaml` ПЕРВИЧНА (поле company),
-    # оргструктурный поиск `*-context` — fallback переходного периода. Нет привязки
-    # / нет YAML-знания → None → glossary падает на встроенный блок (как до Ф5).
-    company = series_markup.company_for_series(meeting_meta.get("series"))
+    # Ф10d: компания НАРЯДА первична (её знает портал точно), затем разметка
+    # `watched.yaml` (Ф6/E6), затем оргструктурный поиск `*-context` — fallback
+    # переходного периода. Нет ничего → None → glossary падает на встроенный блок
+    # (как до Ф5). Наряда нет → ответ буква в букву прежний.
+    company = series_markup.company_for_meeting(meeting_meta)
 
     # FU-11 / Ф5: глоссарий компании в КОНЕЦ system-prompt (после методички) —
     # отдельной секцией, company-scoped (Bolong[mpfirst] не уйдёт в Anzhee-промпт).
@@ -2451,7 +2480,9 @@ def build_cross_memory_block(
         return ""
     try:
         w = series_markup._load_watched_safe(watched)
-        current_company = series_markup.company_for_series(series, watched=w)
+        # Ф10d: та же дверь, что у генерации — иначе кросс-фон посчитал бы
+        # «своей» другую компанию и мягкий штраф лёг бы не на ту память.
+        current_company = series_markup.company_for_meeting(meeting_meta, watched=w)
 
         def _markup(slug):
             return series_markup.markup_for_series(slug, watched=w)
@@ -3560,22 +3591,14 @@ def maybe_clarify_task_count(
         return None
 
     bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
-    chat_id_raw = (
-        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
-        or os.environ.get("TELEGRAM_CHAT_ID")
-        or ""
-    ).strip()
-    if not bot_token or not chat_id_raw:
+    # Ф10d: адресата называет маршрут встречи (личка владельца НАРЯДА).
+    chat_id = _clarify_target_chat(meeting_meta, meeting_id)
+    if not bot_token or chat_id is None:
         logger.warning(
             "[task-clarify] meeting=%s tasks=%d > threshold=%d, "
-            "но TELEGRAM_NOTARIUS_BOT_TOKEN/CHAT_ID не заданы — пропуск",
+            "но токен бота не задан / адресата уточнений нет — пропуск",
             meeting_id, len(tasks), threshold,
         )
-        return None
-    try:
-        chat_id = int(chat_id_raw)
-    except ValueError:
-        logger.warning("[task-clarify] meeting=%s TELEGRAM_CHAT_ID не число", meeting_id)
         return None
 
     series = meeting_meta.get("series") or "—"
@@ -3670,20 +3693,14 @@ def maybe_clarify_pending_deadlines(
     if not ilia_tasks_no_deadline:
         return None
     bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
-    chat_id_raw = (
-        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
-        or os.environ.get("TELEGRAM_CHAT_ID")
-        or ""
-    ).strip()
-    if not bot_token or not chat_id_raw:
+    # Ф10d: адресата называет маршрут встречи (личка владельца НАРЯДА).
+    chat_id = _clarify_target_chat(meeting_meta, meeting_id)
+    if not bot_token or chat_id is None:
         logger.warning(
-            "[task-clarify] meeting=%s deadlines=%d, но bot/chat не заданы — пропуск",
+            "[task-clarify] meeting=%s deadlines=%d, но токен бота не задан / "
+            "адресата уточнений нет — пропуск",
             meeting_id, len(ilia_tasks_no_deadline),
         )
-        return None
-    try:
-        chat_id = int(chat_id_raw)
-    except ValueError:
         return None
 
     series = meeting_meta.get("series") or "—"
@@ -3759,16 +3776,9 @@ def notify_unknown_owners(
     if count <= 0:
         return False
     bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
-    chat_id_raw = (
-        os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID")
-        or os.environ.get("TELEGRAM_CHAT_ID")
-        or ""
-    ).strip()
-    if not bot_token or not chat_id_raw:
-        return False
-    try:
-        chat_id = int(chat_id_raw)
-    except ValueError:
+    # Ф10d: адресата называет маршрут встречи (личка владельца НАРЯДА).
+    chat_id = _clarify_target_chat(meeting_meta, meeting_id)
+    if not bot_token or chat_id is None:
         return False
     series = meeting_meta.get("series") or "—"
     date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
@@ -4356,13 +4366,43 @@ def deliver_protocol(
     series = meeting_meta.get("series") or ""
     date = meeting_meta.get("date") or (meeting_meta.get("startTs") or "")[:10] or "—"
 
-    # Шаг 1: chat_id из meta / watched.yaml.
+    # Шаг 0 (Ф10d): чья это встреча. Наряда нет — `is_owner_legacy`, и дальше всё
+    # идёт буква в букву как до Ф10d (личные серии владельца сюда и попадают).
+    # Наряд есть — адресата называет ОН, а не привязка серии: наряд знает и
+    # компанию, и владельца, а `watched.yaml` — только серию.
+    route = None
+    try:
+        from notary.lib import delivery_route  # noqa: PLC0415
+
+        route = delivery_route.route_for_meeting(meeting_meta, session_uid=meeting_sid)
+    except Exception as e:  # noqa: BLE001 — модуль не доехал → вчерашнее поведение
+        logger.warning("[delivery] маршрут не резолвится (%s)", type(e).__name__)
+        route = None
+
+    # Шаг 1: chat_id из явного аргумента / наряда / meta / watched.yaml.
     chat_id = target_chat_id
+    if chat_id is None and route is not None and not route.is_owner_legacy:
+        if route.portal_only:
+            # 🔴 Ни в какой чат. Не «раз адресата нет, отправим владельцу
+            # портала» — это и был бы чужой протокол в чужой личке. Результат
+            # уедет на портал очередью Ф10c, там он виден по правам.
+            logger.info(
+                "[delivery] meeting=%s наряд %s → только портал (%s)",
+                meeting_sid or "?", route.order_id, route.reason,
+            )
+            return {
+                "status": "portal-only",
+                "chat_id": None,
+                "message_ids": [],
+                "parts_count": 0,
+                "route": route.as_dict(),
+            }
+        chat_id = route.chat_id
     if chat_id is None:
         chat_id_from_meta = meeting_meta.get("telegram_chat_id")
         if isinstance(chat_id_from_meta, int) and not isinstance(chat_id_from_meta, bool):
             chat_id = chat_id_from_meta
-    if chat_id is None and series:
+    if chat_id is None and series and (route is None or route.is_owner_legacy):
         chat_id = _load_watched_for_series(series)
 
     bot_token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
@@ -6465,6 +6505,7 @@ def review_and_flag_protocol_file(
     extra_findings: Optional[list[dict]] = None,
     prior_sources: Optional[list[str]] = None,
     series: Optional[str] = None,
+    company: Optional[str] = None,
 ) -> int:
     """Высокоуровневая обёртка 5.2/Ф4/Ф7: читает протокол+транскрипт, прогоняет
     ревью-проход (ОДИН claude-вызов), затем правит файлы.
@@ -6563,7 +6604,7 @@ def review_and_flag_protocol_file(
         return _selfreview_rewrite_and_apply(
             protocol_path, transcript_path, protocol_text, transcript_md,
             checks=checks, meeting_sid=meeting_sid, extra_findings=extra,
-            prior_sources=prior_sources, series=series,
+            prior_sources=prior_sources, series=series, company=company,
         )
 
     findings = review_protocol(
@@ -6650,7 +6691,7 @@ def _item_present_in(item: str, text_tokens: set[str]) -> bool:
 
 
 def _load_review_knowledge(
-    checks: tuple[str, ...], series: Optional[str],
+    checks: tuple[str, ...], series: Optional[str], company: Optional[str] = None,
 ) -> Optional["context_knowledge.KnowledgeBundle"]:
     """Ф3 (УПУ1): знание компании для критик-прохода — ОДНО чтение диска за проход.
 
@@ -6677,8 +6718,11 @@ def _load_review_knowledge(
         logger.info("[selfreview] knowledge-сверка выключена (ENABLE_PROTOCOL_KNOWLEDGE_REVIEW=0)")
         return None
     try:
-        company = series_markup.company_for_series(series)
-        return context_knowledge.load_protocol_knowledge(company)
+        # Ф10d: компания НАРЯДА (если встреча порталовая) перебивает угадывание по
+        # slug'у — та же дверь, что у генерации. Без неё критик мог бы прийти со
+        # знанием другой компании и «поправить» верный канон.
+        resolved = company or series_markup.company_for_series(series)
+        return context_knowledge.load_protocol_knowledge(resolved)
     except Exception as e:  # noqa: BLE001 — знание опционально, встреча важнее
         logger.warning(
             "[selfreview] knowledge load failed (non-fatal): %s", type(e).__name__,
@@ -6697,6 +6741,7 @@ def _selfreview_rewrite_and_apply(
     extra_findings: Optional[list[dict]] = None,
     prior_sources: Optional[list[str]] = None,
     series: Optional[str] = None,
+    company: Optional[str] = None,
 ) -> int:
     """Ф7 (G8): прогоняет второй проход (`review_and_rewrite_protocol`, ОДИН
     вызов) и применяет результат:
@@ -6721,7 +6766,9 @@ def _selfreview_rewrite_and_apply(
     компания не определилась / знания нет → поведение как до Ф3.
     """
     prior_items = _extract_prior_items(prior_sources)
-    knowledge = _load_review_knowledge(checks, series)
+    # Ф10d: `company` (компания наряда) перебивает резолв по slug'у — генерация и
+    # критик обязаны идти на ОДНОМ знании, иначе критик «поправит» верный канон.
+    knowledge = _load_review_knowledge(checks, series, company)
     result = review_and_rewrite_protocol(
         protocol_text, transcript_md, checks=checks, meeting_sid=meeting_sid,
         prior_items=prior_items, knowledge=knowledge,

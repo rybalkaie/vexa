@@ -144,7 +144,20 @@ def build_edit_instruction(edits: Optional[list]) -> str:
     if not items:
         return ""
     body = "\n".join(f"{i}. [{a}]: {t}" for i, (a, t) in enumerate(items, 1))
-    return ANTI_INJECTION_HEADER + "\n\n" + body
+    header = ANTI_INJECTION_HEADER
+    # Ф10d (R13.2), второй слой правила цитирования. Первый стоит на входе и
+    # ловит явное «добавь дословно»; этот держит окольное — «раскрой пункт
+    # подробнее» тоже способно вытащить прямую речь, а транскрипт у модели перед
+    # глазами целиком. Дописывается ТОЛЬКО когда в раунде есть правка не от
+    # организатора: у владельца своей встречи ограничения нет.
+    try:
+        from notary.lib import quote_policy  # noqa: PLC0415
+
+        if quote_policy.is_enabled() and quote_policy.edits_have_outsider(edits):
+            header = header + "\n\n" + quote_policy.OUTSIDER_QUOTE_GUARD
+    except Exception as e:  # noqa: BLE001 — модуль не доехал → рамка как до Ф10d
+        logger.warning("[reissue] правило цитирования недоступно (%s)", type(e).__name__)
+    return header + "\n\n" + body
 
 
 # --------------------------------------------------------------------------
@@ -778,7 +791,14 @@ def reissue_one(
     # (knowledge_writeback). Своп («перепутал A и B») НЕ durable (per-meeting). Best-
     # effort: не должно ронять перевыпуск. Опасная тройка: текст правок не логируем.
     try:
-        _company = context_knowledge.company_for_series(series)
+        # Ф10d: компания НАРЯДА (штамп в meta) первична. Замок durable, то есть
+        # выученный факт живёт на ВСЕХ будущих встречах компании — ошибиться
+        # компанией здесь значит подмешать чужой канон имён в чужие протоколы,
+        # причём навсегда. Наряда нет → прежний резолв по серии.
+        _company = (meta or {}).get("company") if isinstance(meta, dict) else None
+        _company = _company.strip().lower() if isinstance(_company, str) and _company.strip() else None
+        if _company is None:
+            _company = context_knowledge.company_for_series(series)
         if _company:
             _name_pool = _author_name_pool(meta)
             from . import series_roster as _sr  # lazy: не тянуть в listener без нужды
@@ -1184,6 +1204,28 @@ def reissue_one(
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[reissue] R6 уведомление о фолбэке упало (non-fatal): %s", e)
 
+        # Ф10d (R6.3): новая версия — в ЛЕНТУ ВЕРСИЙ ПОРТАЛА, а не только в
+        # Telegram. До этого портал получал ровно одну версию встречи (v1,
+        # `collector._portal_enqueue_result`), и правка реплаем на портале не
+        # появлялась вовсе: «правка из Telegram и правка с портала попадают в
+        # одну ленту версий» было бы неправдой.
+        #
+        # 🔴 Условие — «протокол на диске ПЕРЕСОБРАН», а не «ушёл в Telegram».
+        # У встречи с маршрутом «только портал» телеграмной доставки нет вовсе
+        # (`not-delivered-yet`), и завязка на `sent` означала бы, что правки
+        # именно этих встреч до портала не доезжают никогда.
+        #
+        # Best-effort и последним: перевыпуск уже состоялся, сбой очереди не
+        # имеет права его откатить.
+        if res.get("status") in ("sent", "not-delivered-yet"):
+            try:
+                _enqueue_portal_revision(state, meta, protocol_path, transcript_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[reissue] новая версия не поставлена в очередь портала (%s)",
+                    type(e).__name__,
+                )
+
         return res
     finally:
         if remap_tmp is not None and remap_tmp.exists():
@@ -1191,6 +1233,97 @@ def reissue_one(
                 remap_tmp.unlink()
             except OSError:
                 pass
+
+
+# --------------------------------------------------------------------------
+# Ф10d (R6.3): перевыпущенная версия → лента версий портала
+# --------------------------------------------------------------------------
+
+
+def _next_portal_version(order_id: str) -> int:
+    """Номер следующей версии результата для портала.
+
+    Считаем по УЖЕ поставленным в очередь ключам `<наряд>#v<N>`: первая доставка
+    делает v1 (`collector`), каждый перевыпуск — следующий номер. Держать счётчик
+    отдельным файлом не нужно и вредно — он разъехался бы с очередью после
+    любого ручного вмешательства, а очередь на диске и есть источник истины.
+    """
+    from . import portal_delivery  # noqa: PLC0415
+
+    highest = 0
+    for item in portal_delivery.list_items():
+        if not isinstance(item, dict) or str(item.get("order_id") or "") != order_id:
+            continue
+        try:
+            highest = max(highest, int(item.get("version") or 0))
+        except (TypeError, ValueError):
+            continue
+    return highest + 1 if highest else 2
+
+
+def _enqueue_portal_revision(
+    state: dict, meta: Optional[dict], protocol_path: Path, transcript_path: Path,
+) -> Optional[str]:
+    """Положить перевыпущенную версию в очередь доставки в портал. None — не наша встреча.
+
+    Наряда у встречи нет (личная серия владельца) → None и ни одного обращения к
+    диску: поведение владельца этой веткой не задевается вовсе.
+    """
+    from . import delivery_route, portal_delivery, portal_ingest  # noqa: PLC0415
+
+    if not portal_delivery.is_enabled():
+        return None
+    order = delivery_route.order_for_meeting(
+        meta or {}, session_uid=(meta or {}).get("sessionUid")
+    )
+    if order is None:
+        return None
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        return None
+    session_uid = str((meta or {}).get("sessionUid") or "")
+    version = _next_portal_version(order_id)
+
+    def _read(path: Optional[Path]) -> str:
+        try:
+            return Path(path).read_text(encoding="utf-8") if path else ""
+        except OSError:
+            return ""
+
+    route = delivery_route.resolve(order)
+    payload = portal_ingest.build_payload(
+        order_id=order_id,
+        meeting_id=order.get("meeting_id"),
+        version=version,
+        company=order.get("company"),
+        session_uid=session_uid,
+        protocol_md=_read(protocol_path),
+        transcript_text=_read(transcript_path),
+        tasks=[],
+        participants=(meta or {}).get("participants") or [],
+        expected_participants=(meta or {}).get("expectedParticipants") or [],
+        started_at=(meta or {}).get("startTs"),
+        ended_at=(meta or {}).get("endTs"),
+        duration_seconds=(meta or {}).get("durationS"),
+        telegram_delivery={"status": route.telegram_status, "mode": route.mode},
+        order_status=order.get("status"),
+        revision_of=version - 1,
+        edits=state.get("edits") or [],
+    )
+    key, created = portal_delivery.enqueue(
+        order_id=order_id,
+        meeting_id=order.get("meeting_id"),
+        version=version,
+        session_uid=session_uid,
+        company=order.get("company"),
+        payload=payload,
+        sources={},
+    )
+    logger.info(
+        "[reissue] версия %d встречи %s поставлена в очередь портала (%s, новая=%s)",
+        version, order_id, key, created,
+    )
+    return key
 
 
 # --------------------------------------------------------------------------

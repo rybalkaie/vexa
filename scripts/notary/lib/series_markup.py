@@ -72,6 +72,46 @@ def company_for_series(series: Optional[str], *, watched: Optional[dict] = None)
     return context_knowledge.company_for_series(slug)
 
 
+def company_for_meeting(
+    meeting_meta: Optional[dict], *, watched: Optional[dict] = None
+) -> Optional[str]:
+    """Ф10d: компания ВСТРЕЧИ. Наряд портала — источник истины, slug — фолбэк.
+
+    ЧТО БЫЛО. Компания нигде не передавалась параметром: `generate_protocol`,
+    критик и кросс-фон угадывали её заново по slug'у серии
+    (`company_for_series`), а тот при неразмеченной серии перебирает оргструктуры
+    ВСЕХ компаний и берёт первое совпадение (`context_knowledge.company_for_series`).
+    Пока серии — личные серии владельца, ответ случайно верен. Наряд портала
+    ЗНАЕТ компанию точно (поле обязательное, шлюз без него наряд не принимает), но
+    до сборки протокола это знание не доезжало: встреча МПервого, чей slug нашёлся
+    в оргструктуре Anzhee, собиралась бы на знании Anzhee.
+
+    ЧТО СТАЛО. Компания наряда, отштампованная в meta (`delivery_route.stamp_meta`),
+    ПЕРЕБИВАЕТ угадывание. Наряда нет → буква в букву прежний `company_for_series`.
+
+    Значение из meta проверяется по канону компаний — `meta` собирает конвейер, и
+    мусор в этом поле не имеет права стать путём к чужому каталогу знаний.
+    """
+    if isinstance(meeting_meta, dict):
+        raw = meeting_meta.get("company")
+        if isinstance(raw, str) and raw.strip():
+            value = raw.strip().lower()
+            try:
+                from notary.cli.registry import VALID_COMPANIES  # noqa: PLC0415
+
+                known = value in VALID_COMPANIES
+            except Exception:  # noqa: BLE001 — канон недоступен → не доверяем
+                known = False
+            if known:
+                return value
+            logger.warning(
+                "[series-markup] в meta встречи компания %r вне канона — игнорирую",
+                value,
+            )
+    series = (meeting_meta or {}).get("series") if isinstance(meeting_meta, dict) else None
+    return company_for_series(series, watched=watched)
+
+
 def visibility_for_series(series: Optional[str], *, watched: Optional[dict] = None) -> Optional[str]:
     """Видимость серии из разметки `watched.yaml`. Нет разметки → None.
 
