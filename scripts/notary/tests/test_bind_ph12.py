@@ -59,12 +59,30 @@ STRANGER = 999
 CODE = "482913"
 
 
-def _msg(text, *, chat=GROUP, from_id=OWNER, title="Директорат Anzhee", username=None):
+def _msg(
+    text,
+    *,
+    chat=GROUP,
+    from_id=OWNER,
+    title="Директорат Anzhee",
+    username=None,
+    chat_type=None,
+):
+    """Сообщение Telegram.
+
+    `chat_type` живой Telegram проставляет ВСЕГДА (`private` / `group` /
+    `supergroup` / `channel`), и именно по нему бот решает, личка ли это. По
+    умолчанию выводим его из знака идентификатора, как это делает и сам бот.
+    """
     frm = {"id": from_id}
     if username:
         frm["username"] = username
     return {
-        "chat": {"id": chat, "title": title},
+        "chat": {
+            "id": chat,
+            "title": title,
+            "type": chat_type or ("private" if chat > 0 else "supergroup"),
+        },
         "from": frm,
         "message_id": 1000,
         "date": 1718000000,
@@ -212,7 +230,13 @@ class TestGroupBinding(unittest.TestCase):
 
 
 class TestCodeBinding(unittest.TestCase):
-    """Код в личке."""
+    """Код в личке.
+
+    🔴 АКТЁР ЗДЕСЬ — НЕЗНАКОМЕЦ, А НЕ ВЛАДЕЛЕЦ. Первым заходом фазы весь этот
+    класс проходил личку владельца, и на ней дефект «личка считается через
+    вопрос о доверии» не проявлялся вовсе (у владельца оба ответа совпадают).
+    Живой сценарий R8.1 — сотрудник, которого бот ещё не знает.
+    """
 
     def setUp(self):
         self.portal = _FakePortal(reply="Готово — теперь я знаю, что это вы.", outcome="linked")
@@ -234,13 +258,14 @@ class TestCodeBinding(unittest.TestCase):
 
     def test_code_in_dm_goes_to_portal_and_reply_is_portals(self):
         handled = ml.maybe_route_to_bind_command(
-            "tok", OWNER, OWNER, _msg(CODE, chat=OWNER, username="ilya_rybalka")
+            "tok", STRANGER, OWNER,
+            _msg(CODE, chat=STRANGER, from_id=STRANGER, title=None, username="petrov_tg"),
         )
         self.assertTrue(handled)
         payload = self.portal.calls[0]["payload"]
         self.assertEqual(payload["kind"], "code")
         self.assertEqual(payload["code"], CODE)
-        self.assertEqual(payload["telegram_username"], "ilya_rybalka")
+        self.assertEqual(payload["telegram_username"], "petrov_tg")
         # 🔴 ОТВЕТ — ДОСЛОВНО ОТ ПОРТАЛА, бот его не сочиняет.
         self.assertIn("теперь я знаю", self._said())
 
@@ -248,20 +273,26 @@ class TestCodeBinding(unittest.TestCase):
         """Любой исход — тем же путём: бот не переводит «expired» на свой язык."""
         self.portal.reply = "Код истёк. Возьмите новый на портале."
         self.portal.outcome = "expired"
-        ml.maybe_route_to_bind_command("tok", OWNER, OWNER, _msg(CODE, chat=OWNER))
+        ml.maybe_route_to_bind_command(
+            "tok", STRANGER, OWNER, _msg(CODE, chat=STRANGER, from_id=STRANGER, title=None)
+        )
         self.assertIn("Код истёк", self._said())
 
     def test_portal_down_gets_honest_answer_not_silence(self):
         mock.patch.object(
             portal_link, "_http_post", _FakePortal(raise_exc=OSError("нет сети"))
         ).start()
-        handled = ml.maybe_route_to_bind_command("tok", OWNER, OWNER, _msg(CODE, chat=OWNER))
+        handled = ml.maybe_route_to_bind_command(
+            "tok", STRANGER, OWNER, _msg(CODE, chat=STRANGER, from_id=STRANGER, title=None)
+        )
         self.assertTrue(handled)
         self.assertIn("не отвечает", self._said())
 
     def test_start_explains_without_network(self):
         calls_before = len(self.portal.calls)
-        handled = ml.maybe_route_to_bind_command("tok", OWNER, OWNER, _msg("/start", chat=OWNER))
+        handled = ml.maybe_route_to_bind_command(
+            "tok", STRANGER, OWNER, _msg("/start", chat=STRANGER, from_id=STRANGER, title=None)
+        )
         self.assertTrue(handled)
         self.assertIn("шести цифр", self._said())
         # /start в сеть не ходит: человек ещё ничего не прислал.
@@ -270,11 +301,162 @@ class TestCodeBinding(unittest.TestCase):
     def test_code_never_appears_in_logs(self):
         """🔴 КОД — ПАРОЛЬ НА 15 МИНУТ, а лог листенера лежит файлом на VPS."""
         with self.assertLogs("meetings-listener", level="INFO") as captured:
-            ml.maybe_route_to_bind_command("tok", OWNER, OWNER, _msg(CODE, chat=OWNER))
+            ml.maybe_route_to_bind_command(
+                "tok", STRANGER, OWNER, _msg(CODE, chat=STRANGER, from_id=STRANGER, title=None)
+            )
         joined = "\n".join(captured.output)
         self.assertNotIn(CODE, joined)
         # И числового отправителя рядом с исходом привязки тоже нет.
-        self.assertNotIn(str(OWNER), joined)
+        self.assertNotIn(str(STRANGER), joined)
+
+
+class TestStrangerInDirectChat(unittest.TestCase):
+    """🔴 ГЛАВНЫЙ ВХОД ФАЗЫ, КОТОРОГО НЕ БЫЛО НИ В ОДНОЙ ПРОБЕ: НЕЗНАКОМЕЦ В ЛИЧКЕ.
+
+    Все прежние пробы кода проходили личку ВЛАДЕЛЬЦА (`chat == OWNER ==
+    allowed_chat`), а юнит-разбор получал признак лички хардкодом. На этой паре
+    подстановок дефект не виден вовсе: `_is_direct_chat` отвечает не «личка ли
+    это», а «личка ли это ДОВЕРЕННОГО лица», и у владельца оба ответа совпадают.
+
+    А фаза адресована ровно обратному человеку — сотруднику, которого бот ещё НЕ
+    знает: он берёт код на портале и шлёт шесть цифр в личку. При прежнем вопросе
+    признак лички для него был ЛОЖЬЮ, разбор возвращал «это не про привязку», и в
+    портал не уходило НИЧЕГО. Курица и яйцо: чтобы стать доверенным — привяжись,
+    чтобы привязаться — будь доверенным.
+    """
+
+    def setUp(self):
+        self.portal = _FakePortal(reply="Готово — теперь я знаю, что это вы.", outcome="linked")
+        self.env = mock.patch.dict(
+            "os.environ",
+            {
+                "MEETING_NOTARY_PORTAL_INGEST_URL": "https://portal.example/api/meetings/notary/ingest",
+                "MEETING_NOTARY_PORTAL_INGEST_TOKEN": "t" * 40,
+            },
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        mock.patch.object(portal_link, "_http_post", self.portal).start()
+        self.send = mock.patch.object(ml, "send_message", return_value=777).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _said(self):
+        return "\n".join(str(c.args[2]) for c in self.send.call_args_list)
+
+    def test_unknown_employee_code_reaches_portal(self):
+        """Сотрудник, которого бот не знает, шлёт шесть цифр в личку → УШЛО В ПОРТАЛ."""
+        handled = ml.maybe_route_to_bind_command(
+            "tok",
+            STRANGER,  # его личка: id чата == id человека
+            OWNER,  # …а доверенная личка — чужая, владельца
+            _msg(CODE, chat=STRANGER, from_id=STRANGER, title=None, username="petrov"),
+        )
+        self.assertTrue(handled, "роут обязан взять сообщение незнакомца")
+        self.assertEqual(len(self.portal.calls), 1, "в портал не ушло ничего")
+        payload = self.portal.calls[0]["payload"]
+        self.assertEqual(payload["kind"], "code")
+        self.assertEqual(payload["code"], CODE)
+        self.assertEqual(payload["telegram_user_id"], str(STRANGER))
+        self.assertIn("теперь я знаю", self._said())
+
+    def test_unknown_employee_code_with_spacing(self):
+        """Он же, но перепечатал код с разрядкой, как нарисовано на экране портала."""
+        ml.maybe_route_to_bind_command(
+            "tok", STRANGER, OWNER, _msg("482 913", chat=STRANGER, from_id=STRANGER, title=None)
+        )
+        self.assertEqual(len(self.portal.calls), 1)
+        self.assertEqual(self.portal.calls[0]["payload"]["kind"], "code")
+
+    def test_start_from_unknown_employee_explains(self):
+        """`/start` незнакомцу тоже отвечает — это первый экран инструкции."""
+        handled = ml.maybe_route_to_bind_command(
+            "tok", STRANGER, OWNER, _msg("/start", chat=STRANGER, from_id=STRANGER, title=None)
+        )
+        self.assertTrue(handled)
+        self.assertIn("шести цифр", self._said())
+
+    def test_private_chat_never_becomes_a_group(self):
+        """🔴 `/привязать` В ЛИЧКЕ — НЕ ПРИВЯЗКА ГРУППЫ.
+
+        Следствие того же корня: при ложном признаке лички команда без аргумента
+        трактовалась как «привяжи ЭТОТ чат», и портал заводил ЛИЧНЫЙ чат
+        сотрудника как «группу компании» — с его числовым Telegram открытым
+        текстом в колонке адреса доставки.
+        """
+        for text in ("/привязать", "/bind", "/привязать@AnzheeWatsonBot"):
+            with self.subTest(text=text):
+                self.send.reset_mock()
+                self.portal.calls.clear()
+                handled = ml.maybe_route_to_bind_command(
+                    "tok", STRANGER, OWNER, _msg(text, chat=STRANGER, from_id=STRANGER, title=None)
+                )
+                self.assertTrue(handled)
+                self.assertEqual(
+                    [c["payload"]["kind"] for c in self.portal.calls],
+                    [],
+                    "личка ушла в портал как группа",
+                )
+                self.assertIn("шести цифр", self._said())
+
+    def test_group_binding_from_private_chat_is_blocked_at_the_route(self):
+        """Второй пояс: даже согласись разбор считать личку группой — роут не пустит.
+
+        Разбор сюда не доводит (в личке команда без аргумента = «объясни»), но
+        цена пропуска слишком велика: портал завёл бы ЛИЧНЫЙ чат как «группу
+        компании», и числовой Telegram сотрудника лёг бы открытым текстом в
+        колонку адреса доставки. Подменяем разбор швом и проверяем сам пояс.
+        """
+        from notary.lib import bind_command as bc
+
+        with mock.patch.object(
+            bc, "parse_bind_command", return_value=bc.BindCommand(kind="group")
+        ):
+            handled = ml.maybe_route_to_bind_command(
+                "tok",
+                STRANGER,
+                OWNER,
+                _msg("/привязать", chat=STRANGER, from_id=STRANGER, title=None),
+            )
+        self.assertTrue(handled)
+        self.assertEqual(self.portal.calls, [], "личка ушла в портал как группа")
+
+    def test_owner_private_chat_is_not_a_group_either(self):
+        """И у владельца тоже: его личка — не «группа компании»."""
+        ml.maybe_route_to_bind_command("tok", OWNER, OWNER, _msg("/привязать", chat=OWNER))
+        self.assertEqual([c["payload"]["kind"] for c in self.portal.calls], [])
+
+    def test_group_still_binds_as_group(self):
+        """Сторож на противоход: настоящая группа обязана остаться группой."""
+        ml.maybe_route_to_bind_command(
+            "tok", GROUP, OWNER, _msg("/привязать", from_id=STRANGER)
+        )
+        self.assertEqual([c["payload"]["kind"] for c in self.portal.calls], ["group"])
+
+    def test_bare_digits_from_known_person_are_not_a_code(self):
+        """🔴 «141500» В ЛИЧКЕ ВЛАДЕЛЬЦА — ЭТО ВРЕМЯ, А НЕ КОД.
+
+        Роут стоит ПЕРВЫМ, поэтому съеденное им сообщение до остальных роутов не
+        доходит вовсе: человек получал бы «такого кода не знаю» вместо разбора, а
+        пять таких подряд выбивали бы ему пятнадцатиминутную блокировку на
+        портале. Бот владельца ЗНАЕТ — значит и код от него не ждёт.
+        """
+        for text in ("141500", "141 500", "482913"):
+            with self.subTest(text=text):
+                handled = ml.maybe_route_to_bind_command(
+                    "tok", OWNER, OWNER, _msg(text, chat=OWNER)
+                )
+                self.assertFalse(handled, "сообщение владельца съедено привязкой")
+        self.assertEqual(self.portal.calls, [])
+        self.send.assert_not_called()
+
+    def test_known_person_can_still_relink_with_explicit_command(self):
+        """Переезд на другой аккаунт знакомому оставлен — явной формой с кодом."""
+        handled = ml.maybe_route_to_bind_command(
+            "tok", OWNER, OWNER, _msg(f"/привязать {CODE}", chat=OWNER)
+        )
+        self.assertTrue(handled)
+        self.assertEqual(self.portal.calls[0]["payload"]["kind"], "code")
+        self.assertEqual(self.portal.calls[0]["payload"]["code"], CODE)
 
 
 class TestRouteOrder(unittest.TestCase):
