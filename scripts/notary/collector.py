@@ -825,12 +825,30 @@ def _portal_note_recording(sid: str, meta: dict | None) -> None:
         logger.warning("Удержание исходников не поставлено (%s)", type(e).__name__)
 
 
-def _telegram_delivery_note(order: dict | None, delivery_status: str | None) -> dict:
+def _telegram_delivery_note(
+    order: dict | None,
+    delivery_status: str | None,
+    delivery: dict | None = None,
+) -> dict:
     """Ф10d: что сказать порталу про доставку в Telegram — статус И маршрут.
 
     Без маршрута панель «Доставка» может показать только «пропущено», и человек
     не поймёт, это поломка или так задумано. С маршрутом она говорит «ушло в
     группу серии» / «только на портал: телеграм сотрудника не привязан».
+
+    🔴 `mode` — ЭТО ФАКТ ОТПРАВКИ, А НЕ НАМЕРЕНИЕ НАРЯДА (ремонт 18.08.2026).
+    Раньше здесь стоял только `delivery_route.resolve(order)` — то есть «куда
+    ПОЛАГАЛОСЬ отправить». Отправлял при этом другой процесс (финализация), у
+    которого в тот день были сломаны импорты: он не сумел вывести маршрут и увёл
+    протокол в личку владельца бота по legacy-фолбэку. Порталу же уехало
+    `status: sent, mode: group` — панель «Доставка» показала «ушло в группу», а
+    в группе не было ничего. Рапорт, который не может отличиться от правды,
+    хуже отсутствия рапорта: по нему закрыли бы разбор.
+
+    Поэтому сверяем чат: `delivery["chat_id"]` — куда РЕАЛЬНО ушло (его вернула
+    сама отправка), `route.chat_id` — куда собирались. Разошлись → говорим
+    порталу правду о фактическом адресате и ставим `reason=delivered_elsewhere`,
+    по которому портал печатает человеку строку «ушло не туда».
     """
     note: dict = {"status": delivery_status or "unknown"}
     try:
@@ -839,6 +857,24 @@ def _telegram_delivery_note(order: dict | None, delivery_status: str | None) -> 
         route = delivery_route.resolve(order)
         note["mode"] = route.mode
         note["reason"] = route.reason
+        fact_chat = (delivery or {}).get("chat_id")
+        if (
+            delivery_status == "sent"
+            and isinstance(fact_chat, int)
+            and not isinstance(fact_chat, bool)
+            and isinstance(route.chat_id, int)
+            and fact_chat != route.chat_id
+        ):
+            # Знак chat_id у Telegram и есть тип чата: группы/супергруппы
+            # отрицательные, личка — положительная. Это не эвристика «на глаз»,
+            # а свойство протокола, и другого признака у нас в этой точке нет.
+            note["mode"] = "group" if fact_chat < 0 else "dm"
+            note["reason"] = "delivered_elsewhere"
+            logger.error(
+                "🔴 доставка ушла НЕ по наряду: отправлено в чат %s, наряд %s "
+                "требовал чат %s. Порталу отправлен ФАКТ (%s), не намерение",
+                fact_chat, (order or {}).get("id"), route.chat_id, note["mode"],
+            )
     except Exception as e:  # noqa: BLE001 — маршрут опционален, статус важнее
         logger.warning("Маршрут доставки не резолвится (%s)", type(e).__name__)
     return note
@@ -852,6 +888,7 @@ def _portal_enqueue_result(
     transcript_path: Path | None,
     protocol_path: Path | None,
     delivery_status: str | None,
+    delivery: dict | None = None,
 ) -> None:
     """Ф10c (R7.5): результат встречи → durable-очередь доставки в портал.
 
@@ -907,7 +944,7 @@ def _portal_enqueue_result(
             # Ф10d: панели «Доставка» мало слова «skipped» — ей нужно сказать
             # человеку ПОЧЕМУ. `mode`/`reason` отвечают на это машинно:
             # «только портал, потому что телеграм сотрудника не привязан».
-            telegram_delivery=_telegram_delivery_note(order, delivery_status),
+            telegram_delivery=_telegram_delivery_note(order, delivery_status, delivery),
             order_status=order.get("status"),
         )
         portal_delivery.enqueue(
@@ -1495,6 +1532,7 @@ def _do_finalize_and_collect(session_uid: str) -> None:
                 if finalize_protocol_path else None
             ),
             delivery_status=delivery_status,
+            delivery=delivery if isinstance(delivery, dict) else None,
         )
 
     # 3. WAV cleanup (Ф1-доработки 29.05). Удаляем WAV ТОЛЬКО когда оба

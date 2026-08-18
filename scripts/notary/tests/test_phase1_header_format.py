@@ -133,6 +133,39 @@ class TestSeriesDisplayName(unittest.TestCase, _SeriesDisplayConfigMixin):
             name = ptg.resolve_series_display_name({"series": "totally-unknown-xyz"})
         self.assertTrue(name)  # humanize-fallback, не падает
 
+    def test_portal_order_title_beats_machine_slug(self):
+        """Порталовая встреча: имя берётся из наряда (ремонт 18.08.2026).
+
+        Slug у неё машинный и у каждой встречи свой — в маппинг его не занести
+        в принципе. Без этого шага в рабочую группу, где протокол читают
+        сотрудники, уходила подпись «Portal 0ebc0725 24d1 4ee6 8e9d».
+        """
+        meta = {
+            "series": "portal-0ebc0725-24d1-4ee6-8e9d-7076601264e8",
+            "order": {
+                "id": "portal:0ebc0725-24d1-4ee6-8e9d-7076601264e8",
+                "series_title": "Еженедельная координация",
+            },
+        }
+        with self._with_config({}):
+            name = ptg.resolve_series_display_name(meta)
+        self.assertEqual(name, "Еженедельная координация")
+        self.assertNotIn("portal", name.lower())
+
+    def test_explicit_meta_title_still_wins_over_order(self):
+        meta = {
+            "series": "portal-abc",
+            "seriesTitle": "Ручное имя",
+            "order": {"series_title": "Имя из наряда"},
+        }
+        with self._with_config({}):
+            self.assertEqual(ptg.resolve_series_display_name(meta), "Ручное имя")
+
+    def test_personal_series_without_order_unchanged(self):
+        with self._with_config({"anzhee-direktorat": "Директорат"}):
+            name = ptg.resolve_series_display_name({"series": "anzhee-direktorat"})
+        self.assertEqual(name, "Директорат")
+
 
 class TestTgHeaderSeriesTitle(unittest.TestCase, _SeriesDisplayConfigMixin):
     """A1/F1 — шапка TG показывает имя серии, не generic «ПРОТОКОЛ ВСТРЕЧИ»."""

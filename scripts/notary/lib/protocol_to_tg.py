@@ -1430,16 +1430,30 @@ def resolve_series_display_name(
 
     Приоритет:
       1. Явное поле meta (`seriesTitle`/`series_display`) — future-proof.
-      2. Маппинг slug → имя: `_config/series-display.json` перебивает
+      2. Название из НАРЯДА портала (`meta["order"]["series_title"]`).
+      3. Маппинг slug → имя: `_config/series-display.json` перебивает
          хардкод-дефолты `_SERIES_DISPLAY_OVERRIDES`.
-      3. Тема `**Встреча:** Имя — …` из шапки протокола (до « — »).
-      4. Гуманизированный slug + warning (видно в логе → владелец добавит маппинг).
+      4. Тема `**Встреча:** Имя — …` из шапки протокола (до « — »).
+      5. Гуманизированный slug + warning (видно в логе → владелец добавит маппинг).
+
+    🔴 ПОЧЕМУ НАРЯД ВЫШЕ МАППИНГА (ремонт 18.08.2026). У порталовой встречи slug
+    серии машинный — `portal-<uuid>`, — и в маппинг его никто не занесёт: он
+    новый у каждой встречи. Без этого шага в рабочую группу, где протокол читают
+    сотрудники, уходила подпись «Portal 0ebc0725 24d1 4ee6 8e9d». Название
+    встречи при этом ИЗВЕСТНО ТОЧНО: портал прислал его в наряде, гадать не
+    нужно. Личные серии владельца наряда не имеют — для них порядок прежний.
     """
     meta = meeting_meta or {}
     for key in ("seriesTitle", "series_display", "seriesDisplayName"):
         v = meta.get(key)
         if isinstance(v, str) and v.strip():
             return v.strip()
+
+    order = meta.get("order")
+    if isinstance(order, dict):
+        title = order.get("series_title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
 
     series = (meta.get("series") or "").strip()
     if series:

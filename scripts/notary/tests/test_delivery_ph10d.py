@@ -232,10 +232,26 @@ class TestTwoEmployeesTwoCompanies(_Base):
     def _deliver(self, meta: Dict[str, Any], sent: List[tuple]) -> Dict[str, Any]:
         """Прогон настоящей `deliver_protocol` с перехватом отправки."""
         from notary.lib import llm_postprocess as lp
+        from notary.lib import protocol_to_pdf as real_pdf
+        from notary.lib import telegram_api as real_tg
 
-        with mock.patch.object(lp, "_send_protocol_pdf", create=True) as pdf:
-            pdf.return_value = {"ok": True, "message_id": 900}
+        # 🔴 КЛАССЫ ОШИБОК ПОДМЕНЯТЬ НЕЛЬЗЯ — ИНАЧЕ СТРАЖ СЛЕПНЕТ (ремонт
+        # 18.08.2026). `mock.patch.object(lp, "telegram_api")` заменяет модуль
+        # целиком, и `except (protocol_to_pdf.PdfRenderError,
+        # telegram_api.TelegramApiError, OSError)` внутри доставки ловит уже не
+        # исключения, а Mock'и: Python отвечает `TypeError: catching classes
+        # that do not inherit from BaseException`, и тест падал ВСЕГДА —
+        # независимо от того, куда ушёл документ. Ровно этот тест обязан был
+        # поймать инцидент «протокол уехал в личку вместо группы», а он к тому
+        # моменту не проверял ничего. Возвращаем настоящие классы на макеты.
+        #
+        # Подмена `_send_protocol_pdf` убрана: такой функции в доставке больше
+        # нет (сборка PDF инлайнится), `create=True` молча создавал атрибут и
+        # маскировал расхождение теста с кодом.
+        with mock.patch.object(lp, "protocol_to_pdf") as pdf_mod:
+            pdf_mod.PdfRenderError = real_pdf.PdfRenderError
             with mock.patch.object(lp, "telegram_api") as tg:
+                tg.TelegramApiError = real_tg.TelegramApiError
                 tg.send_document.side_effect = lambda token, chat_id, *a, **kw: (
                     sent.append(("doc", chat_id)) or {"message_id": 900}
                 )
