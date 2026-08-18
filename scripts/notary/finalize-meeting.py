@@ -940,7 +940,12 @@ def main() -> int:
             # lib/clarify_worker.py). Фикс только здесь означал бы, что поздняя
             # пересборка протокола вернёт хвост в шпаргалочную серию (ровно грабли
             # ISS-10, память [[review-checks-two-call-sites]]).
-            open_questions_carry = series_memory.carries_open_questions(meta.get("series"))
+            # `digests` обязателен: у ПОРТАЛЬНОЙ серии (`portal-<id встречи>`) своей
+            # записи в реестре нет и быть не может, и режим наследуется от той серии,
+            # из чьей памяти приехал хвост (см. `open_questions_mode_for_meeting`).
+            open_questions_carry = series_memory.carries_open_questions(
+                meta.get("series"), digests=series_memory_digests,
+            )
             if open_questions_carry:
                 open_tasks_block = series_memory.build_open_tasks_block(
                     series_memory_digests, series_dir=series_dir, meeting_sid=session_uid,

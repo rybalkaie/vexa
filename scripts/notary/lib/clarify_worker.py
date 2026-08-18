@@ -239,7 +239,11 @@ def _apply_resolution(
                 # finalize-meeting.py). Без него поздняя пересборка протокола вернула бы
                 # раздел «с прошлых встреч» в шпаргалочную серию — и ком поехал бы
                 # дальше через сам протокол ([[review-checks-two-call-sites]], ISS-10).
-                if series_memory.carries_open_questions(meta_block.get("series")):
+                # `digests` — тот же паритет с finalize: порталовая серия наследует
+                # режим от серии, из чьей памяти приехал хвост.
+                if series_memory.carries_open_questions(
+                    meta_block.get("series"), digests=_smem,
+                ):
                     open_tasks_block = series_memory.build_open_tasks_block(
                         _smem, series_dir=transcript_path.parent,
                         meeting_sid=state.get("meeting_id"),

@@ -567,13 +567,111 @@ def _drop_tasks_before_carry_since(
     return kept
 
 
-def carries_open_questions(series: Optional[str], *, watched: Optional[dict] = None) -> bool:
+def carries_open_questions(
+    series: Optional[str],
+    *,
+    watched: Optional[dict] = None,
+    digests: Optional[list] = None,
+) -> bool:
     """`True` — серия-накопление (`carry`): хвост в протоколе, статусы, сверщик.
 
     Читается на каждом call-site как ОДНО условие, чтобы «шпаргалочная» ветка нигде
     не расползлась в собственную копию сравнения строк.
+
+    `digests` — уже разрезолвленная память серии; нужна ПОРТАЛЬНЫМ встречам, см.
+    `open_questions_mode_for_meeting`.
     """
-    return open_questions_mode(series, watched=watched) == OPEN_QUESTIONS_MODE_CARRY
+    return (
+        open_questions_mode_for_meeting(series, digests=digests, watched=watched)
+        == OPEN_QUESTIONS_MODE_CARRY
+    )
+
+
+#: Префикс серий, которые ведёт портал: `portal-<id встречи>`. У них НЕТ и не может
+#: быть записи в `watched.yaml` — slug свой у КАЖДОЙ встречи, заводить их в реестр
+#: пришлось бы еженедельно руками.
+PORTAL_SERIES_PREFIX = "portal-"
+
+
+def open_questions_mode_for_meeting(
+    series: Optional[str],
+    *,
+    digests: Optional[list] = None,
+    watched: Optional[dict] = None,
+) -> str:
+    """Режим открытых вопросов ДЛЯ КОНКРЕТНОЙ ВСТРЕЧИ, включая порталовые.
+
+    🔴 ЗАЧЕМ ОТДЕЛЬНАЯ ФУНКЦИЯ (ремонт 18.08.2026). `open_questions_mode` при
+    отсутствии серии в реестре отвечает `carry` — сознательный fail-safe: «встреча,
+    дошедшая до протокола, в реестре есть по построению, значит мы смотрим не в тот
+    реестр». Для ПОРТАЛЬНОЙ встречи это рассуждение неверно целиком: её серия зовётся
+    `portal-<id встречи>`, в `watched.yaml` её нет и не будет никогда.
+
+    Цена ошибки была видна на живой встрече: «Еженедельная координация» 18.08 ушла
+    в группу с разделом «Вопросы с прошлых встреч, по которым не ясен статус» на
+    18 пунктов, хотя у этой серии перенос ВЫКЛЮЧЕН (в реестре режим не задан →
+    дефолт `last-only`), а висяки владелец разбирает утренним дайджестом. То есть
+    перевод встречи на портал молча вернул поведение, от которого ушли.
+
+    Как решаем — по порядку:
+      1. серия НЕ порталовая → прежний резолв, буква в букву;
+      2. порталовая и в реестре ЕСТЬ (кто-то завёл руками) → её запись главнее;
+      3. порталовая, памяти нет вовсе → дефолт реестра (`last-only`);
+      4. порталовая, память приехала фолбэком по составу участников из ДРУГОЙ серии
+         → берём режим ТОЙ серии. Это и есть перевод встречи на портал: хвост мы
+         унаследовали от неё, значит и правило про хвост — её.
+    """
+    if not isinstance(series, str) or not series.startswith(PORTAL_SERIES_PREFIX):
+        return open_questions_mode(series, watched=watched)
+
+    if watched is None:
+        try:
+            watched = load_watched_for_modes()
+        except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort
+            logger.warning("[open-tasks] реестр недоступен (%s) — порталовой серии "
+                           "%s назначаю дефолт реестра", type(e).__name__, series)
+            watched = None
+
+    if watched is not None:
+        try:
+            from notary.cli.registry import series_records  # noqa: PLC0415
+        except ImportError:  # окружение без пакета `notary`
+            from cli.registry import series_records  # noqa: PLC0415
+        try:
+            if series_records(series, watched):
+                return open_questions_mode(series, watched=watched)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[open-tasks] запись порталовой серии не прочитана (%s)",
+                           type(e).__name__)
+
+    # Чья память приехала: у выжимки записано ИМЯ СЕРИИ, из которой она взята.
+    # Берём самую свежую чужую — она же и дала хвост.
+    inherited = None
+    for digest in reversed(list(digests or [])):
+        if not isinstance(digest, dict):
+            continue
+        origin = digest.get("series")
+        if isinstance(origin, str) and origin.strip() and origin != series:
+            inherited = origin.strip()
+            break
+
+    if inherited is None:
+        # 🔴 НЕ `open_questions_mode(None)`: он для «серии нет в реестре» отвечает
+        # `carry` — тем самым fail-safe, который для порталовой встречи и неверен.
+        # Берём именно ДЕФОЛТ РЕЕСТРА (решение владельца 29.07: новые серии живут
+        # справкой), тот же, что получила бы обычная запись без поля.
+        try:
+            from notary.cli.registry import DEFAULT_OPEN_QUESTIONS_MODE  # noqa: PLC0415
+        except ImportError:
+            from cli.registry import DEFAULT_OPEN_QUESTIONS_MODE  # noqa: PLC0415
+        logger.info("[open-tasks] порталовая серия %s: прошлых встреч не нашлось — "
+                    "режим по дефолту реестра (%s)", series, DEFAULT_OPEN_QUESTIONS_MODE)
+        return DEFAULT_OPEN_QUESTIONS_MODE
+
+    mode = open_questions_mode(inherited, watched=watched or {})
+    logger.info("[open-tasks] порталовая серия %s наследует режим «%s» от серии %s "
+                "(хвост приехал оттуда)", series, mode, inherited)
+    return mode
 
 
 def open_tasks_max() -> int:
