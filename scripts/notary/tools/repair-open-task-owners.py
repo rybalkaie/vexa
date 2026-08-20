@@ -23,10 +23,16 @@
 именем), и файл пропускается целиком. Так же пропускается выжимка, собранная из
 другой версии протокола: хотя бы одна задача не сошлась → не трогаем ничего.
 
-🔴 СТАТУСЫ ПЕРЕЕЗЖАЮТ ВМЕСТЕ С ТЕКСТОМ. Sidecar статусов (`task-status.json`)
-ключуется по ПОЛНОМУ тексту задачи, а он меняется («задача» → «Имя: задача»).
-Найденный статус переносится под новый ключ, иначе проставленное «сделано»
-потерялось бы и закрытая задача воскресла бы висящей.
+🔴 ЗА ТЕКСТОМ ПЕРЕЕЗЖАЮТ ОБА SIDECAR'а. И статусы (`task-status.json`), и слепки
+нумерации отправленных дайджестов (`open-tasks-snapshots.json`) ключуются по
+ПОЛНОМУ тексту задачи, а он меняется («задача» → «Имя: задача»).
+  • статус не перенести — проставленное «сделано» потеряется, закрытая задача
+    воскреснет висящей;
+  • слепок не перенести — ответ человека реплаем на УЖЕ ОТПРАВЛЕННЫЙ дайджест
+    («закрой третью») запишет статус под старый ключ, и с починенной выжимкой он
+    не сойдётся: задача останется висеть, хотя человек её закрыл.
+Оба файла правятся под тем же межпроцессным замком серии, что и сам бот, — иначе
+параллельная запись reply-канала или ночного сверщика была бы затёрта.
 
 По умолчанию — DRY-RUN: печатает, что изменится, и ничего не пишет. Реальная
 запись — только по явному `--apply`.
@@ -189,6 +195,47 @@ def _migrate_statuses(series_dir: Path, renames: list, *, apply: bool) -> int:
     return moved
 
 
+def _migrate_snapshots(series_dir: Path, renames: list, *, apply: bool) -> int:
+    """Переписать key-тексты в слепках нумерации отправленных дайджестов.
+
+    Слепок хранит ПОЛНЫЕ ключи задач по позициям показа — по ним резолвится ответ
+    «закрой третью» на уже отправленное сообщение. Оставить там старый безымянный
+    текст значит записать статус под ключ, которого в починенной выжимке больше нет.
+    Возвращает число заменённых позиций.
+    """
+    path = sm.open_tasks_snapshot_path(series_dir)
+    if not path.is_file():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    snaps = data.get("snapshots")
+    if not isinstance(snaps, dict):
+        return 0
+    by_key = {sm._status_key(o): n for o, n in renames}
+    changed = 0
+    for rec in snaps.values():
+        if not isinstance(rec, dict):
+            continue
+        positions = rec.get("positions")
+        if not isinstance(positions, list):
+            continue
+        new_positions = []
+        for pos in positions:
+            replacement = by_key.get(sm._status_key(pos)) if isinstance(pos, str) else None
+            if replacement and replacement != pos:
+                new_positions.append(replacement)
+                changed += 1
+            else:
+                new_positions.append(pos)
+        rec["positions"] = new_positions
+    if changed and apply:
+        data["snapshots"] = snaps
+        _write_json(path, data)
+    return changed
+
+
 def _write_json(path: Path, payload: dict) -> None:
     """Атомарная запись с правами 600 — как у самого бота (файлы серии приватны)."""
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -221,6 +268,7 @@ def main() -> int:
 
     repaired = 0
     statuses = 0
+    snapshots = 0
     for series_dir in series_dirs:
         for entry in sorted(series_dir.iterdir(), key=lambda p: p.name):
             if not entry.is_file():
@@ -241,21 +289,28 @@ def main() -> int:
                 print(f"    стало: {new[:70]}")
             if len(renames) > 3:
                 print(f"    … и ещё {len(renames) - 3}")
-            moved = _migrate_statuses(series_dir, renames, apply=args.apply)
+            # Под тем же замком, что держит сам бот: reply-канал и ночной сверщик
+            # пишут эти же файлы, и наш read-modify-write затёр бы их запись.
+            with sm._status_store_lock(series_dir):
+                moved = _migrate_statuses(series_dir, renames, apply=args.apply)
+                shifted = _migrate_snapshots(series_dir, renames, apply=args.apply)
+                if args.apply:
+                    digest = plan["digest"]
+                    digest["open_tasks"] = plan["new_items"]
+                    if plan["new_born"] is not None:
+                        digest[sm.OPEN_TASKS_BORN_HERE_KEY] = plan["new_born"]
+                    _write_json(mem_path, digest)
             if moved:
                 print(f"    статусов переносим в sidecar: {moved}")
+            if shifted:
+                print(f"    позиций в слепках нумерации переписываем: {shifted}")
             statuses += moved
-            if args.apply:
-                digest = plan["digest"]
-                digest["open_tasks"] = plan["new_items"]
-                if plan["new_born"] is not None:
-                    digest[sm.OPEN_TASKS_BORN_HERE_KEY] = plan["new_born"]
-                _write_json(mem_path, digest)
+            snapshots += shifted
             repaired += 1
 
     tail = "" if args.apply else "  (DRY-RUN, ничего не записано — повтори с --apply)"
     print(f"\n{'✅' if args.apply else 'ℹ️'} выжимок к починке: {repaired}, "
-          f"статусов перенесено: {statuses}{tail}")
+          f"статусов перенесено: {statuses}, позиций в слепках: {snapshots}{tail}")
     return 0
 
 
