@@ -31,6 +31,7 @@ _NOTARY = _HERE.parent
 if str(_NOTARY) not in sys.path:
     sys.path.insert(0, str(_NOTARY))
 
+from lib import series_memory  # noqa: E402
 from lib import vocative_check as vc  # noqa: E402
 
 
@@ -424,6 +425,93 @@ class TestReviewContourIntegration(unittest.TestCase):
             )
         written = self.protocol_path.read_text(encoding="utf-8")
         self.assertNotIn(self.lp.SPEAKER_PLAQUE_SENTINEL, written)
+
+
+class TestVocativeFlagKeepsTaskOwner(unittest.TestCase):
+    """РЕГРЕСС 20.08.2026: врезка вокатива в подзаголовке НЕ должна съедать исполнителя.
+
+    Боевой случай (marketplaces-tatiana, 12.08.2026): ревью-проход приклеил
+    «⚠️ проверьте: тут мог быть …» к строке `**Илья Рыбалка**` блока «Задачи».
+    Разбор выжимки (`series_memory._OWNER_SUBHEADING_RE`) требовал конца строки
+    сразу после `**` — подзаголовок перестал опознаваться, и все 25 задач встречи
+    уехали в память серии БЕЗ префикса «Имя: ». Итог у людей: утренний дайджест
+    Ватсона и вкладка «Задачи» портала показали всё «без ответственного».
+    """
+
+    def _protocol(self, owner_line_ilya: str, owner_line_tanya: str) -> str:
+        return "\n".join([
+            "# Протокол",
+            "",
+            "**Участники:** Илья Рыбалка, Татьяна",
+            "",
+            "## Задачи",
+            "",
+            owner_line_ilya,
+            "",
+            "- Приподнять цену на чёрный проектор.",
+            "",
+            owner_line_tanya,
+            "",
+            "- Настроить скидки 5% на ООО.",
+            "",
+        ])
+
+    def test_owner_survives_inline_vocative_flag(self):
+        text = self._protocol(
+            "**Илья Рыбалка**  ⚠️ проверьте: тут мог быть Татьяна, а не Илья Рыбалка",
+            "**Татьяна**  ⚠️ проверьте: тут мог быть Илья Рыбалка, а не Татьяна",
+        )
+        tasks = series_memory.extract_open_tasks(text)
+        self.assertEqual(tasks, [
+            "Илья Рыбалка: Приподнять цену на чёрный проектор.",
+            "Татьяна: Настроить скидки 5% на ООО.",
+        ])
+        nameless, owned = series_memory.group_open_tasks_by_owner(tasks)
+        self.assertEqual(nameless, [])
+        self.assertEqual([o for o, _ in owned], ["Илья Рыбалка", "Татьяна"])
+
+    def test_owner_without_flag_unchanged(self):
+        """Строка без врезки читается ровно как раньше (поведение не поехало)."""
+        text = self._protocol("**Илья Рыбалка**", "**Татьяна**")
+        self.assertEqual(series_memory.extract_open_tasks(text), [
+            "Илья Рыбалка: Приподнять цену на чёрный проектор.",
+            "Татьяна: Настроить скидки 5% на ООО.",
+        ])
+
+    def test_bold_lead_with_prose_is_not_owner(self):
+        """`**Важно** дальше проза` подзаголовком НЕ становится: иначе случайное
+        жирное слово в разделе задач приклеило бы своё «имя» к чужим задачам."""
+        text = "\n".join([
+            "# Протокол",
+            "",
+            "## Задачи",
+            "",
+            "**Важно** ниже список того, что берём в работу",
+            "",
+            "- Приподнять цену на чёрный проектор.",
+            "",
+        ])
+        self.assertEqual(
+            series_memory.extract_open_tasks(text),
+            ["Приподнять цену на чёрный проектор."],
+        )
+
+    def test_carryover_owner_survives_flag(self):
+        """Тот же подзаголовок в «🔻 С прошлых встреч» — врезка и там не теряет имя."""
+        text = "\n".join([
+            "# Протокол",
+            "",
+            "## 🔻 С прошлых встреч",
+            "",
+            "**Татьяна**  ⚠️ проверьте: тут мог быть Илья Рыбалка, а не Татьяна",
+            "",
+            "- Просчитать себестоимость поставки — висит",
+            "",
+        ])
+        self.assertEqual(
+            series_memory.extract_open_tasks(text),
+            ["Татьяна: Просчитать себестоимость поставки"],
+        )
 
 
 if __name__ == "__main__":
