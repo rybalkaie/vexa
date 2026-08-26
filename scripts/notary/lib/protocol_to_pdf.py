@@ -371,10 +371,26 @@ def render_pdf_from_markdown(
     out_path = Path(out_pdf)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     html_doc = markdown_to_html(md_text, title, subtitle)
-    html_path = out_path.with_suffix(".html")
+    # ─────────────────────────────────────────────────────────────────────────
+    # 🔴 ПРОМЕЖУТОЧНЫЙ HTML ЖИВЁТ ВО ВРЕМЕННОЙ ПАПКЕ, А НЕ РЯДОМ С PDF
+    # (сверка 26.08.2026).
+    #
+    # ЧТО БЫЛО. Файл писался как `out_path.with_suffix(".html")`. Пока PDF
+    # собирался во временный каталог, HTML умирал вместе с ним. С 26.08 PDF
+    # кладётся РЯДОМ С ПРОТОКОЛОМ — и рядом же начал оседать HTML: в папке
+    # протоколов появилась ТРЕТЬЯ копия того же текста, о которой не знает ни
+    # метельщик, ни уборка по сроку хранения. То есть дословный разговор
+    # переживал бы удаление `.md` и `.pdf`, для которых срок объявлен.
+    #
+    # Временный каталог снимает оба вопроса разом: мусора нет, лишней копии нет,
+    # и поведение больше не зависит от того, куда просят положить PDF.
+    # ─────────────────────────────────────────────────────────────────────────
+    html_dir = tempfile.mkdtemp(prefix="protocol-pdf-html-")
+    html_path = Path(html_dir) / "protocol.html"
     try:
         html_path.write_text(html_doc, encoding="utf-8")
     except OSError as e:
+        shutil.rmtree(html_dir, ignore_errors=True)
         raise PdfRenderError(f"не записал HTML для PDF: {e}") from e
 
     # Изолированный профиль (`--user-data-dir`) на каждый рендер — защита от
@@ -404,6 +420,7 @@ def render_pdf_from_markdown(
     finally:
         if tmp_profile:
             shutil.rmtree(tmp_profile, ignore_errors=True)
+        shutil.rmtree(html_dir, ignore_errors=True)
 
     if proc.returncode != 0:
         # stderr НЕ логируем целиком (может содержать пути) — только хвост кода.
