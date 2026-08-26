@@ -4549,13 +4549,58 @@ def deliver_protocol(
     started = time.monotonic()
     safe_date = re.sub(r"[^0-9A-Za-z._-]", "-", str(date)) or "protokol"
     pdf_filename = f"protokol-{safe_date}.pdf"
+    # ─────────────────────────────────────────────────────────────────────────
+    # 🔴 PDF СОБИРАЕТСЯ СРАЗУ РЯДОМ С ПРОТОКОЛОМ, А НЕ ВО ВРЕМЕННУЮ ПАПКУ
+    # (замечание владельца 25.08.2026).
+    #
+    # Этот же документ через минуту спросит портал — кнопкой «Скачать PDF». Пока
+    # файл жил в `TemporaryDirectory`, портал шёл к шлюзу, шлюз запускал
+    # headless-браузер второй раз и падал под лимитами своего юнита: человек
+    # видел «PDF временно недоступен» на каждой встрече. Теперь собранный файл
+    # остаётся рядом с `<date>-protokol.md`, и портал отдаёт его чтением с диска.
+    #
+    # Новых данных на диске не появляется: рядом уже лежит тот же текст в `.md`,
+    # в той же папке, с тем же сроком хранения (см. `stored_pdf_path`).
+    #
+    # ⚠️ ОТПРАВКА В TELEGRAM НЕ ЗАВИСИТ ОТ ТОГО, УДАЛОСЬ ЛИ СОХРАНИТЬ. Каталог
+    # может оказаться недоступным на запись (чужие права, переполненный диск) —
+    # это НЕ повод не доставить протокол людям: тогда собираем во временную
+    # папку, как раньше, и портал просто соберёт себе сам.
+    # ─────────────────────────────────────────────────────────────────────────
+    stored_pdf = None
+    if meta_json_path is not None:
+        try:
+            md_path = Path(meta_json_path).parent / f"{date}-protokol.md"
+            candidate = protocol_to_pdf.stored_pdf_path(md_path)
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            if os.access(candidate.parent, os.W_OK):
+                stored_pdf = candidate
+        except (OSError, ValueError, TypeError):
+            stored_pdf = None
+
     try:
         with tempfile.TemporaryDirectory(prefix="deliver-pdf-") as td:
-            pdf_path = Path(td) / pdf_filename
-            protocol_to_pdf.render_pdf_from_markdown(
-                protocol_text, str(pdf_path),
-                title=pdf_title, subtitle=pdf_subtitle,
-            )
+            pdf_path = stored_pdf if stored_pdf is not None else Path(td) / pdf_filename
+            try:
+                protocol_to_pdf.render_pdf_from_markdown(
+                    protocol_text, str(pdf_path),
+                    title=pdf_title, subtitle=pdf_subtitle,
+                )
+            except protocol_to_pdf.PdfRenderError:
+                # Сборка рядом с протоколом не удалась — пробуем во временную
+                # папку: доставка людям важнее готового файла для портала.
+                if stored_pdf is None:
+                    raise
+                logger.warning(
+                    "[delivery] PDF рядом с протоколом собрать не вышло — "
+                    "собираю во временную папку meeting=%s", meeting_sid or "?",
+                )
+                stored_pdf = None
+                pdf_path = Path(td) / pdf_filename
+                protocol_to_pdf.render_pdf_from_markdown(
+                    protocol_text, str(pdf_path),
+                    title=pdf_title, subtitle=pdf_subtitle,
+                )
             send_result = telegram_api.send_document(
                 bot_token, chat_id, str(pdf_path),
                 caption=caption, filename=pdf_filename,

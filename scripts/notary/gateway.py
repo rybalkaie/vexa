@@ -1028,15 +1028,50 @@ class _Handler(BaseHTTPRequestHandler):
             # В лог — только объём. Текст протокола в лог не попадает никогда.
             self._log(200, "protocol md %d bytes" % len(body))
             return
-        self._protocol_pdf(order, md_text)
+        self._protocol_pdf(order, md_text, path)
 
-    def _protocol_pdf(self, order: Dict[str, Any], md_text: str) -> None:
+    def _protocol_pdf(self, order: Dict[str, Any], md_text: str, md_path: Path) -> None:
         import tempfile
 
         try:
-            from notary.lib.protocol_to_pdf import PdfRenderError, render_pdf_from_markdown
+            from notary.lib.protocol_to_pdf import (
+                PdfRenderError,
+                is_stored_pdf_fresh,
+                render_pdf_from_markdown,
+                stored_pdf_path,
+            )
         except Exception as exc:  # noqa: BLE001
             self._error(503, "pdf_unavailable", "сборка PDF недоступна: %s" % exc)
+            return
+
+        # ─────────────────────────────────────────────────────────────────────
+        # 🔴 СНАЧАЛА ИЩЕМ ГОТОВЫЙ ФАЙЛ, И ЭТО ОСНОВНОЙ ПУТЬ, А НЕ ОПТИМИЗАЦИЯ
+        # (замечание владельца 25.08.2026: «PDF должен лежать готовым»).
+        #
+        # ЧТО БЫЛО. На каждое нажатие «Скачать PDF» шлюз запускал headless-Chrome.
+        # У юнита шлюза лимиты 192 МБ памяти и 64 задачи — браузеру этого не
+        # хватает, он падал с кодом -5, и портал показывал «PDF временно
+        # недоступен» ВСЕГДА, на любой встрече. Замерено боем 25.08.2026: три
+        # запроса подряд, три 503 `pdf_unavailable`.
+        #
+        # Теперь готовый PDF кладёт рядом с протоколом сама доставка
+        # (`deliver_protocol`), а шлюз его просто читает — это чтение файла,
+        # оно не может упасть по памяти. Сборка осталась запасным путём: для
+        # протоколов, собранных до этой правки, и для тех, чей PDF устарел
+        # после правки текста.
+        #
+        # ⚠️ УСТАРЕВШИЙ ФАЙЛ НЕ ОТДАЁМ. `is_stored_pdf_fresh` сверяет время
+        # правки: протокол переписывают (поправка из Telegram, правка с портала),
+        # и старый PDF выглядел бы для человека текущей редакцией.
+        # ─────────────────────────────────────────────────────────────────────
+        stored = stored_pdf_path(md_path)
+        if is_stored_pdf_fresh(md_path, stored):
+            try:
+                body = stored.read_bytes()
+            except OSError as exc:
+                self._error(503, "pdf_unavailable", "PDF временно недоступен: %s" % exc)
+                return
+            self._send_pdf(order, body, cached=True)
             return
         title = str(order.get("series_title") or order.get("series") or "Протокол встречи")
         subtitle = str(order.get("start_at") or "")[:10]
@@ -1061,6 +1096,10 @@ class _Handler(BaseHTTPRequestHandler):
                 os.rmdir(tmpdir)
             except OSError:
                 pass
+        self._send_pdf(order, body, cached=False)
+
+    def _send_pdf(self, order: Dict[str, Any], body: bytes, *, cached: bool) -> None:
+        """Отдать тело PDF. В лог — только объём и откуда взяли; текста нет."""
         self.send_response(200)
         self.send_header("Content-Type", "application/pdf")
         self.send_header("Content-Length", str(len(body)))
@@ -1070,7 +1109,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        self._log(200, "protocol pdf %d bytes" % len(body))
+        # Пометка «готовый / собран сейчас» — она и отвечает на вопрос «почему
+        # медленно»: собранный на лету PDF занимает секунды, готовый — мгновение.
+        self._log(200, "protocol pdf %d bytes (%s)" % (len(body), "stored" if cached else "rendered"))
 
 
 def _unquote_id(raw: str) -> str:

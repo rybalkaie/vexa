@@ -309,6 +309,46 @@ def _build_chrome_cmd(chrome: str, out_path: Path, html_path: Path,
     return cmd
 
 
+def stored_pdf_path(md_path) -> Path:
+    """Где лежит ГОТОВЫЙ PDF протокола — рядом с самим протоколом.
+
+    🔴 ЗАЧЕМ ФАЙЛ ВООБЩЕ ЛОЖИТСЯ НА ДИСК (замечание владельца 25.08.2026).
+    Портал просил PDF у шлюза в момент нажатия кнопки, шлюз запускал headless-
+    браузер — и под лимитами своего юнита (192 МБ памяти, 64 задачи) браузер
+    падал: человек видел «PDF временно недоступен» на каждой встрече. Собирать
+    заново документ, который уже собирали при отправке в Telegram, незачем: PDF
+    протокола неизменен, пока неизменен сам протокол.
+
+    🔴 НОВЫХ ДАННЫХ НА ДИСКЕ НЕ ПОЯВЛЯЕТСЯ. Рядом уже лежит `<date>-protokol.md`
+    с тем же текстом и в той же папке с теми же правами — PDF не расширяет круг
+    того, что хранится, и не меняет срок хранения (его чистит тот же метельщик,
+    что и протокол).
+
+    Имя — `<date>-protokol.pdf` рядом с `<date>-protokol.md`.
+    """
+    return Path(md_path).with_suffix(".pdf")
+
+
+def is_stored_pdf_fresh(md_path, pdf_path=None) -> bool:
+    """Готовый PDF годен, только если он НЕ СТАРШЕ своего протокола.
+
+    🔴 СРАВНЕНИЕ ПО ВРЕМЕНИ ПРАВКИ — НЕСУЩЕЕ. Протокол переписывается: человек
+    присылает поправку в Telegram, портал правит текст, бот пересобирает версию.
+    Отдать «какой-нибудь» лежащий PDF значило бы выдать человеку СТАРУЮ редакцию
+    протокола как текущую — и он бы этого не заметил.
+    """
+    md = Path(md_path)
+    pdf = Path(pdf_path) if pdf_path is not None else stored_pdf_path(md)
+    try:
+        if not pdf.is_file() or not md.is_file():
+            return False
+        if pdf.stat().st_size < MIN_VALID_PDF_BYTES:
+            return False
+        return pdf.stat().st_mtime >= md.stat().st_mtime
+    except OSError:
+        return False
+
+
 def render_pdf_from_markdown(
     md_text: str,
     out_pdf: str,
