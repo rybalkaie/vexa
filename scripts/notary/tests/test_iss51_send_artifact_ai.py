@@ -1076,6 +1076,14 @@ class TestVerblessRequests(unittest.TestCase):
         ("высылай протокол", "protocol"),
     )
 
+    def test_the_send_verb_dictionary_is_still_alive(self):
+        # Предпосылка класса: проверка «в этих фразах нет глагола отправки» ничего не
+        # значит, если словарь глаголов вообще перестал срабатывать.
+        # Именно узкий словарь ISS-45: «вышли» в нём НЕТ по историческим причинам —
+        # с этого пробела фаза и началась, поэтому его сюда брать нельзя.
+        for text in ("пришли протокол", "скинь протокол", "покажи открытые вопросы"):
+            self.assertTrue(sa._SEND_VERB.search(sa._norm(text)), text)
+
     def test_none_of_them_carries_a_send_verb(self):
         # Страховка от зелёного вхолостую: если фразы ловятся старым словарём
         # быстрого пути, класс ничего не доказывает.
@@ -1092,6 +1100,42 @@ class TestVerblessRequests(unittest.TestCase):
                 sa.detect_artifact_request(text, allow_bare_file=False,
                                            answer_fn=_ai(artifact="unknown")),
                 want, text)
+
+    # По одной фразе на КАЖДЫЙ признак формы. Без этого признаков было тринадцать, а
+    # фикстур семь: половину можно было выкинуть из кода, и гейт не краснел (проверка
+    # мутациями, второй заход).
+    SHAPES = (
+        ("вопрос", "а протокол?"),
+        ("можно", "можно протокол"),
+        ("прошу", "прошу протокол вчерашней встречи"),
+        ("мне бы", "мне бы протокол последней встречи"),
+        ("нужно", "нужно протокол со вчера"),
+        ("надо", "надо протокол со вчера"),
+        ("хотел бы", "хотел бы протокол последней встречи"),
+        ("есть у кого", "есть у кого протокол"),
+        ("в студию", "список открытых вопросов в студию"),
+        ("пожалуйста", "протокол, пожалуйста"),
+        ("плиз", "протокол плиз"),
+        ("плз", "протокол плз"),
+        ("обращение к боту", "бот, открытые вопросы"),
+    )
+
+    def test_every_shape_marker_is_pinned_by_its_own_phrase(self):
+        for name, text in self.SHAPES:
+            with self.subTest(признак=name):
+                # Признак держит фразу ОДИН: словарь маркеров её не ловит, значит
+                # удаление признака из кода эту фразу сломает — и тест покраснеет.
+                self.assertFalse(sa.looks_like_request(text),
+                                 f"{name}: фразу ловит словарь, признак не пришпилен")
+                self.assertTrue(sa.looks_like_a_request_in_shape(text), name)
+                self.assertTrue(sa.should_ask_ai(text), name)
+
+    def test_the_shape_check_is_not_a_blanket_yes(self):
+        # Страховка от зелёного вхолостую: если признак формы начнёт срабатывать на
+        # чём угодно, класс выше станет бессмысленным.
+        for text in ("протокол подписан вчера", "обсудим протокол на встрече",
+                     "по протоколу испытаний всё ок"):
+            self.assertFalse(sa.looks_like_a_request_in_shape(text), text)
 
 
 class TestMentioningIsNotAsking(unittest.TestCase):
@@ -1166,12 +1210,44 @@ class TestBareFileOnlyInReplyToUs(unittest.TestCase):
             self.assertFalse(claimed, text)
             self.assertFalse(dig or prot, text)
 
-    def test_the_route_asks_for_our_surface_not_for_any_reply(self):
-        # Инвариант на исходнике: `allow_bare_file` обязан считаться от того же
-        # `surface`, которым резолвится наш документ, а не от факта реплая.
-        src = inspect.getsource(ml.maybe_route_to_send_artifact)
-        self.assertNotIn("allow_bare_file=is_reply", src)
-        self.assertIn("allow_bare_file=surface is not None", src)
+    def test_both_call_sites_get_the_same_gate(self):
+        """Роут спрашивает `send_artifact` ДВАЖДЫ — сперва дешёвым пред-чеком, потом
+        разбором. Условие «можно ли считать интентом голый объект» обязано быть у них
+        ОДНО. Поломка в одном месте поведенчески не видна (пред-чек fail-closed, а
+        `surface` считается один раз), поэтому ловим её не текстом исходника — текст
+        переписывается эквивалентно, — а тем, что оба места РЕАЛЬНО получили."""
+        seen: dict = {}
+        real_may, real_detect = sa.may_be_request, sa.detect_artifact_request
+
+        def spy_may(text, **kw):
+            seen["пред-чек"] = kw.get("allow_bare_file")
+            return real_may(text, **kw)
+
+        def spy_detect(text, **kw):
+            seen["разбор"] = kw.get("allow_bare_file")
+            return real_detect(text, **kw)
+
+        with mock.patch.dict(os.environ, {"ENABLE_SEND_ARTIFACT_AI": "1"}), \
+             mock.patch.object(sa, "may_be_request", side_effect=spy_may), \
+             mock.patch.object(sa, "detect_artifact_request", side_effect=spy_detect), \
+             mock.patch.object(sa, "understand_request", side_effect=_greedy), \
+             mock.patch.object(ml, "_chat_context_series",
+                               return_value=(["koord"], None)), \
+             mock.patch.object(ml, "_reply_context_series", return_value=None), \
+             mock.patch.object(ml, "_reply_context_series_digest", return_value=None), \
+             mock.patch.object(ml, "_resend_protocol", return_value=True), \
+             mock.patch.object(ml, "_resend_digest", return_value=True), \
+             mock.patch.object(ml, "send_message"):
+            # Фраза с ЯВНЫМ объектом: пред-чек её пропускает, значит до разбора дело
+            # доходит и оба места успевают отметиться.
+            ml.maybe_route_to_send_artifact(
+                "tok", self.GROUP, self.OWNER,
+                self._msg("пришли протокол", reply=True))
+        self.assertEqual(sorted(seen), ["пред-чек", "разбор"], seen)
+        self.assertEqual(seen["пред-чек"], seen["разбор"],
+                         f"пред-чек и разбор гейтятся по-разному: {seen}")
+        self.assertFalse(seen["разбор"],
+                         "реплай на ЧУЖОЕ сообщение разрешил голый объект")
 
 
 if __name__ == "__main__":

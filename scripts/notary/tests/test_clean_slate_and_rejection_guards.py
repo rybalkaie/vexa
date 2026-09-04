@@ -137,6 +137,47 @@ class TestYesCancelsNoAcrossKinds(unittest.TestCase):
         joined = " ".join(res["summary_lines"])
         self.assertIn("серию", joined.lower())
 
+    def test_a_lone_no_really_creates_a_rejection_stub(self):
+        """Предпосылка всего класса. Три утверждения выше истинны и на ПУСТОМ
+        множестве: перестань заглушка отказа создаваться — и они зазеленеют, ничего
+        не охраняя. Здесь проверяется, что предмет охраны вообще существует."""
+        start = (datetime.now(timezone.utc) + timedelta(days=5)).replace(
+            minute=0, second=0, microsecond=0)
+        data = {"watched": []}
+        with mock.patch.object(mar, "load_watched", lambda *a, **k: data), \
+             mock.patch.object(mar, "save_watched", lambda d: None), \
+             mock.patch.object(mar, "load_rooms", lambda *a, **k: {"rooms": []}), \
+             mock.patch.object(mar, "release_watched_lock", lambda: None):
+            mar.apply_decisions(
+                [{"n": 1, "action": "reject"}],
+                [self._snapshot(1, "primary", "evt-A", "rr-A", start)])
+        marked = [w for w in data["watched"]
+                  if w.get(mar.REJECTION_OWNER_FIELD) or w.get("rejected_start_at")]
+        self.assertTrue(marked, "отказ вообще не оставил метки — охранять нечего")
+        self.assertTrue(
+            any(not w.get("recurring_event_id") for w in marked),
+            "заглушка отказа перестала быть одноразовой — весь класс потерял смысл")
+
+    def test_the_rejection_alone_does_stop_the_bot(self):
+        """Вторая половина предпосылки: метка отказа обязана РЕАЛЬНО снимать старт.
+        Иначе «бот приедет» из теста выше не доказывает ничего — он приезжал бы и со
+        сломанным снятием отказа."""
+        start = (datetime.now(timezone.utc) + timedelta(days=5)).replace(
+            minute=0, second=0, microsecond=0)
+        data = {"watched": []}
+        with mock.patch.object(mar, "load_watched", lambda *a, **k: data), \
+             mock.patch.object(mar, "save_watched", lambda d: None), \
+             mock.patch.object(mar, "load_rooms", lambda *a, **k: {"rooms": []}), \
+             mock.patch.object(mar, "release_watched_lock", lambda: None):
+            mar.apply_decisions(
+                [{"n": 1, "action": "reject"}],
+                [self._snapshot(1, "primary", "evt-A", "rr-A", start)])
+        queue = [{"meeting_id": "series-koord", "start_at": start.isoformat(),
+                  "url": self.URL, "ical_uid": self.ICAL,
+                  "calendar_id": "primary", "event_id": "evt-A"}]
+        self.assertEqual(sched.drop_rejected_occurrences(queue, data["watched"]), [],
+                         "«нет» не снимает старт — значит и «да» нечего отменять")
+
     def test_no_rejection_marks_survive_the_agreement(self):
         _res, watched, _queue = self._reject_then_accept_series()
         still = [w.get("id") for w in watched
