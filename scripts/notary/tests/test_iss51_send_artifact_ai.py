@@ -1049,5 +1049,130 @@ class TestInvariants(unittest.TestCase):
         self.assertIn("looks_like_edit_request", src)
 
 
+
+# ==========================================================================
+# 🔴 Доводка: просьба БЕЗ глагола отправки (мутации М1/М2/М3 проходили насквозь)
+# ==========================================================================
+class TestVerblessRequests(unittest.TestCase):
+    """Обещание фазы — «формулировка глагола роли не играет» — не было закреплено.
+
+    Все десять фикстур `TestLiveRequests` начинаются с глагола отправки («вышли»,
+    «скинь», «пришли», «дай», «шли», «отправьте»). Просьбы БЕЗ глагола в наборе не
+    было ни одной, поэтому набор не заметил, что ремонт поставил перед моделью
+    словарь глаголов — то есть вернул на шаг раньше ровно то, ради устранения чего
+    делалась фаза. Проверка мутациями: подмена фильтра обратно на словарь проходила
+    гейт зоны насквозь.
+
+    Здесь просьба узнаётся по ФОРМЕ: вопрос, вежливая конструкция, обращение к боту.
+    """
+
+    VERBLESS = (
+        ("а можно протокол?", "protocol"),
+        ("мне бы протокол последней встречи", "protocol"),
+        ("список открытых вопросов в студию", "digest"),
+        ("протокол, пожалуйста", "protocol"),
+        ("бот, открытые вопросы", "digest"),
+        ("есть у кого протокол?", "protocol"),
+        ("высылай протокол", "protocol"),
+    )
+
+    def test_none_of_them_carries_a_send_verb(self):
+        # Страховка от зелёного вхолостую: если фразы ловятся старым словарём
+        # быстрого пути, класс ничего не доказывает.
+        caught = [t for t, _ in self.VERBLESS if sa._SEND_VERB.search(sa._norm(t))]
+        self.assertEqual(caught, [], f"эти ловятся словарём быстрого пути: {caught}")
+
+    def test_all_of_them_reach_the_model(self):
+        for text, _ in self.VERBLESS:
+            self.assertTrue(sa.should_ask_ai(text), text)
+
+    def test_all_of_them_are_understood(self):
+        for text, want in self.VERBLESS:
+            self.assertEqual(
+                sa.detect_artifact_request(text, allow_bare_file=False,
+                                           answer_fn=_ai(artifact="unknown")),
+                want, text)
+
+
+class TestMentioningIsNotAsking(unittest.TestCase):
+    """Обратная сторона: НАЗВАТЬ документ — не значит попросить его.
+
+    `да[йте]+` ловил слово «дате», и «уточню по дате протокола» отправляло протокол
+    БЫСТРЫМ путём — без модели, то есть в дефолтной конфигурации, которую и увидит
+    боевой сервер. Мутация с возвратом старого словаря гейт не красила."""
+
+    MENTIONS = (
+        "уточню по дате протокола",
+        "определимся по дате встречи",
+        "по протоколу испытаний всё ок",
+        "протокол подписан вчера",
+        "обсудим протокол на встрече",
+    )
+
+    def test_regex_path_stays_silent(self):
+        # Быстрый путь — ровно то, что работает при выключенном флаге.
+        for text in self.MENTIONS:
+            self.assertIsNone(sa.detect_artifact_request(text), text)
+
+    def test_they_do_not_even_reach_the_model(self):
+        for text in self.MENTIONS:
+            self.assertFalse(sa.should_ask_ai(text), text)
+
+
+class TestBareFileOnlyInReplyToUs(unittest.TestCase):
+    """🔴 Утечка: «пришли файл с ценами» в ответ КОЛЛЕГЕ выкладывало в чат протокол.
+
+    Голый объект («файл / версия / документ») разрешается контекстом ответа — но
+    контекстом должен быть НАШ документ, а роут передавал «ответ на что угодно».
+    Существующий набор проверял два крайних положения (без реплая / реплай на наш
+    документ) и ровно расходящийся случай — реплай на чужое сообщение — пропускал."""
+
+    GROUP = -100500
+    OWNER = 12345
+
+    def _msg(self, text, *, reply):
+        m = {"chat": {"id": self.GROUP}, "from": {"id": 42, "first_name": "Мария"},
+             "message_id": 1000, "date": 1718000000, "text": text}
+        if reply:
+            m["reply_to_message"] = {"message_id": 999, "from": {"id": 77},
+                                     "text": "коллега что-то написал"}
+        return m
+
+    def _route(self, text, *, reply):
+        with mock.patch.dict(os.environ, {"ENABLE_SEND_ARTIFACT_AI": "1"}), \
+             mock.patch.object(sa, "understand_request", side_effect=_greedy), \
+             mock.patch.object(ml, "_chat_context_series",
+                               return_value=(["koord"], None)), \
+             mock.patch.object(ml, "_reply_context_series", return_value=None), \
+             mock.patch.object(ml, "_reply_context_series_digest", return_value=None), \
+             mock.patch.object(ml, "_resend_digest", return_value=True) as rd, \
+             mock.patch.object(ml, "_resend_protocol", return_value=True) as rp, \
+             mock.patch.object(ml, "send_message"):
+            claimed = ml.maybe_route_to_send_artifact(
+                "tok", self.GROUP, self.OWNER, self._msg(text, reply=reply))
+        return claimed, rd.called, rp.called
+
+    def test_reply_to_a_colleague_does_not_hand_out_our_documents(self):
+        for text in ("Оля, пришли файл с ценами",
+                     "дайте актуальную версию договора",
+                     "скиньте документ по складу"):
+            claimed, dig, prot = self._route(text, reply=True)
+            self.assertFalse(claimed, text)
+            self.assertFalse(dig or prot, text)
+
+    def test_same_words_without_any_reply_are_silent_too(self):
+        for text in ("Оля, пришли файл с ценами", "дайте актуальную версию договора"):
+            claimed, dig, prot = self._route(text, reply=False)
+            self.assertFalse(claimed, text)
+            self.assertFalse(dig or prot, text)
+
+    def test_the_route_asks_for_our_surface_not_for_any_reply(self):
+        # Инвариант на исходнике: `allow_bare_file` обязан считаться от того же
+        # `surface`, которым резолвится наш документ, а не от факта реплая.
+        src = inspect.getsource(ml.maybe_route_to_send_artifact)
+        self.assertNotIn("allow_bare_file=is_reply", src)
+        self.assertIn("allow_bare_file=surface is not None", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
