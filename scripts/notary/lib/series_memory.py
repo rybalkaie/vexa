@@ -548,12 +548,24 @@ def _drop_tasks_before_carry_since(
     since = open_questions_carry_since(series_name, watched=watched)
     if not since:
         return tasks
-    # Полосу считаем по ТОМУ ЖЕ списку выжимок, из которого собран хвост. Один
-    # caller (`build_open_tasks_block` на холодном старте) отдаёт только самую
-    # свежую — тогда все пункты считаются свежими и не режется ничего. Это
-    # безопасная сторона (лишний хвост обратим, потерянный — нет), а холодный
-    # старт по определению значит, что копить эта серия ещё не начинала.
-    origins = _tail_run_origins(digests)
+    # 🔴 Полосу происхождения считаем по ПОЛНОЙ истории серии, а не по тому окну,
+    # из которого собран хвост. Раньше брали переданный список: у дайджеста и у
+    # сверщика это вся история, а у раздела протокола — окно `SERIES_MEMORY_DEPTH`
+    # (дефолт 3). Стоило окну целиком уехать за отсечку — происхождение старого
+    # пункта «омолаживалось» до края окна, отсечка его не срезала, и один и тот же
+    # ком дайджест считал снятым, а протокол печатал. Состояние самоподдерживающееся
+    # и на диске выглядит нормально. Тот же приём уже применён рядом
+    # (`build_open_tasks_block` читает полную историю ради origin-дат).
+    # Каталог не читается → работаем по переданному списку (фолбэк в сторону
+    # прежнего поведения: лишний хвост обратим, потерянный — нет).
+    origin_src = digests
+    try:
+        full = list_series_digests(Path(series_dir))
+        if full:
+            origin_src = full
+    except Exception:  # noqa: BLE001 — origin best-effort, отсечку не роняем
+        pass
+    origins = _tail_run_origins(origin_src)
     kept = []
     for t in tasks:
         origin = origins.get(_status_key(t))
@@ -1994,7 +2006,10 @@ def _collect_hanging_open_tasks(series_dir: Optional[Path]) -> list[str]:
             return []
         store = load_task_status(Path(series_dir))
         cap = open_tasks_max()
-        fresh = _resolve_open_tasks_raw(digests)
+        # `series_dir` включает отсечку «счёт с чистого листа». Без него этот
+        # канонический порядок расходился бы с показом дайджеста, хотя докстринг
+        # обещает «тем же пайплайном»: заряженная мина под будущего потребителя.
+        fresh = _resolve_open_tasks_raw(digests, series_dir=Path(series_dir))
         hanging = merge_open_tasks_with_status(fresh, store).get("open") or []
         if cap > 0:
             hanging = hanging[:cap]
