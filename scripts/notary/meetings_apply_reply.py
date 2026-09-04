@@ -668,6 +668,17 @@ def apply_decisions(
                             "остаётся выключенной — встречу ведёт «%s»)",
                             n, other.get("id"), existing.get("id") if existing else "?",
                         )
+                # Заглушка отказа ДРУГОГО рода в `candidates` не попадает, а
+                # планировщик её увидит и снимет старт — расчищаем и её.
+                for stub in find_rejection_twins(item, data, rooms=rooms, room=chosen_room):
+                    if stub is existing:
+                        continue
+                    _clear_rejection_marks(stub)
+                    logger.info(
+                        "«да» по номеру %s снял отказ с записи «%s» другого рода — "
+                        "иначе планировщик снял бы старт, на который владелец согласился",
+                        n, stub.get("id"),
+                    )
                 if existing is not None:
                     was_ignored = bool(existing.get("ignored"))
                     # обновим enabled=True, ignored=False — Илья «передумал»
@@ -1102,6 +1113,46 @@ def find_duplicates_watched(
         proof, conflict = compare(_record_fp(rec, rooms), cand, series_scope=series)
         if proof:
             out.append((rec, proof, conflict))
+    return out
+
+
+def find_rejection_twins(
+    item: dict[str, Any],
+    data: dict[str, Any],
+    *,
+    rooms: dict[str, Any] | None = None,
+    room: str | None = None,
+) -> list[dict[str, Any]]:
+    """Отказные заглушки про ЭТУ ЖЕ встречу — записи ЛЮБОГО рода.
+
+    `find_duplicates_watched` намеренно не смешивает «серию» и «только этот
+    экземпляр»: это разные обещания владельцу, и подменять одно другим нельзя.
+    Но снятие отказа — не подмена. «Да» отменяет прошлое «нет» по этой встрече
+    целиком, а `scheduler.drop_rejected_occurrences` сравнивает БЕЗ
+    `series_scope`, то есть гасит старт, совпавший по секунде, независимо от
+    рода записи.
+
+    🔴 Пока снятие меток ходило только по `candidates` (свой род), боевой случай
+    «первую копию не надо, вторую пиши серией» (одна встреча приезжает в
+    вечернем блоке двумя номерами из двух календарей) оставлял одноразовую
+    заглушку с меткой отказа: владельцу говорилось «записал серию», планировщик
+    молча снимал этот старт, и бот на встречу не приходил.
+
+    Сравнение здесь — ТОЙ ЖЕ формулой, что у планировщика: что он погасит, то мы
+    и обязаны расчистить.
+    """
+    cand = _item_fp(meeting_fingerprint(item), room, rooms)
+    if not cand.ical and not (cand.start and cand.url):
+        return []
+    out: list[dict[str, Any]] = []
+    for rec in data.get("watched", []) or []:
+        if not isinstance(rec, dict) or rec.get("type") != "google-calendar":
+            continue
+        if not (rec.get(REJECTION_OWNER_FIELD) or rec.get("rejected_start_at")):
+            continue
+        proof, _conflict = compare(_record_fp(rec, rooms), cand)
+        if proof:
+            out.append(rec)
     return out
 
 

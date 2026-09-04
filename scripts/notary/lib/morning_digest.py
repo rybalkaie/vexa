@@ -335,7 +335,8 @@ def collect_items(series_dir: Path, *, mode: Optional[str] = None) -> dict:
             fresh = series_memory._resolve_open_tasks_raw(
                 digests, series_dir=Path(series_dir))
         hanging = series_memory.merge_open_tasks_with_status(fresh, store).get("open") or []
-        minor_all = series_memory._resolve_minor_open_tasks_raw(digests)
+        minor_all = series_memory._resolve_minor_open_tasks_raw(
+            digests, series_dir=Path(series_dir))
         minor = series_memory.merge_open_tasks_with_status(minor_all, store).get("open") or []
         if cap > 0:
             hanging, minor = hanging[:cap], minor[:cap]
@@ -578,9 +579,20 @@ def record_sent(
         # иначе третья отправка дня строила бы матрёшку.
         rec["also"] = [{k: v for k, v in p.items() if k != "also"} for p in prev]
     sent[date] = rec
+    # 🔴 Отсечка — по моменту СОЗДАНИЯ отметки (`at`), а НЕ по дате дайджеста.
+    # По дате функция стирала отметку, которую только что записала: дайджест за
+    # прошедшую дату переставал считаться отправленным, `already_sent` навсегда
+    # False — и плановый тик слал бы его снова каждые 15 минут, «и так до начала
+    # встречи» (аварийная ветка ниже описывает ровно этот отказ). Заодно терялась
+    # метка режима, и ответ на документ получал «я тут вопросы не веду».
+    # Записи без валидного `at` не стареют — консервативно, как в reply_ack_state.
     cutoff = (datetime.now(MSK).date() - timedelta(days=_KEEP_SENT_DAYS)).isoformat()
-    sent = {d: r for d, r in sent.items()
-            if isinstance(d, str) and (len(d) != 10 or d >= cutoff)}
+
+    def _fresh(rec) -> bool:
+        at = rec.get("at") if isinstance(rec, dict) else None
+        return not (isinstance(at, str) and len(at) >= 10 and at[:10] < cutoff)
+
+    sent = {d: r for d, r in sent.items() if _fresh(r)}
     payload = {"schema": DIGEST_SCHEMA, "sent": sent}
     try:
         series_memory._atomic_write_text(

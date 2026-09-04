@@ -1799,12 +1799,27 @@ def _resolve_open_tasks_raw(
     return _drop_tasks_before_carry_since(out, digests, series_dir, watched=watched)
 
 
-def _resolve_minor_open_tasks_raw(digests: list[dict]) -> list[str]:
+def _resolve_minor_open_tasks_raw(
+    digests: list[dict], *, series_dir: Optional[Path] = None,
+    watched: Optional[dict] = None,
+) -> list[str]:
     """Мелочь из самой свежей выжимки, дедуплицированная, БЕЗ капа.
 
     Выделено из `resolve_minor_open_tasks` по той же причине, что `_resolve_open_tasks_raw`
     из `resolve_open_tasks`: потребитель, накладывающий sidecar-статусы, обязан капить
     уже ВИСЯЩИЕ — иначе закрытая мелочь в первых N съест слот капа у живой.
+
+    🔴 `series_dir` включает отсечку «счёт с чистого листа». Раньше вторая корзина
+    отсечки не знала вовсе, и сразу после возврата серии в накопление первый же
+    дайджест уходил в чат с до-переключательным пунктом — под текстом «старые
+    вопросы не поднимаю», который бот отправил в тот же чат минутой раньше. Хуже
+    того, дайджеста не было бы вовсе (`open` пуст), и отправляла его ровно эта
+    мелочь.
+
+    ⚖️ Здесь сталкиваются два решения владельца: 7 («счёт с чистого листа») и 8
+    («мелочь входит»). Выбрано 7: обещание произнесено вслух всему чату, а
+    непóднятая мелочь восстановима словами — нарушенное обещание нет. Строка
+    вынесена владельцу как противоречие внутри замысла.
     """
     if not digests:
         return []
@@ -1821,7 +1836,7 @@ def _resolve_minor_open_tasks_raw(digests: list[dict]) -> list[str]:
         if s and k and k not in seen:
             seen.add(k)
             out.append(s)
-    return out
+    return _drop_tasks_before_carry_since(out, digests, series_dir, watched=watched)
 
 
 def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
@@ -2829,11 +2844,19 @@ def record_open_tasks_snapshot(
     with _status_store_lock(series_dir):  # FU-2: read-modify-write под серийным locks'ом
         snaps = dict(_load_open_tasks_snapshots(series_dir))
         snaps[mid] = rec
+        # 🔴 Отсечка — по моменту СОЗДАНИЯ записи (`at`), а НЕ по дате документа.
+        # По дате документа функция стирала запись, которую только что сделала:
+        # `finalize-meeting` берёт дату из `startTs` встречи, и протокол записи,
+        # собранной с опозданием (или перегнанной заново), терял нумерацию молча —
+        # ответы «1 сделал, 2 в работе» по нему переставали резолвиться. Тот же
+        # принцип, что в `lib/reply_ack_state.py`: там прунят по дате СОЗДАНИЯ и
+        # прямо предупреждают, что иначе «ответ на старый протокол протух бы
+        # мгновенно». Записи без валидного `at` не стареют — консервативно.
         cutoff = (_date.today() - _td(days=_KEEP_SNAPSHOT_DAYS)).isoformat()
         snaps = {
             k: v for k, v in snaps.items()
-            if not (isinstance(v, dict) and isinstance(v.get("date"), str)
-                    and len(v["date"]) == 10 and v["date"] < cutoff)
+            if not (isinstance(v, dict) and isinstance(v.get("at"), str)
+                    and len(v["at"]) >= 10 and v["at"][:10] < cutoff)
         }
         payload = {"schema": OPEN_TASKS_SNAPSHOT_SCHEMA, "snapshots": snaps}
         try:
