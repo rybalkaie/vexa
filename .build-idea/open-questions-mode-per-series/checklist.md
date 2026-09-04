@@ -142,7 +142,10 @@
 - [x] Сторож класса написан календарно-устойчивым → scripts/notary/tests/test_stale_date_record_prune.py
 - [x] Обещание «чистый лист» проверено на всех четырёх поверхностях → .build-idea/open-questions-mode-per-series/artifacts/seams-review.md
 - [x] Сторож Т9 оживлён (не запускался вовсе) → journal.md
-- [ ] Мутации по каждой починке внесены НЕ автором → .build-idea/open-questions-mode-per-series/artifacts/repair-mutations.md
+- [x] Мутации по каждой починке внесены НЕ автором → .build-idea/open-questions-mode-per-series/artifacts/repair-mutations.md
 - [x] Гейт зоны после ремонта: карантин базовой линии и ничего сверх → .build-idea/open-questions-mode-per-series/artifacts/gate-repair3.txt
 - [x] Долги пополнены, закрытое отмечено → plans/follow-ups-open-questions-mode-per-series.md
 - [x] Лист решений владельцу дополнен → decisions.md
+- [x] Сторожа дописаны на все семь непойманных мутаций → scripts/notary/tests/test_clean_slate_and_rejection_guards.py
+- [x] Повторная проверка мутациями: 10 из 10 → .build-idea/open-questions-mode-per-series/artifacts/repair-mutations-2.md
+- [x] Слабые места сторожей (инвариант на исходнике, непокрытые признаки, зелёное на пустом множестве) починены → scripts/notary/tests/test_iss51_send_artifact_ai.py
