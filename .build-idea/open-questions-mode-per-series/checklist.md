@@ -126,3 +126,23 @@
 - [x] Файл долгов → plans/follow-ups-open-questions-mode-per-series.md
 - [x] «Что нового» для сотрудников → whats-new/2026-08-05-open-questions-mode-per-series.md
 - [x] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
+
+## Доводка после обрыва (05.09)
+
+- [x] Инвентаризация: brief, state, план, чек-лист, хвост журнала, хендофф прочитаны → journal.md
+- [x] Гейт паспорта перегнан заново, а не взят из записи прошлого прогона → .build-idea/open-questions-mode-per-series/artifacts/gate-resume.txt
+- [x] Базовая линия сверена ПОИМЁННО: код до прогона восстановлен и прогнан на сегодняшнем календаре → journal.md
+- [x] Недостающее третье ревью фазы 6 проведено → .build-idea/open-questions-mode-per-series/artifacts/f6-review-3.md
+- [x] Четыре следа сдачи фазы 6 закрыты доказательствами → .build-idea/open-questions-mode-per-series/artifacts/f6-traces.md
+- [x] Ремонт швов (никем не просмотренный коммит) отревьюен → .build-idea/open-questions-mode-per-series/artifacts/seams-review.md
+- [x] КРИТ швов («да» после «нет» не приводит бота на встречу) воспроизведён и починен → journal.md
+- [x] Т10 доведён до формулировки плана: фильтр по форме просьбы, а не по глаголу → .build-idea/open-questions-mode-per-series/artifacts/f6-review-3.md
+- [x] Утечка чужого документа в чат закрыта → .build-idea/open-questions-mode-per-series/artifacts/f6-review-3.md
+- [x] Класс «запись стирает сама себя» найден, воспроизведён, починен в обоих местах → journal.md
+- [x] Сторож класса написан календарно-устойчивым → scripts/notary/tests/test_stale_date_record_prune.py
+- [x] Обещание «чистый лист» проверено на всех четырёх поверхностях → .build-idea/open-questions-mode-per-series/artifacts/seams-review.md
+- [x] Сторож Т9 оживлён (не запускался вовсе) → journal.md
+- [ ] Мутации по каждой починке внесены НЕ автором → .build-idea/open-questions-mode-per-series/artifacts/repair-mutations.md
+- [x] Гейт зоны после ремонта: карантин базовой линии и ничего сверх → .build-idea/open-questions-mode-per-series/artifacts/gate-repair3.txt
+- [x] Долги пополнены, закрытое отмечено → plans/follow-ups-open-questions-mode-per-series.md
+- [x] Лист решений владельцу дополнен → decisions.md
