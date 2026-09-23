@@ -515,13 +515,32 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
       const wired = new Set<string>();
       const rescan = (): number => {
         let added = 0;
-        const all = Array.from(document.querySelectorAll("audio, video")) as HTMLMediaElement[];
-        for (const el of all) {
-          let ms: MediaStream | null = null;
-          try { ms = (el as any).srcObject as MediaStream | null; } catch { ms = null; }
-          if (!ms) continue;
-          let tracks: MediaStreamTrack[] = [];
-          try { tracks = ms.getAudioTracks(); } catch { tracks = []; }
+        // Телемост 3.0 (23.09.2026): звонок живёт во вложенном iframe того же
+        // origin (/private-join/) — смотрим и его документ. Плюс входящие дорожки,
+        // пойманные хуком RTCPeerConnection из join.ts (если звук играет не через
+        // <audio>). Дубли отсекает wired по track.id.
+        const docs: Document[] = [document];
+        const wins: any[] = [win];
+        for (const fr of Array.from(document.querySelectorAll("iframe"))) {
+          try {
+            const d = (fr as HTMLIFrameElement).contentDocument;
+            if (d) { docs.push(d); wins.push((fr as HTMLIFrameElement).contentWindow); }
+          } catch { /* чужой origin — не наш звонок */ }
+        }
+        const candidates: MediaStreamTrack[] = [];
+        for (const d of docs) {
+          for (const el of Array.from(d.querySelectorAll("audio, video")) as HTMLMediaElement[]) {
+            let ms: MediaStream | null = null;
+            try { ms = (el as any).srcObject as MediaStream | null; } catch { ms = null; }
+            if (!ms) continue;
+            try { candidates.push(...ms.getAudioTracks()); } catch { /* */ }
+          }
+        }
+        for (const w of wins) {
+          try { candidates.push(...((w && w.__vexaRemoteAudioTracks) || [])); } catch { /* */ }
+        }
+        {
+          const tracks = candidates;
           for (const track of tracks) {
             if (!track || wired.has(track.id)) continue;
             if (track.readyState === "ended") continue;

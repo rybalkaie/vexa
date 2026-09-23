@@ -7,19 +7,39 @@
 // История изменений:
 // - Ф3 (2026-05-26): закреплены реальные in-meeting testid'ы из DOM-dump
 //   прогона Ф2 (handoff п.5).
+// - 2026-09-23: «Телемост 3.0» (выкачен ~21.09). Лобби (поле имени, кнопки
+//   микрофона/камеры, «Подключиться») с ПРЕЖНИМИ testid переехало во вложенный
+//   iframe `telemost.yandex.ru/private-join/<id>` — на главной странице его нет,
+//   там только виджет звонка («Групповой звонок / Подключение», кнопки с
+//   aria-label «Завершить звонок», «Выключить микрофон»). Сам звонок (WebRTC)
+//   живёт в том же iframe. Поверх всего при загрузке — окно онбординга «Большое
+//   обновление в Телемосте». Гость в 3.0 по умолчанию с ВКЛ микрофоном и камерой.
+//   Проверено живым заходом гостя в Т-10 изнутри образа бота 23.09.2026.
 
-// Промежуточный экран «Вы подключаетесь к видеовстрече» с одной кнопкой.
+// Промежуточный экран «Подключение к звонку» (в 3.0 — со своим testid).
 // ВАЖНО: `to-home-screen-button` — это кнопка «На главную» (стрелка-крест в углу),
-// она НЕ ведёт в lobby. Игнорируем её. Реальная «Продолжить в браузере» —
-// один из orb-button BUTTON; ищем по тексту.
+// она НЕ ведёт в lobby. Игнорируем её.
 export const telemostInterstitialContinueSelectors: string[] = [
+  '[data-testid="meeting-continue-in-browser-continue"]',
   'button:has-text("Продолжить в браузере")',
 ];
 
-// Lobby: поле ввода имени.
+// Телемост 3.0: окно онбординга поверх интерстициала. Перекрывает «Продолжить в
+// браузере» — Playwright-клик упирается в него. Браузер бота стартует с чистым
+// профилем, поэтому окно будет на каждом заходе.
+export const telemostOnboardingDismissSelectors: string[] = [
+  '[data-testid="telemost-3-onboarding-close"]',
+  '[data-testid="telemost-3-onboarding-confirm"]',
+];
+
+// Телемост 3.0: iframe с лобби и самим звонком — ищем по куску URL.
+export const telemostLobbyFrameUrlMarker = "/private-join/";
+
+// Lobby: поле ввода имени (в 3.0 — внутри iframe лобби). В 3.0 тот же testid носит поле
+// поиска чатов (placeholder «Поиск») — его исключаем, иначе бот впечатает
+// своё имя в поиск.
 export const telemostNameInputSelectors: string[] = [
-  '[data-testid="orb-textinput-input"]',
-  'input[data-testid="orb-textinput-input"]',
+  'input[data-testid="orb-textinput-input"]:not([placeholder="Поиск"]):not([placeholder="Search"])',
 ];
 
 // Lobby: кнопка «Подключиться» (вход в комнату).
@@ -72,20 +92,38 @@ export const telemostRejectionIndicators: string[] = [
 ];
 
 // In-meeting: панель/тулбар встречи (виден когда мы в комнате).
-// Источник: DOM-dump прогона Ф2 (2026-05-26).
+// Источник: DOM-dump прогона Ф2 (2026-05-26); первая строка — Телемост 3.0.
+// «Завершить звонок» в 3.0 виден и в лобби (виджет на главной) — поэтому
+// join.ts сам проверяет, что лобби закрылось, прежде чем вернуть управление.
 export const telemostInMeetingIndicators: string[] = [
+  'button[aria-label="Завершить звонок"]',
   '[data-testid="end-call-alt-button"]',
   '[data-testid="mute-audio"]',
   '[aria-label*="Выйти из встречи"]',
   '[aria-label*="Выйти"]',
 ];
 
-// In-meeting: кнопка выхода. Точный testid из DOM-dump Ф2.
+// In-meeting: кнопка выхода. Список уходит в document.querySelector внутри
+// страницы (leave.ts) — только чистый CSS, без Playwright-расширений вроде :has-text.
+// В 3.0 «Завершить звонок» уводит из звонка сразу, без окна подтверждения.
 export const telemostLeaveButtonSelectors: string[] = [
+  'button[aria-label="Завершить звонок"]',
   '[data-testid="end-call-alt-button"]',
   'button[aria-label*="Выйти из встречи"]',
   'button[aria-label*="Выйти"]',
-  'button:has-text("Выйти")',
+];
+
+// Телемост 3.0: микрофон и камера в звонке. «Выключить …» видна, когда устройство
+// ВКЛЮЧЕНО. Гость в 3.0 заходит с включённым микрофоном (проверено изнутри образа),
+// бот — наблюдатель, поэтому выключает сам.
+export const telemostCallMicOnSelectors: string[] = [
+  'button[aria-label="Выключить микрофон"]',
+];
+export const telemostCallMicOffSelectors: string[] = [
+  'button[aria-label="Включить микрофон"]',
+];
+export const telemostCallCameraOnSelectors: string[] = [
+  'button[aria-label="Выключить камеру"]',
 ];
 
 // In-meeting: кнопки управления mic/camera в meeting (отличаются от lobby).
