@@ -46,6 +46,7 @@ from notary.cli.registry import (  # noqa: E402
 )
 from notary.lib.notify import push  # noqa: E402
 from notary.lib import late_join, portal_queue, slots, waitlist  # noqa: E402
+from notary.lib import join_watch  # noqa: E402
 from notary.lib.state import (  # noqa: E402
     read_queue,
     read_state,
@@ -137,6 +138,9 @@ def main(now: datetime | None = None) -> int:
     setup_logging()
     now = now or datetime.now(timezone.utc)
     pu = pause_until()
+    # ISS-60: сторож входа — ДО всего остального и под try. Упадёт — боты
+    # запускаются как раньше. На паузе повторов не делает, только сообщает.
+    _join_watch_tick(now, allow_retry=not pu)
     if pu:
         logger.debug("Пауза до %s — тик пропущен", pu)
         return 0
@@ -257,6 +261,7 @@ def main(now: datetime | None = None) -> int:
         launched_ok = _launch_bot(cand, now, seq=len(launched_series))
         if launched_ok:
             _remember_portal_run(cand, now)
+            _join_watch_register(cand, now, attempt=1)
             launched_series.add(series)
             running_count += 1  # учитываем в лимите для следующих кандидатов тика
             waited_reason = str((wl.get(skey) or {}).get("reason") or "")
@@ -641,7 +646,7 @@ def _remember_portal_run(item: dict[str, Any], now: datetime) -> None:
         )
 
 
-def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
+def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0, attempt: int = 1) -> bool:
     """Дёрнуть docker run на VPS. Не блокируется — запускаем в фоне.
 
     `seq` — порядковый номер запуска В ЭТОМ ТИКЕ (0-based). Нужен для
@@ -651,6 +656,9 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
     один meeting_id и один канал команд → stop/reconfigure одной встречи рвал бы
     запись другой (У2 цикла Ф3). seq ≤ MAX_CONCURRENT_BOTS ≪ 60с между тиками →
     коллизий между тиками нет.
+
+    `attempt` — номер попытки входа (ISS-60): повтор идёт НОВЫМ контейнером с
+    суффиксом `-a<N>` в имени сессии — упавший остаётся для разбора.
 
     Возвращает True если ssh+docker run отработали успешно (rc=0).
     """
@@ -663,7 +671,7 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
     # (isinstance str) тихо не сработал бы (Н1 цикла Ф4).
     series = str(item.get("series") or item["meeting_id"])
     start_at = item["start_at"]
-    session_uid = _safe_session_uid(item["meeting_id"], start_at)
+    session_uid = _session_uid_for(item, attempt)
 
     # Ф1 (ISS-28): chat_id группового чата серии в BOT_CONFIG — задел под Ф2
     # (уведомление «в момент детекта» R4b шлёт сам бот из recording.ts, ему нужен
@@ -725,6 +733,10 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
         # «в момент детекта» (recording.ts читает seriesChatId из BOT_CONFIG).
         # None не кладём — пусть отсутствует, чтобы не путать с «привязка = 0».
         **({"seriesChatId": series_chat_id} if series_chat_id is not None else {}),
+        # 23.09.2026: кому люди пересылают ручную запись, если бот сломался посреди
+        # встречи (текст тревоги бота в группу): Илье — по его сериям, организатору —
+        # по встречам портала.
+        "recordingRecipient": "организатору встречи" if item.get("order_id") else "Илье",
     }
 
     # Ф4 (2026-05-29): docker label'ы для матчинга «бот ещё в звонке» в collector'е.
@@ -750,16 +762,25 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
     if room_hash:
         labels[ROOM_LABEL] = room_hash
 
+    child_env: dict[str, str] | None = None
     if LOCAL_DOCKER:
         label_args: list[str] = []
         for k, v in labels.items():
             label_args += ["--label", f"{k}={v}"]
+        # 23.09.2026: боту в контейнер — токен Ватсона и личка владельца. Без них
+        # все тревоги, которые бот шлёт сам (зал ожидания, выброс из встречи,
+        # «оглох»), молча пропускались: `telegram.ts` читает TELEGRAM_BOT_TOKEN /
+        # TELEGRAM_CHAT_ID, а запускатель их не передавал. Значения идут через
+        # окружение docker-клиента (`-e ИМЯ` без значения), а не в командной
+        # строке — в списке процессов секрета нет.
+        tg_args, child_env = _bot_telegram_env()
         docker_cmd = [
             "docker", "run", "-d",
             "--name", f"vexa-notarius-{session_uid}",
             "--network", DOCKER_NETWORK,
             "-v", TRANSCRIPTS_VOLUME,
             *label_args,
+            *tg_args,
             "-e", f"BOT_CONFIG={json.dumps(bot_config, ensure_ascii=False)}",
             "-e", f"TRANSCRIPTION_SERVICE_URL={TRANSCRIPTION_URL}",
             "-e", f"ENABLE_LIVE_DRAFT={ENABLE_LIVE_DRAFT}",
@@ -782,7 +803,8 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
         )
         docker_cmd = ["ssh", SSH_HOST, docker_inner]
 
-    log_file = RUNS_DIR / f"{now.strftime('%Y%m%dT%H%M%SZ')}-{item['meeting_id']}.log"
+    attempt_suffix = f"-a{int(attempt)}" if attempt > 1 else ""
+    log_file = RUNS_DIR / f"{now.strftime('%Y%m%dT%H%M%SZ')}-{item['meeting_id']}{attempt_suffix}.log"
     mode_hint = "local docker" if LOCAL_DOCKER else "ssh docker run"
     logger.info(
         "Запуск (%s): meeting=%s event_id=%s start=%s url=%s session=%s log=%s",
@@ -803,6 +825,7 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
             proc = subprocess.run(
                 docker_cmd,
                 stdout=f, stderr=subprocess.STDOUT, timeout=60,
+                env=child_env,
             )
         if proc.returncode != 0:
             push(
@@ -834,6 +857,185 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0) -> bool:
         )
         logger.exception("Запуск упал: %s", e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# ISS-60: сторож входа (lib/join_watch.py) — связка с запускателем
+# ---------------------------------------------------------------------------
+
+#: Каталог записей на хосте и статусов входа в нём (бот пишет в
+#: /transcripts/.join-status/ — это та же папка через том контейнера).
+TRANSCRIPTS_HOST_DIR = Path(TRANSCRIPTS_VOLUME.split(":", 1)[0])
+JOIN_STATUS_HOST_DIR = TRANSCRIPTS_HOST_DIR / ".join-status"
+
+
+def _session_uid_for(item: dict[str, Any], attempt: int = 1) -> str:
+    base = _safe_session_uid(item["meeting_id"], item["start_at"])
+    return base if attempt <= 1 else f"{base}-a{int(attempt)}"
+
+
+def _bot_telegram_env() -> tuple[list[str], dict[str, str] | None]:
+    """`-e`-флаги и окружение docker-клиента с токеном Ватсона для бота.
+
+    Нет токена или лички владельца → флагов нет, бот ведёт себя как раньше.
+    """
+    token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
+    chat = (os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID") or "").strip()
+    if not token or not chat:
+        return [], None
+    env = dict(os.environ)
+    env["TELEGRAM_BOT_TOKEN"] = token
+    env["TELEGRAM_CHAT_ID"] = chat
+    return ["-e", "TELEGRAM_BOT_TOKEN", "-e", "TELEGRAM_CHAT_ID"], env
+
+
+def _docker_cmd(inner: list[str]) -> list[str]:
+    if LOCAL_DOCKER:
+        return inner
+    return ["ssh", SSH_HOST, " ".join(shlex.quote(a) for a in inner)]
+
+
+def _jw_inspect(name: str) -> "join_watch.ContainerState":
+    if not name:
+        return join_watch.ContainerState("missing")
+    try:
+        proc = subprocess.run(
+            _docker_cmd(["docker", "inspect", name, "--format",
+                         "{{.State.Status}}|{{.State.ExitCode}}"]),
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return join_watch.ContainerState("unknown")
+    if proc.returncode != 0:
+        err = (proc.stderr or "").lower()
+        if "no such object" in err or "no such container" in err:
+            return join_watch.ContainerState("missing")
+        return join_watch.ContainerState("unknown")
+    status, _, code = proc.stdout.strip().partition("|")
+    try:
+        exit_code: int | None = int(code)
+    except ValueError:
+        exit_code = None
+    return join_watch.ContainerState(status or "unknown", exit_code)
+
+
+def _jw_read_status(session_uid: str) -> dict[str, Any] | None:
+    if LOCAL_DOCKER:
+        return join_watch.read_status(JOIN_STATUS_HOST_DIR, session_uid)
+    try:
+        proc = subprocess.run(
+            ["ssh", SSH_HOST, "cat " + shlex.quote(str(JOIN_STATUS_HOST_DIR / f"{session_uid}.json"))],
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _jw_stop(name: str) -> None:
+    subprocess.run(_docker_cmd(["docker", "stop", "-t", "20", name]),
+                   capture_output=True, text=True, timeout=60)
+
+
+def _jw_save_logs(name: str) -> None:
+    """Логи сорвавшегося контейнера — в постоянный файл (контейнеры раз в неделю чистятся)."""
+    if not name:
+        return
+    dest_dir = LOG_DIR / "bot-containers"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(_docker_cmd(["docker", "logs", name]),
+                          capture_output=True, text=True, timeout=60)
+    (dest_dir / f"{name}.log").write_text((proc.stdout or "") + (proc.stderr or ""), encoding="utf-8")
+
+
+def _jw_relaunch(entry: dict[str, Any], attempt: int) -> dict[str, str] | None:
+    """Повторная попытка входа. Нет места под второго бота → None (сторож сообщит)."""
+    item = dict(entry.get("item") or {})
+    if not item.get("url") or not item.get("meeting_id") or not item.get("start_at"):
+        return None
+    snapshot = _running_bots_snapshot()
+    if int(snapshot.get("total") or 0) >= max_concurrent_bots():
+        logger.warning("Повтор входа %s: нет свободного слота", entry.get("series"))
+        return None
+    if not _launch_bot(item, datetime.now(timezone.utc), seq=0, attempt=attempt):
+        return None
+    uid = _session_uid_for(item, attempt)
+    return {"session_uid": uid, "container": f"vexa-notarius-{uid}"}
+
+
+def _jw_alert(entry: dict[str, Any], reason: str, attempts: int, crash_kit: str | None) -> None:
+    from notary.lib import join_alert  # noqa: PLC0415
+
+    payload = dict(entry.get("item") or {})
+    payload.update({
+        "series": entry.get("series"),
+        "start_at": entry.get("start_at"),
+        "order_id": entry.get("order_id"),
+        "series_title": entry.get("series_title"),
+        "container": entry.get("container"),
+    })
+    join_alert.send(payload, reason, attempts=attempts, crash_kit=crash_kit)
+
+
+def _jw_note_owner(text: str) -> None:
+    push(text, dedupe=False, silent=True)
+
+
+def _join_watch_active() -> bool:
+    """Сторож работает только там, где живут боты (VPS, docker локально).
+
+    Режим «мак + ssh» — архивный путь отката (README, runbook): там сторож не
+    нужен, а заодно тесты, которые гоняют `runner.main()` на маке, не ходят по
+    ssh на боевой сервер.
+    """
+    return LOCAL_DOCKER and join_watch.is_enabled()
+
+
+def _join_watch_register(item: dict[str, Any], now: datetime, *, attempt: int) -> None:
+    """Занести старт в журнал сторожа. Best-effort: бот уже запущен."""
+    if not _join_watch_active():
+        return
+    try:
+        ledger = join_watch.load_ledger()
+        uid = _session_uid_for(item, attempt)
+        join_watch.register_launch(
+            ledger, start_key(item), item,
+            session_uid=uid, container=f"vexa-notarius-{uid}",
+            attempt=attempt, now=now,
+        )
+        join_watch.save_ledger(ledger)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Сторож входа: старт не записан (%s)", type(e).__name__)
+
+
+def _join_watch_tick(now: datetime, *, allow_retry: bool) -> None:
+    """Проход сторожа входа. НИКОГДА не бросает — запуск ботов важнее."""
+    if not _join_watch_active():
+        return
+    try:
+        ledger = join_watch.load_ledger()
+        if ledger:
+            hooks = join_watch.Hooks(
+                inspect=_jw_inspect,
+                read_status=_jw_read_status,
+                stop=_jw_stop,
+                relaunch=_jw_relaunch,
+                alert=_jw_alert,
+                note_owner=_jw_note_owner,
+                save_logs=_jw_save_logs,
+            )
+            if join_watch.tick(ledger, now=now, hooks=hooks, allow_retry=allow_retry):
+                join_watch.save_ledger(ledger)
+        if now.minute == 0:
+            join_watch.prune_diagnostics(TRANSCRIPTS_HOST_DIR)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Сторож входа упал (%s) — запуск ботов продолжается", type(e).__name__)
 
 
 def _auto_disable_one_off(meeting_id: str) -> None:

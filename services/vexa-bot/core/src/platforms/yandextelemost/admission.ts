@@ -20,6 +20,7 @@ import {
   telemostNameInputSelectors,
 } from "./selectors";
 import { sendTelegramMessage } from "./telegram";
+import { writeJoinStatus } from "./join-status";
 
 const LOG_PREFIX = "[adapter-telemost]";
 const WAITING_ROOM_PUSH_AFTER_MS = 30_000;
@@ -153,6 +154,8 @@ export async function waitForYandexTelemostAdmission(
       if (waitingRoomFirstSeenAt === null) {
         waitingRoomFirstSeenAt = Date.now();
         logStep("waiting_room_detected");
+        // ISS-60: сторож на хосте видит «ждёт в зале ожидания» и не считает это зависанием.
+        writeJoinStatus("waiting_room");
         try {
           await callAwaitingAdmissionCallback(botConfig);
         } catch {

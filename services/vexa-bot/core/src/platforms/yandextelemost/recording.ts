@@ -735,6 +735,13 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     return typeof v === "number" && Number.isFinite(v) ? v : null;
   })();
   logStep("series_chat_resolved", { has_chat: seriesChatId != null });
+  // 23.09.2026: кому пересылать ручную запись при сбое — Илье (личные серии) или
+  // организатору (наряды портала). Приходит от запускателя в сыром BOT_CONFIG;
+  // нет поля (старый запускатель) — прежний текст «перешлите файл Илье».
+  const recordingRecipient: string = (() => {
+    const v = rawBotConfig.recordingRecipient;
+    return typeof v === "string" && v.trim() && v.length <= 60 ? v.trim() : "Илье";
+  })();
 
   // Ф1 (ISS-28) R1: id комнаты из `/j/<meetingId>`. Детект выброса = «адрес
   // потерял этот сегмент» (не «ушёл с домена telemost» — корень его содержит).
@@ -1109,7 +1116,9 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     if (seriesChatId != null) {
       await sendTelegramMessage(
         "⚠️ Бот-протокол не смог записать встречу (технический сбой на стороне Телемоста). " +
-          "Пожалуйста, поставьте встречу на запись вручную и перешлите файл Илье — он соберёт протокол.",
+          (recordingRecipient === "Илье"
+            ? "Пожалуйста, поставьте встречу на запись вручную и перешлите файл Илье — он соберёт протокол."
+            : `Пожалуйста, поставьте встречу на запись вручную и перешлите файл ${recordingRecipient} — так контекст встречи не потеряется.`),
         { chatId: seriesChatId, dedupeKey: `evicted-group-${sessionUid}`, dedupeMs: 10 * 60_000 },
       );
     } else {
