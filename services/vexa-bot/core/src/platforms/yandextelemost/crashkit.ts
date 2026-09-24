@@ -29,6 +29,7 @@ export type FrameSnapshot = {
   dialogs: Array<{ aria: string | null; buttons: string[] }>;
   iframes: string[];
   testids: string[];
+  headings: string[];
 };
 
 /** Снять видимую структуру ВСЕХ окон страницы. Никогда не бросает. */
@@ -89,11 +90,18 @@ export async function snapshotFrames(page: Page): Promise<FrameSnapshot[]> {
         )
           .filter(Boolean)
           .slice(0, 200);
-        return { url: strip(location.href), title: cut(document.title, 80), buttons, inputs, dialogs, iframes, testids };
+        // Заголовки экрана («Такого звонка нет», «Подключение к звонку») — по
+        // ним причину видно без скриншота.
+        const headings = Array.from(document.querySelectorAll("h1, h2, h3, [role='heading']"))
+          .filter(vis)
+          .slice(0, 10)
+          .map((h) => cut((h as HTMLElement).innerText, 60))
+          .filter(Boolean);
+        return { url: strip(location.href), title: cut(document.title, 80), buttons, inputs, dialogs, iframes, testids, headings };
       });
       out.push(snap);
     } catch {
-      out.push({ url: "(недоступно)", title: "", buttons: [], inputs: [], dialogs: [], iframes: [], testids: [] });
+      out.push({ url: "(недоступно)", title: "", buttons: [], inputs: [], dialogs: [], iframes: [], testids: [], headings: [] });
     }
   }
   return out;
