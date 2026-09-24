@@ -25,7 +25,10 @@ import { log } from "../../utils";
 const TRANSCRIPT_DIR = process.env.TELEMOST_TRANSCRIPT_DIR || "/transcripts";
 export const JOIN_STATUS_DIR = path.join(TRANSCRIPT_DIR, ".join-status");
 
-export type JoinPhase = "joining" | "waiting_room" | "in_call" | "failed";
+// admission — «Подключиться» нажато, бот ждёт признаков звонка (до
+// waitingRoomTimeout, по умолчанию 5 мин): у сторожа на эту фазу свой, более
+// длинный срок, чтобы не убить бота, которого ещё могут впустить (цикл5 Н1).
+export type JoinPhase = "joining" | "admission" | "waiting_room" | "in_call" | "failed";
 
 // Коды причин — машинные, их понимает join_alert.py (тексты для людей там).
 export const JOIN_REASONS = [
@@ -95,6 +98,22 @@ export function writeJoinStatus(phase: JoinPhase, extra: Record<string, unknown>
   }
 }
 
+/**
+ * Событие по ходу встречи для сторожа на хосте (24.09.2026, цикл5 фазы 1, С1/Н4):
+ * `evicted_failure` — выкинуло и вернуться не вышло; `deaf_after_start` — оглох.
+ * Бот сам в Телеграм НЕ пишет: токена в контейнере с браузером нет намеренно
+ * (браузер открывает чужие страницы), а адресата людям считает только сторож —
+ * тем же маршрутом, что и протокол. Фаза при этом не меняется. Никогда не бросает.
+ */
+export function addJoinEvent(type: string, extra: Record<string, unknown> = {}): void {
+  const events = Array.isArray(state.events) ? state.events : [];
+  state = {
+    ...state,
+    events: [...events, { type, at: new Date().toISOString(), ...extra }].slice(-20),
+  };
+  writeJoinStatus((state.phase as JoinPhase) || "in_call");
+}
+
 /** Отметить, что вход прошёл запасным путём (Фаза 3) — не сбой, а сигнал «Телемост поменялся». */
 export function noteJoinFallback(detail: Record<string, unknown>): void {
   state = { ...state, fallback_used: { ...(state.fallback_used || {}), ...detail } };
@@ -120,13 +139,28 @@ export function classifyJoinError(message: string): string {
 const MEETING_GONE_RE =
   /(такого звонка нет|в ссылке опечатка|звонок (уже )?(завершён|завершен|закончился)|такой встречи не существует|встреч[аи] не существует|встреча (уже )?завершена|встреча закончилась|ссылка (устарела|недействительна)|meeting (not found|has ended|doesn.t exist)|call (not found|has ended))/i;
 
+/**
+ * Текст экрана говорит «встречи нет / завершена»? Чистая функция (тест:
+ * join-status.test.ts). Смотрим ОТДЕЛЬНЫЕ строки экрана, короткие и без знака
+ * вопроса: «Такого звонка нет» — отдельная надпись, а справочное «Что делать,
+ * если ссылка недействительна?» или длинное пояснение сюда не попадают — иначе
+ * настоящий сбой бота превращался бы в «встречи нет» без повтора и без
+ * сообщения людям (цикл5 Н7).
+ */
+export function isMeetingGoneText(text: string): boolean {
+  return (text || "")
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .some((line) => line.length > 0 && line.length <= 60 && !line.includes("?") && MEETING_GONE_RE.test(line));
+}
+
 /** Есть ли на странице (в любом окне) надпись «встречи нет / завершена». */
 export async function detectMeetingGone(page: Page | null): Promise<boolean> {
   if (!page) return false;
   for (const fr of page.frames()) {
     try {
       const txt: string = await fr.evaluate(() => (document.body && document.body.innerText) || "");
-      if (MEETING_GONE_RE.test(txt)) return true;
+      if (isMeetingGoneText(txt)) return true;
     } catch {
       // окно ушло или чужой origin — дальше
     }

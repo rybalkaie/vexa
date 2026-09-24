@@ -1,10 +1,8 @@
 """ISS-60: запускатель ↔ сторож входа.
 
 Проверяет:
-  * токен Ватсона уходит боту через окружение docker-клиента, а не в командной
-    строке (в списке процессов секрета нет);
-  * повторная попытка — новый контейнер с суффиксом `-a2`;
-  * в BOT_CONFIG — кому пересылать ручную запись (Илье / организатору);
+  * токен Ватсона в контейнер бота НЕ передаётся (браузер открывает чужие страницы);
+  * повторная попытка — новый контейнер с суффиксом `-a2` и своим каналом команд;
   * старт попадает в журнал сторожа; сорванный вход → повтор → сообщение;
   * упавший сторож не мешает запуску; на маке (режим ssh) сторож инертен.
 
@@ -95,36 +93,23 @@ class LaunchTest(_Env):
         self.assertTrue(ok)
         return calls[0]
 
-    def test_token_goes_via_client_env_not_argv(self):
+    def test_no_telegram_token_in_bot_container(self):
+        # цикл5 С1: токен Ватсона в контейнер с браузером не передаётся
         cmd, kw = self._launch(_item(datetime.now(timezone.utc)))
         joined = " ".join(cmd)
         self.assertNotIn(TOKEN, joined)
-        i = cmd.index("TELEGRAM_BOT_TOKEN")
-        self.assertEqual(cmd[i - 1], "-e")
-        self.assertIn("TELEGRAM_CHAT_ID", cmd)
-        self.assertEqual(kw["env"]["TELEGRAM_BOT_TOKEN"], TOKEN)
-        self.assertEqual(kw["env"]["TELEGRAM_CHAT_ID"], OWNER)
-
-    def test_no_token_no_flags(self):
-        with mock.patch.dict(os.environ, {"TELEGRAM_NOTARIUS_BOT_TOKEN": ""}):
-            cmd, kw = self._launch(_item(datetime.now(timezone.utc)))
-        self.assertNotIn("TELEGRAM_BOT_TOKEN", cmd)
+        self.assertNotIn("TELEGRAM_BOT_TOKEN", joined)
+        self.assertNotIn("TELEGRAM_CHAT_ID", joined)
         self.assertIsNone(kw.get("env"))
 
-    def test_retry_container_name_and_recipient(self):
+    def test_retry_container_name(self):
         start = datetime.now(timezone.utc)
         cmd, _ = self._launch(_item(start), attempt=2)
         name = cmd[cmd.index("--name") + 1]
         self.assertTrue(name.endswith("-a2"), name)
         cfg = json.loads(next(a for a in cmd if a.startswith("BOT_CONFIG="))[len("BOT_CONFIG="):])
-        self.assertEqual(cfg["recordingRecipient"], "Илье")
         self.assertTrue(cfg["sessionUid"].endswith("-a2"))
-
-    def test_portal_recipient_is_organizer(self):
-        with mock.patch("notary.lib.orders.get_order", return_value=None):
-            cmd, _ = self._launch(_item(datetime.now(timezone.utc), order_id="o1"))
-        cfg = json.loads(next(a for a in cmd if a.startswith("BOT_CONFIG="))[len("BOT_CONFIG="):])
-        self.assertEqual(cfg["recordingRecipient"], "организатору встречи")
+        self.assertNotIn("recordingRecipient", cfg)
 
     def test_session_uid_suffix(self):
         it = _item(datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc))
@@ -145,6 +130,18 @@ class WatchWiringTest(_Env):
         with mock.patch.object(runner, "LOCAL_DOCKER", True), \
              mock.patch.object(join_watch, "load_ledger", side_effect=RuntimeError("boom")):
             runner._join_watch_tick(datetime.now(timezone.utc), allow_retry=True)  # не бросает
+
+    def test_retry_gets_own_command_channel(self):
+        # цикл5 Н3: у повтора свой meeting_id — команда `leave` не уйдёт двум ботам
+        seqs = []
+        snapshot = {"by_series": {}, "by_room": {}, "unlabeled": [], "total": 0}
+        entry = {"item": _item(datetime.now(timezone.utc)), "series": "anzhee-direktorat"}
+        with mock.patch.object(runner, "_running_bots_snapshot", return_value=snapshot), \
+             mock.patch.object(runner, "_launch_bot", side_effect=lambda item, now, seq=0, attempt=1: seqs.append(seq) or True):
+            self.assertTrue(runner._jw_relaunch(entry, 2))
+            self.assertTrue(runner._jw_relaunch(entry, 2))
+        self.assertEqual(len(set(seqs)), 2)
+        self.assertTrue(all(s >= runner._RETRY_SEQ_BASE for s in seqs))
 
     def test_kill_switch(self):
         now = datetime.now(timezone.utc)

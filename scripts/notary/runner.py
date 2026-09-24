@@ -733,10 +733,6 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0, attempt: int 
         # «в момент детекта» (recording.ts читает seriesChatId из BOT_CONFIG).
         # None не кладём — пусть отсутствует, чтобы не путать с «привязка = 0».
         **({"seriesChatId": series_chat_id} if series_chat_id is not None else {}),
-        # 23.09.2026: кому люди пересылают ручную запись, если бот сломался посреди
-        # встречи (текст тревоги бота в группу): Илье — по его сериям, организатору —
-        # по встречам портала.
-        "recordingRecipient": "организатору встречи" if item.get("order_id") else "Илье",
     }
 
     # Ф4 (2026-05-29): docker label'ы для матчинга «бот ещё в звонке» в collector'е.
@@ -762,25 +758,20 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0, attempt: int 
     if room_hash:
         labels[ROOM_LABEL] = room_hash
 
-    child_env: dict[str, str] | None = None
     if LOCAL_DOCKER:
         label_args: list[str] = []
         for k, v in labels.items():
             label_args += ["--label", f"{k}={v}"]
-        # 23.09.2026: боту в контейнер — токен Ватсона и личка владельца. Без них
-        # все тревоги, которые бот шлёт сам (зал ожидания, выброс из встречи,
-        # «оглох»), молча пропускались: `telegram.ts` читает TELEGRAM_BOT_TOKEN /
-        # TELEGRAM_CHAT_ID, а запускатель их не передавал. Значения идут через
-        # окружение docker-клиента (`-e ИМЯ` без значения), а не в командной
-        # строке — в списке процессов секрета нет.
-        tg_args, child_env = _bot_telegram_env()
+        # 24.09.2026 (цикл5 фазы 1, С1): токен Телеграма боту в контейнер НЕ
+        # передаётся намеренно — браузер внутри открывает чужие страницы. Свои
+        # тревоги (зал ожидания, выброс, «оглох») бот пишет событием в статус
+        # входа, а отправляет их сторож на хосте (lib/join_watch.py).
         docker_cmd = [
             "docker", "run", "-d",
             "--name", f"vexa-notarius-{session_uid}",
             "--network", DOCKER_NETWORK,
             "-v", TRANSCRIPTS_VOLUME,
             *label_args,
-            *tg_args,
             "-e", f"BOT_CONFIG={json.dumps(bot_config, ensure_ascii=False)}",
             "-e", f"TRANSCRIPTION_SERVICE_URL={TRANSCRIPTION_URL}",
             "-e", f"ENABLE_LIVE_DRAFT={ENABLE_LIVE_DRAFT}",
@@ -825,7 +816,6 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0, attempt: int 
             proc = subprocess.run(
                 docker_cmd,
                 stdout=f, stderr=subprocess.STDOUT, timeout=60,
-                env=child_env,
             )
         if proc.returncode != 0:
             push(
@@ -872,21 +862,6 @@ JOIN_STATUS_HOST_DIR = TRANSCRIPTS_HOST_DIR / ".join-status"
 def _session_uid_for(item: dict[str, Any], attempt: int = 1) -> str:
     base = _safe_session_uid(item["meeting_id"], item["start_at"])
     return base if attempt <= 1 else f"{base}-a{int(attempt)}"
-
-
-def _bot_telegram_env() -> tuple[list[str], dict[str, str] | None]:
-    """`-e`-флаги и окружение docker-клиента с токеном Ватсона для бота.
-
-    Нет токена или лички владельца → флагов нет, бот ведёт себя как раньше.
-    """
-    token = (os.environ.get("TELEGRAM_NOTARIUS_BOT_TOKEN") or "").strip()
-    chat = (os.environ.get("TELEGRAM_NOTARIUS_CHAT_ID") or "").strip()
-    if not token or not chat:
-        return [], None
-    env = dict(os.environ)
-    env["TELEGRAM_BOT_TOKEN"] = token
-    env["TELEGRAM_CHAT_ID"] = chat
-    return ["-e", "TELEGRAM_BOT_TOKEN", "-e", "TELEGRAM_CHAT_ID"], env
 
 
 def _docker_cmd(inner: list[str]) -> list[str]:
@@ -954,24 +929,39 @@ def _jw_save_logs(name: str) -> None:
     (dest_dir / f"{name}.log").write_text((proc.stdout or "") + (proc.stderr or ""), encoding="utf-8")
 
 
-def _jw_relaunch(entry: dict[str, Any], attempt: int) -> dict[str, str] | None:
-    """Повторная попытка входа. Нет места под второго бота → None (сторож сообщит)."""
+#: Номер запуска для повторов: у каждого бота свой `meeting_id` = свой
+#: redis-канал команд. Основной цикл даёт seq 0..N-1 в пределах тика; повтор
+#: идёт ДО него в том же тике и с тем же временем — без смещения совпал бы с
+#: новым ботом (команда `leave` ушла бы обоим, цикл5 Н3).
+_RETRY_SEQ_BASE = 100
+_retry_seq_counter = 0
+
+
+def _jw_plan_retry(entry: dict[str, Any], attempt: int) -> dict[str, str]:
+    """Имя сессии и контейнера попытки N — без побочных эффектов."""
     item = dict(entry.get("item") or {})
-    if not item.get("url") or not item.get("meeting_id") or not item.get("start_at"):
-        return None
-    snapshot = _running_bots_snapshot()
-    if int(snapshot.get("total") or 0) >= max_concurrent_bots():
-        logger.warning("Повтор входа %s: нет свободного слота", entry.get("series"))
-        return None
-    if not _launch_bot(item, datetime.now(timezone.utc), seq=0, attempt=attempt):
-        return None
     uid = _session_uid_for(item, attempt)
     return {"session_uid": uid, "container": f"vexa-notarius-{uid}"}
 
 
-def _jw_alert(entry: dict[str, Any], reason: str, attempts: int, crash_kit: str | None) -> None:
-    from notary.lib import join_alert  # noqa: PLC0415
+def _jw_relaunch(entry: dict[str, Any], attempt: int) -> bool:
+    """Повторная попытка входа. Нет места под второго бота → False (сторож сообщит)."""
+    global _retry_seq_counter
+    item = dict(entry.get("item") or {})
+    if not item.get("url") or not item.get("meeting_id") or not item.get("start_at"):
+        return False
+    snapshot = _running_bots_snapshot()
+    if int(snapshot.get("total") or 0) >= max_concurrent_bots():
+        logger.warning("Повтор входа %s: нет свободного слота", entry.get("series"))
+        return False
+    _retry_seq_counter += 1
+    return _launch_bot(
+        item, datetime.now(timezone.utc),
+        seq=_RETRY_SEQ_BASE + _retry_seq_counter, attempt=attempt,
+    )
 
+
+def _jw_payload(entry: dict[str, Any]) -> dict[str, Any]:
     payload = dict(entry.get("item") or {})
     payload.update({
         "series": entry.get("series"),
@@ -980,11 +970,30 @@ def _jw_alert(entry: dict[str, Any], reason: str, attempts: int, crash_kit: str 
         "series_title": entry.get("series_title"),
         "container": entry.get("container"),
     })
-    join_alert.send(payload, reason, attempts=attempts, crash_kit=crash_kit)
+    return payload
+
+
+def _jw_alert(
+    entry: dict[str, Any], reason: str, attempts: int, crash_kit: str | None, owner_note: str | None
+) -> None:
+    from notary.lib import join_alert  # noqa: PLC0415
+
+    join_alert.send(_jw_payload(entry), reason, attempts=attempts, crash_kit=crash_kit, owner_note=owner_note)
+
+
+def _jw_event_alert(entry: dict[str, Any], event_type: str, event: dict[str, Any]) -> None:
+    """Событие встречи (выкинуло / оглох / ждёт в зале ожидания) — людям и владельцу."""
+    from notary.lib import join_alert  # noqa: PLC0415
+
+    join_alert.send(_jw_payload(entry), event_type, kind=event_type)
 
 
 def _jw_note_owner(text: str) -> None:
     push(text, dedupe=False, silent=True)
+
+
+def _jw_persist_failed(text: str) -> None:
+    push(text, dedupe_key="join-watch-ledger-write-failed")
 
 
 def _join_watch_active() -> bool:
@@ -1025,9 +1034,13 @@ def _join_watch_tick(now: datetime, *, allow_retry: bool) -> None:
                 inspect=_jw_inspect,
                 read_status=_jw_read_status,
                 stop=_jw_stop,
+                plan_retry=_jw_plan_retry,
                 relaunch=_jw_relaunch,
                 alert=_jw_alert,
+                event_alert=_jw_event_alert,
                 note_owner=_jw_note_owner,
+                persist=join_watch.save_ledger,
+                persist_failed=_jw_persist_failed,
                 save_logs=_jw_save_logs,
             )
             if join_watch.tick(ledger, now=now, hooks=hooks, allow_retry=allow_retry):

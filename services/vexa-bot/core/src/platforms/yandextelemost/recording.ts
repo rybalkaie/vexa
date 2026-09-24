@@ -32,7 +32,7 @@ import { startParticipantsPolling } from "./participants";
 // «изнутри» ветки evicted зовём их здесь напрямую.
 import { joinYandexTelemost } from "./join";
 import { waitForYandexTelemostAdmission } from "./admission";
-import { sendTelegramMessage } from "./telegram";
+import { addJoinEvent } from "./join-status";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -735,13 +735,6 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     return typeof v === "number" && Number.isFinite(v) ? v : null;
   })();
   logStep("series_chat_resolved", { has_chat: seriesChatId != null });
-  // 23.09.2026: кому пересылать ручную запись при сбое — Илье (личные серии) или
-  // организатору (наряды портала). Приходит от запускателя в сыром BOT_CONFIG;
-  // нет поля (старый запускатель) — прежний текст «перешлите файл Илье».
-  const recordingRecipient: string = (() => {
-    const v = rawBotConfig.recordingRecipient;
-    return typeof v === "string" && v.trim() && v.length <= 60 ? v.trim() : "Илье";
-  })();
 
   // Ф1 (ISS-28) R1: id комнаты из `/j/<meetingId>`. Детект выброса = «адрес
   // потерял этот сегмент» (не «ушёл с домена telemost» — корень его содержит).
@@ -1095,35 +1088,16 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     return back;
   };
 
-  // R4a + R4b: уведомления при НЕустранимом сбое (перезаход исчерпан). Шлёт сам
-  // бот «в момент детекта» (он жив во время встречи). R4a — личка Ильи (дефолт
-  // sendTelegramMessage). R4b — групповой чат серии (seriesChatId); нет чата →
-  // молча скип, личный алерт всё равно ушёл (A8). Тексты фиксированные (R11) —
-  // содержимого встречи в них нет.
+  // R4a + R4b: уведомления при НЕустранимом сбое (перезаход исчерпан). С 24.09.2026
+  // (цикл5 фазы 1 плана telemost-update-resilience, С1/Н4) бот сам в Телеграм НЕ
+  // пишет: записывает событие в статус входа, а сообщение отправляет сторож на
+  // хосте (join_watch → join_alert) — людям туда же, куда уходит протокол, и
+  // технический разбор владельцу. Токена в контейнере с браузером нет намеренно.
+  // До этого оба сообщения молча пропускались: запускатель не передавал боту токен.
   const sendEvictionAlerts = async (snap: EvictionSnapshot | null): Promise<void> => {
-    const room = escapeHtml(meetingUrl || "?");
-    const reason = describeEvictionReason(snap); // только числовые WS-коды/фикс-фраза — спецсимволов нет
-    const seriesLbl = series ? ` «${escapeHtml(series)}»` : "";
-    // R4a — личный алерт Илье (ссылка комнаты + причина).
-    await sendTelegramMessage(
-      `🔴 <b>Бот-протокол</b>: не смог записать встречу${seriesLbl} — выброс из Телемоста, ` +
-        `восстановиться не удалось за ${EVICTION_MAX_ATTEMPTS} попыток.\n` +
-        `Комната: <code>${room}</code>\nТехпричина: ${reason}\n` +
-        `Зайти руками сейчас — скажи Альфреду: «подключи Ватсона к этой встрече».`,
-      { dedupeKey: `evicted-owner-${sessionUid}`, dedupeMs: 10 * 60_000 },
-    );
-    // R4b — групповой чат серии (ДОСЛОВНЫЙ текст, Q2). Нет чата → молча скип.
-    if (seriesChatId != null) {
-      await sendTelegramMessage(
-        "⚠️ Бот-протокол не смог записать встречу (технический сбой на стороне Телемоста). " +
-          (recordingRecipient === "Илье"
-            ? "Пожалуйста, поставьте встречу на запись вручную и перешлите файл Илье — он соберёт протокол."
-            : `Пожалуйста, поставьте встречу на запись вручную и перешлите файл ${recordingRecipient} — так контекст встречи не потеряется.`),
-        { chatId: seriesChatId, dedupeKey: `evicted-group-${sessionUid}`, dedupeMs: 10 * 60_000 },
-      );
-    } else {
-      logStep("eviction_group_alert_skipped", { reason: "no_series_chat" });
-    }
+    const reason = describeEvictionReason(snap); // только числовые WS-коды/фикс-фраза
+    addJoinEvent("evicted_failure", { detail: reason, attempts: EVICTION_MAX_ATTEMPTS });
+    logStep("eviction_alert_event_written", { has_series_chat: seriesChatId != null });
   };
 
   // Все cleanup'ы в finally — иначе при исключении в main Promise
@@ -1321,13 +1295,8 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
               participants: participantsPoll.getNames().length,
             });
             try {
-              await sendTelegramMessage(
-                `🔴 <b>Бот-протокол</b>: оглох на встрече${series ? ` «${escapeHtml(series)}»` : ""} — ` +
-                  `потеряны аудио-дорожки при живом подключении.\n` +
-                  `Комната: <code>${escapeHtml(meetingUrl || "?")}</code>\n` +
-                  `Запись могла прерваться — проверь / запиши вручную.`,
-                { dedupeKey: `deaf-owner-${sessionUid}`, dedupeMs: 10 * 60_000 },
-              );
+              // Сообщение владельцу шлёт сторож на хосте по этому событию (см. выше, R4a).
+              addJoinEvent("deaf_after_start", { degraded_for_s: Math.round((now - deafAfterStartSince) / 1000) });
             } catch (e: any) {
               log(`${LOG_PREFIX} deaf alert failed (non-fatal): ${e?.message}`);
             }

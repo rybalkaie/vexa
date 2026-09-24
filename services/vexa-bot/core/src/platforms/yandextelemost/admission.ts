@@ -19,7 +19,6 @@ import {
   telemostInMeetingIndicators,
   telemostNameInputSelectors,
 } from "./selectors";
-import { sendTelegramMessage } from "./telegram";
 import { writeJoinStatus } from "./join-status";
 
 const LOG_PREFIX = "[adapter-telemost]";
@@ -163,18 +162,15 @@ export async function waitForYandexTelemostAdmission(
         }
       }
       const inWaitingFor = Date.now() - waitingRoomFirstSeenAt;
+      // 24.09.2026 (цикл5 фазы 1, С1/С4/У1): «впустите бота» и «не впустили» бот
+      // сам больше не шлёт — токена в контейнере с браузером нет. По фазе
+      // waiting_room сторож на хосте через ~30 с просит впустить бота тех, кому
+      // уходит протокол (группа / организатор), а после срыва — обычным сообщением.
       if (!waitingRoomPushSent && inWaitingFor >= WAITING_ROOM_PUSH_AFTER_MS) {
         waitingRoomPushSent = true;
-        await sendTelegramMessage(
-          `🟡 <b>Telemost</b>: бот в waiting room.\nКомната: <code>${botConfig.meetingUrl ?? "?"}</code>\nВпусти бота, если ты на встрече.`,
-          { dedupeKey: `wait-${botConfig.connectionId}`, dedupeMs: 5 * 60_000 }
-        );
+        logStep("waiting_room_long", { waited_ms: inWaitingFor });
       }
       if (inWaitingFor >= WAITING_ROOM_ABANDON_AFTER_MS) {
-        await sendTelegramMessage(
-          `🔴 <b>Telemost</b>: бот ушёл из waiting room — admit не получен за 2 мин. Запись не сделана.\nКомната: <code>${botConfig.meetingUrl ?? "?"}</code>`,
-          { dedupeKey: `abandon-${botConfig.connectionId}`, dedupeMs: 10 * 60_000 }
-        );
         throw new Error("Bot was not admitted from Telemost waiting room within 2 minutes");
       }
     }

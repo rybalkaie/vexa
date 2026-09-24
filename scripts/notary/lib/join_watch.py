@@ -1,29 +1,39 @@
-"""Сторож входа бота во встречу (ISS-60, 23.09.2026).
+"""Сторож входа и хода встречи (ISS-60, 23–24.09.2026).
 
 ЧТО БЫЛО. Запускатель смотрел на контейнер бота один раз — через 3 секунды после
 старта (`runner._verify_container_alive`). С 21 по 23.09.2026 бот падал на 40-й
 секунде (Телемост 3.0 спрятал лобби во вложенное окно), и три дня ни одна встреча
 не записалась без единой тревоги: тревога «пустая запись» живёт от `meta.json`,
-а его бот пишет только после входа.
+а его бот пишет только после входа. Свои собственные тревоги (зал ожидания,
+выброс, «оглох») бот слал сам — но токена Телеграма в контейнере не было, и они
+никогда никуда не доходили.
 
 ЧТО СТАЛО. Запускатель заносит каждый старт в журнал сторожа, а на каждом своём
-тике (раз в минуту) сторож смотрит на статус входа, который пишет сам бот
-(`<transcripts>/.join-status/<session_uid>.json`: joining → waiting_room →
-in_call / failed + причина), и на состояние контейнера:
+тике (раз в минуту) сторож смотрит на статус, который пишет сам бот
+(`<transcripts>/.join-status/<session_uid>.json`: joining → admission →
+waiting_room → in_call / failed + причина, плюс события по ходу встречи), и на
+состояние контейнера:
 
-* в звонке → всё хорошо, дальше встречу стережёт сам бот (выброс, глухота);
+* вход удался → молча; дальше сторож доставляет события встречи (выкинуло и не
+  вернулся, оглох) до выхода контейнера;
 * сорвался вход → ОДНА повторная попытка новым контейнером; снова сорвался →
-  сообщение туда, куда уходит протокол (`join_alert`), и технический разбор
-  владельцу;
-* завис на входе дольше 4 минут → остановить и повторить / сообщить.
+  сообщение туда, куда уходит протокол (`join_alert`), и разбор владельцу;
+* завис на входе / в ожидании впуска дольше срока → остановить и повторить;
+* ждёт в зале ожидания дольше 30 с → попросить людей впустить бота.
 
-🔴 СТАРЫЙ ОБРАЗ БЕЗ СТАТУСОВ. Скрипты и образ бота выкатываются раздельно. Пока
-образ не пишет статус, сторож не знает, где бот, и потому НИКОГО не
-останавливает: реагирует только на выход контейнера с кодом 1 (так upstream
-выходит при сорванном входе) и забывает про встречу через 20 минут.
+Сообщения шлёт ТОЛЬКО сторож: токена в контейнере с браузером нет намеренно
+(браузер открывает чужие страницы), а адресат людям один на всё — маршрут
+протокола.
 
-🔴 СТОРОЖ НЕ МЕШАЕТ ЗАПУСКУ. Всё, что здесь происходит, вызывается запускателем
-под `try`: упади сторож — боты запускаются как раньше.
+🔴 СНАЧАЛА ЗАПИСЬ, ПОТОМ ДЕЙСТВИЕ. Перед каждым повтором и сообщением сторож
+сохраняет журнал с отметкой «сделано». Не сохранился (диск, права) → действие не
+выполняется, владельцу одно сообщение. Иначе при сломанной записи журнала группа
+получала бы одно и то же сообщение каждую минуту до 12 часов.
+
+🔴 СТАРЫЙ ОБРАЗ БЕЗ СТАТУСОВ. Пока образ не пишет статус, сторож никого не
+останавливает: реагирует только на выход контейнера с кодом 1.
+
+🔴 СТОРОЖ НЕ МЕШАЕТ ЗАПУСКУ. Всё вызывается запускателем под `try`.
 
 Решение (`decide`) — чистая функция без docker и файлов: её и тестируем.
 """
@@ -36,7 +46,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("notary.join_watch")
 
@@ -50,8 +60,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def is_enabled() -> bool:
-    """Выключатель: `MEETING_NOTARY_JOIN_WATCH=0`. По умолчанию сторож включён —
-    это прямая просьба владельца 23.09.2026 («не молчать»)."""
+    """Выключатель: `MEETING_NOTARY_JOIN_WATCH=0`. По умолчанию включён —
+    прямая просьба владельца 23.09.2026 («не молчать»)."""
     return (os.environ.get("MEETING_NOTARY_JOIN_WATCH") or "1").strip() not in {"0", "false", "no", "off"}
 
 
@@ -59,32 +69,39 @@ def max_attempts() -> int:
     return _env_int("MEETING_NOTARY_JOIN_MAX_ATTEMPTS", 2)
 
 
-#: Сколько бот может висеть в фазе «вход» (не в зале ожидания), прежде чем
-#: считаться зависшим. Нормальный вход — 30–60 с.
-STUCK_JOINING_SEC = _env_int("MEETING_NOTARY_JOIN_STUCK_SEC", 240)
+#: Фаза «вход» (лобби): нормальный вход — 30–135 с от запуска контейнера.
+STUCK_JOINING_SEC = _env_int("MEETING_NOTARY_JOIN_STUCK_SEC", 300)
+#: Фаза «жду впуска» (после «Подключиться»): бот сам ждёт до waitingRoomTimeout
+#: (по умолчанию 300 с) и в конце может войти «методом исключения» — даём запас.
+STUCK_ADMISSION_SEC = _env_int("MEETING_NOTARY_ADMISSION_STUCK_SEC", 420)
 #: Зал ожидания бот бросает сам через 2,5 мин; это страховка от зависания.
 STUCK_WAITING_SEC = _env_int("MEETING_NOTARY_JOIN_STUCK_WAITING_SEC", 600)
+#: Через сколько в зале ожидания просить людей впустить бота.
+WAITING_NUDGE_SEC = 30
 #: Сорвавшийся бот выходит за секунды; если контейнер ещё жив через столько —
 #: останавливаем его, чтобы не держать повтор.
 FAILED_EXIT_GRACE_SEC = 90
 #: «В звонке» засчитывается, только если продержалось столько: сразу после
-#: in_call бот ещё раз проверяет, что он в звонке, и при промахе пишет failed
-#: (admission_false_positive). Сторож не должен успеть закрыть вход «успехом».
+#: in_call бот ещё раз проверяет вход и при промахе пишет failed.
 IN_CALL_STABLE_SEC = 20
+#: Упал с кодом 1 вскоре после входа — это сорванная встреча, а не её конец.
+IN_CALL_CRASH_WINDOW_SEC = 300
 #: Повторять вход имеет смысл до этого момента после старта встречи.
 RETRY_DEADLINE_AFTER_START_MIN = 30
 #: Старый образ без статусов — сколько следим за контейнером.
 LEGACY_WATCH_SEC = 20 * 60
 #: Ошибка docker — сколько ждём, прежде чем забыть.
 UNKNOWN_FORGET_SEC = 30 * 60
-#: Сколько живут записи журнала.
+#: Сколько живут записи журнала (длинная встреча укладывается).
 LEDGER_TTL_HOURS = 12
-#: Аварийные снимки и статусы старше — убираются (это диагностика, не записи встреч).
+#: Аварийные снимки и статусы старше — убираются (диагностика, не записи встреч).
 CRASH_KIT_TTL_DAYS = 30
 STATUS_TTL_DAYS = 7
 
-#: Причины, где повтор бессмысленен: встречи нет, людей отклонили бота.
+#: Причины, где повтор бессмысленен: встречи нет, бота отклонили.
 NO_RETRY_REASONS = frozenset({"meeting_not_found", "admission_rejected"})
+#: События по ходу встречи, о которых сторож сообщает.
+MEETING_EVENTS = frozenset({"evicted_failure", "deaf_after_start"})
 
 # Действия решения.
 OK = "ok"
@@ -95,10 +112,13 @@ STOP_RETRY = "stop_retry"
 STOP_ALERT = "stop_alert"
 FORGET = "forget"
 
+_GONE = {"exited", "missing", "dead"}
+_RUNNING = {"running", "restarting", "created"}
+
 
 @dataclass(frozen=True)
 class ContainerState:
-    #: running / exited / created / restarting / missing / unknown
+    #: running / exited / created / restarting / missing / paused / unknown
     status: str
     exit_code: Optional[int] = None
 
@@ -113,6 +133,7 @@ class Observation:
     crash_kit: Optional[str] = None
     #: Сколько секунд назад бот записал текущую фазу.
     phase_age_sec: Optional[float] = None
+    events: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -140,8 +161,9 @@ def decide(
     start_at: Optional[datetime],
     now: datetime,
 ) -> Decision:
-    """Что делать с одной попыткой входа. Чистая функция."""
+    """Что делать с одной попыткой входа (до подтверждённого входа). Чистая функция."""
     age = (now - launched_at).total_seconds()
+    phase_age = obs.phase_age_sec if obs.phase_age_sec is not None else age
     retry_allowed = attempt < max_attempts_ and (
         start_at is None or now <= start_at + timedelta(minutes=RETRY_DEADLINE_AFTER_START_MIN)
     )
@@ -151,29 +173,33 @@ def decide(
             return Decision(STOP_ALERT if stop else ALERT, reason)
         return Decision(STOP_RETRY if stop else RETRY, reason)
 
-    running = obs.container.status in {"running", "restarting", "created"}
+    status = obs.container.status
+    running = status in _RUNNING
+    gone = status in _GONE
 
     # 1. Бот сам сказал «сорвалось» — даже если перед этим мелькнуло «в звонке»
     #    (admission_false_positive пишется сразу после in_call).
     if obs.phase == "failed":
         reason = obs.reason or "join_error"
         if running:
-            # Сорвавшийся бот выходит за секунды. Ждём, чтобы не было двух ботов разом;
-            # завис на выходе — останавливаем.
-            if (obs.phase_age_sec or 0) >= FAILED_EXIT_GRACE_SEC:
+            if phase_age >= FAILED_EXIT_GRACE_SEC:
                 return fail(reason, stop=True)
             return Decision(WAIT, reason)
         return fail(reason)
 
-    # 2. В звонке и держится — вход удался. Дальше встречу стережёт сам бот
-    #    (выброс, глухота). Вышел после входа — это уже не дело сторожа входа.
+    # 2. В звонке.
     if obs.phase == "in_call":
-        if not running or (obs.phase_age_sec or 0) >= IN_CALL_STABLE_SEC:
+        if gone:
+            # Упал с ошибкой почти сразу после входа — встреча не пишется.
+            if obs.container.exit_code == 1 and phase_age < IN_CALL_CRASH_WINDOW_SEC:
+                return fail("crashed_after_join")
             return Decision(OK)
-        return Decision(WAIT)
+        if running and phase_age >= IN_CALL_STABLE_SEC:
+            return Decision(OK)
+        return Decision(WAIT)  # свежий вход или docker не ответил
 
     # 3. Контейнера больше нет или он вышел, а в звонок не попал.
-    if obs.container.status in {"exited", "missing", "dead"}:
+    if gone:
         if obs.status_seen:
             return fail("crashed")
         # Старый образ без статусов: судим только по коду выхода.
@@ -188,6 +214,10 @@ def decide(
                 if age >= STUCK_WAITING_SEC:
                     return fail("waiting_room_not_admitted", stop=True)
                 return Decision(WAIT)
+            if obs.phase == "admission":
+                if phase_age >= STUCK_ADMISSION_SEC:
+                    return fail("stuck_admission", stop=True)
+                return Decision(WAIT)
             if age >= STUCK_JOINING_SEC:
                 return fail("stuck_joining", stop=True)
             return Decision(WAIT)
@@ -196,7 +226,7 @@ def decide(
             return Decision(FORGET, "legacy_running")
         return Decision(WAIT)
 
-    # 5. docker не ответил — ждём, но не вечно.
+    # 5. docker не ответил (или контейнер на паузе) — ждём, но не вечно.
     if age >= UNKNOWN_FORGET_SEC:
         return Decision(FORGET, "docker_unknown")
     return Decision(WAIT)
@@ -207,7 +237,8 @@ def decide(
 # ---------------------------------------------------------------------------
 
 #: Поля элемента очереди, нужные для повтора и сообщения. Ссылка на комнату
-#: нужна для повтора; журнал живёт рядом с реестром на сервере (там же ссылки).
+#: нужна для повтора; журнал живёт рядом с реестром на сервере (там же ссылки),
+#: права 0600.
 _ITEM_FIELDS = (
     "meeting_id", "event_id", "series", "start_at", "duration_minutes", "url",
     "expected_participants", "keep_audio", "type", "calendar_id", "ical_uid",
@@ -234,10 +265,17 @@ def load_ledger() -> Dict[str, Any]:
 
 
 def save_ledger(data: Dict[str, Any]) -> None:
+    """Атомарно; временный файл сразу с правами 0600 (в журнале ссылки на комнаты)."""
     p = ledger_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.chmod(tmp, 0o600)
     os.replace(tmp, p)
 
@@ -294,6 +332,7 @@ def observe(
     st = status or {}
     phase = st.get("phase")
     ts = _parse_ts(st.get("updated_at"))
+    events = st.get("events") if isinstance(st.get("events"), list) else []
     return Observation(
         phase=phase if isinstance(phase, str) else None,
         reason=st.get("reason") if isinstance(st.get("reason"), str) else None,
@@ -302,12 +341,17 @@ def observe(
         fallback_used=st.get("fallback_used") if isinstance(st.get("fallback_used"), dict) else None,
         crash_kit=st.get("crash_kit") if isinstance(st.get("crash_kit"), str) else None,
         phase_age_sec=(now - ts).total_seconds() if ts else None,
+        events=tuple(e for e in events if isinstance(e, dict)),
     )
 
 
 # ---------------------------------------------------------------------------
 # Тик
 # ---------------------------------------------------------------------------
+
+
+def _noop(*_a: Any, **_k: Any) -> None:
+    return None
 
 
 @dataclass
@@ -317,10 +361,44 @@ class Hooks:
     inspect: Callable[[str], ContainerState]
     read_status: Callable[[str], Optional[Dict[str, Any]]]
     stop: Callable[[str], None]
-    relaunch: Callable[[Dict[str, Any], int], Optional[Dict[str, str]]]
-    alert: Callable[[Dict[str, Any], str, int, Optional[str]], None]
+    #: Имя сессии и контейнера для попытки N — без побочных эффектов.
+    plan_retry: Callable[[Dict[str, Any], int], Dict[str, str]]
+    #: Запустить попытку N. True — контейнер поднят.
+    relaunch: Callable[[Dict[str, Any], int], bool]
+    #: Сорванный вход: (запись, причина, попыток, снимок, пометка для владельца).
+    alert: Callable[[Dict[str, Any], str, int, Optional[str], Optional[str]], None]
+    #: Событие встречи: (запись, тип, событие).
+    event_alert: Callable[[Dict[str, Any], str, Dict[str, Any]], None]
     note_owner: Callable[[str], None]
-    save_logs: Callable[[str], None] = lambda name: None
+    #: Сохранить журнал СЕЙЧАС (бросает при сбое) — до любого действия.
+    persist: Callable[[Dict[str, Any]], None]
+    #: Журнал не сохранился — одно сообщение владельцу (с глушилкой повторов).
+    persist_failed: Callable[[str], None] = _noop
+    save_logs: Callable[[str], None] = _noop
+
+
+def _commit(ledger: Dict[str, Any], hooks: Hooks) -> bool:
+    try:
+        hooks.persist(ledger)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[join-watch] журнал не сохранён (%s) — действие отложено", type(e).__name__)
+        try:
+            hooks.persist_failed(
+                "⚠️ Сторож Ватсона не может сохранить свой журнал на сервере — повторы входа "
+                "и сообщения людям о сбоях сейчас не отправляются (чтобы не слать одно и то же "
+                "каждую минуту). Проверь место на диске сервера."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
+def _safe(fn: Callable[..., Any], *args: Any) -> None:
+    try:
+        fn(*args)
+    except Exception as e:  # noqa: BLE001 — внешний мир не должен ронять тик
+        logger.warning("[join-watch] внешний вызов упал (%s)", type(e).__name__)
 
 
 def _quiet_note_text(entry: Dict[str, Any], kind: str, detail: str) -> str:
@@ -342,6 +420,30 @@ def _quiet_note_text(entry: Dict[str, Any], kind: str, detail: str) -> str:
     )
 
 
+def _event_key(ev: Dict[str, Any]) -> str:
+    return f"{ev.get('type')}@{ev.get('at')}"
+
+
+def _deliver_events(ledger: Dict[str, Any], entry: Dict[str, Any], obs: Observation, hooks: Hooks) -> bool:
+    """Доставить новые события встречи. Возвращает True, если журнал менялся."""
+    changed = False
+    sent = entry.setdefault("events_sent", [])
+    for ev in obs.events:
+        et = ev.get("type")
+        if et not in MEETING_EVENTS:
+            continue
+        key = _event_key(ev)
+        if key in sent:
+            continue
+        sent.append(key)
+        changed = True
+        if not _commit(ledger, hooks):
+            sent.remove(key)
+            return changed
+        _safe(hooks.event_alert, entry, et, ev)
+    return changed
+
+
 def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bool = True) -> bool:
     """Один проход сторожа по журналу. Возвращает True, если журнал изменился."""
     changed = False
@@ -357,7 +459,8 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             ledger.pop(key, None)
             changed = True
             continue
-        if entry.get("state") != "watching":
+        state = entry.get("state")
+        if state not in ("watching", "in_call"):
             continue
         attempts = entry.get("attempts") or []
         if not attempts:
@@ -373,8 +476,34 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             container = hooks.inspect(name)
         except Exception:  # noqa: BLE001
             container = ContainerState("unknown")
-        status = hooks.read_status(uid) if uid else None
+        try:
+            status = hooks.read_status(uid) if uid else None
+        except Exception:  # noqa: BLE001
+            status = None
         obs = observe(status, container, now)
+
+        # --- Вход уже подтверждён: доставляем события встречи до выхода бота.
+        if state == "in_call":
+            changed = _deliver_events(ledger, entry, obs, hooks) or changed
+            if container.status in _GONE:
+                entry["state"] = "done"
+                entry["closed_at"] = now.isoformat()
+                changed = True
+            continue
+
+        # --- Бот в зале ожидания: попросить людей впустить (один раз).
+        if (
+            obs.phase == "waiting_room"
+            and (obs.phase_age_sec or 0) >= WAITING_NUDGE_SEC
+            and not entry.get("waiting_nudged")
+        ):
+            entry["waiting_nudged"] = True
+            changed = True
+            if _commit(ledger, hooks):
+                _safe(hooks.event_alert, entry, "waiting_room", {"type": "waiting_room"})
+            else:
+                entry["waiting_nudged"] = False
+
         d = decide(
             obs,
             attempt=attempt_no,
@@ -387,15 +516,25 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             continue
         changed = True
         if d.action == OK:
-            entry["state"] = "ok"
-            entry["closed_at"] = now.isoformat()
+            entry["state"] = "in_call"
+            entry["joined_at"] = now.isoformat()
+            notes = []
             if attempt_no > 1:
                 prev = attempts[-2] if len(attempts) > 1 else {}
-                hooks.note_owner(_quiet_note_text(entry, "second_try", str(prev.get("reason") or "join_error")))
+                notes.append(_quiet_note_text(entry, "second_try", str(prev.get("reason") or "join_error")))
             if obs.fallback_used:
                 detail = ", ".join(f"{k}: {v}" for k, v in obs.fallback_used.items())[:300]
-                hooks.note_owner(_quiet_note_text(entry, "fallback", detail))
+                notes.append(_quiet_note_text(entry, "fallback", detail))
+            if not _commit(ledger, hooks):
+                entry["state"] = "watching"
+                continue
+            for text in notes:
+                _safe(hooks.note_owner, text)
             logger.info("[join-watch] %s: вход подтверждён (попытка %d)", key, attempt_no)
+            changed = _deliver_events(ledger, entry, obs, hooks) or changed
+            if container.status in _GONE:
+                entry["state"] = "done"
+                entry["closed_at"] = now.isoformat()
             continue
         if d.action == FORGET:
             entry["state"] = "forgotten"
@@ -403,46 +542,54 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             logger.info("[join-watch] %s: слежу дальше не буду (%s)", key, d.reason)
             continue
 
-        # Сорвалось.
+        # --- Сорвалось.
         cur["reason"] = d.reason
         cur["crash_kit"] = obs.crash_kit
         if d.action in (STOP_RETRY, STOP_ALERT) and obs.status_seen:
-            try:
-                hooks.stop(name)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[join-watch] не смог остановить %s (%s)", name, type(e).__name__)
-        try:
-            hooks.save_logs(name)
-        except Exception:  # noqa: BLE001
-            pass
+            _safe(hooks.stop, name)
+        _safe(hooks.save_logs, name)
         logger.warning("[join-watch] %s: вход сорвался (попытка %d, %s)", key, attempt_no, d.reason)
 
+        owner_note: Optional[str] = None
         if d.action in (RETRY, STOP_RETRY):
-            launched = None
+            nxt = attempt_no + 1
+            planned = None
             try:
-                launched = hooks.relaunch(entry, attempt_no + 1)
+                planned = hooks.plan_retry(entry, nxt)
             except Exception as e:  # noqa: BLE001
-                logger.warning("[join-watch] повтор %s упал (%s)", key, type(e).__name__)
-            if launched:
+                logger.warning("[join-watch] повтор %s не спланирован (%s)", key, type(e).__name__)
+            if planned:
                 attempts.append({
-                    "attempt": attempt_no + 1,
-                    "session_uid": launched.get("session_uid"),
-                    "container": launched.get("container"),
+                    "attempt": nxt,
+                    "session_uid": planned.get("session_uid"),
+                    "container": planned.get("container"),
                     "launched_at": now.isoformat(),
                 })
-                entry["container"] = launched.get("container")
-                logger.info("[join-watch] %s: повторная попытка %d запущена", key, attempt_no + 1)
-                continue
-            d = Decision(ALERT, "no_slot_for_retry" if d.reason not in NO_RETRY_REASONS else d.reason)
-            cur["reason"] = cur.get("reason") or d.reason
+                entry["container"] = planned.get("container")
+                if not _commit(ledger, hooks):
+                    attempts.pop()
+                    entry["container"] = name
+                    continue
+                launched = False
+                try:
+                    launched = bool(hooks.relaunch(entry, nxt))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("[join-watch] повтор %s упал (%s)", key, type(e).__name__)
+                if launched:
+                    logger.info("[join-watch] %s: повторная попытка %d запущена", key, nxt)
+                    continue
+                attempts.pop()
+                entry["container"] = name
+            owner_note = "повтор не запущен: не нашлось свободного места или запуск не удался"
 
         entry["state"] = "alerted"
         entry["closed_at"] = now.isoformat()
         entry["alert_reason"] = cur.get("reason") or d.reason
-        try:
-            hooks.alert(entry, str(cur.get("reason") or d.reason), len(attempts), obs.crash_kit)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[join-watch] сообщение о %s не ушло (%s)", key, type(e).__name__)
+        if not _commit(ledger, hooks):
+            entry["state"] = "watching"
+            entry.pop("closed_at", None)
+            continue
+        _safe(hooks.alert, entry, str(cur.get("reason") or d.reason), len(attempts), obs.crash_kit, owner_note)
     return changed
 
 
@@ -452,27 +599,49 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
 
 
 def prune_diagnostics(transcripts_dir: Path, *, now_ts: Optional[float] = None) -> int:
-    """Убрать старые статусы и аварийные снимки. Записи встреч не трогает никогда."""
+    """Убрать старые статусы и аварийные снимки. Записи встреч не трогает никогда.
+
+    🔴 Папки наполняет контейнер (root, браузер на чужих страницах), а убирает
+    пользователь сервера. Поэтому НИ ОДНОЙ символической ссылки не проходим и не
+    удаляем по ней: иначе ссылка «.crash-kits/x → папка протоколов» стёрла бы
+    протоколы (цикл5 С2). Сами папки тоже не должны быть ссылками.
+    """
     now_ts = now_ts or time.time()
     removed = 0
+
+    def _real_dir(p: Path) -> bool:
+        try:
+            return p.is_dir() and not p.is_symlink()
+        except OSError:
+            return False
+
     status_dir = transcripts_dir / ".join-status"
+    if _real_dir(status_dir):
+        try:
+            with os.scandir(status_dir) as it:
+                for de in it:
+                    if not de.name.endswith(".json") or not de.is_file(follow_symlinks=False):
+                        continue
+                    if now_ts - de.stat(follow_symlinks=False).st_mtime > STATUS_TTL_DAYS * 86400:
+                        os.unlink(de.path)
+                        removed += 1
+        except OSError:
+            pass
     kits_dir = transcripts_dir / ".crash-kits"
-    try:
-        for p in status_dir.glob("*.json"):
-            if now_ts - p.stat().st_mtime > STATUS_TTL_DAYS * 86400:
-                p.unlink(missing_ok=True)
-                removed += 1
-    except OSError:
-        pass
-    try:
-        for d in kits_dir.iterdir():
-            if not d.is_dir() or now_ts - d.stat().st_mtime <= CRASH_KIT_TTL_DAYS * 86400:
-                continue
-            for f in d.iterdir():
-                if f.is_file():
-                    f.unlink(missing_ok=True)
-            d.rmdir()
-            removed += 1
-    except OSError:
-        pass
+    if _real_dir(kits_dir):
+        try:
+            with os.scandir(kits_dir) as it:
+                for de in it:
+                    if not de.is_dir(follow_symlinks=False):
+                        continue
+                    if now_ts - de.stat(follow_symlinks=False).st_mtime <= CRASH_KIT_TTL_DAYS * 86400:
+                        continue
+                    with os.scandir(de.path) as inner:
+                        for f in inner:
+                            if f.is_file(follow_symlinks=False) or f.is_symlink():
+                                os.unlink(f.path)  # ссылку удаляем как ссылку, не цель
+                    os.rmdir(de.path)
+                    removed += 1
+        except OSError:
+            pass
     return removed

@@ -62,6 +62,10 @@ export async function handleYandexTelemost(
       }
     },
     waitForAdmission: (async (p: Page, timeoutMs: number, cfg: BotConfig) => {
+      // «Подключиться» нажато, ждём признаков звонка: у сторожа на эту фазу свой
+      // срок (до waitingRoomTimeout + запас), чтобы не убить бота, которого ещё
+      // могут впустить (цикл5 Н1).
+      writeJoinStatus("admission", { admission_timeout_ms: timeoutMs });
       try {
         const admitted = await waitForYandexTelemostAdmission(p, timeoutMs, cfg);
         if (admitted) writeJoinStatus("in_call");
@@ -74,7 +78,10 @@ export async function handleYandexTelemost(
     checkAdmissionSilent: (async (p: Page) => {
       const ok = await checkForTelemostAdmissionSilent(p);
       if (!ok) {
-        writeJoinStatus("failed", { reason: "admission_false_positive", step: "verify" });
+        // «Вход не подтвердился» — вероятная форма следующей поломки (Телемост
+        // поменял экран звонка): снимок нужен именно здесь (цикл5 У8).
+        const kit = await captureCrashKit(p, "admission_false_positive").catch(() => null);
+        writeJoinStatus("failed", { reason: "admission_false_positive", step: "verify", crash_kit: kit });
       }
       return ok;
     }) as any,
