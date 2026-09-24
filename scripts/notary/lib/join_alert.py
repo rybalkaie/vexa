@@ -283,7 +283,8 @@ def _default_sender(chat_id: int, text: str) -> bool:
         return False
     from notary.lib import telegram_api  # noqa: PLC0415
 
-    telegram_api.send_message(token, chat_id, text)
+    # Тестовый режим — беззвучно: проверка маршрута не должна будить владельца.
+    telegram_api.send_message(token, chat_id, text, disable_notification=_redirect_to_owner())
     return True
 
 
@@ -303,7 +304,7 @@ def send(
     if owner_push is None:
         from notary.lib.notify import push as _push  # noqa: PLC0415
 
-        owner_push = lambda text: _push(text, dedupe=False)  # noqa: E731
+        owner_push = lambda text: _push(text, dedupe=False, silent=_redirect_to_owner())  # noqa: E731
     msgs = build_messages(entry, reason, attempts=attempts, crash_kit=crash_kit, watched=watched, now=now)
     redirect = _redirect_to_owner()
     owner = owner_chat()

@@ -84,9 +84,11 @@ def send_message(
     parse_mode: Optional[str] = None,
     disable_web_page_preview: bool = True,
     reply_to_message_id: Optional[int] = None,
+    disable_notification: bool = False,
 ) -> dict:
     """Отправляет сообщение. Возвращает `result` (включая `message_id`).
 
+    `disable_notification` — беззвучно (тестовые и тихие служебные сообщения).
     Логи: только chat_id + len(text). Содержимое — нет.
     """
     payload: dict[str, Any] = {
@@ -94,6 +96,8 @@ def send_message(
         "text": text,
         "disable_web_page_preview": disable_web_page_preview,
     }
+    if disable_notification:
+        payload["disable_notification"] = True
     if parse_mode:
         payload["parse_mode"] = parse_mode
     if reply_markup is not None:
