@@ -29,6 +29,14 @@ echo "[Entrypoint] Creating virtual microphone from TTS sink monitor..."
 pactl load-module module-remap-source master=tts_sink.monitor source_name=virtual_mic source_properties=device.description="VirtualMicrophone" 2>/dev/null || true
 pactl set-default-source virtual_mic 2>/dev/null || true
 
+# meeting-notary 25.09.2026 (ISS-60, фаза 4 «второе ухо»): звук, который играет
+# браузер (голоса звонка), — явно в zoom_sink. Раньше он попадал туда лишь потому,
+# что zoom_sink создан первым (проверено вживую: `pactl info` → zoom_sink). С его
+# монитора бот пишет второе ухо (src/platforms/yandextelemost/second-ear.ts).
+# НИКОГДА не tts_sink: из его монитора сделан микрофон бота (virtual_mic) — звук
+# встречи вернулся бы людям эхом.
+pactl set-default-sink zoom_sink 2>/dev/null || true
+
 # Mute TTS sink AND virtual_mic source — silent until /speak explicitly unmutes.
 # Muting only the sink is not enough: the remap source still passes a low-level signal
 # to WebRTC, which Teams' VAD interprets as speech. Muting the source cuts it at capture level.

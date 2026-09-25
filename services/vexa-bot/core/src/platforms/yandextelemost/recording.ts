@@ -35,6 +35,16 @@ import { waitForYandexTelemostAdmission } from "./admission";
 import { addJoinEvent } from "./join-status";
 import { installFrameWalker } from "./rtc-hook";
 import { ensureTelemostDevicesOff } from "./devices";
+// Фаза 4 (ISS-60, 25.09.2026): второе ухо — запись всего, что играет браузер.
+import { SecondEarRecorder } from "./second-ear";
+import {
+  SecondEarJudge,
+  FinalDecision,
+  SECOND_EAR_CHUNK_IDX,
+  EAR_BLOCK_MS,
+  forceDeafFromRawConfig,
+  audioSourceView,
+} from "./second-ear-judge";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -759,6 +769,12 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   })();
   logStep("series_chat_resolved", { has_chat: seriesChatId != null });
 
+  // Фаза 4 (живая проверка второго уха, только тестовый образ): основная запись
+  // «оглохла» принудительно — её звук обнуляется до записи и до оценки тишины.
+  // Сырой BOT_CONFIG.telemostForceDeaf; запускатель его не ставит никогда.
+  const forceDeaf = forceDeafFromRawConfig(rawBotConfig);
+  if (forceDeaf) logStep("second_ear_force_deaf", { enabled: true });
+
   // Ф1 (ISS-28) R1: id комнаты из `/j/<meetingId>`. Детект выброса = «адрес
   // потерял этот сегмент» (не «ушёл с домена telemost» — корень его содержит).
   const meetingUrl = botConfig.meetingUrl || (botConfig as any).meetingUrl || "";
@@ -804,6 +820,16 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   let evictionHandling = false;
   let evictionRecoveryCount = 0; // успешных возвратов за сессию (антизацикл)
   let deafAfterStartSince: number | null = null;
+
+  // Фаза 4 (ISS-60): судья второго уха — держать ли бота на встрече, когда основная
+  // запись молчит, а браузер играет речь, и не оглохла ли основная (second-ear-judge.ts).
+  // Второе ухо НЕ меняет поведение, пока основная слышит встречу: оно вмешивается,
+  // только когда само слышит речь, которой основная не слышит.
+  const earJudge = new SecondEarJudge(startTs, forceDeaf);
+  const secondEarPath = chunkWavPath(stamp, sessionUid, SECOND_EAR_CHUNK_IDX);
+  let secondEar: SecondEarRecorder | null = null;
+  // Итог второго уха в конце встречи (считается один раз, в finally, до финальной meta).
+  let earFinal: FinalDecision | null = null;
 
   // ISS-20 #2: «никто не пришёл» нельзя объявлять, если в панели ВИДНЫ люди —
   // это «оглох» (вероятный сбой захвата), а не пустая комната. При живых людях
@@ -872,6 +898,35 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       : (chunks.length ? chunks[0].wav : null);
     const totalSamples = chunks.reduce((a, c) => a + c.samples, 0);
     const totalDurationS = chunks.reduce((a, c) => a + c.durationS, 0);
+    const mainChunks = chunks.map((c) => ({
+      idx: c.idx,
+      wav: c.wav,
+      startTs: c.startTs,
+      firstSpeechMs: c.firstSpeechMs,
+      lastSpeechMs: c.lastSpeechMs,
+      endTs: c.endTs,
+      durationS: Math.round(c.durationS),
+    }));
+    // Фаза 4: второе ухо. Пока основная запись слышит встречу, здесь только сведения
+    // о нём (recording.secondEar), а его файл в chunks[] НЕ попадает — иначе
+    // финализация склеила бы два звука одной встречи. Основная оглохла → chunks[] и
+    // files.wav указывают на второе ухо (в нём вся встреча с начала записи), куски
+    // основной уходят в primaryChunks для разбора (audioSourceView). По ходу встречи —
+    // сразу после правила «минута подряд» (чтобы и при падении бота финализация
+    // взяла второе ухо), в конце — по итогу судьи (earFinal).
+    const earStats = secondEar ? secondEar.stats() : null;
+    const deafVerdict = earFinal ? earFinal.verdict : earJudge.deaf;
+    const audio = audioSourceView({
+      useEar: earFinal ? earFinal.useEar : earJudge.deaf !== null,
+      mainChunks,
+      primaryWav,
+      primaryFirstMs: topFirst,
+      primaryLastMs: topLast,
+      earPath: secondEarPath,
+      ear: earStats,
+      earFirstMs: earJudge.firstEarLoudTs,
+      earLastMs: earJudge.lastEarLoudTs,
+    });
     return {
       sessionUid,
       botName,
@@ -883,8 +938,8 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       startTs: new Date(startTs).toISOString(),
       endTs: new Date(endTs).toISOString(),
       durationS: Math.round((endTs - startTs) / 1000),
-      audioDurationS: Math.round(totalDurationS),
-      audioSamples: totalSamples,
+      audioDurationS: audio.audioDurationS ?? Math.round(totalDurationS),
+      audioSamples: audio.audioSamples ?? totalSamples,
       sampleRate: SAMPLE_RATE,
       endReason,
       participants: participantsPoll.getNames(),
@@ -895,17 +950,36 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         startedFromCommit,
         // Ф3-конвенция (UNIX epoch ms). Топ-уровень = агрегат по chunks для Ф1
         // single-chunk fallback; основной источник длительности — chunks[].
-        firstSpeechMs: topFirst,
-        lastSpeechMs: topLast,
-        chunks: chunks.map((c) => ({
-          idx: c.idx,
-          wav: c.wav,
-          startTs: c.startTs,
-          firstSpeechMs: c.firstSpeechMs,
-          lastSpeechMs: c.lastSpeechMs,
-          endTs: c.endTs,
-          durationS: Math.round(c.durationS),
-        })),
+        firstSpeechMs: audio.firstSpeechMs,
+        lastSpeechMs: audio.lastSpeechMs,
+        chunks: audio.chunks,
+        ...(audio.primaryChunks ? { primaryChunks: audio.primaryChunks } : {}),
+        // Фаза 4: откуда финализация берёт звук — "primary" (основная запись) или
+        // "second_ear". По "second_ear" финализация пишет владельцу.
+        audioSource: audio.audioSource,
+        primaryDeaf: deafVerdict
+          ? {
+            rule: deafVerdict.rule,
+            since: new Date(deafVerdict.since).toISOString(),
+            detectedAt: new Date(deafVerdict.detectedAt).toISOString(),
+            primarySilentS: Math.round(deafVerdict.primarySilentMs / 1000),
+            earLoudS: Math.round(deafVerdict.earLoudMs / 1000),
+            primaryLoudS: Math.round(deafVerdict.primaryLoudMs / 1000),
+            forced: deafVerdict.forced,
+            reverted: earFinal ? earFinal.reverted : false,
+          }
+          : null,
+        // Громкое время (сумма 3-секундных кусков не тише −50 дБ): основная / второе ухо.
+        primaryLoudS: Math.round(earJudge.primaryLoudTotalMs / 1000),
+        secondEar: earStats
+          ? {
+            ...earStats,
+            loudS: Math.round(earJudge.earLoudTotalMs / 1000),
+            firstSoundMs: earJudge.firstEarLoudTs,
+            lastSoundMs: earJudge.lastEarLoudTs,
+            forcedPrimaryDeaf: forceDeaf,
+          }
+          : null,
         // Ф1 (ISS-28) R3: причина выброса (заполняется при подтверждённом выбросе:
         // evicted_normal_end/_failure/_recovered). По БЕЛОМУ СПИСКУ типов —
         // навигации/console-error-warning/WS-close. Текста реплик/имён здесь нет
@@ -916,7 +990,8 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         // Backward-compat: до Ф5.3 (multi-chunk finalize) финализатор читает
         // files.wav — указываем на первый chunk. Для классического прогона без
         // пауз chunk_1 = весь WAV встречи. Multi-chunk → meta.recording.chunks[].
-        wav: primaryWav,
+        // Фаза 4: основная оглохла → второе ухо (им же займутся чистка и удержание).
+        wav: audio.filesWav,
         draftTxt: txtPath,
         meta: metaPath,
       },
@@ -1002,14 +1077,19 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   // Регистрируем exposed function ДО запуска browser-капчи.
   await page.exposeFunction(
     "__vexaTelemostAudio",
-    async (b64: string, rms: number) => {
+    async (b64: string, rawRms: number) => {
       const RMS_SILENCE_THRESHOLD = 0.003;
       const nowMs = Date.now();
+      // Фаза 4: живая проверка второго уха — основная «оглохла» по флагу (тестовый образ).
+      const rms = forceDeaf ? 0 : rawRms;
       const isSilent = rms < RMS_SILENCE_THRESHOLD;
+      // Судья второго уха сравнивает, что слышит основная и что играет браузер.
+      earJudge.onPrimaryBlock(nowMs, rms);
 
       // 1) Декодируем сэмплы СРАЗУ — нужны и для WAV-стрима, и для транскрипции.
       const bin = Buffer.from(b64, "base64");
       const samples = new Float32Array(bin.buffer, bin.byteOffset, bin.byteLength / 4);
+      if (forceDeaf) samples.fill(0);
 
       // 2) Речь + границы + resume из паузы. ВАЖНО: resume-транзишн ДО writeSamples,
       //    чтобы первый не-тихий кадр после паузы попал уже в новый chunk_(N+1).
@@ -1145,6 +1225,24 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     logStep("eviction_alert_event_written", { has_series_chat: seriesChatId != null });
   };
 
+  // Фаза 4 (ISS-60): второе ухо — запись того, что браузер играет в звуковую
+  // систему контейнера (монитор zoom_sink, second-ear.ts). Каждый его 3-секундный
+  // кусок — судье: если ухо слышит речь (≥ 3 громких куска за 30 с), встреча идёт —
+  // бот не уходит по «никто не пришёл», «оглох» и тишине, даже когда основная
+  // запись молчит. Пока идёт перезаход после выброса — таймеры не трогаем.
+  const onEarBlock = (b: { ts: number; rms: number; loud: boolean }): void => {
+    earJudge.onEarBlock(b.ts, b.rms);
+    if (evictionHandling || !earJudge.earHearsSpeech(b.ts)) return;
+    const heardAt = earJudge.lastEarLoudTs ?? b.ts;
+    if (heardAt > lastNonSilenceTs) lastNonSilenceTs = heardAt;
+    if (!meetingStarted) {
+      meetingStarted = true;
+      logStep("meeting_started_second_ear", { ear_loud_s: Math.round(earJudge.earLoudTotalMs / 1000) });
+    }
+  };
+  secondEar = new SecondEarRecorder(secondEarPath, onEarBlock, (step, ctx) => logStep(step, ctx || {}));
+  await secondEar.start(); // не бросает: сбой второго уха основную запись не трогает
+
   // Все cleanup'ы в finally — иначе при исключении в main Promise
   // (например, в setInterval/setupBrowserCapture) WAV-fd останется
   // открытым в долгоживущем runner-процессе Ф5+ (в Ф3 docker run --rm
@@ -1192,7 +1290,11 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           closeChunk(now, "evicted");
           recState = "recording_paused_in_call";
 
-          const speechMs = recordedSpeechMs();
+          // Фаза 4: основная оглохла, встречу пишет второе ухо — объём разговора
+          // считаем и по нему (иначе выброс в конце долгой встречи сочли бы сбоем).
+          const speechMs = earJudge.deaf
+            ? Math.max(recordedSpeechMs(), earJudge.earLoudTotalMs)
+            : recordedSpeechMs();
           // В docker-лог (его персистит R6) — только МЕТАДАННЫЕ + навигации/WS-коды
           // (тексты console-error НЕ кладём — могли бы нести ПДн; едут лишь в meta).
           logStep("evicted_confirmed", {
@@ -1287,6 +1389,27 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           consecutiveOutOfRoom = 0;
         }
 
+        // Фаза 4: «основная оглохла» — она молчит минуту подряд, а второе ухо за эту
+        // минуту слышало звук хотя бы четверть времени. Объявляется один раз; с этого
+        // момента meta указывает на второе ухо (при падении бота финализация возьмёт
+        // его), в статус входа — событие primary_deaf (его ждёт самопроверка; сторож
+        // людям по нему не пишет — владельцу напишет финализация).
+        const deafNow = earJudge.checkPrimaryDeaf(now);
+        if (deafNow) {
+          const ctx = {
+            rule: deafNow.rule,
+            since: new Date(deafNow.since).toISOString(),
+            primary_silent_s: Math.round(deafNow.primarySilentMs / 1000),
+            ear_loud_s: Math.round(deafNow.earLoudMs / 1000),
+            forced: deafNow.forced,
+          };
+          logStep("primary_deaf_detected", { ...ctx, ear_status: secondEar ? secondEar.stats().status : null });
+          try {
+            addJoinEvent("primary_deaf", ctx);
+          } catch { /* статус — помощник, не условие записи */ }
+          writeMeta("primary_deaf");
+        }
+
         // До «начала встречи» работает только noOneJoinedTimeout.
         if (!meetingStarted) {
           const elapsed = now - startTs;
@@ -1328,7 +1451,12 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         } catch {
           degraded = false; // контекст недоступен — не триггерим (безопасно)
         }
-        if (degraded && hasRealParticipants()) {
+        // Фаза 4: без дорожек, но встречу слышит второе ухо — это не «оглох», бот
+        // остаётся и пишет вторым ухом: основная объявлена оглохшей — навсегда; ухо
+        // слышало речь за последние DEAF_AFTER_START_TIMEOUT_MS — пока держим.
+        const earCovers = earJudge.deaf !== null
+          || (earJudge.lastEarSpeechTs !== null && now - earJudge.lastEarSpeechTs < DEAF_AFTER_START_TIMEOUT_MS);
+        if (degraded && hasRealParticipants() && !earCovers) {
           if (deafAfterStartSince == null) {
             deafAfterStartSince = now;
             logStep("deaf_after_start_suspected", { participants: participantsPoll.getNames().length, present: presentNow() });
@@ -1350,7 +1478,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
             return resolve();
           }
         } else if (deafAfterStartSince != null) {
-          logStep("deaf_after_start_recovered", { degraded, has_people: hasRealParticipants() });
+          logStep("deaf_after_start_recovered", { degraded, has_people: hasRealParticipants(), ear_covers: earCovers });
           deafAfterStartSince = null;
         }
 
@@ -1408,10 +1536,30 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
       log(`${LOG_PREFIX} eviction capture detach failed: ${err.message}`);
     }
 
+    // Фаза 4: второе ухо — остановить (хвост дописывается), затем итог судьи: брать
+    // ли второе ухо вместо основной (короткую встречу «минута подряд» могла не
+    // поймать). Итог попадает в финальную meta ниже.
+    try {
+      if (secondEar) await secondEar.stop();
+    } catch (err: any) {
+      log(`${LOG_PREFIX} second ear stop failed: ${err.message}`);
+    }
+    const closeTs = Date.now();
+    earFinal = earJudge.finalDecision(closeTs);
+    logStep("second_ear_final", {
+      use_ear: earFinal.useEar && !!secondEar && secondEar.stats().samples > 0,
+      rule: earFinal.verdict ? earFinal.verdict.rule : null,
+      reverted: earFinal.reverted,
+      ear_loud_s: Math.round(earFinal.earLoudMs / 1000),
+      primary_loud_s: Math.round(earFinal.primaryLoudMs / 1000),
+      ear_status: secondEar ? secondEar.stats().status : null,
+      ear_blocks: earJudge.earBlocks,
+      block_ms: EAR_BLOCK_MS,
+    });
+
     // final_exit «событие». closeChunk само-защищён (закрывает writer только
     // если он открыт) и ВСЕГДА пишет финальную meta с полным chunks[]. Если вышли
     // из паузы (writer уже закрыт) — chunk не трогается, пишется только meta.
-    const closeTs = Date.now();
     closeChunk(closeTs, "final_exit");
 
     logStep("recording_done", {
