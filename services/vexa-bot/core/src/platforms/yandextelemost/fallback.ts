@@ -68,7 +68,8 @@ function logStep(step: string, ctx: Record<string, unknown> = {}): void {
 // Типы
 // ---------------------------------------------------------------------------
 
-export type FbTier = "tid" | "label" | "text";
+/** Ярусы поиска: метка → подпись → текст; у поля имени ещё «по месту» (form). */
+export type FbTier = "tid" | "label" | "text" | "form";
 export type FbTarget = FallbackButtonTarget | "name";
 
 /** Видимый элемент одного окна (кнопка или поле) — только признаки, без введённых значений. */
@@ -296,6 +297,33 @@ export function lobbyControlsVisible(controls: FbControl[]): boolean {
   );
 }
 
+/**
+ * Поле имени «по месту» — структурный ярус (живая самопроверка 25.09, `no-testid`:
+ * в настоящем лобби 3.0 у поля имени нет ни подсказки, ни подписи, ни <label>, и
+ * без метки запасной путь его не находил). В окне, где видна кнопка «Подключиться»
+ * (по белому списку — метка, подпись или текст, как у самой кнопки; неактивная тоже:
+ * вход часто закрыт, пока имя не вписано), и в нём РОВНО ОДНО видимое доступное
+ * текстовое поле (не поиск, не строка сообщения — `nameInputEligible`) — это поле
+ * имени. Два и больше — не угадываем. Главное окно 3.0 (чат комнаты) этим ярусом
+ * не трогаем: там поле сообщения и карточки «Подключиться». Возвращает id полей.
+ */
+export function structuralNameInputs(controls: FbControl[], noTestid = false): Set<string> {
+  const ui30 = controls.some((c) => c.frame === "call");
+  const byFrame = new Map<number, { frame: FrameKind; inputs: FbControl[]; join: boolean }>();
+  for (const c of controls) {
+    const e = byFrame.get(c.frameIdx) || { frame: c.frame, inputs: [], join: false };
+    if (nameInputEligible(c)) e.inputs.push(c);
+    else if (matchButton(c, "join", noTestid)) e.join = true;
+    byFrame.set(c.frameIdx, e);
+  }
+  const out = new Set<string>();
+  for (const e of byFrame.values()) {
+    if (ui30 && e.frame === "main") continue;
+    if (e.join && e.inputs.length === 1) out.add(e.inputs[0].id);
+  }
+  return out;
+}
+
 function soleInputs(controls: FbControl[]): Set<string> {
   const byFrame = new Map<number, FbControl[]>();
   for (const c of controls) {
@@ -351,7 +379,8 @@ export function chooseFallbackAction(controls: FbControl[], st: FbDecisionState)
     }
   }
 
-  // 2) Поле имени.
+  // 2) Поле имени: метка → подпись → текст рядом → «по месту» (единственное поле
+  //    в окне с «Подключиться»).
   const sole = soleInputs(controls);
   let name: { control: FbControl; m: FbMatch } | null = null;
   for (const tier of tiers(st.noTestid)) {
@@ -363,6 +392,11 @@ export function chooseFallbackAction(controls: FbControl[], st: FbDecisionState)
       }
     }
     if (name) break;
+  }
+  if (!name) {
+    const byPlace = structuralNameInputs(controls, st.noTestid);
+    const c = live.find((x) => byPlace.has(x.id));
+    if (c) name = { control: c, m: { target: "name", tier: "form", match: "единственное поле рядом с «Подключиться»" } };
   }
   // Имя вписываем, пока его нет в поле (страница могла перерисовать поле и стереть).
   if (name && !name.control.isBotName) return { kind: "fill", control: name.control, m: name.m };
@@ -387,7 +421,12 @@ export function chooseFallbackAction(controls: FbControl[], st: FbDecisionState)
 // Итог для статуса и владельца (наши слова, без текстов страницы)
 // ---------------------------------------------------------------------------
 
-const TIER_RU: Record<FbTier, string> = { tid: "по метке", label: "по подписи", text: "по тексту" };
+const TIER_RU: Record<FbTier, string> = {
+  tid: "по метке",
+  label: "по подписи",
+  text: "по тексту",
+  form: "по месту (единственное поле рядом с «Подключиться»)",
+};
 const PRIMARY_RU: Record<string, string> = {
   name_input_not_found: "не нашёл поле имени",
   join_button_not_found: "не нашёл кнопку «Подключиться»",
@@ -835,7 +874,9 @@ export async function runFallbackJoin(page: Page, o: FallbackRunOptions): Promis
     }
     if (steps.length >= MAX_ACTIONS) break;
 
-    if (scan.controls.some((c) => matchNameInput(c, false, false))) sawName = true;
+    if (scan.controls.some((c) => matchNameInput(c, false, false)) || structuralNameInputs(scan.controls, noTestid).size > 0) {
+      sawName = true;
+    }
     st.joinWithoutName = !sawName && Date.now() - start >= NAME_GRACE_MS;
     const action = chooseFallbackAction(scan.controls, st);
     if (!action) {

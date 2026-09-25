@@ -23,6 +23,7 @@ import {
   matchButton,
   matchNameInput,
   normLabel,
+  structuralNameInputs,
   MAX_POPUP_CLICKS,
 } from "./fallback";
 import { telemostFallbackButtons } from "./selectors";
@@ -255,6 +256,55 @@ expect("без меток: крестик онбординга по тексту
   pick([...onboarding(), ...interstitial(), ...main30()], state({ noTestid: true })), ["click", "popup_dismiss", "text", "onb-x"]);
 expect("звонок идёт (панель звонка): делать нечего",
   pick([btn({ tid: "end-call-alt-button", id: "e" }), btn({ tid: "mute-audio", aria: "Выключить микрофон", id: "m" }), ...main30()]), null);
+
+console.log("поле имени «по месту» — живое лобби 3.0 без меток (самопроверка no-testid 25.09)");
+// Снимок живого лобби: поле без подсказки, подписи и <label>; кнопки «На главный
+// экран», «Включить камеру», «Подключиться» (только текст), «Открыть настройки».
+const liveLobby = (over: { name?: Partial<FbControl>; join?: Partial<FbControl> } = {}) => [
+  btn({ tid: "to-home-screen-button", aria: "На главный экран", id: "home" }),
+  inp({ tid: "orb-textinput-input", type: "text", near: "Подключение к звонку", id: "nm", ...(over.name || {}) }),
+  btn({ tid: "turn-on-camera-button", aria: "Включить камеру", id: "cam" }),
+  btn({ tid: "enter-conference-button", text: "Подключиться", id: "join", ...(over.join || {}) }),
+  btn({ tid: "open-settings-button", aria: "Открыть настройки", id: "set" }),
+];
+expect("без меток: единственное поле рядом с «Подключиться» — поле имени по месту",
+  pick([...liveLobby(), ...main30()], state({ noTestid: true })), ["fill", "name", "form", "nm"]);
+expect("…кнопка «Подключиться» неактивна, пока нет имени — всё равно поле имени",
+  pick([...liveLobby({ join: { disabled: true } }), ...main30()], state({ noTestid: true })), ["fill", "name", "form", "nm"]);
+expect("…имя вписано — «Подключиться» по тексту",
+  pick([...liveLobby({ name: { isBotName: true } }), ...main30()], state({ noTestid: true, nameFilled: true })), ["click", "join", "text", "join"]);
+expect("с метками (обычный запасной путь) — как раньше, по метке",
+  pick([...liveLobby(), ...main30()]), ["fill", "name", "tid", "nm"]);
+expect("два поля без подписей в окне — не угадываем (имени нет, вход без имени не разрешён)",
+  pick([...liveLobby(), inp({ tid: "orb-textinput-input", type: "text", id: "nm2" }), ...main30()], state({ noTestid: true })), null);
+expect("два поля — структурный ярус пуст",
+  [...structuralNameInputs([...liveLobby(), inp({ type: "text", id: "nm2" })], true)], []);
+expect("в окне нет «Подключиться» — не по месту",
+  [...structuralNameInputs(liveLobby().filter((c) => c.id !== "join"), true)], []);
+expect("«Подключиться» только в другом окне — не по месту",
+  [...structuralNameInputs([...liveLobby().filter((c) => c.id !== "join"), btn({ ...MAIN, text: "Подключиться", id: "j2" })], true)], []);
+{
+  // 3.0: поле только в окне чата (главное), там же карточка «Подключиться»; лобби
+  // во вложенном окне без поля — в поле чата имя не вписываем никогда.
+  const chatOnly = [
+    btn({ tid: "enter-conference-button", text: "Подключиться", id: "join" }),
+    inp({ ...MAIN, type: "text", id: "chat-in" }),
+    btn({ ...MAIN, text: "Подключиться", id: "chat-card" }),
+  ];
+  expect("3.0: поле только в чате главного окна — не поле имени по месту", [...structuralNameInputs(chatOnly, true)], []);
+  const a = chooseFallbackAction(chatOnly, state({ noTestid: true }));
+  expect("3.0: поле только в чате главного окна — не вписываем", !!(a && a.kind === "fill"), false);
+}
+expect("старый интерфейс (окна звонка нет): поле на главной рядом с «Подключиться» — по месту",
+  [...structuralNameInputs([inp({ ...MAIN, type: "text", id: "old-nm" }), btn({ ...MAIN, text: "Подключиться", id: "old-j" })], true)], ["old-nm"]);
+expect("поиск рядом с «Подключиться» — не поле имени по месту",
+  [...structuralNameInputs([inp({ type: "search", id: "s" }), btn({ text: "Подключиться", id: "j" })], true)], []);
+expect("строка «Сообщение» рядом с «Подключиться» — не поле имени по месту",
+  [...structuralNameInputs([inp({ placeholder: "Сообщение", id: "m" }), btn({ text: "Подключиться", id: "j" })], true)], []);
+expect("строка владельцу: «по месту»",
+  fallbackSummary(null, "no-testid", [{ target: "name", tier: "form", frame: "call", method: "fill", ok: true }]).includes("имя — по месту"), true);
+expect("шаги для машины: name:form",
+  fallbackStepsCode([{ target: "name", tier: "form", frame: "call", method: "fill", ok: true }]), "name:form");
 
 console.log("lobbyControlsVisible — «в звонке» до входа не засчитывать");
 expect("виджет главной 3.0 без лобби — лобби не видно", lobbyControlsVisible(main30()), false);

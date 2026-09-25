@@ -214,6 +214,45 @@ const thenJs = (next: string, nextWidget: string) =>
   `window.__nextScreen = ${JSON.stringify(next)}; window.__nextWidget = ${JSON.stringify(nextWidget)};`;
 const lobbyThen = (next: string, nextWidget: string) => callDoc(LOBBY_BODY, thenJs(next, nextWidget));
 
+// Живое лобби 3.0 (самопроверка no-testid 25.09, аварийный снимок): поле имени без
+// подсказки, подписи и <label>; кнопки «На главный экран», «Включить камеру»,
+// «Подключиться» (только текст), «Открыть настройки». На главной открыт онбординг
+// «Большое обновление в Телемосте» поверх всего (крестик — только значок: без меток
+// его не закрыть), под ним «Продолжить в браузере». `fields: 2` — два поля без
+// подписей (угадывать нельзя).
+const liveLobbyBody = (fields: 1 | 2) =>
+  `<div>Подключение к звонку</div>` +
+  `<button data-testid="to-home-screen-button" aria-label="На главный экран" data-danger="home">←</button>` +
+  (fields === 1
+    ? `<div class="fld"><input data-testid="orb-textinput-input" type="text" id="realname"></div>`
+    : `<div class="fld"><input data-testid="orb-textinput-input" type="text" data-not-name="f1"></div>` +
+      `<div class="fld"><input data-testid="orb-textinput-input" type="text" data-not-name="f2"></div>`) +
+  `<button data-testid="turn-on-camera-button" aria-label="Включить камеру" data-danger="cam-on" onclick="toggleCam(this)">к</button>` +
+  `<button data-testid="open-settings-button" aria-label="Открыть настройки">⚙</button>` +
+  `<button data-testid="enter-conference-button" onclick="joinClicked()">Подключиться</button>`;
+const LIVE_MAIN = mainDoc(
+  `<div>Телемост</div>${SEARCH}<div id="widget">${WIDGET_LOBBY}</div>` +
+    `<div role="dialog" id="onb" class="overlay"><h2>Большое обновление в Телемосте</h2>` +
+    `<button data-testid="telemost-3-onboarding-close" onclick="document.getElementById('onb').remove()">` +
+    `<svg width="12" height="12"></svg></button></div>` +
+    `<div id="inter">Вы подключаетесь к видеовстрече ` +
+    `<button data-testid="meeting-continue-in-browser-continue" onclick="cont()">Продолжить в браузере</button></div>`,
+  `function cont(){var i=document.getElementById('inter'); if(i) i.remove(); if(document.getElementById('call')) return;` +
+    `var f=document.createElement('iframe'); f.id='call'; f.src='${CALL_PATH}?embed=1'; document.body.appendChild(f);}`,
+);
+const liveLobbyThen = (fields: 1 | 2) => callDoc(liveLobbyBody(fields), thenJs(IN_CALL_BODY([BOT, SPEAKER]), widgetCall(2)));
+// 3.0: поле ввода только в чате главного окна (без подсказки) и карточка «Подключиться»
+// в чате; лобби во вложенном окне без поля имени.
+const CHAT_FIELD_MAIN = mainDoc(
+  `<div>Телемост</div><div id="widget">${WIDGET_LOBBY}</div>` +
+    `<div class="chat"><div>Анна Тестова: заходите</div><input type="text" data-not-name="chat">` +
+    `<button data-danger="chat-card-join">Подключиться</button></div>${IFRAME}`,
+);
+const LOBBY_NO_INPUT_BODY =
+  `<div>Подключение к звонку</div>` +
+  `<button data-testid="turn-on-camera-button" aria-label="Включить камеру" data-danger="cam-on">к</button>` +
+  `<button data-testid="enter-conference-button" onclick="joinClicked()">Подключиться</button>`;
+
 /** `callPath` — путь вложенного окна звонка (по умолчанию сегодняшний `/private-join/`). */
 type Screens = { main: string; call?: string; callPath?: string };
 
@@ -859,6 +898,18 @@ function fallbackCases(): FallbackCase[] {
       name: "опасные кнопки + безопасное «Присоединиться»",
       screens: { main: BAIT_MAIN, call: baitLobby(true) }, ok: true, screen: "in_call", steps: "name:tid,join:text",
     },
+    // Живое лобби 3.0 без меток (самопроверка no-testid 25.09 была красной): поле
+    // имени — единственное рядом с «Подключиться», онбординг так и остаётся открытым.
+    {
+      name: "живое лобби 3.0 без меток",
+      screens: { main: LIVE_MAIN, call: liveLobbyThen(1) }, mode: "no-testid",
+      ok: true, screen: "in_call", steps: "continue:text,name:form,join:text",
+    },
+    {
+      name: "живое лобби 3.0 с метками (как основной)",
+      screens: { main: LIVE_MAIN, call: liveLobbyThen(1) },
+      ok: true, screen: "in_call", steps: "popup_dismiss:tid,continue:tid,name:tid,join:tid",
+    },
   ];
 }
 
@@ -881,6 +932,22 @@ async function fallbackOnCopies(browser: Browser): Promise<void> {
     });
   }
   expect("на всех копиях: опасных нажатий 0", dangerTotal, 0);
+
+  // Поле имени «по месту» — только когда поле одно и рядом «Подключиться», и не в чате.
+  await withScreens(browser, { main: LIVE_MAIN, call: liveLobbyThen(2) }, async (page) => {
+    const r = await runFallbackJoin(page, { botName: BOT, reason: null, forced: "no-testid", budgetMs: 30_000, idleMs: 3_000 });
+    const nm = await nameCheck(page);
+    expect("два поля без подписей в лобби: имя не вписано никуда, не вошёл",
+      [r.ok, r.missing, nm.leaked, fallbackStepsCode(r.steps)], [false, "name", 0, "continue:text"]);
+    expect("два поля без подписей в лобби: опасных нажатий нет", (await dangerIn(page)).what, []);
+  });
+  await withScreens(browser, { main: CHAT_FIELD_MAIN, call: callDoc(LOBBY_NO_INPUT_BODY, thenJs(IN_CALL_2(), widgetCall(2))) }, async (page) => {
+    const r = await runFallbackJoin(page, { botName: BOT, reason: null, forced: "no-testid", budgetMs: 30_000, idleMs: 3_000 });
+    const nm = await nameCheck(page);
+    expect("поле только в чате главного окна 3.0: имя туда не вписано", nm.leaked, 0);
+    expect("поле только в чате: карточка «Подключиться» в чате не нажата, вошёл лобби без имени",
+      [(await dangerIn(page)).what, r.ok, !!r.nameless], [[], true, true]);
+  });
 
   // Цикл5 фазы 3 (Н7/У7): поле имени не узнано → вход без имени, но микрофон и
   // камера выключены ДО «Подключиться», а владелец видит «без имени» первым.
