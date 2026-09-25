@@ -1,0 +1,30 @@
+[Unit]
+Description=Ватсон: ежедневная самопроверка бота в Т-10 (ISS-60, фаза 2)
+Documentation=file:///srv/meeting-notary/vexa/scripts/notary/lib/canary.py
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dev
+Group=dev
+WorkingDirectory=/srv/meeting-notary/vexa
+EnvironmentFile=/srv/meeting-notary/.env.notary
+Environment=PYTHONPATH=scripts
+Environment=HOME=/home/dev
+Environment=MEETING_NOTARY_LOCAL_DOCKER=1
+Environment=MEETING_NOTARY_REGISTRY_DIR=/srv/meeting-notary/registry
+Environment=MEETING_NOTARY_CANARY_STATE_DIR=/srv/meeting-notary/state/canary
+Environment=MEETING_NOTARY_CANARY_DIR=/home/dev/meeting-notary/_tmp/canary
+# Значения по умолчанию: если то же задано в .env.notary — выигрывает файл.
+Environment=MEETING_NOTARY_LOG_DIR=/home/dev/meeting-notary/logs
+# Питон с `requests` (расшифровка локальным whisper идёт через lib/transcribe.py)
+# и `pyyaml` (rooms.yaml) — тот же, что у финализации и шлюза. В venv-cli
+# запускателя `requests` может не быть: тогда самопроверка была бы 🟡 каждый день.
+ExecStart=/home/dev/meeting-notary/venv/bin/python -m notary.canary run --reason daily
+# Два полных прогона (красный перепроверяется через 3 мин) укладываются в 40 мин;
+# если первый шёл слишком долго, перепроверку сделает часовой «нюх».
+TimeoutStartSec=40min
+Nice=5
+
+# [Install] нет намеренно: службу запускает только таймер.

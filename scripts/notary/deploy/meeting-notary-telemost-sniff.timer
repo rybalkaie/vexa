@@ -1,0 +1,11 @@
+[Unit]
+Description=Ватсон: «нюх» версии Телемоста раз в час
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=false
+Unit=meeting-notary-telemost-sniff.service
+
+[Install]
+WantedBy=timers.target

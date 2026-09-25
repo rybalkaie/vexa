@@ -1,0 +1,12 @@
+[Unit]
+Description=Ватсон: самопроверка бота в Т-10 каждый день в 04:40 МСК
+
+[Timer]
+# Сервер живёт в UTC: 01:40 UTC = 04:40 МСК — встреч нет, переговорка пустая.
+OnCalendar=*-*-* 01:40:00 UTC
+# Пропущенный запуск (сервер был выключен) днём НЕ догоняем: днём Т-10 занята людьми.
+Persistent=false
+Unit=meeting-notary-canary.service
+
+[Install]
+WantedBy=timers.target

@@ -150,6 +150,9 @@ def main(now: datetime | None = None) -> int:
     # перестраивается раз в 15 минут, а кнопка обязана поднимать бота минутами.
     # При `ENABLE_PORTAL_ORDERS=OFF` возвращает очередь как есть, диска не касаясь.
     queue = _with_immediate_orders(queue, now)
+    # ISS-60, фаза 2: пока самопроверка красная — предупредить владельца за ~10
+    # минут до встречи. Под try: упадёт — запуск ботов идёт как раньше.
+    _canary_warn_tick(queue, now)
 
     # Ф10b: очередь ожидания. Старт, пропущенный по занятости или лимиту, не
     # выпадает из окна навсегда — он ждёт свободного слота до конца встречи.
@@ -1049,6 +1052,24 @@ def _join_watch_tick(now: datetime, *, allow_retry: bool) -> None:
             join_watch.prune_diagnostics(TRANSCRIPTS_HOST_DIR)
     except Exception as e:  # noqa: BLE001
         logger.warning("Сторож входа упал (%s) — запуск ботов продолжается", type(e).__name__)
+
+
+def _canary_warn_tick(queue: list[dict[str, Any]], now: datetime) -> None:
+    """ISS-60, фаза 2: самопроверка красная → предупредить владельца перед встречами.
+
+    Только там, где живут боты (VPS); выключатель `MEETING_NOTARY_CANARY_WARN=0`.
+    НИКОГДА не бросает — запуск ботов важнее.
+    """
+    if not LOCAL_DOCKER:
+        return
+    try:
+        from notary.lib import canary  # noqa: PLC0415
+
+        if not canary.warn_enabled():
+            return
+        canary.warn_tick(queue, now)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Предупреждение самопроверки упало (%s) — запуск ботов продолжается", type(e).__name__)
 
 
 def _auto_disable_one_off(meeting_id: str) -> None:

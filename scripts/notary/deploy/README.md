@@ -160,3 +160,62 @@ git-репозитория бота, рядом положена копия `.de
 утверждает, что он там есть — то есть расхождение кода и намерения. Если кто-то однажды
 приведёт команду к комментарию, зеркало снесёт реестр нарядов молча. Одна строка
 исключений страхует от чужой будущей правки. Файл вне обоих репозиториев — правит владелец.
+
+---
+
+# Самопроверка бота в Т-10 и «нюх» версии Телемоста (ISS-60, фаза 2)
+
+**Что это.** Каждый день в 04:40 МСК (и сразу после обновления Телемоста) в
+запасную переговорку Т-10 заходят «Тест-диктор» и бот — тем же образом и тем же
+кодом входа, что на встречах. Диктор говорит фразу с кодовым словом, бот её
+записывает, самопроверка ищет слово в расшифровке (локальный whisper). Красное
+перепроверяется вторым прогоном через 3 минуты, и только потом — сообщение
+владельцу. Пока самопроверка красная, запускатель за ~10 минут до каждой встречи
+предупреждает владельца: «включи запись в Телемосте». Логика и все решения —
+`../lib/canary.py`, диктор — `../canary-kit/speaker.{sh,js}`.
+
+| Файл | Что делает |
+|---|---|
+| `meeting-notary-canary.service` + `.timer` | самопроверка, 01:40 UTC = 04:40 МСК |
+| `meeting-notary-telemost-sniff.service` + `.timer` | раз в час версия Телемоста; сменилась — внеплановая самопроверка |
+
+Состояние — `/srv/meeting-notary/state/canary/` (`health.json` «бот здоров/сломан»,
+`runs/<run_id>.json` по каждому прогону, `telemost-version.json`, `warned.json`,
+`journal.jsonl`). Записи прогонов — `/home/dev/meeting-notary/_tmp/canary/<run_id>/`
+(вне папки записей бота: сборщик их не видит). Посмотреть: `python -m notary.canary status`.
+
+## Установка (при выкатке, фаза 7 — сейчас не ставим)
+
+```bash
+# на VPS, от dev; скрипты уже привезены обычной выкаткой скриптов нотариуса
+sudo -u dev mkdir -p /srv/meeting-notary/state/canary /home/dev/meeting-notary/_tmp/canary /home/dev/meeting-notary/logs
+# комната самопроверки должна быть в реестре: rooms.yaml → rooms: [{name: t10, url: …}]
+grep -n "name: t10" /srv/meeting-notary/registry/rooms.yaml
+# проверка вручную до таймеров (на тестовом образе — --image vexa-bot:resil-…)
+cd /srv/meeting-notary/vexa && sudo -u dev env $(grep -v '^#' /srv/meeting-notary/.env.notary | xargs) \
+  PYTHONPATH=scripts MEETING_NOTARY_LOCAL_DOCKER=1 \
+  /home/dev/meeting-notary/venv/bin/python -m notary.canary run --reason manual
+sudo cp scripts/notary/deploy/meeting-notary-canary.{service,timer} \
+        scripts/notary/deploy/meeting-notary-telemost-sniff.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer
+systemctl list-timers 'meeting-notary-*'
+```
+
+⚠️ Выкатка скриптов юниты не ставит — только привозит файлы (см. §2 выше).
+⚠️ Службы работают на питоне `/home/dev/meeting-notary/venv` (есть `requests` для
+whisper и `pyyaml`), а не на `venv-cli` запускателя.
+Предупреждение перед встречами отдельного юнита не требует: оно живёт в тике
+запускателя и включается выкаткой скриптов.
+
+## Как выключить
+
+```bash
+sudo systemctl disable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer
+# предупреждения перед встречами — строка в /srv/meeting-notary/.env.notary:
+MEETING_NOTARY_CANARY_WARN=0
+```
+
+Контейнеры самопроверки — `vexa-canary-speaker-*` / `vexa-canary-bot-*` с меткой
+`meeting-notary.role=canary`; запускатель, сборщик и сторож их не видят. Если
+прогон прервали, следующий сам убирает оставшиеся контейнеры с этой меткой.

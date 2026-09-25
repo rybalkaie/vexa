@@ -1,0 +1,26 @@
+[Unit]
+Description=Ватсон: «нюх» версии Телемоста; сменилась — внеплановая самопроверка (ISS-60, фаза 2)
+Documentation=file:///srv/meeting-notary/vexa/scripts/notary/lib/canary.py
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dev
+Group=dev
+WorkingDirectory=/srv/meeting-notary/vexa
+EnvironmentFile=/srv/meeting-notary/.env.notary
+Environment=PYTHONPATH=scripts
+Environment=HOME=/home/dev
+Environment=MEETING_NOTARY_LOCAL_DOCKER=1
+Environment=MEETING_NOTARY_REGISTRY_DIR=/srv/meeting-notary/registry
+Environment=MEETING_NOTARY_CANARY_STATE_DIR=/srv/meeting-notary/state/canary
+Environment=MEETING_NOTARY_CANARY_DIR=/home/dev/meeting-notary/_tmp/canary
+# Значения по умолчанию: если то же задано в .env.notary — выигрывает файл.
+Environment=MEETING_NOTARY_LOG_DIR=/home/dev/meeting-notary/logs
+ExecStart=/home/dev/meeting-notary/venv/bin/python -m notary.canary sniff
+# Сам запрос — секунды; срок — под внеплановую самопроверку, если версия сменилась.
+TimeoutStartSec=45min
+Nice=5
+
+# [Install] нет намеренно: службу запускает только таймер.

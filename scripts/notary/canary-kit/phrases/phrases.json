@@ -1,0 +1,14 @@
+{
+  "voice": "Milena (macOS say), 48 кГц моно 16 бит",
+  "template": "Это автоматическая проверка бота-протоколиста. Кодовое слово: {word}. Повторяю: {word}.",
+  "phrases": [
+    {"file": "dandelion.wav", "word": "одуванчик"},
+    {"file": "kangaroo.wav", "word": "кенгуру"},
+    {"file": "samovar.wav", "word": "самовар"},
+    {"file": "drum.wav", "word": "барабан"},
+    {"file": "turtle.wav", "word": "черепаха"},
+    {"file": "flashlight.wav", "word": "фонарик"},
+    {"file": "traffic-light.wav", "word": "светофор"},
+    {"file": "pendulum.wav", "word": "маятник"}
+  ]
+}
