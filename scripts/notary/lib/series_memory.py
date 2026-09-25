@@ -1466,6 +1466,17 @@ def save_meeting_digest(
         speaker_mapping=speaker_mapping, participant_filter=participant_filter,
         publication=publication, significance_filter=significance_filter,
     )
+    # Ф5 + правка цикла5 (25.09): метка «авторство подтвердил человек» переживает
+    # ПЕРЕВЫПУСК. `build_digest` собирает выжимку с нуля, а `save_digest` пишет файл
+    # целиком — значит любая повторная финализация (ретрай, восстановление из ручной
+    # записи, заливка через ingest) МОЛЧА гасила подтверждение, и якорь на встречах
+    # вдвоём переставал работать без единой строки в логе. Переносим метку только
+    # если разметка НЕ изменилась: поменялась — подтверждение к ней уже не относится.
+    _prev = load_digest(digest_path(series_dir, date))
+    if (isinstance(_prev, dict) and _prev.get("speaker_mapping_confirmed")
+            and _norm_speaker_mapping(_prev.get("speaker_mapping")) == _norm_speaker_mapping(digest.get("speaker_mapping"))
+            and digest.get("speaker_mapping")):
+        digest["speaker_mapping_confirmed"] = True
     saved = save_digest(series_dir, date, digest)
     if prune_days and prune_days > 0:
         prune_old_digests(series_dir, prune_days)

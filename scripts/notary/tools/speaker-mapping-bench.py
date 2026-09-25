@@ -27,10 +27,22 @@ LLM и без денег — и показывает, что изменилос�
         --root /srv/meeting-notary/protocols --registry /srv/meeting-notary/registry/watched.yaml
 
 Полезные ключи:
-    --series anzhee-direktorat   только одна серия
-    --no-expand-first-word       смоделировать Фазу 2 (без дубля кандидата)
-    --json out.json              сохранить результат для сравнения «до/после»
-    --compare before.json        показать дифф против прошлого прогона
+    --series anzhee-direktorat     только одна серия
+    --legacy-expand-first-word     СТАРОЕ поведение до Фазы 2 (двойник кандидата)
+    --confirmed-anchor-only        наследовать только подтверждённое человеком
+    --json out.json                сохранить результат для сравнения «до/после»
+    --compare before.json          показать дифф против прошлого прогона
+
+⚠️ Умолчание = БОЙ (правка цикла5, 25.09). Раньше стенд по умолчанию моделировал код
+ДО Фазы 2, которая уже выкачена: прогон без флагов печатал «эталон верно 0» и выглядел
+как обвал, хотя боевой код даёт «верно 2». Старый флаг `--no-expand-first-word`
+принимается ради записанных команд, но ничего не меняет — это и есть новое умолчание.
+
+⚠️ Чего стенд НЕ воспроизводит (знать обязательно, иначе замер обманет): пул кандидатов
+он строит ТОЛЬКО из реестра, а бой добавляет туда имена из панели Телемоста; `map_all`
+зовётся с `roster=None`, то есть источники `map_from_roster_domain` и
+`disambiguate_namesakes` на стенде не работают вовсе. Серии без состава в реестре
+прогоняются вхолостую — про них стенд теперь предупреждает отдельной строкой.
 """
 from __future__ import annotations
 
@@ -82,8 +94,12 @@ def load_registry(path: Path) -> dict[str, list[str]]:
 
 
 def utterances_from_raw(raw: dict) -> list:
-    """raw_json AssemblyAI -> list[Utterance]. Пустой список, если формат чужой."""
-    from lib.assemblyai_client import Utterance  # noqa: PLC0415
+    """raw_json AssemblyAI -> list[Utterance]. Пустой список, если формат чужой.
+
+    Повторяет `assemblyai_client.parse_utterances`, включая срезку «титровых»
+    галлюцинаций: без неё стенд кормит маппер текстом, которого в бою уже нет
+    (правка цикла5 — расхождение прибора с боем)."""
+    from lib.assemblyai_client import Utterance, strip_hallucination_prefix  # noqa: PLC0415
 
     items = (raw or {}).get("utterances") or []
     out = []
@@ -91,11 +107,14 @@ def utterances_from_raw(raw: dict) -> list:
         spk, text = u.get("speaker"), u.get("text")
         if not spk or not text:
             continue
+        text = strip_hallucination_prefix(str(text).strip())
+        if not text:
+            continue
         out.append(Utterance(
             speaker=str(spk),
             start=float(u.get("start") or 0) / 1000.0,
             end=float(u.get("end") or 0) / 1000.0,
-            text=str(text),
+            text=text,
         ))
     return out
 
@@ -203,8 +222,8 @@ def same_person(a: str | None, b: str | None) -> bool:
     Сравнение по строке врало бы: до Фазы 2 маппер выдаёт короткую форму, эталон
     хранит полную. Правило: совпало первое слово И хотя бы одна из форм короткая
     (то есть это форма того же имени, а не однофамильцы/тёзки с разными фамилиями)."""
-    if not a or not b:
-        return False
+    if not a or not b or not a.strip() or not b.strip():
+        return False  # имя из одних пробелов роняло `pa[0]` с IndexError (правка цикла5)
     if a == b:
         return True
     pa, pb = a.split(), b.split()
@@ -244,8 +263,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default="/srv/meeting-notary/protocols", help="корень папок серий")
     ap.add_argument("--registry", default="/srv/meeting-notary/registry/watched.yaml")
     ap.add_argument("--series", default=None, help="только эта серия")
+    # 🔴 Правка цикла5: умолчание РАЗВЕРНУТО. До правки стенд по умолчанию клал
+    # первое слово отдельным кандидатом — то есть моделировал код ДО Фазы 2, которая
+    # уже в бою. Прогон без флагов давал «эталон верно 0» и выглядел как обвал, хотя
+    # боевой код даёт «верно 2». Прибор обязан по умолчанию показывать БОЙ, а старое
+    # поведение — по явному флагу.
+    ap.add_argument("--legacy-expand-first-word", action="store_true",
+                    help="СТАРОЕ поведение до Фазы 2: класть первое слово отдельным кандидатом")
     ap.add_argument("--no-expand-first-word", action="store_true",
-                    help="не класть первое слово отдельным кандидатом (модель Фазы 2)")
+                    help=argparse.SUPPRESS)  # оставлен, чтобы не ломать записанные команды
     ap.add_argument("--confirmed-anchor-only", action="store_true",
                     help="наследовать только подтверждённую человеком разметку (модель Фазы 5)")
     ap.add_argument("--json", default=None, help="сохранить результат в файл")
@@ -260,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.series and series_dir.name != args.series:
             continue
         expected = registry.get(series_dir.name, [])
-        r = run_one(tr, expected, expand_first_word=not args.no_expand_first_word,
+        r = run_one(tr, expected, expand_first_word=args.legacy_expand_first_word,
                     confirmed_anchor_only=args.confirmed_anchor_only)
         if r:
             rows.append(r)
@@ -273,7 +299,16 @@ def main(argv: list[str] | None = None) -> int:
     many = [r for r in rows if r["too_many_voices"]]
     ok, bad, partial, notes = verdict_against_truth(rows)
 
-    print(f"прогнано расшифровок: {len(rows)}")
+    # 🔴 Правка цикла5: прибор, показывающий «всё хорошо» на пустом входе, опаснее
+    # сломанного. Без состава серии пул кандидатов пуст → дублей нет, имён нет,
+    # все счётчики нулевые, и отчёт выглядит зелёным, хотя не проверено НИЧЕГО.
+    blind = [r for r in rows if not r["people_expected"]]
+    if blind:
+        print(f"⚠️  ВНИМАНИЕ: у {len(blind)} из {len(rows)} расшифровок состава серии нет "
+              f"в реестре — по ним НИЧЕГО не проверено, нули в счётчиках ничего не значат.")
+        print(f"    серии без состава: {sorted({r['series'] for r in blind})}")
+        print()
+    print(f"прогнано расшифровок: {len(rows)} (из них с известным составом: {len(rows) - len(blind)})")
     print(f"эталон: верно {ok}, НЕВЕРНО {bad}, частично {partial} (из {len(GROUND_TRUTH)})")
     for n in notes:
         print(n)
