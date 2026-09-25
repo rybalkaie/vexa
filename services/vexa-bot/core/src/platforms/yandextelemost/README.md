@@ -1,108 +1,155 @@
-# Yandex Telemost adapter
+# Адаптер Яндекс Телемоста (as-built, Телемост 3.0, 25.09.2026)
 
-Адаптер Vexa для Яндекс Телемост — реализует Фазу 2 проекта meeting-notary
-([план](../../../../../../../me/plans/2026-05-26-bot-notarius-telemost.md)).
+Бот-нотариус («Ватсон») заходит в звонок Телемоста гостем, пишет звук, по ходу
+делает черновую расшифровку и в конце оставляет `meta.json` для финализации
+протокола на хосте (`scripts/notary/finalize-meeting.py`). Адаптер встроен в общий
+`runMeetingFlow` Vexa по схеме стратегий (`index.ts`).
 
-## Архитектура
+План, по которому это сделано: `plans/2026-09-23-telemost-update-resilience.md`
+(ISS-60). Исходный запуск — `me/plans/2026-05-26-bot-notarius-telemost.md`.
 
-Strategy-pattern как у остальных платформ Vexa. Поток:
+## Как устроен Телемост 3.0 (выкачен ~21.09.2026, разведка 23–25.09)
 
-1. `joinYandexTelemost` — открыть URL, пройти промежуточный экран
-   «Продолжить в браузере», ввести имя, нажать «Подключиться».
-2. `waitForYandexTelemostAdmission` — детект admitted / waiting / rejected;
-   на waiting room ≥ 30s шлём push в Telegram, 2 мин без admit → abandon.
-3. `prepareForRecording` — exposeFunction `logBot` / `getBotConfig` /
-   `performLeaveAction`.
-4. `startYandexTelemostRecording` — основной цикл (см. ниже).
-5. `startYandexTelemostRemovalMonitor` — стерегёт removal-индикаторы.
-6. `leaveYandexTelemost` — клик «Выйти», fallback на закрытие страницы.
+- Главная `https://telemost.yandex.ru/j/<id>` — чат комнаты. Поверх при загрузке —
+  окно «Большое обновление в Телемосте», под ним промежуточный экран
+  «Продолжить в браузере».
+- Лобби и сам звонок — во вложенном окне `https://telemost.yandex.ru/private-join/<id>`
+  (поле имени, микрофон, камера, «Подключиться» — с прежними `data-testid`).
+- Поле поиска чатов на главной носит ту же метку (`orb-textinput-input`), что поле имени.
+- «Завершить звонок» и «Выключить микрофон» виджета на главной видны уже в лобби —
+  это НЕ признак звонка. В звонке на главной — мини-виджет «Открыть экран звонка»
+  со счётчиком «N участников».
+- Звонок: панель во вложенном окне (`end-call-alt-button`, `mute-audio` с подписью
+  «Выключить/Включить микрофон», `turn-on-camera-button`, `share-button`,
+  `more-popup-alt-button`), имена — на плитках (`[class*="participantName_"]`).
+- Гость входит с ВКЛЮЧЁННЫМ микрофоном и камерой — бот выключает оба сам.
 
-## Захват аудио (Ф2 — без диарезации)
+Старый интерфейс (всё на главной, без вложенного окна) по-прежнему понимается.
 
-Browser-сторона:
+## Поток входа
 
-- Собирает все `<audio>`/`<video>` элементы с активным `srcObject`.
-- Сводит их в один `MediaStreamDestination` (combined stream).
-- `ScriptProcessor` 16kHz mono режет на чанки ~3 секунды.
-- Каждый чанк (Float32 → base64) шлёт в Node.js через
-  `__vexaTelemostAudio(b64, rms)`.
+1. `join.ts` — `joinYandexTelemost(page, url, botName, cfg)`:
+   - ссылка сверяется до перехода (`isTelemostMeetingUrl`: хост целиком, без `\`,
+     логина, чужого порта) — чужую страницу бот не открывает (`meeting_url_rejected`);
+   - перехват соединений звонка ставится в каждое окно (`rtc-hook.ts`);
+   - **основной путь** (`joinPrimary`): онбординг → «Продолжить в браузере» → лобби во
+     вложенном окне (имя, микрофон/камера выкл. с проверкой подписи, «Подключиться»)
+     или старое лобби на главной; после «Подключиться» экран классифицируется
+     (`screen.ts`), «лобби пройдено» ≠ «в звонке»;
+   - **запасной путь** (`fallback.ts`) — только если основной сорвался на поле имени,
+     кнопке «Подключиться» или остался в лобби (см. ниже).
+2. `admission.ts` — ожидание впуска: экран читается во ВСЕХ окнах одной чистой
+   функцией (`classifyTelemostScreen`) в порядке «встречи нет / отказ → зал ожидания →
+   лобби → в звонке → неясно». Неясный экран — сорванный вход (`admission_unclear`),
+   а не «в звонке». Впустили — микрофон и камера выключаются с проверкой (`devices.ts`).
+3. `recording.ts` — запись: звук из `<audio>/<video>` и из пойманных дорожек
+   RTCPeerConnection (завершённые выкидываются), куски `chunk_N.wav` с паузой на 5 мин
+   тишины и выходом после 20 мин; выброс из комнаты (адрес потерял `/j/<id>`) —
+   перезаход тем же `joinYandexTelemost`; «никто не пришёл» по `noOneJoinedTimeout`
+   (5 мин), «оглох при людях» до 30 мин, «оглох после начала» — событие сторожу.
+   Страховка раз в минуту держит микрофон и камеру выключенными.
+4. `participants.ts` — имена с плиток во вложенном окне и счётчик виджета (раз в 15 с,
+   без нажатий); панель «Участники» — запасной путь (старый интерфейс).
+5. `removal.ts` — конец встречи / «нас убрали» во всех окнах (короткие строки и метки;
+   пока видна панель звонка — строка чата не считается).
+6. `leave.ts` — выход (см. ниже); `performLeaveAction` в странице — для общего
+   `meetingFlow` при таймауте впуска.
 
-Node.js-сторона:
+## Статус входа, сторож, снимки
 
-- Декодирует Float32, считает RMS — тихие чанки не транскрибирует.
-- Не-тихий чанк → WAV → POST в `TRANSCRIPTION_SERVICE_URL`
-  (faster-whisper medium на VPS).
-- Текст с таймкодом дописывает в `/transcripts/<date>-<sessionUid>.txt`
-  (внутри контейнера; в compose-override это bind-mount наружу в
-  `~/meeting-notary/_tmp/transcripts/` на VPS).
-- Дублирует в stdout с пометкой `[telemost-transcript]`.
+- `join-status.ts` пишет `<TRANSCRIPT_DIR>/.join-status/<sessionUid>.json`: фазы
+  `joining → admission → waiting_room → in_call` или `failed` + код причины, события
+  встречи (`evicted_failure`, `deaf_after_start`), отметки запасного пути
+  (`fallback_used` — вошёл им, `fallback_tried` — пробовал, не вышло).
+  `sessionUid` берётся из СЫРОГО `BOT_CONFIG` (Zod апстрима режет незнакомые ключи).
+- Сторож на хосте (`scripts/notary/lib/join_watch.py`) по статусу повторяет вход
+  новым контейнером, пишет людям туда, куда уходит протокол, и владельцу. Сам бот в
+  Телеграм НЕ пишет: токена в контейнере с браузером нет намеренно
+  (`telegram.ts` — наследие, без токена молчит).
+- `crashkit.ts` — при сорванном входе снимок всех окон (кнопки, поля без значений,
+  заголовки) + скриншот в `<TRANSCRIPT_DIR>/.crash-kits/<sessionUid>/`.
+- `stop-signal.ts` — `docker stop` (SIGTERM) доходит до node (`exec` в
+  `entrypoint.sh`); пока бот не был в звонке — сначала снимок, потом штатный выход.
 
-## Метрики конца встречи
+## Запасной путь входа (фаза 3б)
 
-- 60 секунд непрерывной тишины (`RMS < 0.003`) → завершение.
-- URL ушёл с `telemost.yandex.ru` → завершение.
-- Был хотя бы 1 participant-тайл, потом 0 в течение 30 секунд → завершение.
-- Page закрылась — завершение.
+Зачем: Телемост меняет вход раз в 1–2 месяца; основной путь знает точные метки
+сегодняшнего экрана и ломается вместе с ними.
 
-## Selectors
+- Включается, только если основной путь сорвался (`name_input_not_found`,
+  `join_button_not_found`, `still_in_lobby`); сеть, чужая ссылка, остановка — нет.
+- Во всех окнах Телемоста (чужие окна и чужие страницы не трогаются) ищет по ярусам
+  метка (`data-testid`) → подпись (`aria-label`, `title`, `placeholder`, `<label>`) →
+  видимый текст: всплывашку (закрыть), поле имени (вписать), «Подключиться»,
+  «Продолжить в браузере». Решает чистая функция `chooseFallbackAction`.
+- **Белый и чёрный списки — в `selectors.ts`** (`telemostFallbackButtons`,
+  `telemostFallbackNameInput`, `telemostFallbackBlacklist`). Чёрный сильнее белого:
+  выйти/завершить, запись, демонстрация, включить микрофон/камеру, пригласить, вход в
+  аккаунт, «На главную», «Отмена», «в приложении»… — не нажимаются никогда, даже с
+  текстом «Понятно» или «Подключиться». «Закрыть»/«×»/«Позже» — только в окне поверх
+  экрана и только если это окно не само лобби; «Понятно» на главной вне окна — нет
+  (там чат комнаты).
+- Каждое нажатие проверяется: экран сменился (кнопка пропала или признаки окон другие) —
+  шаг засчитан; нет — ровно один JS-клик и снова проверка; нет — кнопка больше не
+  трогается. Перед самым нажатием кнопка перечитывается и сверяется со списками ещё раз.
+- Вошёл → `fallback_used` в статусе (`primary_reason`, `steps` вида
+  `popup_ack:text,name:label,join:text`, `summary` — строка владельцу своими словами),
+  сторож шлёт владельцу тихую строку «Телемост поменял вход, бот обошёл сам». Не
+  вошёл → `fallback_tried`, наверх уходит исходная ошибка основного пути.
+- **Живая проверка** (только тестовый образ): в сыром `BOT_CONFIG`
+  `"telemostForceFallback": true` — сразу запасным путём, основной не запускается;
+  `"no-testid"` — ещё и без меток (как будто Телемост переименовал все `data-testid`).
+  По умолчанию выключено. В самопроверке — `MEETING_NOTARY_CANARY_FORCE_FALLBACK=1`
+  (или `=no-testid`) при запуске `canary.py` с тестовым `--image`; на боевом образе
+  флаг игнорируется.
 
-Все DOM-селекторы вынесены в [`selectors.ts`](./selectors.ts). Lobby-селекторы
-подтверждены живой разведкой Playwright 2026-05-26 и завязаны на стабильные
-`data-testid` дизайн-системы Orb:
+## Выход из звонка
 
-- `[data-testid="orb-textinput-input"]` — поле имени
-- `[data-testid="turn-on-mic-button"]` / `turn-on-camera-button` — mic/cam
-  (по дефолту ВЫКЛЮЧЕНЫ — бот их не кликает)
-- `[data-testid="enter-conference-button"]` — «Подключиться»
-- `[data-testid="to-home-screen-button"]` или текст «Продолжить в браузере» —
-  интерстициал
+`clickTelemostLeave`: кнопка выхода во всех окнах (окно звонка первым,
+`end-call-alt-button`); выход подтверждается любым признаком — окно звонка ушло,
+кнопка пропала, соединения звонка закрылись (`__vexaOpenPeerConnections`, перехват
+`rtc-hook.ts`). Не подтвердился — окно «Выйти из звонка?» (нажимается только «Выйти»,
+никогда «для всех»), затем ровно один JS-клик по той же кнопке. В журнале:
+`leave_result clicked=… left=… via=… method=…`. Спрятанная панель — JS-клик по кнопке
+3.0. По сигналу остановки ожидания короче (у docker на всё 20 с).
 
-In-meeting селекторы (leave / participants / waiting) — гипотезы из Orb
-naming convention, помечены в коде «уточним на первом прогоне». Адаптер при
-admitted делает один-раз DOM dump (`dom_dump` / `dom_batch=N` в логах),
-чтобы можно было допилить селекторы постфактум.
+## Селекторы
 
-## Telegram push
+Всё про экран Телемоста — в [`selectors.ts`](./selectors.ts); строгие признаки экрана
+3.0 — в [`screen.ts`](./screen.ts). Телемост поменял экран → сначала снимок из
+`.crash-kits/` и самопроверка (`scripts/notary/canary.py`), потом правка здесь, не по
+всему адаптеру.
 
-Через `telegram.ts` — прямой вызов Telegram Bot API из контейнера.
-Требуются env-переменные:
+## Проверки
 
-- `TELEGRAM_BOT_TOKEN` — токен бота (Ф1 заявил `@Ilia_claude_1_bot`)
-- `TELEGRAM_CHAT_ID` — chat_id Ильи
-
-Если переменных нет — push молча пропускается (адаптер продолжает работу).
-
-## Что НЕ делает на Ф2
-
-- Не делает per-speaker diarization (это Ф3).
-- Не делает маппинг имён участников (это Ф3).
-- Не делает шаблон протокола `.md` (это Ф3).
-- Не интегрируется с meeting-api / runtime-api dispatcher (это Ф5).
-  Запускается напрямую через `BOT_CONFIG` env с `platform: "yandex_telemost"`.
-
-## Запуск (Ф2 — ручной)
+В образе (`/app/dist/...`), без сети — копии экранов подаются перехватом запросов:
 
 ```bash
-docker run --rm --platform linux/amd64 \
-  --network vexa_dev_vexa_default \
-  --env-file ~/meeting-notary/vexa/.env.notary \
-  -e BOT_CONFIG='{
-    "platform":"yandex_telemost",
-    "meetingUrl":"https://telemost.yandex.ru/j/XXXXXXXX",
-    "botName":"Бот — протокол встречи",
-    "token":"dev",
-    "connectionId":"test-1",
-    "nativeMeetingId":"XXXXXXXX",
-    "meeting_id":1,
-    "language":"ru",
-    "redisUrl":"redis://redis:6379/0",
-    "automaticLeave":{
-      "waitingRoomTimeout":150000,
-      "noOneJoinedTimeout":300000,
-      "everyoneLeftTimeout":30000
-    }
-  }' \
-  -e TRANSCRIPTION_SERVICE_URL=http://172.17.0.1:8083/v1/audio/transcriptions \
-  -v ~/meeting-notary/_tmp/transcripts:/transcripts \
-  vexaai/vexa-bot:notarius-telemost
+node /app/dist/platforms/yandextelemost/screen.test.js         # классификатор экрана, ссылка
+node /app/dist/platforms/yandextelemost/call-ui.test.js        # микрофон/камера, участники, дорожки, соединения
+node /app/dist/platforms/yandextelemost/join-status.test.js    # причины срыва входа
+node /app/dist/platforms/yandextelemost/fallback.test.js       # запасной путь: списки, ярусы, выбор шага
+node /app/dist/platforms/yandextelemost/screen-copies.test.js  # настоящий браузер на копиях экранов
 ```
+
+`screen-copies.test.js`: `ONLY=screens,devices,admission,join,leave,fallback,fallback-e2e,stop`,
+`VERBOSE=1`; на маке — `CHROMIUM_PATH=<chrome-headless-shell>`. Копии не доказывают
+вход в живой Телемост — это делает самопроверка в Т-10.
+
+## Ручной запуск
+
+Ссылки на комнаты, номера чатов и токены в репозиторий не кладём (форк публичный) —
+только заглушки:
+
+```bash
+docker run --rm --network vexa_vexa \
+  -v /home/dev/meeting-notary/_tmp/transcripts:/transcripts \
+  -e BOT_CONFIG='{"platform":"yandex_telemost","meetingUrl":"https://telemost.yandex.ru/j/<id>",
+                  "botName":"Бот — протокол встречи","sessionUid":"manual-1","language":"ru",
+                  "task":"transcribe","redisUrl":"redis://vexa-redis-1:6379","meeting_id":1}' \
+  -e TRANSCRIPTION_SERVICE_URL=http://172.17.0.1:8083/v1/audio/transcriptions \
+  vexa-bot:notarius-telemost
+```
+
+Обычно ботов поднимает запускатель (`scripts/notary/runner.py`), а самопроверку —
+`scripts/notary/canary.py`.

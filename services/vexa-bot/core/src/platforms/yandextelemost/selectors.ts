@@ -249,3 +249,185 @@ export const telemostDeviceLabels: { mic: TelemostDeviceLabels; camera: Telemost
     toolbarTid: null,
   },
 };
+
+// ---------------------------------------------------------------------------
+// Запасной путь входа (фаза 3б, 25.09.2026) — БЕЛЫЙ и ЧЁРНЫЙ списки.
+// Решает fallback.ts; включается, только если основной путь (join.ts) не прошёл.
+//
+// Как читать: у каждой цели три яруса поиска — метка (data-testid, точная или по
+// образцу) → подпись (aria-label / title; у поля ещё placeholder и <label>) →
+// видимый текст. Подписи и тексты сравниваются ЦЕЛИКОМ после нормализации
+// (регистр, ё=е, пробелы, точка в конце), не подстрокой.
+//
+// 🔴 ЧЁРНЫЙ СПИСОК сильнее белого: кнопка, у которой метка, подпись, title или
+// текст совпали с чёрным списком, не нажимается НИКОГДА — даже если её текст
+// «Понятно» или «Подключиться». Добавлять в белый список — только то, что
+// нельзя понять как «выйти / записать / показать экран / включить микрофон или
+// камеру / пригласить / уйти со страницы / отменить вход».
+// ---------------------------------------------------------------------------
+
+export type FallbackButtonTarget = "continue" | "join" | "popup_ack" | "popup_dismiss";
+
+export type FallbackButtonList = {
+  /** Точные метки (data-testid) — известные сегодня. */
+  tids: string[];
+  /** Метки по образцу — на случай, если Телемост переименует их в том же смысле. */
+  tidPatterns: RegExp[];
+  /** Подпись (aria-label / title) или видимый текст — точное совпадение после нормализации. */
+  labels: string[];
+};
+
+export const telemostFallbackButtons: Record<FallbackButtonTarget, FallbackButtonList> = {
+  // Промежуточный экран «Вы подключаетесь к видеовстрече».
+  continue: {
+    tids: ["meeting-continue-in-browser-continue"],
+    tidPatterns: [/continue-in-browser/i, /open-in-browser/i, /browser-continue/i],
+    labels: [
+      "Продолжить в браузере",
+      "Открыть в браузере",
+      "Остаться в браузере",
+      "Продолжить в веб-версии",
+      "Continue in browser",
+      "Open in browser",
+    ],
+  },
+  // Вход в звонок из лобби. Голое «Войти» сюда НЕ входит: на главной 3.0 это
+  // вход в аккаунт Яндекса (уводит со страницы встречи).
+  join: {
+    tids: ["enter-conference-button"],
+    tidPatterns: [/enter-conference/i, /join-(call|meeting|conference)/i, /^join-button$/i],
+    labels: [
+      "Подключиться",
+      "Присоединиться",
+      "Подключиться к звонку",
+      "Подключиться к встрече",
+      "Присоединиться к звонку",
+      "Присоединиться к встрече",
+      "Войти в звонок",
+      "Войти во встречу",
+      "Попросить войти",
+      "Попросить подключиться",
+      "Join",
+      "Join call",
+      "Join meeting",
+      "Join now",
+      "Ask to join",
+    ],
+  },
+  // Всплывающее окно: «принял к сведению». Можно нажать и вне окна поверх
+  // экрана (плашка), но не внутри окна лобби.
+  popup_ack: {
+    tids: ["telemost-3-onboarding-confirm"],
+    tidPatterns: [],
+    labels: ["Понятно", "Хорошо", "Ок", "OK", "Ясно", "Got it"],
+  },
+  // Всплывающее окно: закрыть / отложить. ТОЛЬКО внутри окна поверх экрана, и
+  // только если это окно — не само лобби («Закрыть» или «Позже» там = отказаться
+  // от входа).
+  popup_dismiss: {
+    tids: ["telemost-3-onboarding-close", "orb-button-close"],
+    tidPatterns: [/(^|[-_])(close|dismiss)([-_]|$)/i],
+    labels: [
+      "Закрыть",
+      "Не сейчас",
+      "Позже",
+      "Пропустить",
+      "Нет, спасибо",
+      "×",
+      "✕",
+      "✖",
+      "Close",
+      "Dismiss",
+      "Not now",
+      "Skip",
+      "Maybe later",
+      "No thanks",
+    ],
+  },
+};
+
+// Поле имени лобби. Метка — сегодняшняя (её же носит поле поиска чатов 3.0, поэтому
+// исключения проверяются на КАЖДОМ ярусе). Подпись — aria-label, placeholder,
+// title, <label>. Видимый текст рядом — только если поле в окне единственное.
+export const telemostFallbackNameInput = {
+  tids: ["orb-textinput-input"],
+  labelPatterns: [/имя/i, /как (вас|тебя) (зовут|представить)/i, /представьтесь/i, /\bname\b/i],
+  // Не поле имени: поиск, чат, ссылки, коды, почта, телефон, приглашения.
+  excludePatterns: [
+    /поиск|найти|search|find/i,
+    /сообщени|написать|напишите|чат|chat|message|коммент|comment/i,
+    /ссылк|link|url|адрес/i,
+    /код|code|\bpin\b|парол|password/i,
+    /почт|e-?mail|телефон|phone|номер/i,
+    /пригла|invite|логин|login/i,
+  ],
+  /** Допустимые type у <input> (пусто = text). */
+  allowedTypes: ["", "text"],
+};
+
+// ЧЁРНЫЙ СПИСОК. Метки — по образцу; подписи, title и тексты — по образцу внутри
+// нормализованной строки (здесь именно подстрока: «Завершить звонок для всех»
+// должен попасть так же, как «Завершить»).
+export const telemostFallbackBlacklist: { tidPatterns: RegExp[]; labelPatterns: RegExp[] } = {
+  tidPatterns: [
+    /end-?call/i,
+    /hang-?up/i,
+    /leave/i,
+    /disconnect/i,
+    /close-(call|meeting|conference|room)|(call|meeting|conference|room)-close/i,
+    /(^|[-_])exit([-_]|$)/i,
+    /record/i,
+    /demonstration/i,
+    /screen-?share|share-?screen|(^|[-_])share([-_]|$)/i,
+    /invite/i,
+    /hand-?up/i,
+    /turn-on-(mic|camera|video)/i,
+    /^mute-(audio|video)$/i,
+    /unmute/i,
+    /login|logout|sign-?in|passport|(^|[-_])auth([-_]|$)/i,
+    /to-home|home-screen/i,
+    /create-(call|meeting|conference|chat)|new-call|start-call/i,
+    /(^|[-_])send([-_]|$)/i,
+    /cancel/i,
+    /(^|[-_])back([-_]|$)|go-?back/i,
+  ],
+  labelPatterns: [
+    /заверш/i,
+    /выйти|выход|покинуть|повесить|отключиться|сбросить/i,
+    /закрыть (звонок|встречу|конференцию)/i,
+    /запис/i,
+    /демонстрац|показать экран|поделиться/i,
+    /включить (микрофон|камеру|видео|звук)/i,
+    /приглас/i,
+    /поднять руку/i,
+    /отправить/i,
+    /создать|новый звонок|новая встреча|позвонить/i,
+    /войти в (аккаунт|яндекс)|^войти$|войдите|авториз|сменить аккаунт/i,
+    /на главную|назад/i,
+    /отмен/i,
+    /удалить|исключить/i,
+    /скачать|установить|приложени/i,
+    /разрешить/i,
+    /для всех/i,
+    /end call|end meeting|leave|hang up|disconnect|record|share|present|invite|raise hand|send|sign in|log in|unmute|turn on|download|install|cancel|go back|for everyone/i,
+  ],
+};
+
+// Окно поверх экрана (всплывашка): роль, aria-modal, <dialog open> — или метка /
+// класс по образцу (в 3.0 окна дизайн-системы Orb — `orb-modal*`).
+export const telemostFallbackDialogTidPattern = /(^|[-_])(modal|popup|dialog|onboarding|popover)([-_\d]|$)/i;
+export const telemostFallbackDialogClassPattern = /(^|[\s_-])(modal|popup|dialog|onboarding|popover)[\w-]*/i;
+
+// Выход из звонка: окно подтверждения «Выйти из звонка?» — нажимать только эти
+// кнопки (точное совпадение) и НИКОГДА — «для всех» (это завершило бы встречу всем).
+export const telemostLeaveConfirmLabels: string[] = [
+  "Выйти",
+  "Выйти из звонка",
+  "Выйти из встречи",
+  "Покинуть звонок",
+  "Покинуть встречу",
+  "Leave",
+  "Leave call",
+  "Leave meeting",
+];
+export const telemostLeaveNeverPattern = /(для всех|всем|everyone|for all|all participants)/i;

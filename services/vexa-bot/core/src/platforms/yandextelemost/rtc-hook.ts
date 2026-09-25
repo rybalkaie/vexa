@@ -12,18 +12,35 @@
 // 2) installFrameWalker — ставит в окно обходчик всех окон того же
 //    происхождения вглубь (раньше запись смотрела вложенные окна только на один
 //    уровень).
+//
+// Фаза 3б (25.09.2026): перехват ещё и помнит соединения звонка
+// (`__vexaPeerConnections`, счётчик живых — `__vexaOpenPeerConnections()`). По
+// нему выход из звонка (leave.ts) подтверждается независимо от вида экрана: нажали
+// «Завершить звонок» — Телемост закрывает свои соединения.
 
 /**
  * Поставить перехват RTCPeerConnection в окне `target` (в браузере — само окно).
  * Идемпотентна. Список живых входящих аудио-дорожек — `__vexaRemoteAudioTracks`,
- * чистка — `__vexaPruneRemoteAudioTracks()`.
+ * чистка — `__vexaPruneRemoteAudioTracks()`; сколько соединений звонка ещё не
+ * закрыто — `__vexaOpenPeerConnections()`.
  */
 export function installRtcAudioHook(target?: any): void {
   const w: any = target || (globalThis as any);
   if (!w || w.__vexaRtcHooked || !w.RTCPeerConnection) return;
   w.__vexaRtcHooked = true;
   w.__vexaRemoteAudioTracks = [];
+  w.__vexaPeerConnections = [];
   const MAX_TRACKS = 64;
+  const MAX_PCS = 32;
+  const isOpen = (pc: any): boolean => !!pc && pc.signalingState !== "closed" && pc.connectionState !== "closed";
+  w.__vexaOpenPeerConnections = (): number => {
+    try {
+      const list: any[] = Array.isArray(w.__vexaPeerConnections) ? w.__vexaPeerConnections : [];
+      return list.filter(isOpen).length;
+    } catch {
+      return 0;
+    }
+  };
   const prune = (): void => {
     try {
       const list: any[] = Array.isArray(w.__vexaRemoteAudioTracks) ? w.__vexaRemoteAudioTracks : [];
@@ -36,6 +53,13 @@ export function installRtcAudioHook(target?: any): void {
   const Orig = w.RTCPeerConnection;
   const Hooked: any = function (this: any, ...args: any[]) {
     const pc = new Orig(...args);
+    try {
+      const pcs: any[] = Array.isArray(w.__vexaPeerConnections) ? w.__vexaPeerConnections : [];
+      pcs.push(pc);
+      w.__vexaPeerConnections = pcs.length > MAX_PCS ? pcs.filter(isOpen).slice(-MAX_PCS) : pcs;
+    } catch {
+      /* */
+    }
     pc.addEventListener("track", (e: any) => {
       try {
         const t = e && e.track;

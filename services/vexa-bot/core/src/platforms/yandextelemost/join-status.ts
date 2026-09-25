@@ -53,6 +53,14 @@ export const JOIN_REASONS = [
 export const MEETING_GONE_ERROR = "Telemost meeting is gone (the call has ended or does not exist)";
 export const ADMISSION_UNCLEAR_ERROR = "Telemost admission unclear: the call screen was not recognized";
 export const MEETING_URL_REJECTED_ERROR = "Ссылка встречи ведёт не в Телемост — бот её не открывает";
+// Фаза 3б: ошибки запасного пути (принудительный режим) — причины те же, что у основного.
+export const FALLBACK_ERRORS = {
+  name: "Lobby: поле ввода имени не найдено в Telemost (запасной путь)",
+  join: "Lobby: кнопка «Подключиться» не найдена в Telemost (запасной путь)",
+  lobby: "Lobby: после «Подключиться» бот остался в лобби Telemost (запасной путь)",
+  rejected: "Bot admission was rejected by meeting admin (telemost rejection indicator, fallback)",
+  other: "Telemost fallback join failed",
+} as const;
 
 /** Сырой BOT_CONFIG: Zod апстрима вырезает незнакомые ключи (sessionUid в том числе). */
 export function rawBotConfig(): any {
@@ -140,9 +148,40 @@ export function joinPhaseSeen(phase: JoinPhase): boolean {
   return state.phase === phase || history.some((h: any) => h && h.phase === phase);
 }
 
-/** Отметить, что вход прошёл запасным путём (Фаза 3) — не сбой, а сигнал «Телемост поменялся». */
+/**
+ * Отметить, что вход прошёл запасным путём (фаза 3б) — не сбой, а сигнал
+ * «Телемост поменялся». Пишется сразу (фаза та же): сторож на хосте, увидев
+ * `fallback_used` у подтверждённого входа, шлёт владельцу тихую строку.
+ * В `detail` — только наши слова (что сорвалось, какие шаги), без текстов страницы.
+ */
 export function noteJoinFallback(detail: Record<string, unknown>): void {
   state = { ...state, fallback_used: { ...(state.fallback_used || {}), ...detail } };
+  writeJoinStatus((state.phase as JoinPhase) || "joining");
+}
+
+/**
+ * Запасной путь пробовали, но не вошли — для разбора (уйдёт в статус вместе с
+ * `failed`). Сторож по этому полю ничего не шлёт.
+ */
+export function noteJoinFallbackTried(detail: Record<string, unknown>): void {
+  state = { ...state, fallback_tried: { ...detail } };
+}
+
+/** Режим принудительного запасного пути: все ярусы или «без меток» (Телемост переименовал всё). */
+export type FallbackForceMode = "all" | "no-testid";
+
+/**
+ * Принудительный запасной путь — ТОЛЬКО для живой проверки (самопроверка в Т-10 на
+ * тестовом образе): сырой BOT_CONFIG.telemostForceFallback (Zod апстрима вырезает
+ * незнакомые ключи, поэтому как sessionUid — из сырого). По умолчанию выключен.
+ * true / "1" / "all" — все ярусы; "no-testid" — без меток (как будто Телемост
+ * переименовал все data-testid).
+ */
+export function fallbackForceMode(): FallbackForceMode | null {
+  const v = rawBotConfig().telemostForceFallback;
+  if (v === true || v === 1 || v === "1" || v === "true" || v === "all") return "all";
+  if (v === "no-testid") return "no-testid";
+  return null;
 }
 
 /** Код причины по тексту исключения из join.ts / admission.ts. */

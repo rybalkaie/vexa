@@ -19,6 +19,16 @@
 //   - микрофон в звонке выключает admission.ts сразу после впуска — прежний
 //     клик по виджету на главной его не выключал (разведка 25.09);
 //   - перехват входящих дорожек вынесен в rtc-hook.ts и чистит завершённые.
+//
+// 25.09.2026 (фаза 3б, ISS-60): запасной путь. Основной путь (joinPrimary) —
+// байт в байт прежний. Сорвался он на поле имени, кнопке «Подключиться» или
+// остался в лобби — включается запасной путь (fallback.ts): ищет то же самое во
+// всех окнах по метке, подписи и тексту, всплывашки закрывает только кнопками из
+// белого списка, чёрный список не трогает никогда. Вошёл — в статусе отметка
+// `fallback_used`, сторож шлёт владельцу тихую строку. Не вошёл — наверх уходит
+// исходная ошибка основного пути (причина для людей та же), а в статусе —
+// `fallback_tried` для разбора. Флаг живой проверки `telemostForceFallback` в
+// сыром BOT_CONFIG (по умолчанию выключен) пускает сразу запасным путём.
 
 import { Page, Frame } from "playwright";
 import { log, callJoiningCallback } from "../../utils";
@@ -32,10 +42,21 @@ import {
   telemostOnboardingDismissSelectors,
   telemostLobbyFrameUrlMarker,
 } from "./selectors";
-import { MEETING_URL_REJECTED_ERROR } from "./join-status";
+import {
+  MEETING_URL_REJECTED_ERROR,
+  MEETING_GONE_ERROR,
+  FALLBACK_ERRORS,
+  FallbackForceMode,
+  classifyJoinError,
+  fallbackForceMode,
+  noteJoinFallback,
+  noteJoinFallbackTried,
+} from "./join-status";
 import { isTelemostMeetingUrl, readTelemostScreen, ScreenState } from "./screen";
 import { ensureDeviceOff } from "./devices";
 import { installRtcAudioHook } from "./rtc-hook";
+import { FallbackResult, fallbackStepsCode, fallbackSummary, runFallbackJoin } from "./fallback";
+import { stopSignalReceived } from "./stop-signal";
 
 const LOG_PREFIX = "[adapter-telemost]";
 
@@ -312,6 +333,69 @@ export async function joinYandexTelemost(
 
   await callJoiningCallback(botConfig).catch((e: any) => log(`[telemost] joining-callback failed (non-fatal): ${e.message}`));
 
+  // Живая проверка запасного пути (самопроверка на тестовом образе): сразу им.
+  const forced = fallbackForceMode();
+  if (forced) {
+    logStep("fallback_forced", { mode: forced });
+    await joinByFallback(page, botName, null, forced, null);
+    return;
+  }
+
+  try {
+    await joinPrimary(page, botName);
+  } catch (error: any) {
+    const reason = classifyJoinError(error?.message || String(error));
+    // Запасной путь — только когда основной не нашёл лобби или не вышел из него.
+    // Сеть, чужая ссылка, закрытая страница, остановка — не его дело.
+    if (!FALLBACK_REASONS.has(reason) || !page || page.isClosed() || stopSignalReceived()) throw error;
+    logStep("primary_join_failed", { reason });
+    await joinByFallback(page, botName, reason, null, error);
+  }
+}
+
+/** Причины срыва основного пути, при которых включается запасной. */
+const FALLBACK_REASONS = new Set(["name_input_not_found", "join_button_not_found", "still_in_lobby"]);
+
+/** Текст ошибки принудительного запасного пути — по нему classifyJoinError узнаёт причину. */
+function fallbackErrorText(missing: FallbackResult["missing"]): string {
+  return missing ? FALLBACK_ERRORS[missing] : FALLBACK_ERRORS.other;
+}
+
+/**
+ * Вход запасным путём. Вошёл — отметка `fallback_used` в статусе. Не вошёл —
+ * `fallback_tried` в статус и ошибка: встречи нет / отказали — своя; иначе
+ * исходная ошибка основного пути (или, при принудительном режиме, своя с той же
+ * причиной).
+ */
+async function joinByFallback(
+  page: Page,
+  botName: string,
+  reason: string | null,
+  forced: FallbackForceMode | null,
+  primaryError: any,
+): Promise<void> {
+  const r = await runFallbackJoin(page, { botName, reason, forced });
+  const detail: Record<string, unknown> = {
+    primary_reason: reason,
+    forced,
+    steps: fallbackStepsCode(r.steps),
+    screen: r.screen,
+    summary: fallbackSummary(reason, forced, r.steps),
+  };
+  if (r.ok) {
+    noteJoinFallback(detail);
+    logStep("join_done", { via: "fallback", screen: r.screen });
+    return;
+  }
+  noteJoinFallbackTried({ ...detail, missing: r.missing, aborted: r.aborted });
+  if (r.screen === "gone") throw new Error(MEETING_GONE_ERROR);
+  if (r.screen === "rejected") throw new Error(FALLBACK_ERRORS.rejected);
+  if (primaryError) throw primaryError;
+  throw new Error(fallbackErrorText(r.missing));
+}
+
+/** Основной (сегодняшний) путь: интерстициал, лобби 3.0 во вложенном окне или старое лобби. */
+async function joinPrimary(page: Page, botName: string): Promise<void> {
   // 1) Промежуточный экран «Продолжить в браузере». Не всегда появляется,
   // зависит от user-agent и наличия установленного desktop-приложения.
   await page.waitForTimeout(1500);

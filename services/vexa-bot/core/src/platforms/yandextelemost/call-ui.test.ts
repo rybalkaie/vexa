@@ -118,6 +118,26 @@ fakeWin.__vexaPruneRemoteAudioTracks();
 expect("ручная чистка (её зовёт запись перед подмешиванием)", ids(), ["a3"]);
 expect("окно без RTCPeerConnection — не падаем", (() => { const w: any = {}; installRtcAudioHook(w); return !!w.__vexaRtcHooked; })(), false);
 
+console.log("installRtcAudioHook — соединения звонка (подтверждение выхода, фаза 3б)");
+class FakePC2 extends EventTarget {
+  signalingState = "stable";
+  connectionState = "connected";
+  close() { this.signalingState = "closed"; this.connectionState = "closed"; }
+}
+const pcWin: any = { RTCPeerConnection: FakePC2 };
+installRtcAudioHook(pcWin);
+const p1 = new pcWin.RTCPeerConnection();
+const p2 = new pcWin.RTCPeerConnection();
+expect("два соединения открыты", pcWin.__vexaOpenPeerConnections(), 2);
+p1.close();
+expect("одно закрыли — открыто одно", pcWin.__vexaOpenPeerConnections(), 1);
+p2.close();
+expect("все закрыты — ноль (бот вышел из звонка)", pcWin.__vexaOpenPeerConnections(), 0);
+for (let i = 0; i < 40; i++) new pcWin.RTCPeerConnection().close();
+const livePc = new pcWin.RTCPeerConnection();
+expect("список не растёт без края (закрытые выкидываются)", pcWin.__vexaPeerConnections.length <= 32, true);
+expect("живое соединение после чистки на месте", [pcWin.__vexaOpenPeerConnections(), pcWin.__vexaPeerConnections.includes(livePc)], [1, true]);
+
 console.log("installFrameWalker — вложенные окна вглубь");
 function fakeWindow(name: string, children: any[] = []): any {
   const w: any = { name };

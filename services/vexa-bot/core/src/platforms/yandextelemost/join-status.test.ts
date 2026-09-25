@@ -12,6 +12,7 @@ import {
   MEETING_GONE_ERROR,
   ADMISSION_UNCLEAR_ERROR,
   MEETING_URL_REJECTED_ERROR,
+  FALLBACK_ERRORS,
 } from "./join-status";
 
 let passed = 0;
@@ -41,6 +42,12 @@ expect("прочее", classifyJoinError("something else"), "join_error");
 expect("встреча кончилась во время впуска", classifyJoinError(MEETING_GONE_ERROR), "meeting_not_found");
 expect("экран звонка не распознан ≠ в звонке", classifyJoinError(ADMISSION_UNCLEAR_ERROR), "admission_unclear");
 expect("ссылка не на Телемост (С10)", classifyJoinError(MEETING_URL_REJECTED_ERROR), "meeting_url_rejected");
+// Фаза 3б: ошибки запасного пути — те же причины, что у основного (сторож и тексты людям те же).
+expect("запасной: поле имени", classifyJoinError(FALLBACK_ERRORS.name), "name_input_not_found");
+expect("запасной: кнопка", classifyJoinError(FALLBACK_ERRORS.join), "join_button_not_found");
+expect("запасной: остался в лобби", classifyJoinError(FALLBACK_ERRORS.lobby), "still_in_lobby");
+expect("запасной: отказали", classifyJoinError(FALLBACK_ERRORS.rejected), "admission_rejected");
+expect("запасной: прочее", classifyJoinError(FALLBACK_ERRORS.other), "join_error");
 
 console.log("isMeetingGoneText — «встречи нет» на экране");
 expect("Телемост 3.0 (живой экран 24.09)", isMeetingGoneText("Телемост\nВойдите в аккаунт\nТакого звонка нет\nВозможно, в ссылке опечатка\nНа главную"), true);

@@ -14,15 +14,22 @@
  * (admission.ts), вход через лобби (join.ts) и снимок по сигналу остановки
  * (stop-signal.ts → leave.ts → crashkit.ts, в отдельном процессе).
  *
+ * Фаза 3б (25.09.2026): запасной путь входа (fallback.ts) — на ВСЕХ копиях ни
+ * одного нажатия на опасную кнопку (пометка data-danger), на копиях «переименованные
+ * метки / новая всплывашка / поле поиска с той же меткой» основной путь срывается,
+ * бот входит запасным и статус входа это отмечает (отдельные процессы, как бот);
+ * флаг живой проверки; выход из звонка с подтверждением (leave.ts).
+ *
  * Не доказывает вход в живой Телемост — только то, что код верно читает экраны,
  * сложенные по разведке. Живую проверку делает самопроверка в Т-10.
  *
  * Run (в образе): node /app/dist/platforms/yandextelemost/screen-copies.test.js
  * На маке (браузер Playwright другой сборки):
  *   CHROMIUM_PATH=<путь к chrome-headless-shell> node <сборка>/screen-copies.test.js
- * VERBOSE=1 — печатать журнал бота; ONLY=screens,devices,admission,join,stop —
- * только эти части; NO_SIGNAL_OPTIONS=1 — браузер «как раньше» (ломание для
- * проверки: части stop должны покраснеть).
+ * VERBOSE=1 — печатать журнал бота;
+ * ONLY=screens,devices,admission,join,leave,fallback,fallback-e2e,stop — только эти
+ * части; NO_SIGNAL_OPTIONS=1 — браузер «как раньше» (ломание для проверки: части
+ * stop должны покраснеть).
  */
 
 import { spawn } from "child_process";
@@ -33,12 +40,14 @@ import { chromium, Browser, BrowserContext, Frame, LaunchOptions, Page } from "p
 import { readTelemostScreen, collectFrameSignals, removalEvidence, frameKind } from "./screen";
 import { collectTileParticipants, cleanParticipantNames, presenceFromTiles } from "./participants";
 import { ensureDeviceOff, ensureTelemostDevicesOff } from "./devices";
-import { clickTelemostLeave, leaveYandexTelemost } from "./leave";
+import { clickTelemostLeave, leaveYandexTelemost, openCallConnections } from "./leave";
 import { checkForTelemostRemoval } from "./removal";
 import { waitForYandexTelemostAdmission } from "./admission";
 import { joinYandexTelemost } from "./join";
 import { classifyJoinError, writeJoinStatus } from "./join-status";
 import { armStopSignalCapture, BROWSER_SIGNAL_OPTIONS } from "./stop-signal";
+import { runFallbackJoin, fallbackStepsCode } from "./fallback";
+import { installRtcAudioHook } from "./rtc-hook";
 
 const ROOM = "00000000000000";
 const ORIGIN = "https://telemost.yandex.ru";
@@ -81,14 +90,16 @@ function toggleMic() { window.__micClicks++; if (window.__micDead) return; setMi
 function toggleCam(b) {
   b.setAttribute('data-testid', b.getAttribute('data-testid') === 'turn-off-camera-button' ? 'turn-on-camera-button' : 'turn-off-camera-button');
 }
+function flipAria(b, on, off) { b.setAttribute('aria-label', b.getAttribute('aria-label') === on ? off : on); }
 function leaveCall() {
   window.__left = (window.__left || 0) + 1;
   document.body.innerHTML = '<div>Вы вышли из звонка</div><button>Вернуться в звонок</button>';
   try { var w = parent.document.getElementById('widget'); if (w) w.innerHTML = ''; } catch (e) {}
 }
 function joinClicked() {
-  var inp = document.querySelector('input');
+  var inp = document.getElementById('realname') || document.querySelector('input');
   window.__name = inp ? inp.value : null;
+  window.__notNameValues = Array.prototype.map.call(document.querySelectorAll('[data-not-name]'), function (i) { return i.value; });
   window.__joinClicks = (window.__joinClicks || 0) + 1;
   setTimeout(function () {
     document.body.innerHTML = window.__nextScreen || '';
@@ -97,22 +108,33 @@ function joinClicked() {
 }
 `;
 
+// Фаза 3б: счётчик нажатий на ОПАСНЫЕ кнопки (атрибут data-danger — пометка копии,
+// бот о ней не знает). Запасной путь не имеет права нажать ни одну.
+const DANGER_JS = `
+window.__danger = 0; window.__dangerWhat = [];
+document.addEventListener('click', function (e) {
+  var t = e.target && e.target.closest ? e.target.closest('[data-danger]') : null;
+  if (t) { window.__danger++; window.__dangerWhat.push(t.getAttribute('data-danger')); }
+}, true);
+`;
+
 function callDoc(body: string, extraJs = ""): string {
-  return `<!doctype html><html><head><meta charset="utf-8">${CSS}</head><body>${body}<script>${CALL_JS}${extraJs}</script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${CSS}</head><body>${body}<script>${DANGER_JS}${CALL_JS}${extraJs}</script></body></html>`;
 }
 
 function mainDoc(body: string, extraJs = ""): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Телемост</title>${CSS}</head><body>${body}<script>${extraJs}</script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Телемост</title>${CSS}</head><body>${body}<script>${DANGER_JS}${extraJs}</script></body></html>`;
 }
 
 const IFRAME = `<iframe id="call" src="${CALL_PATH}?embed=1"></iframe>`;
 // Поле поиска чатов на главной 3.0 носит тот же testid, что поле имени лобби.
-const SEARCH = `<input data-testid="orb-textinput-input" placeholder="Поиск">`;
+// data-not-name — пометка копии: имя бота сюда попасть не должно.
+const SEARCH = `<input data-testid="orb-textinput-input" placeholder="Поиск" data-not-name="search">`;
 // Главная 3.0 в лобби: виджет «Групповой звонок / Подключение», где «Завершить
 // звонок» и «Выключить микрофон» видны уже до входа.
 const WIDGET_LOBBY =
   `<div>Групповой звонок</div><div>Подключение</div>` +
-  `<button aria-label="Завершить звонок" onclick="window.__leftMain=(window.__leftMain||0)+1">×</button>` +
+  `<button aria-label="Завершить звонок" data-danger="widget-end" onclick="window.__leftMain=(window.__leftMain||0)+1">×</button>` +
   `<button aria-label="Выключить микрофон">м</button>`;
 // Главная 3.0 в звонке: мини-виджет со счётчиком.
 const widgetCall = (n: number) =>
@@ -120,16 +142,17 @@ const widgetCall = (n: number) =>
 
 const main30 = (widget: string) => mainDoc(`<div>Телемост</div>${SEARCH}<div id="widget">${widget}</div>${IFRAME}`);
 
-const TOOLBAR =
+const toolbar = (endCall = "leaveCall()") =>
   `<div id="toolbar">` +
-  `<button data-testid="end-call-alt-button" onclick="leaveCall()">⏹</button>` +
+  `<button data-testid="end-call-alt-button" data-danger="end-call" onclick="${endCall}">⏹</button>` +
   `<button data-testid="more-popup-alt-button">…</button>` +
   `<button data-testid="mute-audio" aria-label="Выключить микрофон" onclick="toggleMic()">🎤</button>` +
   `<button data-testid="turn-off-mic-button" onclick="toggleMic()">м</button>` +
   `<button data-testid="turn-on-camera-button" onclick="toggleCam(this)">к</button>` +
   `<button data-testid="settings-button">⚙</button>` +
-  `<button data-testid="share-button">⇪</button>` +
+  `<button data-testid="share-button" data-danger="share">⇪</button>` +
   `</div>`;
+const TOOLBAR = toolbar();
 
 const tiles = (names: string[]) =>
   `<div class="grid">` +
@@ -152,8 +175,8 @@ const LOBBY_BODY =
 const IN_CALL_BODY = (names: string[]) => TOOLBAR + tiles(names);
 // Зал ожидания 3.0 вживую не видели: худший случай — панель звонка уже на экране.
 const WAITING_BODY = `<div>Ожидание организатора</div><div>Организатор скоро впустит вас в звонок</div>${TOOLBAR}`;
-const REJECTED_BODY = `<div>Организатор отклонил ваш запрос</div><button>На главную</button>`;
-const ENDED_BODY = `<div>Встреча завершена</div><button>На главную</button>`;
+const REJECTED_BODY = `<div>Организатор отклонил ваш запрос</div><button data-danger="home">На главную</button>`;
+const ENDED_BODY = `<div>Встреча завершена</div><button data-danger="home">На главную</button>`;
 const UNCLEAR_BODY = `<div>Загрузка</div>`;
 // Чат комнаты: в 3.0 звонок живёт в чате, там бывает «Звонок завершён» от прошлой встречи.
 const CHAT = `<div class="chat"><div>${SPEAKER}</div><div>Звонок завершён</div><div>Встреча завершена</div></div>`;
@@ -163,12 +186,15 @@ const OLD_LOBBY = mainDoc(
   `<div>Подключение к встрече</div><input data-testid="orb-textinput-input" placeholder="Введите имя">` +
     `<button data-testid="turn-off-mic-button">м</button><button data-testid="enter-conference-button">Подключиться</button>`,
 );
+// Выход в старом интерфейсе вёл на экран «Вы вышли из встречи» (фаза 3б: копия
+// теперь так и делает — выход подтверждается пропажей кнопки, без второго нажатия).
 const OLD_CALL = mainDoc(
-  `<div>Встреча</div><button aria-label="Завершить звонок" onclick="window.__leftMain=(window.__leftMain||0)+1">×</button>` +
+  `<div>Встреча</div><button aria-label="Завершить звонок" data-danger="old-end" ` +
+    `onclick="window.__leftMain=(window.__leftMain||0)+1; document.body.innerHTML='<div>Вы вышли из встречи</div>'">×</button>` +
     `<button data-testid="mute-audio" aria-label="Выключить микрофон">м</button>` +
     `<button data-testid="participants-button" aria-label="Участники">у</button>`,
 );
-const GONE_30 = mainDoc(`<div>Телемост</div><div>Войдите в аккаунт</div><h1>Такого звонка нет</h1><div>Возможно, в ссылке опечатка</div><button>На главную</button>`);
+const GONE_30 = mainDoc(`<div>Телемост</div><div>Войдите в аккаунт</div><h1>Такого звонка нет</h1><div>Возможно, в ссылке опечатка</div><button data-danger="home">На главную</button>`);
 
 // Главная для полного входа: окно онбординга 3.0 и «Продолжить в браузере»,
 // после которого появляется вложенное окно лобби.
@@ -181,10 +207,90 @@ const JOIN_MAIN = mainDoc(
   `function cont(){var i=document.getElementById('inter'); if(i) i.remove(); if(document.getElementById('call')) return;` +
     `var f=document.createElement('iframe'); f.id='call'; f.src='${CALL_PATH}?embed=1'; document.body.appendChild(f);}`,
 );
-const lobbyThen = (next: string, nextWidget: string) =>
-  callDoc(LOBBY_BODY, `window.__nextScreen = ${JSON.stringify(next)}; window.__nextWidget = ${JSON.stringify(nextWidget)};`);
+const thenJs = (next: string, nextWidget: string) =>
+  `window.__nextScreen = ${JSON.stringify(next)}; window.__nextWidget = ${JSON.stringify(nextWidget)};`;
+const lobbyThen = (next: string, nextWidget: string) => callDoc(LOBBY_BODY, thenJs(next, nextWidget));
 
 type Screens = { main: string; call?: string };
+
+// ---------------------------------------------------------------------------
+// Фаза 3б: копии для запасного пути входа. data-danger — опасные кнопки (их не
+// нажимает никто), data-not-name — поля, куда имя бота попасть не должно.
+// ---------------------------------------------------------------------------
+
+// «Новая всплывашка»: окно, которого основной путь не знает, накрывает лобби.
+// «Начать запись» и «Пригласить» — опасные; закрыть можно только «Понятно».
+const NEW_POPUP =
+  `<div role="dialog" aria-modal="true" class="overlay" id="newpop"><div>Новое: субтитры в звонке</div>` +
+  `<button data-danger="rec">Начать запись</button>` +
+  `<button aria-label="Пригласить участников" data-danger="invite">+</button>` +
+  `<button onclick="document.getElementById('newpop').remove()">Понятно</button></div>`;
+const lobbyPopupThen = (next: string, nextWidget: string) => callDoc(LOBBY_BODY + NEW_POPUP, thenJs(next, nextWidget));
+
+// «Переименованные метки»: онбординг (накрывает интерстициал), интерстициал и
+// лобби с новыми data-testid — узнать их можно только по подписи и тексту.
+const RENAMED_MAIN = mainDoc(
+  `<div>Телемост</div>${SEARCH}<button data-testid="orb-global-bar-login-button" data-danger="login">Войти</button>` +
+    `<div id="widget"></div>` +
+    `<div role="dialog" id="onb" class="overlay">Что нового в Телемосте ` +
+    `<button data-testid="whatsnew-cta" data-danger="rec">Начать запись</button>` +
+    `<button data-testid="whatsnew-x" aria-label="Закрыть" onclick="document.getElementById('onb').remove()">✕</button></div>` +
+    `<div id="inter">Вы подключаетесь к видеовстрече ` +
+    `<button data-testid="interstitial-go" onclick="cont()">Продолжить в браузере</button>` +
+    `<button data-danger="app">Открыть в приложении</button></div>`,
+  `function cont(){var i=document.getElementById('inter'); if(i) i.remove(); if(document.getElementById('call')) return;` +
+    `var w=document.getElementById('widget'); if(w) w.innerHTML=${JSON.stringify(WIDGET_LOBBY)};` +
+    `var f=document.createElement('iframe'); f.id='call'; f.src='${CALL_PATH}?embed=1'; document.body.appendChild(f);}`,
+);
+const RENAMED_LOBBY_BODY =
+  `<div>Подключение к звонку</div>` +
+  `<input data-testid="name-field-v4" placeholder="Как вас представить?">` +
+  `<button data-testid="mic-toggle" aria-label="Выключить микрофон" onclick="flipAria(this,'Выключить микрофон','Включить микрофон')">м</button>` +
+  `<button data-testid="cam-toggle" aria-label="Выключить камеру" onclick="flipAria(this,'Выключить камеру','Включить камеру')">к</button>` +
+  `<button data-testid="cta-primary" onclick="joinClicked()">Присоединиться</button>` +
+  `<button data-testid="go-home" data-danger="home">На главную</button>`;
+const renamedLobbyThen = (next: string, nextWidget: string) => callDoc(RENAMED_LOBBY_BODY, thenJs(next, nextWidget));
+
+// «Поле поиска с той же меткой»: в лобби три поля с меткой поля имени, два из них —
+// поиск (без привычного placeholder «Поиск»); у «Подключиться» метка новая.
+const SAME_LABEL_LOBBY_BODY =
+  `<div>Подключение к звонку</div>` +
+  `<input data-testid="orb-textinput-input" aria-label="Поиск по участникам" data-not-name="search-aria">` +
+  `<input data-testid="orb-textinput-input" type="search" placeholder="Найти чат" data-not-name="search-type">` +
+  `<input data-testid="orb-textinput-input" placeholder="Ваше имя" id="realname">` +
+  `<button data-testid="turn-off-mic-button" onclick="toggleMic()">м</button>` +
+  `<button data-testid="turn-off-camera-button" onclick="toggleCam(this)">к</button>` +
+  `<button data-testid="join-btn-2026" onclick="joinClicked()">Подключиться</button>`;
+const sameLabelThen = (next: string, nextWidget: string) => callDoc(SAME_LABEL_LOBBY_BODY, thenJs(next, nextWidget));
+
+// «Опасные кнопки»: лобби в окне поверх экрана с «Закрыть»/«Позже» (отказ от входа),
+// кнопки с белыми текстами, но опасными метками и подписями, включение микрофона
+// и камеры, приглашение; на главной — вход в аккаунт, «На главную», чат.
+const BAIT_MAIN = mainDoc(
+  `<div>Телемост</div>${SEARCH}<button data-testid="orb-global-bar-login-button" data-danger="login">Войти</button>` +
+    `<button data-danger="home">На главную</button><div id="widget">${WIDGET_LOBBY}</div>` +
+    `<div class="chat"><div>Анна Тестова: присоединяйтесь</div><button data-danger="chat-ok">Хорошо</button>` +
+    `<button data-danger="chat-invite">Пригласить</button></div>${IFRAME}`,
+);
+const baitLobby = (safeJoin: boolean) =>
+  callDoc(
+    `<div role="dialog" id="lobbydlg"><div>Подключение к звонку</div>` +
+      `<input data-testid="orb-textinput-input" placeholder="Ваше имя" id="realname">` +
+      `<button data-danger="lobby-close">Закрыть</button>` +
+      `<button data-danger="lobby-later">Позже</button>` +
+      `<button data-testid="turn-on-mic-button" aria-label="Включить микрофон" data-danger="mic-on">м</button>` +
+      `<button data-testid="turn-on-camera-button" aria-label="Включить камеру" data-danger="cam-on">к</button>` +
+      `<button data-testid="end-call-alt-button" data-danger="end-as-join">Подключиться</button>` +
+      `<button aria-label="Начать запись" data-danger="rec-as-join">Подключиться</button>` +
+      `<button title="Демонстрация экрана" data-danger="share-as-continue">Продолжить в браузере</button>` +
+      `<button data-danger="invite">Пригласить</button>` +
+      (safeJoin ? `<button data-testid="x9" onclick="joinClicked()">Присоединиться</button>` : "") +
+      `</div>` +
+      `<div role="dialog" id="tip"><div>Новое</div>` +
+      `<button aria-label="Выйти из звонка" data-danger="leave-as-ok">Понятно</button>` +
+      `<button data-testid="record-start" data-danger="rec-as-x">×</button></div>`,
+    thenJs(IN_CALL_BODY([BOT, SPEAKER]), widgetCall(2)),
+  );
 
 // ---------------------------------------------------------------------------
 // Обвязка
@@ -253,10 +359,12 @@ async function withScreens(
   browser: Browser,
   screens: Screens,
   fn: (page: Page) => Promise<void>,
-  opts: { goto?: boolean } = {},
+  opts: { goto?: boolean; rtcHook?: boolean } = {},
 ): Promise<void> {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   await routeScreens(ctx, screens);
+  // Перехват соединений звонка — как ставит его join.ts (во всех окнах до их кода).
+  if (opts.rtcHook) await ctx.addInitScript(installRtcAudioHook);
   const page = await ctx.newPage();
   try {
     if (opts.goto !== false) await page.goto(MAIN_URL, { waitUntil: "load" });
@@ -462,6 +570,8 @@ async function fullJoin(browser: Browser): Promise<void> {
       expect("вход: имя вписано в поле лобби", await inCall(page, () => (window as any).__name), BOT);
       expect("вход: «Подключиться» нажата", Number(await inCall(page, () => (window as any).__joinClicks)) >= 1, true);
       expect("вход: в журнале «лобби пройдено» (за лобби звонок)", logHas(/^step=lobby_left ts=/), true);
+      expect("вход основным путём: запасной путь не включался (фаза 3б)",
+        logHas(/^step=(fallback_start|fallback_forced|primary_join_failed) /), false);
       expect("вход: микрофон в лобби выключен с проверкой подписи",
         logHas(/^step=device_off .*device="mic" scope="lobby" .*state="off"/), true);
       expect("вход → впуск", await waitForYandexTelemostAdmission(page, 15_000, cfg), true);
@@ -488,6 +598,350 @@ async function fullJoin(browser: Browser): Promise<void> {
     expect("чужая ссылка (С10): бот её не открывает", classifyJoinError(msg), "meeting_url_rejected");
     expect("чужая ссылка: страница не открывалась", page.url(), "about:blank");
   }, { goto: false });
+}
+
+// ---------------------------------------------------------------------------
+// Фаза 3б: выход из звонка — подтверждение, окно «Выйти?», повтор JS-кликом
+// ---------------------------------------------------------------------------
+
+/** Нажатия на опасные кнопки (data-danger) во всех окнах: сколько и какие. */
+async function dangerIn(page: Page): Promise<{ n: number; what: string[] }> {
+  let n = 0;
+  const what: string[] = [];
+  for (const fr of page.frames()) {
+    const r = await fr
+      .evaluate(() => ({ n: (window as any).__danger || 0, what: (window as any).__dangerWhat || [] }))
+      .catch(() => null);
+    if (r) {
+      n += r.n;
+      what.push(...r.what);
+    }
+  }
+  return { n, what };
+}
+
+/** Куда попало имя бота: в поле имени (на момент «Подключиться») и ни в одно поле data-not-name. */
+async function nameCheck(page: Page): Promise<{ name: string | null; leaked: number }> {
+  let name: string | null = null;
+  let leaked = 0;
+  for (const fr of page.frames()) {
+    const r = await fr
+      .evaluate((bot: string) => {
+        const now = Array.from(document.querySelectorAll("[data-not-name]")).map((i) => (i as HTMLInputElement).value);
+        const atJoin: string[] = (window as any).__notNameValues || [];
+        return { name: (window as any).__name ?? null, leaked: [...now, ...atJoin].filter((v) => v === bot).length };
+      }, BOT)
+      .catch(() => null);
+    if (!r) continue;
+    if (r.name !== null && r.name !== undefined) name = r.name;
+    leaked += r.leaked;
+  }
+  return { name, leaked };
+}
+
+const clicksIn = (page: Page) => inCall(page, () => (window as any).__clicks || 0);
+
+async function leaveChecks(browser: Browser): Promise<void> {
+  console.info("Выход из звонка (фаза 3б): подтверждение по нескольким признакам, окно «Выйти?», повтор JS-кликом");
+  const COUNT = "window.__clicks=(window.__clicks||0)+1;";
+
+  // 1) Медленный выход: панель уходит через 4 с — дождались, второго нажатия нет.
+  await withScreens(
+    browser,
+    { main: main30(widgetCall(1)), call: callDoc(toolbar(`${COUNT} setTimeout(leaveCall, 4000)`) + tiles([BOT])) },
+    async (page) => {
+      const r = await clickTelemostLeave(page);
+      expect("медленный выход: подтверждён (кнопка пропала), второго нажатия нет",
+        [r.left, r.via, r.method, await clicksIn(page)], [true, "button_gone", "click", 1]);
+    },
+  );
+
+  // 2) Первое нажатие не дошло до обработчика — ровно один JS-клик.
+  await withScreens(
+    browser,
+    { main: main30(widgetCall(1)), call: callDoc(toolbar(`${COUNT} if (window.__clicks < 2) return; leaveCall()`) + tiles([BOT])) },
+    async (page) => {
+      const r = await clickTelemostLeave(page);
+      expect("нажатие не дошло: один JS-клик — вышел",
+        [r.left, r.via, r.method, await clicksIn(page)], [true, "button_gone", "click+js_click", 2]);
+    },
+  );
+
+  // 3) Панель на экране осталась (окно звонка спрятано / экран «звонок завершён»),
+  //    а соединение звонка закрылось — это выход (по соединению).
+  await withScreens(
+    browser,
+    {
+      main: main30(widgetCall(1)),
+      call: callDoc(
+        toolbar(`${COUNT} if (window.__pc) window.__pc.close();`) + tiles([BOT]),
+        "try { window.__pc = new RTCPeerConnection(); } catch (e) { window.__pcErr = String(e); }",
+      ),
+    },
+    async (page) => {
+      const open = await openCallConnections(page);
+      const r = await clickTelemostLeave(page);
+      expect("соединение звонка видно перехвату", open, 1);
+      expect("панель осталась, соединение закрылось: выход подтверждён",
+        [r.left, r.via, r.method, await clicksIn(page)], [true, "rtc_closed", "click", 1]);
+    },
+    { rtcHook: true },
+  );
+
+  // 4) Окно «Выйти из звонка?»: нажать «Выйти», никогда «Завершить для всех» и не «Отмена».
+  const CONFIRM_JS =
+    "function showLeaveConfirm(){ if (document.getElementById('confirm')) return;" +
+    " var d=document.createElement('div'); d.id='confirm'; d.setAttribute('role','dialog');" +
+    " d.innerHTML='<div>Выйти из звонка?</div><button data-danger=\"end-all\">Завершить для всех</button>' +" +
+    " '<button onclick=\"leaveCall()\">Выйти</button><button data-danger=\"cancel\">Отмена</button>';" +
+    " document.body.appendChild(d); }";
+  await withScreens(
+    browser,
+    { main: main30(widgetCall(2)), call: callDoc(toolbar(`${COUNT} showLeaveConfirm()`) + tiles([BOT, SPEAKER]), CONFIRM_JS) },
+    async (page) => {
+      const r = await clickTelemostLeave(page);
+      const d = await dangerIn(page);
+      expect("окно «Выйти из звонка?»: нажато «Выйти» — вышел",
+        [r.left, r.via, r.method, await clicksIn(page)], [true, "button_gone", "click+confirm", 1]);
+      expect("«Завершить для всех» и «Отмена» не нажаты (опасных, кроме самой кнопки выхода, нет)",
+        d.what.filter((w) => w !== "end-call"), []);
+    },
+  );
+
+  // 4б) Вместо окна — меню «Завершить звонок для всех / Выйти из звонка»: только «Выйти».
+  const MENU_JS =
+    "function showLeaveMenu(){ if (document.getElementById('menu')) return;" +
+    " var d=document.createElement('div'); d.id='menu'; d.setAttribute('role','menu');" +
+    " d.innerHTML='<div role=\"menuitem\" data-danger=\"end-all\">Завершить звонок для всех</div>' +" +
+    " '<div role=\"menuitem\" onclick=\"leaveCall()\">Выйти из звонка</div>';" +
+    " document.body.appendChild(d); }";
+  await withScreens(
+    browser,
+    { main: main30(widgetCall(2)), call: callDoc(toolbar(`${COUNT} showLeaveMenu()`) + tiles([BOT, SPEAKER]), MENU_JS) },
+    async (page) => {
+      const r = await clickTelemostLeave(page);
+      const d = await dangerIn(page);
+      expect("меню выхода: нажат пункт «Выйти из звонка» — вышел",
+        [r.left, r.via, r.method, await clicksIn(page)], [true, "button_gone", "click+confirm", 1]);
+      expect("«Завершить звонок для всех» не нажат", d.what.filter((w) => w !== "end-call"), []);
+    },
+  );
+
+  // 5) Кнопка «мёртвая»: обычное нажатие + ровно один JS-клик, честно «не подтверждён».
+  await withScreens(
+    browser,
+    { main: main30(widgetCall(1)), call: callDoc(toolbar(COUNT) + tiles([BOT])) },
+    async (page) => {
+      const r = await clickTelemostLeave(page);
+      expect("мёртвая кнопка выхода: два нажатия, выход не подтверждён",
+        [r.left, r.via, r.method, await clicksIn(page)], [false, null, "click+js_click", 2]);
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Фаза 3б: запасной путь на ВСЕХ копиях экранов — ни одной опасной кнопки
+// ---------------------------------------------------------------------------
+
+type FallbackCase = {
+  name: string;
+  screens: Screens;
+  mode?: "all" | "no-testid";
+  ok: boolean;
+  screen?: string;
+  steps?: string;
+  missing?: string;
+};
+
+const IN_CALL_2 = () => IN_CALL_BODY([BOT, SPEAKER]);
+
+function fallbackCases(): FallbackCase[] {
+  return [
+    { name: "3.0 в звонке — ничего не нажимает", screens: { main: main30(widgetCall(2)), call: callDoc(IN_CALL_2()) }, ok: true, screen: "in_call", steps: "" },
+    { name: "3.0 зал ожидания — ничего не нажимает", screens: { main: main30(WIDGET_LOBBY), call: callDoc(WAITING_BODY) }, ok: true, screen: "waiting_room", steps: "" },
+    { name: "3.0 отказ — ничего не нажимает", screens: { main: main30(WIDGET_LOBBY), call: callDoc(REJECTED_BODY) }, ok: false, screen: "rejected", steps: "" },
+    { name: "3.0 встреча завершена — ничего не нажимает", screens: { main: main30(""), call: callDoc(ENDED_BODY) }, ok: false, screen: "gone", steps: "" },
+    { name: "3.0 неясный экран — ничего не нажимает", screens: { main: main30(WIDGET_LOBBY), call: callDoc(UNCLEAR_BODY) }, ok: false, steps: "", missing: "name" },
+    { name: "3.0 лобби", screens: { main: main30(WIDGET_LOBBY), call: lobbyThen(IN_CALL_2(), widgetCall(2)) }, ok: true, screen: "in_call", steps: "name:tid,join:tid" },
+    {
+      name: "3.0 целиком (онбординг, интерстициал, лобби)",
+      screens: { main: JOIN_MAIN, call: lobbyThen(IN_CALL_2(), widgetCall(2)) },
+      ok: true, screen: "in_call", steps: "popup_dismiss:tid,continue:tid,name:tid,join:tid",
+    },
+    {
+      name: "3.0 целиком без меток (как будто Телемост переименовал все)",
+      screens: { main: JOIN_MAIN, call: lobbyThen(IN_CALL_2(), widgetCall(2)) }, mode: "no-testid",
+      ok: true, screen: "in_call", steps: "popup_dismiss:text,continue:text,name:label,join:text",
+    },
+    { name: "старое лобби (кнопка входа не отвечает)", screens: { main: OLD_LOBBY }, ok: false, missing: "lobby" },
+    { name: "старый звонок — ничего не нажимает", screens: { main: OLD_CALL }, ok: true, screen: "in_call", steps: "" },
+    { name: "«Такого звонка нет» — ничего не нажимает", screens: { main: GONE_30 }, ok: false, screen: "gone", steps: "" },
+    {
+      name: "переименованные метки",
+      screens: { main: RENAMED_MAIN, call: renamedLobbyThen(IN_CALL_2(), widgetCall(2)) },
+      ok: true, screen: "in_call", steps: "popup_dismiss:label,continue:text,name:label,join:text",
+    },
+    {
+      name: "новая всплывашка",
+      screens: { main: JOIN_MAIN, call: lobbyPopupThen(IN_CALL_2(), widgetCall(2)) },
+      ok: true, screen: "in_call", steps: "popup_dismiss:tid,continue:tid,popup_ack:text,name:tid,join:tid",
+    },
+    {
+      name: "поле поиска с той же меткой",
+      screens: { main: JOIN_MAIN, call: sameLabelThen(IN_CALL_2(), widgetCall(2)) },
+      ok: true, screen: "in_call", steps: "popup_dismiss:tid,continue:tid,name:tid,join:text",
+    },
+    { name: "опасные кнопки, безопасного входа нет", screens: { main: BAIT_MAIN, call: baitLobby(false) }, ok: false, steps: "name:tid", missing: "join" },
+    {
+      name: "опасные кнопки + безопасное «Присоединиться»",
+      screens: { main: BAIT_MAIN, call: baitLobby(true) }, ok: true, screen: "in_call", steps: "name:tid,join:text",
+    },
+  ];
+}
+
+async function fallbackOnCopies(browser: Browser): Promise<void> {
+  console.info("Запасной путь на всех копиях экранов (принудительно): чёрный список не нажат ни разу");
+  let dangerTotal = 0;
+  for (const c of fallbackCases()) {
+    await withScreens(browser, c.screens, async (page) => {
+      const r = await runFallbackJoin(page, { botName: BOT, reason: null, forced: c.mode || "all", budgetMs: 40_000, idleMs: 3_000 });
+      const d = await dangerIn(page);
+      dangerTotal += d.n;
+      expect(`${c.name}: опасных нажатий нет`, d.what, []);
+      expect(`${c.name}: итог`, [r.ok, ...(c.screen ? [r.screen] : [])], [c.ok, ...(c.screen ? [c.screen] : [])]);
+      if (c.steps !== undefined) expect(`${c.name}: шаги`, fallbackStepsCode(r.steps), c.steps);
+      if (c.missing) expect(`${c.name}: чего не хватило`, r.missing, c.missing);
+      if (r.ok && r.screen === "in_call" && c.steps) {
+        const nm = await nameCheck(page);
+        expect(`${c.name}: имя — в поле имени, ни в поиск, ни в чат`, [nm.name, nm.leaked], [BOT, 0]);
+      }
+    });
+  }
+  expect("на всех копиях: опасных нажатий 0", dangerTotal, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Фаза 3б: основной путь не прошёл → вошли запасным (отдельные процессы, как бот,
+// со статусом входа на диске)
+// ---------------------------------------------------------------------------
+
+type E2E = { screens: Screens; forced: boolean; reason: string | null; steps: string };
+
+function e2eCases(): Record<string, E2E> {
+  return {
+    renamed: {
+      screens: { main: RENAMED_MAIN, call: renamedLobbyThen(IN_CALL_2(), widgetCall(2)) },
+      forced: false, reason: "name_input_not_found", steps: "popup_dismiss:label,continue:text,name:label,join:text",
+    },
+    popup: {
+      screens: { main: JOIN_MAIN, call: lobbyPopupThen(IN_CALL_2(), widgetCall(2)) },
+      forced: false, reason: "name_input_not_found", steps: "popup_ack:text,name:tid,join:tid",
+    },
+    search: {
+      screens: { main: JOIN_MAIN, call: sameLabelThen(IN_CALL_2(), widgetCall(2)) },
+      forced: false, reason: "name_input_not_found", steps: "name:tid,join:text",
+    },
+    // Флаг живой проверки: сразу запасным путём, основной не трогается вовсе.
+    forced: {
+      screens: { main: JOIN_MAIN, call: lobbyThen(IN_CALL_2(), widgetCall(2)) },
+      forced: true, reason: null, steps: "popup_dismiss:tid,continue:tid,name:tid,join:tid",
+    },
+  };
+}
+
+async function fallbackChild(sc: string): Promise<void> {
+  const def = e2eCases()[sc];
+  captureBotLog();
+  const browser = await chromium.launch(launchOptions());
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await routeScreens(ctx, def.screens);
+  const page = await ctx.newPage();
+  const cfg: any = { platform: "yandex_telemost", meetingUrl: MAIN_URL, botName: BOT };
+  let joined = false;
+  let reason: string | null = null;
+  // Как стратегии index.ts: joining → admission → in_call.
+  writeJoinStatus("joining");
+  try {
+    await joinYandexTelemost(page, MAIN_URL, BOT, cfg);
+    writeJoinStatus("admission");
+    joined = await waitForYandexTelemostAdmission(page, 15_000, cfg);
+    if (joined) writeJoinStatus("in_call");
+  } catch (e: any) {
+    reason = classifyJoinError(String(e?.message || e));
+  }
+  const res = {
+    joined,
+    reason,
+    danger: (await dangerIn(page)).what,
+    ...(await nameCheck(page)),
+    primaryFailed: logHas(/^step=primary_join_failed /),
+    forcedLog: logHas(/^step=fallback_forced /),
+    primaryRan: logHas(/^step=(onboarding_closed|onboarding_not_shown|interstitial_continue_clicked|interstitial_skipped) /),
+  };
+  process.stdout.write(`FALLBACK_CHILD_RESULT ${JSON.stringify(res)}\n`);
+  await browser.close().catch(() => {});
+  process.exit(0);
+}
+
+function runFallbackChild(sc: string, dir: string, uid: string, forced: boolean): Promise<{ code: number | null; out: string }> {
+  return new Promise((resolve) => {
+    const botConfig: any = { sessionUid: uid };
+    if (forced) botConfig.telemostForceFallback = true;
+    const child = spawn(process.execPath, [__filename, "--fallback-child", sc], {
+      env: { ...process.env, BOT_CONFIG: JSON.stringify(botConfig), TELEMOST_TRANSCRIPT_DIR: dir },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    const killer = setTimeout(() => child.kill("SIGKILL"), 240_000);
+    child.stdout.on("data", (d) => (out += String(d)));
+    child.stderr.on("data", (d) => (out += String(d)));
+    child.on("exit", (code) => {
+      clearTimeout(killer);
+      resolve({ code, out });
+    });
+  });
+}
+
+async function fallbackE2E(): Promise<void> {
+  console.info("Основной путь не прошёл → бот вошёл запасным, статус это отмечает (4 процесса параллельно, до ~1,5 мин)");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "telemost-fb-"));
+  try {
+    const cases = e2eCases();
+    const runs = await Promise.all(
+      Object.keys(cases).map(async (sc) => {
+        const uid = `fbtest-${sc}-${process.pid}`;
+        return { sc, uid, r: await runFallbackChild(sc, dir, uid, cases[sc].forced) };
+      }),
+    );
+    for (const { sc, uid, r } of runs) {
+      const def = cases[sc];
+      const res = JSON.parse((r.out.match(/FALLBACK_CHILD_RESULT (.*)/) || [])[1] || "{}");
+      let status: any = {};
+      try {
+        status = JSON.parse(fs.readFileSync(path.join(dir, ".join-status", `${uid}.json`), "utf8"));
+      } catch {
+        status = {};
+      }
+      const fb = status.fallback_used || {};
+      if (def.forced) {
+        expect(`${sc}: флаг — сразу запасным путём, основной не запускался`, [res.forcedLog, res.primaryRan, res.primaryFailed], [true, false, false]);
+      } else {
+        expect(`${sc}: сначала основной путь, он сорвался`, [res.primaryRan, res.primaryFailed], [true, true]);
+      }
+      expect(`${sc}: вошёл (в звонке), ошибки нет`, [res.joined, res.reason, status.phase], [true, null, "in_call"]);
+      expect(`${sc}: статус отмечает запасной путь`, [fb.primary_reason ?? null, fb.forced ?? null, fb.steps],
+        [def.reason, def.forced ? "all" : null, def.steps]);
+      expect(`${sc}: строка владельцу своими словами`,
+        String(fb.summary || "").startsWith(def.forced ? "принудительная проверка запасного пути" : "основной путь не нашёл поле имени"), true);
+      expect(`${sc}: опасных нажатий нет`, res.danger, []);
+      expect(`${sc}: имя — в поле имени, не в поиск`, [res.name, res.leaked], [BOT, 0]);
+      if (!res.joined && process.env.VERBOSE === "1") process.stdout.write(r.out.slice(-4000));
+    }
+  } catch (e: any) {
+    expect(`запасной путь в отдельных процессах: проверка не упала (${e?.message || e})`, false, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -583,8 +1037,13 @@ async function main(): Promise<void> {
     await stopChild(process.argv[i + 1] || "joining");
     return;
   }
+  const fb = process.argv.indexOf("--fallback-child");
+  if (fb !== -1) {
+    await fallbackChild(process.argv[fb + 1] || "");
+    return;
+  }
   captureBotLog();
-  // ONLY=screens,devices,admission,join,stop — прогнать только эти части.
+  // ONLY=screens,devices,admission,join,leave,fallback,fallback-e2e,stop — прогнать только эти части.
   const only = (process.env.ONLY || "").split(",").map((x) => x.trim()).filter(Boolean);
   const on = (part: string) => only.length === 0 || only.includes(part);
   const browser = await chromium.launch(launchOptions());
@@ -593,9 +1052,12 @@ async function main(): Promise<void> {
     if (on("devices")) await devicesAndLeave(browser);
     if (on("admission")) await admissionFlow(browser);
     if (on("join")) await fullJoin(browser);
+    if (on("leave")) await leaveChecks(browser);
+    if (on("fallback")) await fallbackOnCopies(browser);
   } finally {
     await browser.close().catch(() => {});
   }
+  if (on("fallback-e2e")) await fallbackE2E();
   if (on("stop")) await stopSignal();
   process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
   process.exit(failed > 0 ? 1 : 0);
