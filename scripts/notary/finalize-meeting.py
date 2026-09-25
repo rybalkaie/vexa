@@ -329,6 +329,7 @@ def _run_assemblyai(
     existing_transcript_id: str | None = None,
     on_transcript_created=None,
     series_slug: str | None = None,
+    expected_speakers: int | None = None,
 ):
     """AssemblyAI-ветка: upload → create → poll вместо whisper+pyannote.
 
@@ -361,8 +362,16 @@ def _run_assemblyai(
     log.info("AssemblyAI keyterms: %d терминов словаря серии", len(keyterms_prompt))
 
     log.info("Step 1/3 — AssemblyAI upload + transcribe + diarize (один job)")
+    # Ф6: ПОТОЛОК голосов = ожидаемых + 1. Запас обязателен — при впритык-потолке
+    # неожиданный участник не получит своего номера, а молча сольётся с чужим
+    # именем. Ставим только когда состав серии известен и людей больше одного.
+    _max_speakers = (expected_speakers + 1) if isinstance(expected_speakers, int) and expected_speakers > 1 else None
+    if _max_speakers:
+        log.info("AssemblyAI: потолок числа голосов = %d (ожидаем %d человек + запас)",
+                 _max_speakers, expected_speakers)
     aai_result = transcribe_diarize_wav(
         wav_path,
+        max_speakers=_max_speakers,
         existing_transcript_id=existing_transcript_id,
         on_transcript_created=on_transcript_created,
         keyterms_prompt=keyterms_prompt,
@@ -1022,6 +1031,7 @@ def main() -> int:
                 existing_transcript_id=existing_transcript_id,
                 on_transcript_created=_on_transcript_created,
                 series_slug=(meta.get("series") if isinstance(meta, dict) else None),
+                expected_speakers=expected_speaker_count,
             )
         else:
             turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)

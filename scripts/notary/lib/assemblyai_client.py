@@ -275,6 +275,7 @@ def _create_transcript(
     audio_url: str,
     *,
     keyterms_prompt: list[str] | None = None,
+    max_speakers: int | None = None,
 ) -> str:
     """Шаг 2. POST /v2/transcript — создать задание с конфигом → id.
 
@@ -298,6 +299,16 @@ def _create_transcript(
         "language_code": LANGUAGE_CODE,
         "speaker_labels": True,
     }
+    # Ф6 (план 2026-09-25): ПОТОЛОК числа голосов, а не точное число. Без него
+    # потолок по умолчанию 30, и движок дробит одного человека на несколько
+    # голосов: 02.09 на разговоре вдвоём вышло ЧЕТЫРЕ голоса, лишние обрывки
+    # разобрали случайные имена. Почему не `speakers_expected`: тот задаёт ТОЧНОЕ
+    # число, документация предостерегает ставить его без уверенности, и решение
+    # владельца AA2 от 13.06 — «не форсируем». Потолок мягче: движок вправе найти
+    # меньше. Запас «+1» кладёт вызыватель: при впритык-потолке неожиданный
+    # участник МОЛЧА сольётся с чужим именем — это хуже нынешней болезни.
+    if isinstance(max_speakers, int) and max_speakers > 1:
+        body["speaker_options"] = {"max_speakers_expected": max_speakers}
     # S4: keyterms и prompt взаимоисключающи. `prompt` мы не задаём — гард на случай
     # будущей правки конфига, чтобы не отправить невалидную пару (keyterms уступает).
     if keyterms_prompt and not body.get("prompt"):
@@ -488,6 +499,7 @@ def transcribe_diarize_wav(
     existing_transcript_id: str | None = None,
     on_transcript_created=None,
     keyterms_prompt: list[str] | None = None,
+    max_speakers: int | None = None,
     sleep=time.sleep,
 ) -> TranscriptionResult:
     """Прогнать WAV через AssemblyAI и вернуть TranscriptionResult.
@@ -545,7 +557,8 @@ def transcribe_diarize_wav(
                     )
                 upload_url = _upload_audio(client, headers, p)
                 transcript_id = _create_transcript(
-                    client, headers, upload_url, keyterms_prompt=keyterms_prompt
+                    client, headers, upload_url, keyterms_prompt=keyterms_prompt,
+                    max_speakers=max_speakers,
                 )
                 logger.info("AssemblyAI transcript created: %s", transcript_id)
                 # Отдать id наверх ДО поллинга (переживает краш/рестарт).
