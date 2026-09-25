@@ -28,7 +28,9 @@
  * 🔴 ЧУЖИЕ ЛЮДИ. Сразу после входа диктор считает участников: кто-то кроме него
  * (или посчитать не удалось) → `busy` и немедленный выход, ни слова. Пока он в
  * звонке, пересчёт каждые ~3 с: разрешены только он и бот; больше → `busy`,
- * голос глушится, выход.
+ * голос глушится, выход. Незнакомое имя на плитке (не диктор и не бот) — тоже
+ * `busy`, в ожидании — после двух пересчётов подряд: по одному числу человека,
+ * вошедшего раньше бота, от бота не отличить (`idleVerdict`).
  *
  * 🔴 МОЛЧАНИЕ ПО УМОЛЧАНИЮ. Голос идёт через PulseAudio (tts_sink → virtual_mic),
  * оба заглушены с запуска (speaker.sh). Интерфейсный микрофон Телемоста 3.0
@@ -64,6 +66,9 @@ const PHRASE_FILE_RE = /^[a-z0-9-]+\.wav$/;
 const ALLOWED_OTHERS = 1;
 // Сколько пересчётов подряд «не смог посчитать» терпим, прежде чем уйти.
 const MAX_UNKNOWN_STREAK = 3;
+// Незнакомое имя на плитке в ожидании — сколько пересчётов подряд, прежде чем
+// уйти. Два, а не один: мигнувшая плитка входящего бота не выгоняет диктора.
+const FOREIGN_NAME_STREAK = 2;
 
 // ---------------------------------------------------------------------------
 // Мелочи
@@ -431,6 +436,34 @@ function strangerWhileSpeaking(cfg, c) {
   return null;
 }
 
+/**
+ * Пересчёт в ожидании команды (до голоса и после): → {busy, unknownStreak, foreignStreak}.
+ * busy — причина уйти или null. Чистая функция: её проверяет tests/test_canary_iss60.py.
+ *
+ * По одному числу постороннего, вошедшего раньше бота, не отличить от бота
+ * (ALLOWED_OTHERS = 1) — самопроверка запустила бы бота в комнату с человеком.
+ * По имени на плитке — можно: «ни диктор, ни бот» два пересчёта подряд → уходим
+ * (цикл5 фазы 2, Н5). Выключается тем же `strictNames: false`.
+ */
+function idleVerdict(cfg, c, streaks) {
+  let unknownStreak = (streaks && streaks.unknownStreak) || 0;
+  let foreignStreak = (streaks && streaks.foreignStreak) || 0;
+  if (c.count === null) {
+    unknownStreak += 1;
+    if (unknownStreak >= MAX_UNKNOWN_STREAK) return { busy: 'count_unknown', unknownStreak, foreignStreak };
+  } else {
+    unknownStreak = 0;
+    if (othersOf(c) > ALLOWED_OTHERS) return { busy: 'strangers', unknownStreak, foreignStreak };
+  }
+  if (cfg.strictNames && c.diag && Number(c.diag.foreign_names) > 0) {
+    foreignStreak += 1;
+    if (foreignStreak >= FOREIGN_NAME_STREAK) return { busy: 'foreign_name', unknownStreak, foreignStreak };
+  } else {
+    foreignStreak = 0;
+  }
+  return { busy: null, unknownStreak, foreignStreak };
+}
+
 async function speak(cfg, phrasePath, ourNames) {
   // Перед голосом — ещё раз: в комнате только мы с ботом.
   const before = await countParticipants(page, ourNames);
@@ -558,7 +591,7 @@ async function main() {
   writeState('alone', { others: 0, count_method: first.method, count_diag: first.diag });
 
   let lastSeq = 0;
-  let unknownStreak = 0;
+  let streaks = { unknownStreak: 0, foreignStreak: 0 };
   let nextCheck = Date.now() + cfg.checkEverySec * 1000;
   for (;;) {
     if (page.isClosed() || !browser.isConnected()) {
@@ -586,28 +619,28 @@ async function main() {
     if (Date.now() >= nextCheck) {
       nextCheck = Date.now() + cfg.checkEverySec * 1000;
       const c = await countParticipants(page, ourNames);
-      if (c.count === null) {
-        unknownStreak += 1;
-        if (unknownStreak >= MAX_UNKNOWN_STREAK) return leaveBusy('count_unknown', c);
-      } else {
-        unknownStreak = 0;
-        if (othersOf(c) > ALLOWED_OTHERS) return leaveBusy('strangers', c);
-      }
+      streaks = idleVerdict(cfg, c, streaks);
+      if (streaks.busy) return leaveBusy(streaks.busy, c);
     }
     await sleep(1000);
   }
 }
 
-main().catch(async (e) => {
-  say('unexpected_error', { error: shortErr(e) });
-  if (!isTerminal()) {
-    let kit = null;
-    try {
-      const crashkit = require(path.join(TELEMOST, 'crashkit.js'));
-      kit = await crashkit.captureCrashKit(page, 'speaker_error');
-    } catch { /* */ }
-    writeState('failed', { reason: 'speaker_error', crash_kit: kit });
-  }
-  await shutdown(1);
-});
+if (require.main === module) {
+  main().catch(async (e) => {
+    say('unexpected_error', { error: shortErr(e) });
+    if (!isTerminal()) {
+      let kit = null;
+      try {
+        const crashkit = require(path.join(TELEMOST, 'crashkit.js'));
+        kit = await crashkit.captureCrashKit(page, 'speaker_error');
+      } catch { /* */ }
+      writeState('failed', { reason: 'speaker_error', crash_kit: kit });
+    }
+    await shutdown(1);
+  });
+} else {
+  // Подключён как модуль (тест) — только чистые решения, без браузера и звука.
+  module.exports = { idleVerdict, strangerWhileSpeaking, ALLOWED_OTHERS, MAX_UNKNOWN_STREAK, FOREIGN_NAME_STREAK };
+}
 

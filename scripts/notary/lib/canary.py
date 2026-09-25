@@ -27,9 +27,21 @@
      сообщение владельцу — только если красный оба раза.
 
 ЧТО ЕЩЁ. `sniff` раз в час смотрит версию Телемоста на главной странице;
-сменилась → внеплановая самопроверка. `warn_tick` (из тика запускателя): пока
-самопроверка красная — за ~10 минут до каждой встречи предупредить владельца,
-чтобы он включил запись в Телемосте сам.
+сменилась → внеплановая самопроверка, её итог владелец получает и тогда, когда
+всё хорошо. `warn_tick` (из тика запускателя): пока самопроверка красная — за
+~10 минут до каждой встречи предупредить владельца, чтобы он включил запись в
+Телемосте сам; и раз в сутки тихо сказать, если самопроверка больше суток не
+доходила до итога (умерла молча / не сработал таймер).
+
+БОЕВОЙ ОБРАЗ И КАНДИДАТЫ. «Бот здоров/сломан» (health.json) и сообщения — только
+по прогону на боевом образе (`is_production_image`). Прогон на тестовом образе
+(`--image vexa-bot:resil-…`) пишет итог в runs/ и журнал, но боевое состояние не
+меняет: иначе зелёный кандидат погасил бы предупреждения при сломанном бое.
+
+🔴 УБОРКА ПРИ ОБРЫВЕ. CLI ставит обработчик SIGTERM/SIGHUP (systemd по сроку
+юнита, оборванный ssh): `finally` в `run_once` успевает вывести бота и диктора из
+комнаты и убрать контейнеры. Юниты — `KillMode=mixed`: сигнал получает только
+питон, docker-команды его уборки не рвутся.
 
 🔴 ЗАПИСИ ПРОГОНОВ НЕ УДАЛЯЮТСЯ — это синтетический голос, мало места, и они
 нужны для разбора. ЕДИНСТВЕННОЕ ИСКЛЮЧЕНИЕ — `room_busy`: в комнате оказался
@@ -158,9 +170,20 @@ SOUND_MAX_DB = -35.0
 SOUND_MEAN_DB = -65.0
 
 # Сообщения.
-ALERT_DEDUPE_HOURS = 24
+#: Дедуп 🔴 по причине. Меньше суток намеренно: ежедневный прогон заканчивается
+#: то на минуту раньше, то позже, и окно ровно в 24 ч глушило бы завтрашнее
+#: напоминание через раз (цикл5 фазы 2, Н3).
+ALERT_DEDUPE_HOURS = 20
 SKIP_ALERT_AFTER = 3
+#: После первого сообщения о пропусках — напоминание каждые N пропусков подряд:
+#: сломанный счётчик участников даёт «занято» каждый день, и одно тихое сообщение
+#: на третий день не должно навсегда выключить самопроверку (цикл5 фазы 2, У2).
+SKIP_REMIND_EVERY = 7
 NIGHT_FROM_H, NIGHT_TO_H = 22, 8   # МСК: ночью — беззвучно
+#: Самопроверка не доходила до итога дольше этого → тихая строка владельцу из тика
+#: запускателя (раз в сутки): процесс мог умирать до записи состояния, таймер —
+#: не срабатывать (цикл5 фазы 2, У1). 30 ч = сутки + запас на сдвиг прогона.
+STALE_AFTER_HOURS = 30
 
 # «Нюх».
 TELEMOST_HOME = "https://telemost.yandex.ru/"
@@ -234,6 +257,18 @@ ROOM_BUSY_DETAIL = {
 def is_local_docker() -> bool:
     """Самопроверка живёт там же, где боты (сервер, docker локально)."""
     return os.environ.get("MEETING_NOTARY_LOCAL_DOCKER") == "1"
+
+
+def is_production_image(image: str) -> bool:
+    """Образ, на котором ходят настоящие боты (`runner.BOT_IMAGE`)?
+
+    Только его прогон меняет «бот здоров/сломан» (health.json) и пишет владельцу.
+    Прогон кандидата правки на тестовом образе (решение 3 плана: «проверенная
+    правка → да владельца») пишет итог в runs/ и журнал, но боевое состояние не
+    трогает: зелёный кандидат не должен гасить предупреждения, пока боевой образ
+    сломан, а красный — пугать владельца перед каждой встречей (цикл5 фазы 2, Н2).
+    """
+    return image == DEFAULT_IMAGE
 
 
 def state_dir() -> Path:
@@ -961,6 +996,14 @@ def run_once(
             started.append(speaker)
             _speaker_to_bot(deps, plan, res, flow, speaker_view, red, started)
     finally:
+        # Контейнер мог подняться, даже когда `docker run` вернул ошибку или
+        # таймаут (или сигнал оборвал его на полпути): тогда его нет в `started`,
+        # и без этой сверки бот вошёл бы в Т-10 без присмотра (цикл5 фазы 2, Н1б).
+        # Смотрим оба имени прогона; «нет такого» — единственное, что пропускаем.
+        for name in (speaker, bot):
+            if name not in started and (_safe(deps.container_state, name) or ("unknown",))[0] != "missing":
+                logger.warning("[canary] %s поднялся мимо учёта — вывожу и убираю", name)
+                started.append(name)
         busy = flow["busy"]
         if busy is not None:
             # Посторонние: бот уходит сразу, контейнеры — стоп, записи — удалить.
@@ -1126,7 +1169,11 @@ def _speaker_to_bot(deps, plan, res, flow, speaker_view, red, started) -> None: 
     _write_cmd(run_dir, "leave", 2)
     if got is False:
         flow["notes"].append("leave_not_received")
-        _safe(deps.stop, bot)  # SIGTERM — бот уходит штатно и дописывает запись
+        # Команду никто не слушает — остаётся `docker stop`. Это НЕ штатный выход:
+        # в образе бота PID 1 — bash без exec/trap (entrypoint.sh), SIGTERM до node
+        # не доходит, через 20 с docker добивает SIGKILL и запись может остаться
+        # недописанной (тогда честный красный «нет записи»). Штатный путь — `leave`.
+        _safe(deps.stop, bot)
 
     def gone(name: str) -> Callable[[], Optional[bool]]:
         return lambda: True if deps.container_state(name)[0] in _GONE else None
@@ -1223,6 +1270,18 @@ def _mini(result: Dict[str, Any]) -> Dict[str, Any]:
     return {k: result.get(k) for k in ("run_id", "status", "skip_reason", "reasons") if result.get(k) is not None}
 
 
+def _times(n: int) -> str:
+    """«3 раза», «10 раз», «24 раза»."""
+    return "раза" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "раз"
+
+
+def _skip_note_due(n: int) -> bool:
+    """Сообщить о пропусках: на 3-м подряд и дальше каждые SKIP_REMIND_EVERY."""
+    if n == SKIP_ALERT_AFTER:
+        return True
+    return n > SKIP_ALERT_AFTER and (n - SKIP_ALERT_AFTER) % SKIP_REMIND_EVERY == 0
+
+
 def apply_final(
     health: Dict[str, Any],
     final: Dict[str, Any],
@@ -1251,9 +1310,10 @@ def apply_final(
             h["pending_recheck"] = True
             h["last_unconfirmed_red"] = {"at": iso(now), **_mini(first or final)}
         h["consecutive_skips"] = int(h.get("consecutive_skips") or 0) + 1
-        if h["consecutive_skips"] == SKIP_ALERT_AFTER:
+        n = h["consecutive_skips"]
+        if _skip_note_due(n):
             msgs.append((
-                f"ℹ️ Самопроверка бота в {room} не доходит до конца уже {SKIP_ALERT_AFTER} раза подряд: "
+                f"ℹ️ Самопроверка бота в {room} не доходит до конца уже {n} {_times(n)} подряд: "
                 f"{human_reasons(final)}. Бот при этом не проверен — если так пойдёт и дальше, "
                 f"поломку Телемоста узнаем только на встрече.",
                 True,
@@ -1299,6 +1359,18 @@ def apply_final(
         msgs.append((
             f"🟡 Самопроверка бота в {room} прошла с замечанием: {human_reasons(final)}. "
             f"Не срочно: бот заходит и пишет.",
+            True,
+        ))
+    # «Нюх» уже написал «Телемост обновился… запускаю внеплановую самопроверку» —
+    # обещанный итог обязан прийти и тогда, когда всё хорошо (цикл5 фазы 2, У3).
+    # Если выше уже ушло 🟢/🟡 — оно и есть итог, второе не шлём.
+    why = str(final.get("reason") or "")
+    if why.startswith("version-change") and status in (GREEN, YELLOW) and not msgs:
+        ver = final.get("telemost_version")
+        remark = f" Замечание: {human_reasons(final)}." if status == YELLOW else ""
+        msgs.append((
+            f"✅ Самопроверка после обновления Телемоста{f' до {ver}' if ver else ''} прошла: "
+            f"бот заходит и пишет.{remark}",
             True,
         ))
     return h, msgs
@@ -1390,16 +1462,24 @@ def _preflight(deps: Deps, room: str) -> Tuple[Optional[str], Optional[str]]:
 def _run_cycle_locked(*, deps, image, room, reason, force, kit) -> Dict[str, Any]:  # noqa: ANN001
     start = deps.now()
     health = load_health()
+    production = is_production_image(image)
 
     def finish(final: Dict[str, Any], first: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        new_h, msgs = apply_final(health, final, deps.now(), first=first)
-        try:
-            save_health(new_h)
-        except OSError as e:
-            logger.warning("[canary] health.json не сохранён (%s)", type(e).__name__)
-        _notify_all(deps, msgs)
+        if production:
+            new_h, msgs = apply_final(health, final, deps.now(), first=first)
+            try:
+                save_health(new_h)
+            except OSError as e:
+                logger.warning("[canary] health.json не сохранён (%s)", type(e).__name__)
+            _notify_all(deps, msgs)
+        else:
+            # Кандидат правки: итог — в runs/, журнал и вывод команды; боевое
+            # состояние и сообщения не трогаем (см. is_production_image).
+            logger.info("[canary] тестовый образ %s: итог %s — состояние боевого бота не меняю",
+                        image, final.get("status"))
         append_journal({
-            "at": iso(deps.now()), "reason": reason, "final": _mini(final),
+            "at": iso(deps.now()), "reason": reason, "image": image, "production": production,
+            "final": _mini(final),
             "first": _mini(first) if first and first is not final else None,
             "note": "разовый сбой" if first and first.get("status") == RED and final.get("status") in (GREEN, YELLOW)
             else None,
@@ -1562,9 +1642,11 @@ def sniff(
         if result.get("skip_reason") == "room_busy":
             st["retry_after"] = iso(now + timedelta(minutes=BUSY_RETRY_BACKOFF_MIN))
         # остальные защиты (идёт бот, скоро встреча, замок) — просто попробуем через час
-    else:
+    elif is_production_image(image):
         st["pending_check"] = False
         st.pop("retry_after", None)
+    # Ручной `sniff --image <кандидат>` проверку после обновления не «съедает»:
+    # её должен пройти боевой образ (цикл5 фазы 2, ход 4 к Н2).
     write_json(version_path(), st)
     return out
 
@@ -1631,37 +1713,70 @@ def warning_text(health: Dict[str, Any], item: Dict[str, Any], start: datetime) 
     return text
 
 
+def stale_note(health: Optional[Dict[str, Any]], now: datetime) -> Optional[str]:
+    """Самопроверка давно не доходила до итога → текст тихой строки владельцу, иначе None.
+
+    `last_run_at` обновляет каждый законченный цикл, включая пропуски и сбои
+    проверки. Если он старше STALE_AFTER_HOURS — цикл умирал до записи состояния
+    (исключение, права на файлы после ручного запуска от root, битая выкатка) или
+    таймер не срабатывал. Нет health.json (самопроверку ещё не ставили) — молчим.
+    """
+    last = parse_ts((health or {}).get("last_run_at"))
+    if last is None or now - last < timedelta(hours=STALE_AFTER_HOURS):
+        return None
+    return (
+        f"⚙️ Самопроверка бота не доходила до итога с {msk_day_hm(last)} — больше суток. "
+        f"Поломку Телемоста теперь узнаем только на встрече. На сервере: "
+        f"systemctl status meeting-notary-canary.service; journalctl -u meeting-notary-canary -n 50"
+    )
+
+
+def _stale_key(now: datetime) -> str:
+    return "stale@" + now.astimezone(_MSK).strftime("%Y%m%d")
+
+
 def warn_tick(
     queue: Sequence[Any],
     now: datetime,
     *,
     notify: Optional[Callable[[str], Any]] = None,
+    notify_quiet: Optional[Callable[[str], Any]] = None,
 ) -> int:
-    """Из тика запускателя. Возвращает число отправленных предупреждений.
+    """Из тика запускателя. Возвращает число отправленных предупреждений о встречах.
 
     Сначала запись «предупреждён», потом отправка: не сохранилось — не шлём
     (иначе при сломанной записи владелец получал бы одно и то же каждую минуту).
+    Заодно, раз в сутки и беззвучно: самопроверка давно не доходила до итога
+    (`stale_note`) — чтобы она не могла умереть молча (цикл5 фазы 2, У1).
     """
     health = load_health()
-    if not is_red(health):
-        return 0  # дёшево: без красного даже warned.json не читаем
+    note = stale_note(health, now)
+    if not is_red(health) and note is None:
+        return 0  # дёшево: без красного и без «давно не было» даже warned.json не читаем
     warned_raw = _dict(read_json(warned_path()))
     warned = {k: v for k, v in warned_raw.items()
               if (parse_ts(v) or now) > now - timedelta(hours=WARN_TTL_HOURS)}
     due = due_warnings(queue, health, warned, now)
-    if not due and len(warned) == len(warned_raw):
+    stale_key = _stale_key(now) if note else None
+    send_stale = stale_key is not None and stale_key not in warned
+    if not due and not send_stale and len(warned) == len(warned_raw):
         return 0
     for key, _item, _start in due:
         warned[key] = iso(now)
+    if send_stale:
+        warned[stale_key] = iso(now)
     try:
         write_json(warned_path(), warned)
     except OSError as e:
         logger.warning("[canary] warned.json не сохранён (%s) — предупреждения не отправлены", type(e).__name__)
         return 0
-    if notify is None:
+    if notify is None or (send_stale and notify_quiet is None):
         from notary.lib.notify import push  # noqa: PLC0415
 
-        notify = lambda text: push(text, dedupe=False)  # noqa: E731
+        if notify is None:
+            notify = lambda text: push(text, dedupe=False)  # noqa: E731
+        if notify_quiet is None:
+            notify_quiet = lambda text: push(text, dedupe=False, silent=True)  # noqa: E731
     sent = 0
     for _key, item, start in due:
         try:
@@ -1671,6 +1786,12 @@ def warn_tick(
             logger.warning("[canary] предупреждение не ушло (%s)", type(e).__name__)
     if sent:
         logger.info("[canary] предупредил владельца о %d встреч(е/ах): самопроверка красная", sent)
+    if send_stale and note:
+        try:
+            notify_quiet(note)
+            logger.warning("[canary] самопроверка давно не доходила до итога — владельцу сказано")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[canary] строка «самопроверка давно не шла» не ушла (%s)", type(e).__name__)
     return sent
 
 

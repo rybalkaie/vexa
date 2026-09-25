@@ -109,6 +109,8 @@ class World:
         cfg = self.cfg()
         if not cfg[f"{kind}_start_ok"]:
             return False, f"docker: cannot start {FAKE_URL}"
+        # `docker run` не дождался ответа (таймаут CLI), а контейнер всё равно поднялся.
+        timed_out = bool(cfg.get(f"{kind}_start_timeout_but_running"))
         env = {a.split("=", 1)[0]: a.split("=", 1)[1] for a in cmd if "=" in a and a.split("=", 1)[0].isupper()}
         c = {"kind": kind, "status": "running", "code": None, "started": self.t, "run_dir": run_dir,
              "cfg": cfg, "leave": False}
@@ -122,6 +124,8 @@ class World:
             c["uid"] = bc["sessionUid"]
         self.containers[name] = c
         self.step()
+        if timed_out:
+            return False, "docker run timeout"
         return True, ""
 
     def container_state(self, name):
@@ -304,7 +308,9 @@ class _Env(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def cycle(self, world, **kw):
-        return lib.run_cycle(deps=world.deps(), image="vexa-bot:resil-test", room="t10",
+        # По умолчанию — боевой образ: только его прогон меняет «бот здоров/сломан»
+        # и пишет владельцу (is_production_image). Кандидаты — `image=...` явно.
+        return lib.run_cycle(deps=world.deps(), image=kw.pop("image", lib.DEFAULT_IMAGE), room="t10",
                              reason=kw.pop("reason", "daily"), **kw)
 
 
@@ -759,6 +765,97 @@ class CycleTest(_Env):
         self.assertEqual(res["reasons"], ["room_url_invalid"])
         self.assertEqual(w.docker_cmds, [])
 
+    # --- цикл5 фазы 2: боевой образ и кандидаты (Н2)
+
+    def test_candidate_image_never_touches_production_state(self):
+        bad = {"bot_result": "failed", "bot_reason": "name_input_not_found"}
+        w = World(runs=[bad, bad])
+        res = self.cycle(w, image="vexa-bot:resil-candidate", reason="manual")
+        self.assertEqual(res["status"], lib.RED)
+        self.assertEqual(w.pushes, [])                  # владельца не пугаем
+        self.assertFalse(lib.health_path().exists())    # боевое состояние не тронуто
+        self.assertEqual(len(self.run_files()), 2)      # итог прогонов — на месте
+        journal = [json.loads(x) for x in
+                   (self.tmp / "state" / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual((journal[-1]["image"], journal[-1]["production"]), ("vexa-bot:resil-candidate", False))
+
+    def test_green_candidate_does_not_mask_red_production(self):
+        bad = {"bot_result": "failed"}
+        self.cycle(World(runs=[bad, bad]))              # боевой образ сломан → красный
+        self.assertEqual(lib.load_health()["status"], lib.RED)
+        w = World(base=NIGHT + timedelta(hours=2), runs=[{"participants": ["Тест-диктор"]}])
+        res = self.cycle(w, image="vexa-bot:resil-fix", reason="manual")
+        self.assertEqual(res["status"], lib.GREEN)
+        self.assertEqual(lib.load_health()["status"], lib.RED)  # предупреждения перед встречами идут дальше
+        self.assertEqual(w.pushes, [])
+
+    # --- цикл5 фазы 2: бот не остаётся в комнате без присмотра (Н1, Н1б)
+
+    def test_bot_up_despite_docker_run_timeout_is_led_out(self):
+        w = World(runs=[{"bot_start_timeout_but_running": True}, {"bot_start_timeout_but_running": True}])
+        res = self.cycle(w)
+        self.assertEqual(res["reasons"], ["bot_start_failed"])
+        bots = [c[c.index("--name") + 1] for c in w.docker_cmds if "-bot-" in c[c.index("--name") + 1]]
+        self.assertEqual(len(bots), 2)
+        for name in bots:
+            self.assertIn(name, w.removed)
+        self.assertEqual(w.containers, {})              # в комнате никого не осталось
+
+    def test_signal_mid_run_leads_everyone_out_and_releases_lock(self):
+        w = World()
+        orig_sleep = w.sleep
+
+        def sleep(s):  # SIGTERM от systemd приходит, когда бот уже в звонке
+            orig_sleep(s)
+            if any(c["kind"] == "bot" and c["status"] == "running" and w.t - c["started"] > 40
+                   for c in w.containers.values()):
+                raise SystemExit(143)
+
+        w.sleep = sleep
+        with self.assertRaises(SystemExit):
+            self.cycle(w)
+        names = [c[c.index("--name") + 1] for c in w.docker_cmds]
+        self.assertEqual(len(names), 2)
+        for n in names:
+            self.assertIn(n, w.removed)
+        self.assertEqual(w.containers, {})
+        self.assertEqual(len(w.published), 1)           # бот попрошен уйти штатно
+        fd = lib.try_lock()                             # замок отпущен
+        self.assertIsNotNone(fd)
+        lib.unlock(fd)
+
+    # --- цикл5 фазы 2: самопроверка не выключается молча (У2) и отвечает на «запускаю» (У3)
+
+    def test_skip_note_repeats_every_week_of_skips(self):
+        pushes = []
+        for i in range(11):
+            w = World(base=NIGHT + timedelta(days=i), runs=[{"speaker_result": "busy"}])
+            self.cycle(w)
+            pushes += w.pushes
+        self.assertEqual(len(pushes), 2, pushes)
+        self.assertIn("уже 3 раза подряд", pushes[0][0])
+        self.assertIn("уже 10 раз подряд", pushes[1][0])
+        self.assertTrue(all(silent for _t, silent in pushes))
+
+    def test_version_change_run_reports_result_when_ok(self):
+        lib.save_health({"status": lib.YELLOW, "since": iso_(NIGHT - timedelta(days=1)),
+                         "reasons": ["names_missing"]})
+        lib.write_json(lib.version_path(), {"version": "212.2.0"})
+        w = World(base=DAY)
+        res = self.cycle(w, reason="version-change", force=True)
+        self.assertEqual(res["status"], lib.YELLOW)
+        self.assertEqual(len(w.pushes), 1, w.pushes)
+        text, silent = w.pushes[0]
+        self.assertTrue(text.startswith("✅ Самопроверка после обновления Телемоста до 212.2.0 прошла"), text)
+        self.assertIn("Замечание", text)
+        self.assertTrue(silent)
+
+    def test_version_change_first_yellow_not_doubled(self):
+        w = World(base=DAY)
+        self.cycle(w, reason="version-change", force=True)
+        self.assertEqual(len(w.pushes), 1)
+        self.assertTrue(w.pushes[0][0].startswith("🟡"))
+
     # --- ссылка комнаты никуда не утекает
 
     def test_room_url_never_leaks(self):
@@ -825,6 +922,35 @@ class CliTest(_Env):
             with self.assertRaises(ValueError):
                 cli.remove("vexa-redis-1")
 
+    def test_sigterm_and_sighup_become_system_exit(self):
+        """systemd по сроку юнита и оборванный ssh → SystemExit, finally успевает убрать (Н1)."""
+        import signal
+
+        import notary.canary as cli
+
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+        try:
+            cli.install_signal_handlers()
+            for s in (signal.SIGTERM, signal.SIGHUP):
+                handler = signal.getsignal(s)
+                self.assertTrue(callable(handler))
+                with self.assertRaises(SystemExit) as cm:
+                    handler(s, None)
+                self.assertEqual(cm.exception.code, 128 + s)
+                # повторный такой же сигнал не рвёт уборку
+                self.assertEqual(signal.getsignal(s), signal.SIG_IGN)
+        finally:
+            for s, h in saved.items():
+                signal.signal(s, h)
+
+    def test_units_signal_only_python(self):
+        """KillMode=mixed: SIGTERM — питону (он уводит бота из комнаты), docker-команды не рвутся."""
+        deploy = _HERE.parent / "deploy"
+        for unit in ("meeting-notary-canary.service", "meeting-notary-telemost-sniff.service"):
+            text = (deploy / unit).read_text(encoding="utf-8")
+            self.assertIn("\nKillMode=mixed\n", text, unit)
+            self.assertIn("\nTimeoutStopSec=", text, unit)
+
 
 # ---------------------------------------------------------------------------
 # Переходы состояния (чисто)
@@ -854,6 +980,18 @@ class ApplyFinalTest(unittest.TestCase):
         self.assertTrue(lib.is_night(datetime(2026, 9, 26, 19, 0, tzinfo=timezone.utc)))   # 22:00 МСК
         self.assertTrue(lib.is_night(datetime(2026, 9, 26, 4, 59, tzinfo=timezone.utc)))   # 07:59 МСК
         self.assertFalse(lib.is_night(datetime(2026, 9, 26, 5, 0, tzinfo=timezone.utc)))    # 08:00 МСК
+
+    def test_daily_red_reminder_survives_run_time_jitter(self):
+        """Завтрашний прогон кончился на 20 с раньше — напоминание о красном всё равно уходит (Н3)."""
+        h, msgs = lib.apply_final({}, self.final(lib.RED, ["silence"]), NIGHT + timedelta(minutes=12, seconds=10))
+        self.assertEqual(len(msgs), 1)
+        _h2, msgs2 = lib.apply_final(h, self.final(lib.RED, ["silence"]),
+                                     NIGHT + timedelta(days=1, minutes=11, seconds=50))
+        self.assertEqual(len(msgs2), 1)
+
+    def test_plural(self):
+        self.assertEqual([lib._times(n) for n in (3, 10, 17, 22, 24, 12, 31)],
+                         ["раза", "раз", "раз", "раза", "раза", "раз", "раз"])
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +1079,19 @@ class SniffTest(_Env):
         run3, calls3 = self.fake_run([])
         lib.sniff(deps=d3, run=run3)
         self.assertEqual(len(calls3), 1)
+
+    def test_candidate_sniff_does_not_consume_version_check(self):
+        lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
+        _w, d = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=1))
+        run, calls = self.fake_run([{"status": lib.GREEN, "run_id": "r"}])
+        lib.sniff(deps=d, image="vexa-bot:resil-candidate", run=run)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(lib.load_version_state()["pending_check"])   # боевой образ ещё должен пройти
+        _w, d2 = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=2))
+        run2, calls2 = self.fake_run([{"status": lib.GREEN, "run_id": "r2"}])
+        lib.sniff(deps=d2, run=run2)
+        self.assertEqual(calls2[0]["image"], lib.DEFAULT_IMAGE)
+        self.assertFalse(lib.load_version_state()["pending_check"])
 
     def test_pending_recheck_from_health_runs(self):
         lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
@@ -1034,6 +1185,36 @@ class WarnTest(_Env):
             self.assertFalse(lib.warn_enabled())
         self.assertTrue(lib.warn_enabled())
 
+    # --- цикл5 фазы 2: самопроверка не умирает молча (У1)
+
+    def test_stale_canary_quiet_note_once_a_day(self):
+        lib.save_health({"status": lib.GREEN, "last_run_at": iso_(self.NOW - timedelta(hours=31))})
+        loud, quiet = [], []
+        self.assertEqual(lib.warn_tick([self.item(10)], self.NOW, notify=loud.append, notify_quiet=quiet.append), 0)
+        self.assertEqual(loud, [])                       # зелёный — о встречах не предупреждаем
+        self.assertEqual(len(quiet), 1)
+        self.assertIn("не доходила до итога с 25.09 02:50 МСК", quiet[0])
+        self.assertIn("meeting-notary-canary", quiet[0])
+        lib.warn_tick([], self.NOW + timedelta(hours=3), notify=loud.append, notify_quiet=quiet.append)
+        self.assertEqual(len(quiet), 1)                  # в тот же день — один раз
+        lib.warn_tick([], self.NOW + timedelta(days=1), notify=loud.append, notify_quiet=quiet.append)
+        self.assertEqual(len(quiet), 2)                  # назавтра — снова
+
+    def test_fresh_or_absent_health_no_stale_note(self):
+        quiet = []
+        lib.warn_tick([], self.NOW, notify=lambda t: None, notify_quiet=quiet.append)   # health.json нет
+        lib.save_health({"status": lib.GREEN, "last_run_at": iso_(self.NOW - timedelta(hours=20))})
+        lib.warn_tick([], self.NOW, notify=lambda t: None, notify_quiet=quiet.append)
+        self.assertEqual(quiet, [])
+        self.assertFalse(lib.warned_path().exists())     # без повода warned.json не пишем
+
+    def test_stale_and_red_both_go(self):
+        lib.save_health({"status": lib.RED, "since": "2026-09-24T01:40:00+00:00", "reasons": ["silence"],
+                         "last_run_at": iso_(self.NOW - timedelta(hours=40))})
+        loud, quiet = [], []
+        self.assertEqual(lib.warn_tick([self.item(10)], self.NOW, notify=loud.append, notify_quiet=quiet.append), 1)
+        self.assertEqual((len(loud), len(quiet)), (1, 1))
+
 
 class RunnerWarnWiringTest(_Env):
     def setUp(self):
@@ -1125,6 +1306,44 @@ class RunnerWarnWiringTest(_Env):
             self.runner.main(now=self_now + timedelta(minutes=1))
         self.assertEqual(push.call_count, 1)
         self.assertIn("бот может не зайти", push.call_args[0][0])
+
+
+@unittest.skipUnless(shutil.which("node"), "нет node — решения диктора не проверить")
+class SpeakerIdleVerdictTest(unittest.TestCase):
+    """canary-kit/speaker.js::idleVerdict — пересчёт участников в ожидании (цикл5 фазы 2, Н5)."""
+
+    def verdicts(self, samples, strict=True):
+        import subprocess
+
+        script = (
+            "const s = require('./speaker.js');"
+            "const cfg = {strictNames: %s}; let st = {}; const out = [];"
+            "for (const [count, foreign] of %s) {"
+            "  st = s.idleVerdict(cfg, {count, method: 'x', diag: {button: count, tiles: count, foreign_names: foreign}}, st);"
+            "  out.push(st.busy);"
+            "}"
+            "console.log(JSON.stringify(out));"
+        ) % ("true" if strict else "false", json.dumps(samples))
+        proc = subprocess.run(["node", "-e", script], cwd=str(KIT), capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_stranger_by_name_before_bot_leaves_after_two_checks(self):
+        # число 2 (диктор + «кто-то»): по числу это мог быть бот, по имени — нет
+        self.assertEqual(self.verdicts([[2, 1], [2, 1]]), [None, "foreign_name"])
+
+    def test_flickering_tile_does_not_evict(self):
+        self.assertEqual(self.verdicts([[2, 1], [2, 0], [2, 1], [2, 0]]), [None, None, None, None])
+
+    def test_bot_alone_with_speaker_is_fine(self):
+        self.assertEqual(self.verdicts([[2, 0], [2, 0], [1, 0]]), [None, None, None])
+
+    def test_count_rules_kept(self):
+        self.assertEqual(self.verdicts([[3, 0]]), ["strangers"])
+        self.assertEqual(self.verdicts([[None, None], [None, None], [None, None]]), [None, None, "count_unknown"])
+
+    def test_strict_names_switch(self):
+        self.assertEqual(self.verdicts([[2, 1], [2, 1], [2, 1]], strict=False), [None, None, None])
 
 
 def iso_(dt):

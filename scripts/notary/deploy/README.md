@@ -191,31 +191,48 @@ git-репозитория бота, рядом положена копия `.de
 sudo -u dev mkdir -p /srv/meeting-notary/state/canary /home/dev/meeting-notary/_tmp/canary /home/dev/meeting-notary/logs
 # комната самопроверки должна быть в реестре: rooms.yaml → rooms: [{name: t10, url: …}]
 grep -n "name: t10" /srv/meeting-notary/registry/rooms.yaml
-# проверка вручную до таймеров (на тестовом образе — --image vexa-bot:resil-…)
-cd /srv/meeting-notary/vexa && sudo -u dev env $(grep -v '^#' /srv/meeting-notary/.env.notary | xargs) \
-  PYTHONPATH=scripts MEETING_NOTARY_LOCAL_DOCKER=1 \
-  /home/dev/meeting-notary/venv/bin/python -m notary.canary run --reason manual
+cd /srv/meeting-notary/vexa
 sudo cp scripts/notary/deploy/meeting-notary-canary.{service,timer} \
         scripts/notary/deploy/meeting-notary-telemost-sniff.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
+# проверка вручную до таймеров — ровно тем окружением, что у таймера (боевой образ):
+sudo systemctl start meeting-notary-canary.service; journalctl -u meeting-notary-canary -n 30 --no-pager
 sudo systemctl enable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer
 systemctl list-timers 'meeting-notary-*'
+
+# кандидат правки на ТЕСТОВОМ образе — только вывод команды и runs/, боевое
+# состояние (health.json) и сообщения владельцу он не трогает:
+sudo -u dev bash -c 'set -a; . /srv/meeting-notary/.env.notary; set +a; cd /srv/meeting-notary/vexa; \
+  PYTHONPATH=scripts MEETING_NOTARY_LOCAL_DOCKER=1 \
+  /home/dev/meeting-notary/venv/bin/python -m notary.canary run --reason manual --image vexa-bot:resil-…'
 ```
+
+🔴 Не передавай `.env.notary` аргументами sudo (`sudo -u dev env $(grep … | xargs) …`):
+sudo пишет команду вместе с аргументами в журнал авторизации сервера — все токены
+окажутся в `journalctl`/`auth.log`. Окружение подгружает сам шелл внутри `bash -c`
+(в журнал уходит только текст команды) или systemd (`systemctl start …service`).
 
 ⚠️ Выкатка скриптов юниты не ставит — только привозит файлы (см. §2 выше).
 ⚠️ Службы работают на питоне `/home/dev/meeting-notary/venv` (есть `requests` для
 whisper и `pyyaml`), а не на `venv-cli` запускателя.
+⚠️ В юнитах `KillMode=mixed`: при остановке или истёкшем сроке SIGTERM получает
+только питон самопроверки — он выводит бота и диктора из Т-10 и убирает контейнеры.
 Предупреждение перед встречами отдельного юнита не требует: оно живёт в тике
-запускателя и включается выкаткой скриптов.
+запускателя и включается выкаткой скриптов. Там же — тихая строка раз в сутки, если
+самопроверка больше 30 часов не доходила до итога (умерла или не сработал таймер);
+сразу после выкатки прогони её вручную (см. выше), иначе строка сошлётся на старые
+тестовые прогоны.
 
 ## Как выключить
 
 ```bash
 sudo systemctl disable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer
-# предупреждения перед встречами — строка в /srv/meeting-notary/.env.notary:
+# предупреждения перед встречами и строка «самопроверка давно не шла» — строка в
+# /srv/meeting-notary/.env.notary (выключаешь таймеры — выключай и её):
 MEETING_NOTARY_CANARY_WARN=0
 ```
 
 Контейнеры самопроверки — `vexa-canary-speaker-*` / `vexa-canary-bot-*` с меткой
-`meeting-notary.role=canary`; запускатель, сборщик и сторож их не видят. Если
-прогон прервали, следующий сам убирает оставшиеся контейнеры с этой меткой.
+`meeting-notary.role=canary`; запускатель, сборщик и сторож их не видят. Прерванный
+прогон (SIGTERM/SIGHUP, Ctrl-C) убирает свои контейнеры сам; если питон убили
+SIGKILL — следующий прогон убирает оставшиеся контейнеры с этой меткой.

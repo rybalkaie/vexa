@@ -22,6 +22,7 @@ import argparse
 import array
 import logging
 import os
+import signal
 import subprocess
 import sys
 import urllib.request
@@ -56,6 +57,28 @@ def setup_logging() -> None:
         pass
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                         handlers=handlers)
+
+
+def _on_signal(signum: int, _frame: object) -> None:
+    """SIGTERM/SIGHUP → SystemExit: блоки finally выводят бота и диктора из комнаты.
+
+    Без обработчика питон умирал сразу (systemd по сроку юнита, оборванный ssh при
+    ручном прогоне), `finally` в `lib.run_once` не выполнялся — контейнеры оставались
+    в Т-10, бот писал комнату до 20 минут тишины, а при людях — дольше (цикл5 фазы 2,
+    Н1). Повторный такой же сигнал игнорируем, чтобы не оборвать саму уборку;
+    последней мерой остаётся SIGKILL systemd после TimeoutStopSec.
+    """
+    try:
+        signal.signal(signum, signal.SIG_IGN)
+    except (OSError, ValueError):
+        pass
+    logger.warning("[canary] сигнал %s — выхожу, сперва вывожу бота и диктора из комнаты", signum)
+    raise SystemExit(128 + signum)
+
+
+def install_signal_handlers() -> None:
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +307,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
     setup_logging()
+    install_signal_handlers()
     deps = build_deps()
     if args.cmd == "run":
         result = lib.run_cycle(deps=deps, image=args.image, room=args.room, reason=args.reason, force=args.force)
-        print(lib.summary_line(result))
+        print(lib.summary_line(result)
+              + ("" if lib.is_production_image(args.image)
+                 else f" [тестовый образ {args.image}: состояние боевого бота и сообщения не трогал]"))
         return 0
     out = lib.sniff(deps=deps, image=args.image, room=args.room)
     print(f"Телемост: версия {out.get('version') or '?'}"
