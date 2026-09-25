@@ -46,6 +46,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent.parent))  # для notary.cli.registry
 
 from notary.cli.registry import VALID_COMPANIES  # noqa: E402
+from notary.lib.telemost_url import url_host_in  # noqa: E402
 
 ORDERS_FILENAME = ".orders.json"
 SCHEMA_VERSION = 1
@@ -375,9 +376,14 @@ def validate_order_payload(
     if not isinstance(room_url, str) or not room_url.strip():
         errors.append(_err("room_url", "required", "ссылка на комнату обязательна"))
     else:
-        parts = urlsplit(room_url.strip())
-        host = (parts.hostname or "").lower()
-        if parts.scheme != "https" or not host:
+        raw_url = room_url.strip()
+        try:
+            parts = urlsplit(raw_url)
+            host = (parts.hostname or "").lower()
+            scheme = parts.scheme
+        except ValueError:  # «https://[::1» и подобное — urlsplit не разбирает
+            host, scheme = "", ""
+        if scheme != "https" or not host:
             errors.append(
                 _err("room_url", "not_https", "ссылка на комнату должна быть https://…")
             )
@@ -391,8 +397,22 @@ def validate_order_payload(
                     % (", ".join(allowed_room_hosts()), host),
                 )
             )
+        elif not url_host_in(raw_url, allowed_room_hosts()):
+            # Хвост С10 (фаза 3б): Python и браузер поняли бы адрес по-разному —
+            # `https://evil.example\@telemost.yandex.ru/…` для urlsplit ведёт в
+            # Телемост, а браузер читает `\` как `/` и открыл бы evil.example. Так же
+            # логин перед адресом, чужой порт, пробелы и переводы строки внутри.
+            errors.append(
+                _err(
+                    "room_url",
+                    "invalid",
+                    "ссылка записана так, что браузер понял бы её иначе (обратная косая "
+                    "черта, логин перед адресом, чужой порт, пробелы) — скопируйте "
+                    "ссылку из Телемоста заново",
+                )
+            )
         else:
-            out["room_url"] = room_url.strip()
+            out["room_url"] = raw_url
 
     # --- время старта ---
     if kind == KIND_IMMEDIATE:

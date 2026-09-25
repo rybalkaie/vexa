@@ -104,6 +104,49 @@ class RegistryRoomTest(unittest.TestCase):
         self.assertTrue(registry.validate_room_record({"name": "t-10", "url": "http://telemost.yandex.ru/j/0"}))
 
 
+class OrdersRoomTest(unittest.TestCase):
+    """Фаза 3б: наряды портала сверяют ссылку той же строгой проверкой (раньше —
+    `urlsplit().hostname`, которому `https://evil.example\\@telemost.yandex.ru/…`
+    казался Телемостом)."""
+
+    def _room_errors(self, url):
+        from notary.lib import orders  # noqa: PLC0415
+
+        payload = {"meeting_id": "m-1", "company": "anzhee", "series_title": "Т", "room_url": url,
+                   "start_at": "2030-01-01T10:00:00+03:00"}
+        _out, errs = orders.validate_order_payload(payload, now=datetime(2029, 12, 31, tzinfo=timezone.utc))
+        return [e for e in errs if e["field"] == "room_url"]
+
+    def test_real_room_accepted(self):
+        self.assertEqual(self._room_errors(REAL), [])
+        self.assertEqual(self._room_errors(REAL + "?utm=1"), [])
+
+    def test_evil_rooms_refused(self):
+        for url in EVIL:
+            self.assertTrue(self._room_errors(url), url)
+
+    def test_browser_reads_it_differently_is_invalid(self):
+        for url in ("https://evil.example\\@telemost.yandex.ru/j/0",
+                    "https://telemost.yandex.ru:8443/j/0",
+                    "https://telemost.yandex.ru/j/0\nhttps://evil.example/"):
+            self.assertEqual([e["code"] for e in self._room_errors(url)], ["invalid"], url)
+
+    def test_broken_url_does_not_crash(self):
+        self.assertTrue(self._room_errors("https://[::1/j/0"))
+
+
+class CanaryRoomTest(unittest.TestCase):
+    """Фаза 3б: самопроверка сверяет ссылку комнаты общим помощником."""
+
+    def test_canary_room_url_strict(self):
+        from notary.lib import canary  # noqa: PLC0415
+
+        self.assertTrue(canary.valid_room_url(REAL))
+        self.assertTrue(canary.valid_room_url(REAL_360))
+        for url in EVIL:
+            self.assertFalse(canary.valid_room_url(url), url)
+
+
 class RunnerGateTest(unittest.TestCase):
     """Последний рубеж: запускатель не поднимает бота на чужой ссылке."""
 

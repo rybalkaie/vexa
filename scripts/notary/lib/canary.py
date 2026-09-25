@@ -613,9 +613,29 @@ def speaker_docker_cmd(plan: RunPlan) -> List[str]:
     ]
 
 
+#: Живая проверка запасного пути входа (фаза 3б): `=1` — бот идёт сразу запасным
+#: путём, `=no-testid` — ещё и без меток (как будто Телемост переименовал все
+#: data-testid). Только для ТЕСТОВОГО образа и только для бота (диктор входит
+#: основным путём); по умолчанию выключено. Бот читает флаг из сырого BOT_CONFIG
+#: (`telemostForceFallback`, join-status.ts → fallbackForceMode).
+FORCE_FALLBACK_ENV = "MEETING_NOTARY_CANARY_FORCE_FALLBACK"
+
+
+def force_fallback_mode(image: str) -> Optional[str]:
+    """«all» / «no-testid» / None. На боевом образе — всегда None (самопроверка боевого
+    бота обязана идти тем путём, каким он ходит на встречи)."""
+    raw = (os.environ.get(FORCE_FALLBACK_ENV) or "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off"):
+        return None
+    if is_production_image(image):
+        logger.warning("[canary] %s задан, но образ боевой — запасной путь не форсирую", FORCE_FALLBACK_ENV)
+        return None
+    return "no-testid" if raw == "no-testid" else "all"
+
+
 def bot_config(plan: RunPlan) -> Dict[str, Any]:
     """BOT_CONFIG как у запускателя (`runner._launch_bot`), кроме серии и номера канала."""
-    return {
+    cfg: Dict[str, Any] = {
         "platform": "yandex_telemost",
         "meetingUrl": plan.meeting_url,
         "botName": BOT_NAME,
@@ -627,6 +647,10 @@ def bot_config(plan: RunPlan) -> Dict[str, Any]:
         "series": SERIES,
         "expectedParticipants": [],
     }
+    mode = force_fallback_mode(plan.image)
+    if mode:
+        cfg["telemostForceFallback"] = True if mode == "all" else mode
+    return cfg
 
 
 def bot_docker_cmd(plan: RunPlan) -> List[str]:
@@ -859,9 +883,15 @@ def resolve_room_url(room: str, loader: Optional[Callable[[], Dict[str, Any]]] =
 
 
 def valid_room_url(url: str) -> bool:
-    m = re.match(r"^https://([^/?#]+)/", url or "")
-    host = (m.group(1).lower() if m else "")
-    return host in ("telemost.yandex.ru", "telemost.360.yandex.ru") or host.endswith(".telemost.yandex.ru")
+    """Ссылка комнаты ведёт в Телемост — общей строгой сверкой (`lib/telemost_url.py`).
+
+    До фазы 3б здесь была своя регулярка по хосту: `https://evil.example\\@telemost.yandex.ru/…`
+    она пропускала (хостом считала кусок после `@`), а браузер читает `\\` как `/`
+    и открыл бы evil.example.
+    """
+    from notary.lib.telemost_url import is_telemost_url  # noqa: PLC0415
+
+    return is_telemost_url(url)
 
 
 # ---------------------------------------------------------------------------
@@ -1169,10 +1199,12 @@ def _speaker_to_bot(deps, plan, res, flow, speaker_view, red, started) -> None: 
     _write_cmd(run_dir, "leave", 2)
     if got is False:
         flow["notes"].append("leave_not_received")
-        # Команду никто не слушает — остаётся `docker stop`. Это НЕ штатный выход:
-        # в образе бота PID 1 — bash без exec/trap (entrypoint.sh), SIGTERM до node
-        # не доходит, через 20 с docker добивает SIGKILL и запись может остаться
-        # недописанной (тогда честный красный «нет записи»). Штатный путь — `leave`.
+        # Команду никто не слушает — остаётся `docker stop -t 20`. С фазы 3а node —
+        # первый процесс контейнера (`exec` в entrypoint.sh): SIGTERM доходит до бота,
+        # и он уходит тем же штатным выходом, что по `leave` (кнопка выхода, запись
+        # закрывается при закрытии страницы). Но на всё у docker 20 с, потом SIGKILL:
+        # не уложится — запись может остаться недописанной (тогда честный красный
+        # «нет записи»). Поэтому первым идёт `leave`, а это — запасной путь.
         _safe(deps.stop, bot)
 
     def gone(name: str) -> Callable[[], Optional[bool]]:

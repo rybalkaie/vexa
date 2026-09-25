@@ -478,6 +478,30 @@ class DockerCommandTest(unittest.TestCase):
         self.assertIn("ENABLE_LIVE_DRAFT=0", cmd)
         self.assertEqual(cmd[-1], "img:tag")
 
+    @staticmethod
+    def _bot_cfg(plan):
+        cmd = lib.bot_docker_cmd(plan)
+        return json.loads(next(a for a in cmd if a.startswith("BOT_CONFIG="))[len("BOT_CONFIG="):])
+
+    def test_force_fallback_off_by_default(self):
+        # Фаза 3б: принудительный запасной путь — только по явному флагу живой проверки.
+        env = {k: v for k, v in os.environ.items() if k != lib.FORCE_FALLBACK_ENV}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertNotIn("telemostForceFallback", self._bot_cfg(self.plan()))
+        with mock.patch.dict(os.environ, {lib.FORCE_FALLBACK_ENV: "0"}):
+            self.assertNotIn("telemostForceFallback", self._bot_cfg(self.plan()))
+
+    def test_force_fallback_only_test_image_and_only_bot(self):
+        import dataclasses  # noqa: PLC0415
+
+        with mock.patch.dict(os.environ, {lib.FORCE_FALLBACK_ENV: "1"}):
+            self.assertIs(self._bot_cfg(self.plan())["telemostForceFallback"], True)
+            prod = dataclasses.replace(self.plan(), image=lib.DEFAULT_IMAGE)
+            self.assertNotIn("telemostForceFallback", self._bot_cfg(prod))   # боевой образ — никогда
+            self.assertNotIn("telemostForceFallback", " ".join(lib.speaker_docker_cmd(self.plan())))  # диктор — основным путём
+        with mock.patch.dict(os.environ, {lib.FORCE_FALLBACK_ENV: "no-testid"}):
+            self.assertEqual(self._bot_cfg(self.plan())["telemostForceFallback"], "no-testid")
+
     def test_speaker_cmd(self):
         cmd = lib.speaker_docker_cmd(self.plan())
         self.assertEqual(cmd[-2:], ["img:tag", "/canary/speaker.sh"])

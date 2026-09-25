@@ -13,9 +13,11 @@
 пробелы и управляющие символы внутри, логин/пароль перед хостом
 (`https://telemost.yandex.ru@evil.example/`), нестандартный порт.
 
-Модуль без зависимостей — его импортируют и планировщик, и реестр, и запускатель.
+Модуль без зависимостей — его импортируют планировщик (`lib/gcal.py`), реестр
+(`cli/registry.py`), запускатель, наряды портала (`lib/orders.py`, с фазы 3б) и
+самопроверка (`lib/canary.valid_room_url`, с фазы 3б).
 Та же проверка в боте — `services/vexa-bot/core/src/platforms/yandextelemost/screen.ts`
-(`isTelemostMeetingUrl`); в самопроверке — `lib/canary.valid_room_url`.
+(`isTelemostMeetingUrl`); в дикторе самопроверки — своя копия (`canary-kit/speaker.js`).
 """
 from __future__ import annotations
 

@@ -417,8 +417,20 @@ def _quiet_note_text(entry: Dict[str, Any], kind: str, detail: str) -> str:
         )
     return (
         f"ℹ️ Ватсон зашёл на «{name}» ({when}) запасным путём: {detail}. "
-        f"Телемост поменял вход — основной путь стоит поправить, бот пока справляется сам."
+        f"Телемост поменял вход, бот обошёл сам — основной путь стоит поправить."
     )
+
+
+def _fallback_detail(fb: Dict[str, Any]) -> str:
+    """Что сказать владельцу про запасной путь (фаза 3б).
+
+    Бот кладёт в `fallback_used.summary` готовую строку из своих слов («основной
+    путь не нашёл поле имени; запасной: …»); старый вид — пары «ключ: значение».
+    """
+    summary = fb.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()[:300]
+    return ", ".join(f"{k}: {v}" for k, v in fb.items())[:300]
 
 
 def _event_key(ev: Dict[str, Any]) -> str:
@@ -524,8 +536,7 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
                 prev = attempts[-2] if len(attempts) > 1 else {}
                 notes.append(_quiet_note_text(entry, "second_try", str(prev.get("reason") or "join_error")))
             if obs.fallback_used:
-                detail = ", ".join(f"{k}: {v}" for k, v in obs.fallback_used.items())[:300]
-                notes.append(_quiet_note_text(entry, "fallback", detail))
+                notes.append(_quiet_note_text(entry, "fallback", _fallback_detail(obs.fallback_used)))
             if not _commit(ledger, hooks):
                 entry["state"] = "watching"
                 continue

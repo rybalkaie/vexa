@@ -291,6 +291,39 @@ class TickTest(unittest.TestCase):
         self.assertEqual(len(self.w.notes), 1)
         self.assertIn("запасным путём", self.w.notes[0])
 
+    def test_fallback_summary_from_bot_goes_to_owner_once(self):
+        # Фаза 3б: бот кладёт готовую строку своими словами — владелец видит её,
+        # а не служебные поля; повторный тик вторую строку не шлёт.
+        fb = {
+            "primary_reason": "name_input_not_found",
+            "forced": None,
+            "steps": "popup_ack:text,name:label,join:text",
+            "screen": "in_call",
+            "summary": "основной путь не нашёл поле имени; запасной: закрыл всплывающее окно (по тексту), "
+                       "имя — по подписи, «Подключиться» — по тексту",
+        }
+        t1 = NOW + timedelta(seconds=90)
+        self.w.status["auto-x"] = st("in_call", at=NOW + timedelta(seconds=40), fb=fb)
+        self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("running")
+        self.run_tick(t1)
+        self.run_tick(t1 + timedelta(seconds=60))
+        self.assertEqual(len(self.w.notes), 1)
+        note = self.w.notes[0]
+        self.assertIn(fb["summary"], note)
+        self.assertIn("обошёл сам", note)
+        self.assertNotIn("primary_reason", note)
+        self.assertNotIn("popup_ack", note)
+
+    def test_fallback_tried_but_failed_is_not_a_quiet_note(self):
+        # Запасной путь не вывел — это обычный сорванный вход (повтор), не «обошёл сам».
+        t1 = NOW + timedelta(seconds=60)
+        self.w.status["auto-x"] = st("failed", at=t1, reason="name_input_not_found")
+        self.w.status["auto-x"]["fallback_tried"] = {"missing": "name", "summary": "…"}
+        self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("exited", 1)
+        self.run_tick(t1)
+        self.assertEqual(self.w.notes, [])
+        self.assertEqual(self.w.relaunched, [2])
+
     def test_note_failure_does_not_break_tick(self):
         # цикл5 Н5: упавшая заметка не роняет тик и не повторяет чужих сообщений
         t1 = NOW + timedelta(seconds=60)
