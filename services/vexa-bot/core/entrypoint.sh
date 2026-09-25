@@ -117,6 +117,11 @@ FBAPPS
     websockify 6080 localhost:5900 &
   fi
 
-  # Run the bot
-  node dist/docker.js
+  # Run the bot.
+  # meeting-notary 25.09.2026 (ISS-60, фаза 3а, хвост У8): exec — node становится
+  # первым процессом контейнера, и `docker stop` (SIGTERM) доходит до него.
+  # Без exec сигнал получал bash, игнорировал, и через таймаут docker добивал
+  # бота SIGKILL: ни штатного выхода из встречи, ни аварийного снимка. SIGTERM и
+  # SIGINT node ловит сам (src/index.ts → gracefulShutdown).
+  exec node dist/docker.js
 fi

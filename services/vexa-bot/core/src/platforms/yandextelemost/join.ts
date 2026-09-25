@@ -8,6 +8,17 @@
 //        b) НЕ кликаем по mic/cam (по дефолту выключены, Orb-кнопки «Включить...»)
 //        c) Клик «Подключиться»
 //   4) Выход в meetingFlow.waitForAdmission
+//
+// 25.09.2026 (фаза 3а, ISS-60):
+//   - ссылка сверяется до перехода: бот открывает только Телемост (хвост С10);
+//   - микрофон и камера в лобби 3.0 выключаются с проверкой подписи кнопки и
+//     одним JS-кликом, если обычный не сработал (devices.ts);
+//   - «лобби пройдено» больше не значит «в звонке»: кнопка «Подключиться»
+//     пропадает и в зале ожидания, поэтому после неё экран классифицируется
+//     (screen.ts) и в лог пишется, куда именно попал бот;
+//   - микрофон в звонке выключает admission.ts сразу после впуска — прежний
+//     клик по виджету на главной его не выключал (разведка 25.09);
+//   - перехват входящих дорожек вынесен в rtc-hook.ts и чистит завершённые.
 
 import { Page, Frame } from "playwright";
 import { log, callJoiningCallback } from "../../utils";
@@ -16,13 +27,15 @@ import {
   telemostInterstitialContinueSelectors,
   telemostNameInputSelectors,
   telemostJoinButtonSelectors,
-  telemostMicButtonSelectors,
   telemostCameraButtonSelectors,
   telemostModalDismissSelectors,
   telemostOnboardingDismissSelectors,
   telemostLobbyFrameUrlMarker,
-  telemostCallMicOnSelectors,
 } from "./selectors";
+import { MEETING_URL_REJECTED_ERROR } from "./join-status";
+import { isTelemostMeetingUrl, readTelemostScreen, ScreenState } from "./screen";
+import { ensureDeviceOff } from "./devices";
+import { installRtcAudioHook } from "./rtc-hook";
 
 const LOG_PREFIX = "[adapter-telemost]";
 
@@ -189,16 +202,37 @@ async function findLobbyFrame(page: Page, timeoutMs = 15000): Promise<Frame | nu
   return null;
 }
 
-/** Кнопка «Подключиться» пропала (или iframe ушёл) — значит, лобби позади. */
-async function waitLobbyClosed(lobby: Frame, timeoutMs: number): Promise<boolean> {
+/**
+ * После «Подключиться»: лобби позади? Кнопка пропала (или окно ушло) ещё не
+ * значит «в звонке» — в зале ожидания она тоже пропадает. Поэтому экран
+ * классифицируется: возвращается состояние (in_call / waiting_room / rejected /
+ * gone / unknown) или null, если бот всё ещё в лобби.
+ */
+async function waitLobbyExit(page: Page, lobby: Frame, timeoutMs: number): Promise<ScreenState | null> {
   const start = Date.now();
+  // Сразу после исчезновения кнопки экран бывает пустым (перерисовка) — даём ему
+  // до 3 с устояться, прежде чем сказать «неясно».
+  const SETTLE_MS = 3000;
+  let unclearSince: number | null = null;
   while (Date.now() - start < timeoutMs) {
-    if (lobby.isDetached()) return true;
-    const visible = await lobby.locator(telemostJoinButtonSelectors[0]).first().isVisible({ timeout: 300 }).catch(() => false);
-    if (!visible) return true;
+    const buttonGone =
+      lobby.isDetached() ||
+      !(await lobby.locator(telemostJoinButtonSelectors[0]).first().isVisible({ timeout: 300 }).catch(() => false));
+    if (buttonGone) {
+      const v = await readTelemostScreen(page);
+      const settled = v.state === "unknown" && unclearSince !== null && Date.now() - unclearSince >= SETTLE_MS;
+      if ((v.state !== "lobby" && v.state !== "unknown") || settled) {
+        logStep("lobby_exit_screen", { state: v.state, ui: v.ui, evidence: v.evidence });
+        return v.state;
+      }
+      if (v.state === "unknown" && unclearSince === null) unclearSince = Date.now();
+      if (v.state === "lobby") unclearSince = null;
+    }
     await new Promise((r) => setTimeout(r, 500));
   }
-  return false;
+  // Кнопка пропала, но экран так и не устоялся — лобби позади, дальше решает admission.
+  if (unclearSince !== null) return "unknown";
+  return null;
 }
 
 /** Телемост 3.0: имя, микрофон/камера и «Подключиться» — внутри iframe лобби. */
@@ -209,22 +243,10 @@ async function joinViaLobbyFrame(page: Page, lobby: Frame, botName: string): Pro
   }
 
   // Гость в 3.0 заходит с ВКЛ микрофоном и камерой. Бот — наблюдатель: гасим оба
-  // одним кликом (без JS-добивки: повторный клик включил бы обратно).
-  for (const tid of ["turn-off-mic-button", "turn-off-camera-button"]) {
-    const sel = `[data-testid="${tid}"]`;
-    try {
-      const btn = lobby.locator(sel).first();
-      if (await btn.isVisible({ timeout: 500 })) {
-        await btn.click({ timeout: 2000 });
-        await new Promise((r) => setTimeout(r, 400));
-        const still = await lobby.locator(sel).first().isVisible({ timeout: 300 }).catch(() => false);
-        logStep("lobby_device_off", { testid: tid, still_visible: still });
-      } else {
-        logStep("lobby_device_already_off", { testid: tid });
-      }
-    } catch (e: any) {
-      logStep("lobby_device_off_failed", { testid: tid, error: e.message });
-    }
+  // в окне лобби. Нажатие → проверка подписи → не сменилась → ровно один JS-клик
+  // по кнопке, всё ещё «включённой» (по уже выключенной он не попадёт).
+  for (const device of ["mic", "camera"] as const) {
+    await ensureDeviceOff(page, device, { onlyFrame: lobby, scope: "lobby" }).catch(() => null);
   }
 
   const joined = await tryClickFirstVisible(lobby, telemostJoinButtonSelectors, "join_clicked", 10000);
@@ -234,37 +256,28 @@ async function joinViaLobbyFrame(page: Page, lobby: Frame, botName: string): Pro
 
   // Лобби должно закрыться. Не закрылось — добиваем JS-кликом (React-handler
   // Телемоста не всегда ловит Playwright-клик) и ждём ещё.
-  let left = await waitLobbyClosed(lobby, 6000);
-  if (!left) {
+  let exit = await waitLobbyExit(page, lobby, 6000);
+  if (exit === null) {
     await lobby.evaluate((s: string) => { (document.querySelector(s) as HTMLElement | null)?.click(); }, telemostJoinButtonSelectors[0]).catch(() => {});
     logStep("join_testid_jsclicked");
-    left = await waitLobbyClosed(lobby, 10000);
+    exit = await waitLobbyExit(page, lobby, 10000);
   }
-  if (!left) {
+  if (exit === null) {
     try {
       await page.screenshot({ path: "/app/vexa-bot/storage/screenshots/telemost-91-still-in-lobby.png", fullPage: true });
     } catch {}
     throw new Error("Lobby: после «Подключиться» бот остался в лобби Telemost");
   }
-  logStep("lobby_left");
-
-  // Страховка: микрофон в звонке всё же включён — выключаем (виджет звонка на
-  // главной странице, aria-label однозначно говорит о состоянии).
-  await page.waitForTimeout(1500);
-  for (const sel of telemostCallMicOnSelectors) {
-    try {
-      const b = page.locator(sel).first();
-      if (await b.isVisible({ timeout: 500 })) {
-        await b.click({ timeout: 2000 });
-        logStep("call_mic_muted", { selector: sel });
-      }
-    } catch {}
-  }
+  // «Лобби пройдено» — только если за ним звонок. Зал ожидания, отказ и неясный
+  // экран дальше разбирает admission.ts (статус, ожидание, причина срыва).
+  if (exit === "in_call") logStep("lobby_left");
+  else if (exit === "waiting_room") logStep("lobby_left_to_waiting_room");
+  else logStep("lobby_left_unclear", { state: exit });
 
   try {
     await page.screenshot({ path: "/app/vexa-bot/storage/screenshots/telemost-02-after-join-click.png", fullPage: true });
   } catch {}
-  logStep("join_done", { via: "lobby_iframe" });
+  logStep("join_done", { via: "lobby_iframe", screen: exit });
 }
 
 export async function joinYandexTelemost(
@@ -275,29 +288,19 @@ export async function joinYandexTelemost(
 ): Promise<void> {
   logStep("join_start", { url: meetingUrl, name: botName });
 
+  // Хвост С10: бот открывает только Телемост — хост ссылки целиком, не подстрока.
+  // Запускатель на хосте проверяет то же самое; это вторая линия.
+  if (!isTelemostMeetingUrl(meetingUrl)) {
+    logStep("meeting_url_rejected");
+    throw new Error(MEETING_URL_REJECTED_ERROR);
+  }
+
   // Телемост 3.0 может играть звук не через <audio>, а через WebAudio — ловим
   // входящие аудио-дорожки прямо у RTCPeerConnection (во всех фреймах, включая
   // iframe звонка). Запись (recording.ts, rescan) подмешивает их вместе с
-  // дорожками из DOM; дубли отсекаются по track.id.
-  await page.addInitScript(() => {
-    const w = window as any;
-    if (w.__vexaRtcHooked || !w.RTCPeerConnection) return;
-    w.__vexaRtcHooked = true;
-    w.__vexaRemoteAudioTracks = [];
-    const Orig = w.RTCPeerConnection;
-    const Hooked: any = function (...args: any[]) {
-      const pc = new Orig(...args);
-      pc.addEventListener("track", (e: any) => {
-        try {
-          if (e.track && e.track.kind === "audio") w.__vexaRemoteAudioTracks.push(e.track);
-        } catch { /* */ }
-      });
-      return pc;
-    };
-    Hooked.prototype = Orig.prototype;
-    Object.setPrototypeOf(Hooked, Orig);
-    w.RTCPeerConnection = Hooked;
-  }).catch((e: any) => logStep("rtc_hook_failed", { error: e.message }));
+  // дорожками из DOM; дубли отсекаются по track.id. Завершённые дорожки из
+  // списка выкидываются (rtc-hook.ts).
+  await page.addInitScript(installRtcAudioHook).catch((e: any) => logStep("rtc_hook_failed", { error: e.message }));
 
   await page.goto(meetingUrl, { waitUntil: "domcontentloaded" });
   await page.bringToFront();

@@ -41,8 +41,18 @@ export const JOIN_REASONS = [
   "waiting_room_not_admitted",
   "admission_timeout",
   "admission_false_positive",
+  // Фаза 3а (25.09.2026): экран после «Подключиться» не распознан — не «в звонке»
+  // (раньше бот объявлял себя в звонке «методом исключения»).
+  "admission_unclear",
+  // Хвост С10: ссылка ведёт не в Телемост — бот её не открывает.
+  "meeting_url_rejected",
   "join_error",
 ] as const;
+
+// Тексты наших исключений — по ним classifyJoinError узнаёт причину.
+export const MEETING_GONE_ERROR = "Telemost meeting is gone (the call has ended or does not exist)";
+export const ADMISSION_UNCLEAR_ERROR = "Telemost admission unclear: the call screen was not recognized";
+export const MEETING_URL_REJECTED_ERROR = "Ссылка встречи ведёт не в Телемост — бот её не открывает";
 
 /** Сырой BOT_CONFIG: Zod апстрима вырезает незнакомые ключи (sessionUid в том числе). */
 export function rawBotConfig(): any {
@@ -114,6 +124,22 @@ export function addJoinEvent(type: string, extra: Record<string, unknown> = {}):
   writeJoinStatus((state.phase as JoinPhase) || "in_call");
 }
 
+/** Текущая фаза входа (для снимка по сигналу остановки) или null. */
+export function currentJoinPhase(): JoinPhase | null {
+  const p = state.phase;
+  return typeof p === "string" ? (p as JoinPhase) : null;
+}
+
+/**
+ * Была ли у бота эта фаза за время работы (по истории статуса). Нужна снимку
+ * по сигналу остановки: бот, уже побывавший в звонке, мог снова попасть в
+ * «зал ожидания» при перезаходе после выброса — снимать живую встречу нельзя.
+ */
+export function joinPhaseSeen(phase: JoinPhase): boolean {
+  const history = Array.isArray(state.history) ? state.history : [];
+  return state.phase === phase || history.some((h: any) => h && h.phase === phase);
+}
+
 /** Отметить, что вход прошёл запасным путём (Фаза 3) — не сбой, а сигнал «Телемост поменялся». */
 export function noteJoinFallback(detail: Record<string, unknown>): void {
   state = { ...state, fallback_used: { ...(state.fallback_used || {}), ...detail } };
@@ -127,6 +153,9 @@ export function classifyJoinError(message: string): string {
   if (/остался в лобби/i.test(m)) return "still_in_lobby";
   if (/rejected by meeting admin/i.test(m)) return "admission_rejected";
   if (/not admitted from Telemost waiting room/i.test(m)) return "waiting_room_not_admitted";
+  if (/meeting is gone/i.test(m)) return "meeting_not_found";
+  if (/admission unclear/i.test(m)) return "admission_unclear";
+  if (/ведёт не в Телемост/i.test(m)) return "meeting_url_rejected";
   if (/admission timeout/i.test(m)) return "admission_timeout";
   if (/net::ERR_|Navigation|page\.goto|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION/i.test(m)) return "navigation_failed";
   return "join_error";

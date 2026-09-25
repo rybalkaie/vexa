@@ -6,7 +6,13 @@
  * Run: npx tsx services/vexa-bot/core/src/platforms/yandextelemost/join-status.test.ts
  */
 
-import { classifyJoinError, isMeetingGoneText } from "./join-status";
+import {
+  classifyJoinError,
+  isMeetingGoneText,
+  MEETING_GONE_ERROR,
+  ADMISSION_UNCLEAR_ERROR,
+  MEETING_URL_REJECTED_ERROR,
+} from "./join-status";
 
 let passed = 0;
 let failed = 0;
@@ -31,6 +37,10 @@ expect("зал ожидания", classifyJoinError("Bot was not admitted from T
 expect("таймаут впуска", classifyJoinError("Telemost admission timeout"), "admission_timeout");
 expect("сеть", classifyJoinError("page.goto: net::ERR_NAME_NOT_RESOLVED at https://x"), "navigation_failed");
 expect("прочее", classifyJoinError("something else"), "join_error");
+// Фаза 3а (25.09.2026): свои тексты исключений admission.ts / join.ts.
+expect("встреча кончилась во время впуска", classifyJoinError(MEETING_GONE_ERROR), "meeting_not_found");
+expect("экран звонка не распознан ≠ в звонке", classifyJoinError(ADMISSION_UNCLEAR_ERROR), "admission_unclear");
+expect("ссылка не на Телемост (С10)", classifyJoinError(MEETING_URL_REJECTED_ERROR), "meeting_url_rejected");
 
 console.log("isMeetingGoneText — «встречи нет» на экране");
 expect("Телемост 3.0 (живой экран 24.09)", isMeetingGoneText("Телемост\nВойдите в аккаунт\nТакого звонка нет\nВозможно, в ссылке опечатка\nНа главную"), true);

@@ -32,12 +32,20 @@ export type FrameSnapshot = {
   headings: string[];
 };
 
+// На одно окно — не дольше этого: зависшее окно не должно съесть весь снимок
+// (по сигналу остановки на всё про всё у бота 20 с — stop-signal.ts).
+const FRAME_SNAPSHOT_TIMEOUT_MS = 2500;
+
+const EMPTY_FRAME = (url: string): FrameSnapshot => ({
+  url, title: "", buttons: [], inputs: [], dialogs: [], iframes: [], testids: [], headings: [],
+});
+
 /** Снять видимую структуру ВСЕХ окон страницы. Никогда не бросает. */
 export async function snapshotFrames(page: Page): Promise<FrameSnapshot[]> {
   const out: FrameSnapshot[] = [];
   for (const fr of page.frames()) {
     try {
-      const snap: FrameSnapshot = await fr.evaluate(() => {
+      const pending: Promise<FrameSnapshot> = fr.evaluate(() => {
         const vis = (el: Element) => {
           const h = el as HTMLElement;
           return !!(h.offsetWidth || h.offsetHeight || h.getClientRects().length);
@@ -99,9 +107,13 @@ export async function snapshotFrames(page: Page): Promise<FrameSnapshot[]> {
           .filter(Boolean);
         return { url: strip(location.href), title: cut(document.title, 80), buttons, inputs, dialogs, iframes, testids, headings };
       });
-      out.push(snap);
+      const snap = await Promise.race([
+        pending,
+        new Promise<null>((r) => setTimeout(() => r(null), FRAME_SNAPSHOT_TIMEOUT_MS)),
+      ]);
+      out.push(snap || EMPTY_FRAME("(не ответило)"));
     } catch {
-      out.push({ url: "(недоступно)", title: "", buttons: [], inputs: [], dialogs: [], iframes: [], testids: [], headings: [] });
+      out.push(EMPTY_FRAME("(недоступно)"));
     }
   }
   return out;

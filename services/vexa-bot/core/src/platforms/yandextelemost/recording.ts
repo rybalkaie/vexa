@@ -33,6 +33,8 @@ import { startParticipantsPolling } from "./participants";
 import { joinYandexTelemost } from "./join";
 import { waitForYandexTelemostAdmission } from "./admission";
 import { addJoinEvent } from "./join-status";
+import { installFrameWalker } from "./rtc-hook";
+import { ensureTelemostDevicesOff } from "./devices";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -411,9 +413,11 @@ class WavStreamWriter {
     // P0-фикс (Ф2, 2026-06-03): держим WAV-заголовок актуальным на диске ПОСЛЕ
     // каждого ~3с-чанка. Корень потери WAV 29.05–03.06: PCM стримился на диск
     // (bind-mount), но data_size в шапке финализировался ТОЛЬКО в close() из
-    // finally-teardown'а. node бежит ребёнком bash (PID 1, см. entrypoint.sh),
-    // поэтому docker stop / рестарт / OOM убивают его SIGKILL'ом → finally не
-    // отрабатывает → шапка остаётся placeholder'ом data_size=0, и ридер видит
+    // finally-teardown'а. node бежал ребёнком bash (PID 1, см. entrypoint.sh),
+    // поэтому docker stop / рестарт / OOM убивали его SIGKILL'ом → finally не
+    // отрабатывал (с 25.09.2026 entrypoint.sh запускает node через exec и
+    // docker stop доходит до node; OOM и kill -9 по-прежнему мгновенные)
+    // → шапка оставалась placeholder'ом data_size=0, и ридер видит
     // «0 байт аудио» при десятках МБ реального PCM (06-01 .recover-bak: 86 МБ,
     // data_size=0). Теперь на диске ВСЕГДА валидный WAV со всей речью минус
     // последний <3с-кадр. Цена — 2 pwrite по 4 байта на чанк (мизер).
@@ -479,6 +483,9 @@ async function transcribeChunk(
  * Возвращает stopper.
  */
 async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
+  // Обходчик вложенных окон (rtc-hook.ts) — в текущий документ; при перезаходе
+  // (page.goto) документ новый, поэтому ставится при каждом старте захвата.
+  await page.evaluate(installFrameWalker).catch((e: any) => log(`${LOG_PREFIX} frame walker install failed (non-fatal): ${e?.message}`));
   await page.evaluate(() => {
     const win = window as any;
 
@@ -519,13 +526,29 @@ async function setupBrowserCapture(page: Page): Promise<() => Promise<void>> {
         // origin (/private-join/) — смотрим и его документ. Плюс входящие дорожки,
         // пойманные хуком RTCPeerConnection из join.ts (если звук играет не через
         // <audio>). Дубли отсекает wired по track.id.
-        const docs: Document[] = [document];
-        const wins: any[] = [win];
-        for (const fr of Array.from(document.querySelectorAll("iframe"))) {
-          try {
-            const d = (fr as HTMLIFrameElement).contentDocument;
-            if (d) { docs.push(d); wins.push((fr as HTMLIFrameElement).contentWindow); }
-          } catch { /* чужой origin — не наш звонок */ }
+        // 25.09.2026 (фаза 3а): окна обходятся ВГЛУБЬ (раньше — один уровень),
+        // а завершённые дорожки из списков хука выкидываются перед подмешиванием.
+        const docs: Document[] = [];
+        const wins: any[] = [];
+        const walkFrames = win.__vexaSameOriginFrameWindows;
+        if (typeof walkFrames === "function") {
+          for (const w of walkFrames(win, 6)) {
+            try {
+              if (w && w.document) { docs.push(w.document); wins.push(w); }
+            } catch { /* чужой origin — не наш звонок */ }
+          }
+        }
+        if (docs.length === 0) {
+          docs.push(document); wins.push(win);
+          for (const fr of Array.from(document.querySelectorAll("iframe"))) {
+            try {
+              const d = (fr as HTMLIFrameElement).contentDocument;
+              if (d) { docs.push(d); wins.push((fr as HTMLIFrameElement).contentWindow); }
+            } catch { /* чужой origin — не наш звонок */ }
+          }
+        }
+        for (const w of wins) {
+          try { if (w && typeof w.__vexaPruneRemoteAudioTracks === "function") w.__vexaPruneRemoteAudioTracks(); } catch { /* */ }
         }
         const candidates: MediaStreamTrack[] = [];
         for (const d of docs) {
@@ -789,11 +812,33 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
   const DEAF_WITH_PEOPLE_TIMEOUT_MS = 1_800_000; // 30 мин потолок «оглох при людях»
   let deafFlagged = false;
   const PARTICIPANT_NOISE = ["скопировать ссылк", "копировать ссылк"]; // UI-шум панели, не имя
-  const hasRealParticipants = (): boolean =>
-    participantsPoll.getNames().some((n) => {
+  // 25.09.2026 (фаза 3а): «есть люди» — по тем, кого видно СЕЙЧАС (плитки и
+  // счётчик «N участников», participants.ts), а не по всем, кого бот видел за
+  // встречу: иначе после ухода людей «оглох» срабатывал бы ложно. Свежего опроса
+  // нет (страница подвисла) — по-старому, по накопленному списку.
+  const PRESENCE_FRESH_MS = 3 * 60_000;
+  const hasRealParticipants = (): boolean => {
+    const p = participantsPoll.getPresence();
+    if (p.others !== null && p.at !== null && Date.now() - p.at <= PRESENCE_FRESH_MS) return p.others > 0;
+    return participantsPoll.getNames().some((n) => {
       const s = (n || "").trim().toLowerCase();
       return s.length > 0 && !PARTICIPANT_NOISE.some((t) => s.includes(t));
     });
+  };
+  const presentNow = (): number | null => participantsPoll.getPresence().others;
+
+  // 25.09.2026 (фаза 3а): страховка микрофона и камеры по ходу встречи — если
+  // Телемост включил их обратно (или после впуска кнопка ещё не отрисовалась),
+  // бот выключает. Нажимает, только если видит «включено»; в лог — только нажатия.
+  const DEVICES_GUARD_MS = 60_000;
+  let devicesGuardBusy = false;
+  const devicesGuard = setInterval(() => {
+    if (devicesGuardBusy || page.isClosed()) return;
+    devicesGuardBusy = true;
+    ensureTelemostDevicesOff(page, "guard", true)
+      .catch(() => null)
+      .finally(() => { devicesGuardBusy = false; });
+  }, DEVICES_GUARD_MS);
 
   // Ф5: состояния chunk-декаплинга.
   //   recording_active        — пишем сэмплы в текущий chunk_N.wav.
@@ -1254,14 +1299,14 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
           if (sawPeople && !deafFlagged && elapsed >= noOneJoinedTimeoutMs) {
             deafFlagged = true;
             logStep("deaf_with_participants_warning", {
-              elapsed_ms: elapsed, participants: participantsPoll.getNames().length,
+              elapsed_ms: elapsed, participants: participantsPoll.getNames().length, present: presentNow(),
             });
           }
           if (elapsed >= effectiveTimeoutMs) {
             endReason = sawPeople ? "deaf_with_participants" : "no_one_joined";
             logStep(sawPeople ? "end_deaf_with_participants" : "end_no_one_joined", {
               elapsed_ms: elapsed, timeout_ms: effectiveTimeoutMs,
-              participants: participantsPoll.getNames().length,
+              participants: participantsPoll.getNames().length, present: presentNow(),
             });
             clearInterval(timer);
             return resolve();
@@ -1286,7 +1331,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
         if (degraded && hasRealParticipants()) {
           if (deafAfterStartSince == null) {
             deafAfterStartSince = now;
-            logStep("deaf_after_start_suspected", { participants: participantsPoll.getNames().length });
+            logStep("deaf_after_start_suspected", { participants: participantsPoll.getNames().length, present: presentNow() });
           } else if (now - deafAfterStartSince >= DEAF_AFTER_START_TIMEOUT_MS) {
             evictionHandling = true; // подавить тики, пока шлём алерт и выходим
             endReason = "deaf_after_start";
@@ -1351,6 +1396,7 @@ export async function startYandexTelemostRecording(page: Page, botConfig: BotCon
     } catch (err: any) {
       log(`${LOG_PREFIX} participants stop failed: ${err.message}`);
     }
+    clearInterval(devicesGuard);
     try {
       await stopCapture();
     } catch (err: any) {

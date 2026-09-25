@@ -7,6 +7,7 @@ import { handleGoogleMeet, leaveGoogleMeet } from "./platforms/googlemeet";
 import { handleMicrosoftTeams, leaveMicrosoftTeams } from "./platforms/msteams";
 import { handleZoom, leaveZoom, leaveZoomWeb } from "./platforms/zoom";
 import { handleYandexTelemost, leaveYandexTelemost } from "./platforms/yandextelemost";
+import { BROWSER_SIGNAL_OPTIONS as TELEMOST_BROWSER_SIGNAL_OPTIONS } from "./platforms/yandextelemost/stop-signal";
 import { reconfigureZoomWebRecording } from "./platforms/zoom/web/recording";
 import { getZoomSpeakerEvents } from "./platforms/zoom/strategies/recording";
 import { browserArgs, getBrowserArgs, getAuthenticatedBrowserArgs, userAgent } from "./constans";
@@ -2402,6 +2403,12 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     browserInstance = await chromium.launch({
       headless: false,
       args: getBrowserArgs(!!botConfig.voiceAgentEnabled),
+      // meeting-notary 25.09.2026 (фаза 3а, хвост У8): после `exec node` в
+      // entrypoint.sh SIGTERM от docker stop доходит до бота, а Playwright по
+      // умолчанию сразу закрыл бы браузер сам — раньше штатного выхода
+      // (gracefulShutdown → performGracefulLeave): ни снимка экрана, ни
+      // нажатия «выйти». Для Телемоста сигналы ловит бот.
+      ...(botConfig.platform === "yandex_telemost" ? TELEMOST_BROWSER_SIGNAL_OPTIONS : {}),
     });
 
     // Create a new page with permissions and viewport for non-Teams

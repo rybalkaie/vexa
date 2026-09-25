@@ -8,6 +8,11 @@
 // сорванном входе бот снимает аварийный комплект (crashkit.ts). По статусу
 // сторож на хосте (scripts/notary/lib/join_watch.py) решает: повторить вход или
 // написать людям. Логика самого входа не меняется.
+//
+// 25.09.2026 (фаза 3а, хвост У8): сторож останавливает зависшего на входе бота
+// сигналом (docker stop). По сигналу бот, пока ещё не в звонке, снимает
+// аварийный снимок (stop-signal.ts → leave.ts) и выходит штатно. Вход, сорванный
+// нашей же остановкой, снимок и статус не перетирает.
 
 import { Page } from "playwright";
 import { BotConfig } from "../../types";
@@ -25,9 +30,13 @@ import {
   shortMessage,
 } from "./join-status";
 import { captureCrashKit } from "./crashkit";
+import { armStopSignalCapture, stopSignalReceived } from "./stop-signal";
 
 /** Сорванный вход: причина → аварийный снимок → статус failed. Не бросает. */
 async function markJoinFailed(page: Page | null, step: string, error: any): Promise<void> {
+  // Вход сорвала наша же остановка (сигнал): снимок уже снят по сигналу, а
+  // «failed» с закрытой страницы был бы ложной причиной.
+  if (stopSignalReceived()) return;
   try {
     const message = error?.message || String(error);
     let reason = classifyJoinError(message);
@@ -51,6 +60,7 @@ export async function handleYandexTelemost(
     errorDetails?: any
   ) => Promise<void>
 ): Promise<void> {
+  armStopSignalCapture();
   const strategies: PlatformStrategies = {
     join: async (p: Page | null, cfg: BotConfig) => {
       writeJoinStatus("joining");
@@ -77,7 +87,7 @@ export async function handleYandexTelemost(
     }) as any,
     checkAdmissionSilent: (async (p: Page) => {
       const ok = await checkForTelemostAdmissionSilent(p);
-      if (!ok) {
+      if (!ok && !stopSignalReceived()) {
         // «Вход не подтвердился» — вероятная форма следующей поломки (Телемост
         // поменял экран звонка): снимок нужен именно здесь (цикл5 У8).
         const kit = await captureCrashKit(p, "admission_false_positive").catch(() => null);

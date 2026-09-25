@@ -191,3 +191,61 @@ export const telemostRemovalIndicators: string[] = [
   'text*="вышли из встречи"',
   '[data-testid*="meeting-ended"]',
 ];
+
+// ---------------------------------------------------------------------------
+// Телемост 3.0 — живая разведка 25.09.2026 (Т-10, два тестовых участника).
+// Старые списки выше не трогаем: они нужны старому интерфейсу. Строгие признаки
+// экрана (зал ожидания, отказ, конец встречи, «в звонке») собраны в screen.ts
+// и ищутся во ВСЕХ окнах, а не только на главной.
+//
+// Вложенное окно звонка `/private-join/` (testid): end-call-alt-button,
+// more-popup-alt-button, mute-audio (подпись «Выключить микрофон» /
+// «Включить микрофон»), turn-off-mic-button, turn-on-camera-button,
+// settings-button, share-button, participant-video-placeholder; плитки —
+// классы newGridItem_*, participantName_*, avatarWithNameBlock_*.
+// Главное окно: мини-виджет с aria-label «Открыть экран звонка» и текстом
+// «N участник(а/ов)».
+// ---------------------------------------------------------------------------
+
+// Мини-виджет звонка на главной: в его тексте счётчик «N участников».
+export const telemostCallWidgetAria = "Открыть экран звонка";
+
+// Имена на плитках во вложенном окне звонка (панель участников — запасной путь).
+export const telemostParticipantNameSelectors: string[] = [
+  '[class*="participantName_"]',
+];
+
+// Выход из звонка в 3.0 — кнопка во вложенном окне. Порядок важен: окно звонка
+// обходится первым, внутри него первой пробуется кнопка 3.0.
+export const telemostLeaveButtonSelectors3: string[] = [
+  '[data-testid="end-call-alt-button"]',
+  ...telemostLeaveButtonSelectors,
+];
+
+// Микрофон и камера (лобби и звонок, оба интерфейса): по подписи и testid бот
+// понимает состояние — подпись «Выключить …» / testid turn-off-* видна, когда
+// устройство ВКЛЮЧЕНО, — и что нажать. Решение — devices.ts (readDeviceState).
+export type TelemostDeviceLabels = {
+  onAria: string;
+  offAria: string;
+  onTid: string;
+  offTid: string;
+  /** Кнопка панели звонка 3.0 с меняющейся подписью. */
+  toolbarTid: string | null;
+};
+export const telemostDeviceLabels: { mic: TelemostDeviceLabels; camera: TelemostDeviceLabels } = {
+  mic: {
+    onAria: "Выключить микрофон",
+    offAria: "Включить микрофон",
+    onTid: "turn-off-mic-button",
+    offTid: "turn-on-mic-button",
+    toolbarTid: "mute-audio",
+  },
+  camera: {
+    onAria: "Выключить камеру",
+    offAria: "Включить камеру",
+    onTid: "turn-off-camera-button",
+    offTid: "turn-on-camera-button",
+    toolbarTid: null,
+  },
+};
