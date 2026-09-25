@@ -174,7 +174,14 @@ def run_one(tr_path: Path, expected: list[str], *, expand_first_word: bool,
     mapping = dict(res.cluster_to_name)
 
     names = [n for n in mapping.values() if n]
-    firsts = [n.split()[0] for n in names]
+    # «Разрезан надвое» = ОДИН человек под разными написаниями. Тёзки с разными
+    # фамилиями («Михаил Еремеев» + «Михаил Саргин») — РАЗНЫЕ люди, не дубль:
+    # на этом я один раз уже ошибся в ручном подсчёте (19 вместо 17).
+    split_person = any(
+        a != b and a.split()[0].lower() == b.split()[0].lower()
+        and (len(a.split()) == 1 or len(b.split()) == 1)
+        for i, a in enumerate(names) for b in names[i + 1:]
+    ) or len(names) != len(set(names))
     return {
         "series": series,
         "date": date,
@@ -184,7 +191,7 @@ def run_one(tr_path: Path, expected: list[str], *, expand_first_word: bool,
         "sources": list(res.sources_used),
         "unresolved": len(res.unresolved_clusters),
         # инвариант: один человек не может занимать два голоса
-        "split_person": len(set(firsts)) < len(firsts),
+        "split_person": split_person,
         # инвариант: голосов не больше, чем людей (+1 на неожиданного участника)
         "too_many_voices": bool(expected) and len(clusters) > len(expected) + 1,
     }

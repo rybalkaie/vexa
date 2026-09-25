@@ -64,6 +64,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -399,6 +400,7 @@ def parse_utterances(raw: dict) -> list[Utterance]:
             continue
         text = u.get("text")
         text = text.strip() if isinstance(text, str) else ""
+        text = strip_hallucination_prefix(text)
         if not text:
             continue
         out.append(Utterance(
@@ -408,6 +410,44 @@ def parse_utterances(raw: dict) -> list[Utterance]:
             text=text,
         ))
     return out
+
+
+# --- галлюцинации распознавания (25.09, план 2026-09-25-speaker-attribution-fix) ---
+# На тишине в начале записи движок выдаёт «титры» — на 4 встречах в протокол уехало
+# «Редактор субтитров А.Семкин Корректор А.Егорова», приклеенное к началу настоящей
+# реплики («…А.Егорова Да, Илья, привет»). Готовый список фраз в проекте есть
+# (`lib/hallucinations/ru.txt`), но был подключён ТОЛЬКО к ветке Whisper
+# (`lib/transcribe.py`) — на боевой ветке AssemblyAI фильтра не было вовсе.
+# Здесь срезаем такую фразу с начала/конца реплики, СОХРАНЯЯ остальной текст:
+# сравнение «вся реплика == фраза», как в whisper-ветке, этот случай не ловит.
+_HALLUCINATION_PREFIXES: tuple[str, ...] = (
+    "редактор субтитров",
+    "корректор",
+    "субтитры создавал",
+    "субтитры сделал",
+    "субтитры делал",
+)
+# Каждое повторение — «ключевое слово + ОДНА фамилия». Жадная вторая фамилия
+# ломала разбор: в «Редактор субтитров А.Семкин Корректор А.Егорова» слово
+# «Корректор» съедалось как фамилия, и хвост «А.Егорова» оставался в реплике.
+_HALLU_TAIL_RE = re.compile(
+    r"^(?:\s*(?:" + "|".join(_HALLUCINATION_PREFIXES) + r")\s+[А-ЯЁA-Z][\w.\-]*[\s.!?]*)+",
+    re.IGNORECASE,
+)
+
+
+def strip_hallucination_prefix(text: str) -> str:
+    """Срезает «титровую» галлюцинацию с начала реплики, остальное оставляет.
+
+    Не трогает текст, где таких фраз нет. Если после срезки ничего не осталось —
+    вернёт пустую строку, и caller такую реплику отбросит."""
+    if not text:
+        return text
+    low = text.lower()
+    if not any(p in low for p in _HALLUCINATION_PREFIXES):
+        return text
+    cleaned = _HALLU_TAIL_RE.sub("", text).strip()
+    return cleaned
 
 
 def _extract_audio_duration_s(raw: dict, utterances: list[Utterance]) -> float:
