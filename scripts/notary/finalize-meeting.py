@@ -858,15 +858,21 @@ def main() -> int:
     # выжимки. Иначе мусор течёт в пул имён map_all и в шапку протокола.
     participants = filter_participant_names(meta.get("participants") or [])
     expected = meta.get("expectedParticipants") or []
+    # 🔴 Короткую форму имени («Илья» из «Илья Рыбалка») в пул кандидатов НЕ кладём.
+    # Раньше клали — и это порождало ДВОЙНИКА: один человек становился двумя
+    # кандидатами. Последствия (разбор 25.09, план 2026-09-25-speaker-attribution-fix):
+    #   • на 1:1 кандидатов 4 вместо 2 → спец-разбор двух говорящих
+    #     (`name_mapping._resolve_two_speakers`, условие «ровно 2 и 2») не включался
+    #     НИКОГДА, управление уходило в жадный перебор, который переворачивает авторство;
+    #   • оба голоса могли получить одного человека под разными написаниями — на 08.07,
+    #     15.07, 29.07 собеседник исчезал из протокола целиком (все реплики «Илья»).
+    # Короткие имена из ПАНЕЛИ Телемоста при этом не теряются: они приходят в
+    # `participants` и остаются в пуле. А поиск обращений в речи и так ведётся по
+    # первому слову (`name_mapping`), так что «Илью» внутри «Ильи Рыбалки» мы находим.
     expanded_expected: list[str] = []
     for full in expected:
-        if not full:
-            continue
-        if full not in expanded_expected:
+        if full and full not in expanded_expected:
             expanded_expected.append(full)
-        first_word = full.split()[0] if full.split() else ""
-        if first_word and first_word not in expanded_expected:
-            expanded_expected.append(first_word)
     participants_union: list[str] = list(dict.fromkeys(participants + expanded_expected))
     language = meta.get("language") or "ru"
 
@@ -914,7 +920,19 @@ def main() -> int:
                 if nm not in expected_enriched:
                     expected_enriched.append(nm)
             series_memory_block = series_memory.format_memory_block(series_memory_digests)
-            series_speaker_anchor = series_memory.resolve_speaker_anchor(series_memory_digests)
+            # Ф5 (план 2026-09-25): на встрече ВДВОЁМ наследуем только разметку,
+            # подтверждённую человеком. Метки S1/S2 между запусками нестабильны, и на
+            # двоих наследование — монетка: промах переворачивает весь протокол
+            # (23.09 инверсия ушла в групповой чат команды). На встречах большего
+            # состава якорь полезен и остаётся как был — отключение его ВЕЗДЕ на
+            # стенде отняло у планёрок МПервого по 2–3 имени из трёх.
+            _pair_meeting = len({n for n in _expected_base if n}) == 2
+            series_speaker_anchor = series_memory.resolve_speaker_anchor(
+                series_memory_digests, confirmed_only=_pair_meeting,
+            )
+            if _pair_meeting and not series_speaker_anchor:
+                log.info("[name-mapping] встреча вдвоём: неподтверждённый якорь не применяю "
+                         "(авторство решают обращения в текущей записи / LLM)")
             # Ф6 (G6/G7/G11): ШИРОКИЙ кросс-встречный фон из ДРУГИХ серий (приоритет
             # своей компании, кросс-компания при релевантности — A7, не стена).
             # Главный guard — фильтр чувствительного G11 (LLM) + ручной маркер серии

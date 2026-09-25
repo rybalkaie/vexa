@@ -1726,8 +1726,18 @@ def resolve_memory(
 # ---------------------------------------------------------------------------
 # Ф4б — якорь авторства серии (cluster→имя) для диаризации (REQ 1.2)
 # ---------------------------------------------------------------------------
-def resolve_speaker_anchor(digests: list[dict]) -> dict[str, str]:
+def resolve_speaker_anchor(digests: list[dict], *, confirmed_only: bool = False) -> dict[str, str]:
     """Ф4б: последнее непустое `speaker_mapping` среди выжимок серии.
+
+    Ф5 (план 2026-09-25) — `confirmed_only=True`: берём только разметку с меткой
+    `speaker_mapping_confirmed` (её ставит правка авторства от человека). Зовётся так
+    ТОЛЬКО для разговоров вдвоём, и вот почему: метки S1/S2 между запусками
+    нестабильны, поэтому на двух говорящих наследование — ставка «кто первым
+    заговорил в прошлый раз», то есть монетка 50/50, и промах переворачивает весь
+    протокол (23.09 инверсия уехала в групповой чат). На планёрке из 5–7 человек
+    случайно совпасть нечему, а пользы от наследования много — там якорь работает
+    как раньше. Замер на стенде: с отключением ВЕЗДЕ планёрки МПервого теряли по
+    2–3 имени из трёх, поэтому отключаем точечно.
 
     `digests` — как из `resolve_memory` (по дате ВОЗРАСТАНИЮ). Берём самое свежее
     непустое сопоставление cluster→имя (последняя правка авторства бьёт ранние).
@@ -1739,10 +1749,13 @@ def resolve_speaker_anchor(digests: list[dict]) -> dict[str, str]:
     """
     anchor: dict[str, str] = {}
     for dig in digests or []:
-        sm = dig.get("speaker_mapping") if isinstance(dig, dict) else None
-        norm = _norm_speaker_mapping(sm)
+        if not isinstance(dig, dict):
+            continue
+        if confirmed_only and not dig.get("speaker_mapping_confirmed"):
+            continue
+        norm = _norm_speaker_mapping(dig.get("speaker_mapping"))
         if norm:
-            anchor = norm  # ascending → последняя непустая выжимка побеждает
+            anchor = norm  # ascending → последняя подходящая выжимка побеждает
     return anchor
 
 
@@ -1773,9 +1786,15 @@ def update_digest_speaker_mapping(
     if new_sm == sm:
         return False
     dig["speaker_mapping"] = new_sm
+    # Ф5 (план 2026-09-25): метка «эту разметку подтвердил ЧЕЛОВЕК». Сюда попадают
+    # только правки авторства реплаем, то есть живое свидетельство участника.
+    # Якорь следующей встречи берёт ТОЛЬКО помеченные выжимки — иначе бот наследует
+    # собственную догадку и тиражирует её (так ошибка 09.09 доехала до 23.09).
+    dig["speaker_mapping_confirmed"] = True
     saved = save_digest(series_dir, date, dig)
     if saved:
-        logger.info("[series-memory] speaker_mapping remapped series=%s date=%s", dig.get("series") or "?", date)
+        logger.info("[series-memory] speaker_mapping remapped series=%s date=%s (подтверждено человеком)",
+                    dig.get("series") or "?", date)
     return bool(saved)
 
 
