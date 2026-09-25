@@ -155,6 +155,8 @@ results/
 test_data/
 *.wav
 !tests/testdata/test-speech-en.wav
+# Фразы диктора самопроверки (синтетический голос, не записи встреч) — ISS-60 фаза 2
+!scripts/notary/canary-kit/phrases/*.wav
 *.webm
 *.mp4
 *.txt
