@@ -117,6 +117,32 @@ class LaunchTest(_Env):
         self.assertEqual(runner._session_uid_for(it, 2), base + "-a2")
 
 
+class VerifyAliveTest(_Env):
+    """Фаза 3а: после `exec node` в entrypoint.sh docker stop даёт боту выйти
+    штатно (код 143) — это внешняя остановка, как 137, а не падение бота."""
+
+    def _alerts_for(self, inspect_line):
+        def fake_run(cmd, **kw):
+            if "inspect" in cmd:
+                return mock.Mock(returncode=0, stdout=inspect_line + "\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        runner.push.reset_mock()
+        with mock.patch.object(runner, "LOCAL_DOCKER", True), \
+             mock.patch.object(runner.time, "sleep"), \
+             mock.patch.object(runner.subprocess, "run", side_effect=fake_run):
+            runner._verify_container_alive("vexa-notarius-x", self.tmp / "logs" / "run.log",
+                                           "anzhee-direktorat", "2026-09-28T08:00:00+00:00")
+        return runner.push.call_count
+
+    def test_external_stop_is_silent(self):
+        for code in ("137", "143"):
+            self.assertEqual(self._alerts_for(f"exited|{code}"), 0, code)
+
+    def test_crash_still_alerts(self):
+        self.assertEqual(self._alerts_for("exited|1"), 1)
+
+
 class WatchWiringTest(_Env):
     def test_inert_on_mac_ssh_mode(self):
         now = datetime.now(timezone.utc)

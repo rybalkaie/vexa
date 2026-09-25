@@ -246,7 +246,12 @@ VIDEO_CALL_HOSTS = (
 
 
 def _is_video_call_url(url: str) -> bool:
-    return any(host in url for host in VIDEO_CALL_HOSTS)
+    # С10 (25.09.2026): хост сверяется ЦЕЛИКОМ (точно или поддомен), а не
+    # подстрокой — иначе `https://evil.example/telemost.yandex.ru/j/1` из описания
+    # события проходила бы, и бот открыл бы чужую страницу.
+    from notary.lib.telemost_url import url_host_in  # noqa: PLC0415
+
+    return url_host_in(url, VIDEO_CALL_HOSTS, schemes=("http", "https"))
 
 
 def extract_meeting_url(event: dict[str, Any]) -> str | None:

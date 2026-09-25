@@ -58,8 +58,10 @@ AUD_OWNER_TECH = "owner_tech"      # технический разбор вла�
 _PEOPLE = (AUD_GROUP, AUD_GROUP_PORTAL, AUD_ORGANIZER)
 _OWNER = (AUD_OWNER, AUD_OWNER_PORTAL, AUD_OWNER_TECH)
 
-#: Причины, где дело не в боте: группе не пишем.
-MEETING_PROBLEM_REASONS = frozenset({"meeting_not_found", "admission_rejected"})
+#: Причины, где дело не в боте: группе не пишем. `meeting_url_rejected` (фаза 3а,
+#: хвост С10) — ссылка ведёт не в Телемост: бот её не открывает, людям о «сбое
+#: бота» писать нечего, проверить ссылку — владельцу или организатору.
+MEETING_PROBLEM_REASONS = frozenset({"meeting_not_found", "admission_rejected", "meeting_url_rejected"})
 #: Не впустили из зала ожидания — людям пишем, но без «сбой бота».
 WAITING_ROOM_REASONS = frozenset({"waiting_room_not_admitted", "admission_timeout"})
 
@@ -79,6 +81,8 @@ REASON_HUMAN: Dict[str, str] = {
     "waiting_room_not_admitted": "его не впустили из зала ожидания",
     "admission_timeout": "его не впустили из зала ожидания",
     "admission_false_positive": "вход не подтвердился — в звонке бота не оказалось",
+    "admission_unclear": "нажал «Подключиться», но не узнал экран звонка — похоже, Телемост поменял экран",
+    "meeting_url_rejected": "ссылка встречи ведёт не в Яндекс Телемост — бот открывает только его",
     "stuck_joining": "завис на входе",
     "stuck_admission": "завис, ожидая впуска во встречу",
     "crashed": "упал во время входа",

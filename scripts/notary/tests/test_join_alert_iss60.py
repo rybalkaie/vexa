@@ -99,10 +99,20 @@ class OwnerSeriesTest(Base):
         self.assertNotIn("перешлите запись Илье", sent[0][1])
 
     def test_meeting_problem_only_owner(self):
-        for reason in ("meeting_not_found", "admission_rejected"):
+        for reason in ("meeting_not_found", "admission_rejected", "meeting_url_rejected"):
             sent, _p, _r = self.run_send(entry(), reason)
             self.assertEqual([c for c, _ in sent], [OWNER], reason)
             self.assertIn("людям не писал", sent[0][1])
+
+    def test_phase3a_reasons_have_human_text(self):
+        # Фаза 3а: новые причины бота — человеческим текстом, не кодом.
+        self.assertIn("не узнал экран звонка", ja.reason_human("admission_unclear"))
+        self.assertIn("не в Яндекс Телемост", ja.reason_human("meeting_url_rejected"))
+        sent, _p, _r = self.run_send(entry(), "admission_unclear")
+        self.assertEqual([c for c, _ in sent], [GROUP, OWNER])  # сбой бота — людям тоже
+        self.assertIn("сбой в работе бота-протоколиста", sent[0][1])
+        self.assertIn("не узнал экран звонка", sent[1][1])
+        self.assertNotIn("admission_unclear", sent[1][1])
 
     def test_waiting_room_failure_not_called_bot_failure(self):
         sent, _p, _r = self.run_send(entry(), "waiting_room_not_admitted")

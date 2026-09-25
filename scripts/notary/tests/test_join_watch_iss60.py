@@ -71,7 +71,7 @@ class DecideTest(unittest.TestCase):
         self.assertEqual((d.action, d.reason), (jw.ALERT, "name_input_not_found"))
 
     def test_no_retry_for_meeting_problems(self):
-        for reason in ("meeting_not_found", "admission_rejected"):
+        for reason in ("meeting_not_found", "admission_rejected", "meeting_url_rejected"):
             d = decide(obs("failed", reason=reason, status="exited", code=0, age=10))
             self.assertEqual(d.action, jw.ALERT, reason)
 
@@ -311,6 +311,31 @@ class TickTest(unittest.TestCase):
         self.run_tick(t1)
         self.assertEqual(self.w.stopped, ["vexa-notarius-auto-x"])
         self.assertEqual(self.w.relaunched, [2])
+
+    def test_stop_signal_crash_kit_reaches_alert(self):
+        # Фаза 3а (хвост У8): по SIGTERM бот снимает экран и дописывает путь в
+        # статус — сторож после остановки перечитывает статус и отдаёт снимок
+        # в технический разбор владельцу.
+        self.fail_attempt("auto-x", NOW, "still_in_lobby")
+        t1 = NOW + timedelta(seconds=60)
+        self.run_tick(t1)
+        self.assertEqual(self.w.relaunched, [2])
+        t2 = t1 + timedelta(seconds=jw.STUCK_JOINING_SEC + 5)
+        self.w.status["auto-x-a2"] = st("joining", at=t1 + timedelta(seconds=2))
+        self.w.containers["vexa-notarius-auto-x-a2"] = jw.ContainerState("running")
+        kit = "/transcripts/.crash-kits/auto-x-a2"
+
+        def stop(name):
+            self.w.stopped.append(name)
+            self.w.status["auto-x-a2"] = dict(self.w.status["auto-x-a2"], crash_kit=kit, stop_signal=True)
+
+        hooks = self.w.hooks()
+        hooks.stop = stop
+        jw.tick(self.ledger, now=t2, hooks=hooks)
+        self.assertEqual(self.w.stopped, ["vexa-notarius-auto-x-a2"])
+        self.assertEqual(len(self.w.alerts), 1)
+        reason, n, got_kit, _note = self.w.alerts[0]
+        self.assertEqual((reason, n, got_kit), ("stuck_joining", 2, kit))
 
     def test_legacy_running_never_stopped(self):
         t1 = NOW + timedelta(seconds=jw.LEGACY_WATCH_SEC + 5)

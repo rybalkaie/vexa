@@ -47,6 +47,7 @@ from notary.cli.registry import (  # noqa: E402
 from notary.lib.notify import push  # noqa: E402
 from notary.lib import late_join, portal_queue, slots, waitlist  # noqa: E402
 from notary.lib import join_watch  # noqa: E402
+from notary.lib import telemost_url  # noqa: E402
 from notary.lib.state import (  # noqa: E402
     read_queue,
     read_state,
@@ -582,11 +583,13 @@ def _verify_container_alive(name: str, log_file: Path, series: str, start_at: st
     status, _, exit_code = (proc.stdout.strip().partition("|"))
     # exited — упал; created/restarting через 3с = stuck на bootstrap (image pull,
     # network init, OCI runtime delay). exit_code=137 (SIGKILL) — внешний docker stop
-    # (например ручной smoke), не наш баг — молча игнор.
+    # (например ручной smoke), не наш баг — молча игнор. С 25.09.2026 (фаза 3а,
+    # entrypoint.sh: `exec node`) docker stop доходит до бота SIGTERM'ом, бот
+    # выходит штатно с кодом 143 — это тот же внешний стоп.
     if status not in {"exited", "created", "restarting"}:
         return
-    if status == "exited" and exit_code == "137":
-        logger.info("Container %s остановлен внешне (SIGKILL exit_code=137) — не алертим", name)
+    if status == "exited" and exit_code in ("137", "143"):
+        logger.info("Container %s остановлен внешне (exit_code=%s) — не алертим", name, exit_code)
         return
     # Контейнер уже Exited / stuck — снимаем логи и алертим
     logs_cmd = (["docker", "logs", "--tail", "40", name] if LOCAL_DOCKER
@@ -675,6 +678,20 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0, attempt: int 
     series = str(item.get("series") or item["meeting_id"])
     start_at = item["start_at"]
     session_uid = _session_uid_for(item, attempt)
+
+    # С10 (25.09.2026): бот ходит только в Телемост — хост ссылки сверяется
+    # ЦЕЛИКОМ, не подстрокой. Сюда сходятся все пути (календарь, реестр, наряды
+    # портала, повтор сторожа), поэтому это последний рубеж перед браузером на
+    # чужой странице (для личных серий ссылку может вписать внешний организатор).
+    # Саму ссылку в сообщение не кладём.
+    if not telemost_url.is_telemost_url(url, schemes=("http", "https")):
+        push(
+            f"Не запустил бот «{series}» (start {start_at}): ссылка встречи ведёт не в "
+            f"Яндекс Телемост — бот открывает только его. Проверь ссылку в приглашении.",
+            dedupe=False,
+        )
+        logger.error("Запуск %s отменён: ссылка встречи не на Телемост", item.get("meeting_id"))
+        return False
 
     # Ф1 (ISS-28): chat_id группового чата серии в BOT_CONFIG — задел под Ф2
     # (уведомление «в момент детекта» R4b шлёт сам бот из recording.ts, ему нужен

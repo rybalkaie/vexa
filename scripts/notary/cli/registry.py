@@ -334,7 +334,11 @@ def validate_room_record(rec: dict[str, Any]) -> list[str]:
     if not re.match(r"^[a-z0-9][a-z0-9_-]*$", name):
         errors.append(f"name='{name}': должно быть kebab-case латиницей")
     url = rec.get("url", "")
-    if not (url.startswith("https://") and TELEMOST_HOST in url):
+    # С10 (25.09.2026): хост целиком, а не подстрока — `https://evil.example/telemost.yandex.ru/…`
+    # раньше проходила. Проверка общая с планировщиком и запускателем.
+    from notary.lib.telemost_url import is_telemost_url  # noqa: PLC0415
+
+    if not is_telemost_url(url):
         errors.append(f"url='{url}': ожидается https://...{TELEMOST_HOST}/...")
     return errors
 

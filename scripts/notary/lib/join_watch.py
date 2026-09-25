@@ -98,8 +98,9 @@ LEDGER_TTL_HOURS = 12
 CRASH_KIT_TTL_DAYS = 30
 STATUS_TTL_DAYS = 7
 
-#: Причины, где повтор бессмысленен: встречи нет, бота отклонили.
-NO_RETRY_REASONS = frozenset({"meeting_not_found", "admission_rejected"})
+#: Причины, где повтор бессмысленен: встречи нет, бота отклонили, ссылка не на
+#: Телемост (фаза 3а, хвост С10 — бот её не открывает, повтор дал бы то же).
+NO_RETRY_REASONS = frozenset({"meeting_not_found", "admission_rejected", "meeting_url_rejected"})
 #: События по ходу встречи, о которых сторож сообщает.
 MEETING_EVENTS = frozenset({"evicted_failure", "deaf_after_start"})
 
@@ -547,6 +548,17 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
         cur["crash_kit"] = obs.crash_kit
         if d.action in (STOP_RETRY, STOP_ALERT) and obs.status_seen:
             _safe(hooks.stop, name)
+            # Хвост У8 (фаза 3а): по сигналу остановки бот, ещё не бывший в
+            # звонке, снимает экран и дописывает путь к снимку в статус —
+            # берём его для разбора владельцу (`docker stop` ждёт выхода бота).
+            if not cur.get("crash_kit") and uid:
+                try:
+                    after = hooks.read_status(uid)
+                except Exception:  # noqa: BLE001
+                    after = None
+                kit = after.get("crash_kit") if isinstance(after, dict) else None
+                if isinstance(kit, str) and kit:
+                    cur["crash_kit"] = kit
         _safe(hooks.save_logs, name)
         logger.warning("[join-watch] %s: вход сорвался (попытка %d, %s)", key, attempt_no, d.reason)
 
@@ -589,7 +601,7 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             entry["state"] = "watching"
             entry.pop("closed_at", None)
             continue
-        _safe(hooks.alert, entry, str(cur.get("reason") or d.reason), len(attempts), obs.crash_kit, owner_note)
+        _safe(hooks.alert, entry, str(cur.get("reason") or d.reason), len(attempts), cur.get("crash_kit"), owner_note)
     return changed
 
 
