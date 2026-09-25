@@ -1031,6 +1031,9 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
             "WAV сохранён (sid=%s): результат ещё не подтверждён порталом (R13.4)", sid,
         )
         return
+    # Фаза 4 (ISS-60): второе ухо — по тем же гейтам, что основная запись, и даже
+    # если основную уже убрали прошлым тиком (иначе второе ухо осталось бы навсегда).
+    _cleanup_second_ear(meta, sid)
     wav_path = (meta.get("files") or {}).get("wav")
     if not wav_path:
         return
@@ -1067,6 +1070,26 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
         _portal_report_purged(sid)
     except OSError as e:
         logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
+
+
+def _cleanup_second_ear(meta: dict | None, sid: str) -> None:
+    """Фаза 4 (ISS-60): удалить второе ухо (`<дата>-<сессия>.chunk0.wav`) встречи.
+
+    Второе ухо подчиняется ТЕМ ЖЕ правилам хранения, что основная запись: зовётся
+    только там, где сборщик удаляет `files.wav`, и только после тех же гейтов —
+    доставка подтверждена, keep_audio нет, портал не держит исходники. Путь — как у
+    `files.wav` (из meta бота, без переписывания). Только на сервере (LOCAL_FINALIZE):
+    с мака по ssh второе ухо не удаляется никогда. Если второе ухо и есть `files.wav`
+    (основная оглохла, протокол собран из него), его удаляет основной код.
+    """
+    if not LOCAL_FINALIZE or not isinstance(meta, dict):
+        return
+    try:
+        from notary.lib import second_ear  # noqa: PLC0415
+
+        second_ear.cleanup_after_delivery(meta, sid, host_path=Path)
+    except Exception as e:  # noqa: BLE001 — уборка не должна ронять сбор встреч
+        logger.warning("Второе ухо не убрано (sid=%s): %s", sid, type(e).__name__)
 
 
 def _read_series_from_meta(filename_uid: str) -> str | None:
@@ -1585,6 +1608,8 @@ def _do_finalize_and_collect(session_uid: str) -> None:
             _portal_report_purged(session_uid)
         except OSError as e:
             logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
+    # Фаза 4 (ISS-60): второе ухо — те же гейты, та же минута, что у основной записи.
+    _cleanup_second_ear(meta_obj, session_uid)
 
 
 _SESSION_RE = re.compile(r"^auto-(?P<mid>[^-]+(?:-[^-]+)*?)-(?P<dt>\d{4}\d{2}\d{2}T\d{6}Z)$")

@@ -25,6 +25,14 @@
      список участников пока не собирается, фаза 3).
   6. 🔴 перепроверяется вторым полным прогоном через 3 минуты (`run_cycle`);
      сообщение владельцу — только если красный оба раза.
+  7. Фаза 4 — второе ухо бота (`*.chunk0.wav`, всё, что играл браузер) судится
+     отдельно от основной записи: основная не услышала диктора, а бот сам
+     переключил протокол на второе ухо и в нём кодовое слово → 🟡 `primary_deaf`
+     (встреча не потерялась бы, основную пора чинить); второе ухо сломано при
+     живой основной → 🟡 `second_ear_problem`. Живая проверка «основная оглохла»
+     (`MEETING_NOTARY_CANARY_FORCE_DEAF=1`, только тестовый образ): бот глушит
+     основную запись, самопроверка ждёт, пока он сам объявит её оглохшей, и судит
+     второе ухо — запись, звук, кодовое слово, переключение, «не ушёл раньше команды».
 
 ЧТО ЕЩЁ. `sniff` раз в час смотрит версию Телемоста на главной странице;
 сменилась → внеплановая самопроверка, её итог владелец получает и тогда, когда
@@ -134,23 +142,37 @@ AFTER_SPEAK_PAUSE_SEC = 10            # хвост записи после фр�
 BOT_EXIT_TIMEOUT_SEC = 180            # бот: выход по `leave` и дописывание записи
 SPEAKER_EXIT_TIMEOUT_SEC = 30
 SPEAK_PLAYS = 3
+#: Фаза 4, живая проверка второго уха («основная оглохла» по флагу): диктор говорит
+#: дольше (5 повторов ≈ 32 с), чтобы звука хватило правилу бота «минута подряд»
+#: (второе ухо слышит ≥ 15 с за минуту, пока основная молчит)…
+SPEAK_PLAYS_DEAF = 5
+#: …и самопроверка ждёт, пока бот САМ объявит основную оглохшей (событие
+#: `primary_deaf` в статусе входа; бот объявляет через минуту после начала записи).
+DEAF_EVENT_TIMEOUT_SEC = 100
 #: Срок жизни диктора: вход + ожидание бота + голос + пауза + запас. Больше
 #: дефолта speaker.js (360 с), иначе при медленном входе бота диктор ушёл бы сам.
 SPEAKER_MAX_SECONDS = (
     SPEAKER_ALONE_TIMEOUT_SEC + BOT_IN_CALL_TIMEOUT_SEC + SPOKE_TIMEOUT_SEC
-    + AFTER_SPEAK_PAUSE_SEC + 80
+    + AFTER_SPEAK_PAUSE_SEC + DEAF_EVENT_TIMEOUT_SEC + 80
 )
 TRANSCRIBE_TIMEOUT_SEC = 240
 TRANSCRIBE_MAX_FILES = 2
+#: Второе ухо расшифровывается отдельно (ещё один файл): в режиме «оглохшей основной»
+#: всегда, в обычном — только если основная не услышала кодовое слово.
+TRANSCRIBE_EAR_FILES = 1
 
 # Повтор перед тревогой.
 RETRY_PAUSE_SEC = 180
 #: Юнит самопроверки живёт ≤ 40 мин (TimeoutStartSec); повтор не начинаем, если
 #: худший второй прогон не успеет — красный тогда перепроверит часовой «нюх».
 CYCLE_BUDGET_SEC = 38 * 60
+#: Худший обычный прогон (для решения «успеет ли перепроверка в срок юнита»).
+#: Ожидание «основная оглохла» (DEAF_EVENT_TIMEOUT_SEC) сюда не входит: режим
+#: «оглохшей основной» — только ручной прогон тестового образа, таймер его не ставит.
 MAX_RUN_SEC = (
     SPEAKER_ALONE_TIMEOUT_SEC + BOT_IN_CALL_TIMEOUT_SEC + SPOKE_TIMEOUT_SEC
-    + AFTER_SPEAK_PAUSE_SEC + BOT_EXIT_TIMEOUT_SEC + TRANSCRIBE_MAX_FILES * TRANSCRIBE_TIMEOUT_SEC
+    + AFTER_SPEAK_PAUSE_SEC + BOT_EXIT_TIMEOUT_SEC
+    + (TRANSCRIBE_MAX_FILES + TRANSCRIBE_EAR_FILES) * TRANSCRIBE_TIMEOUT_SEC
 )
 
 # Защиты.
@@ -208,7 +230,19 @@ ERROR_REASONS = frozenset({
     "speaker_setup_failed", "room_not_found", "room_url_invalid", "kit_missing", "internal_error",
 })
 #: Некритичные причины → 🟡.
-YELLOW_REASONS = frozenset({"transcribe_failed", "names_missing", "fallback_join"})
+YELLOW_REASONS = frozenset({
+    "transcribe_failed", "names_missing", "fallback_join",
+    # Фаза 4 (второе ухо): основная не слышит, встречу спасает второе ухо; второе
+    # ухо сломано при живой основной; бот не успел сам объявить глухоту (живая проверка).
+    "primary_deaf", "second_ear_problem", "deaf_rule_not_live",
+})
+#: Фаза 4: причины, по которым бот уходит из встречи САМ (не по команде `leave`
+#: самопроверки). В живой проверке «оглохшей основной» любая из них — бот ушёл
+#: раньше времени: второе ухо его не удержало.
+BOT_SELF_EXIT_REASONS = frozenset({
+    "no_one_joined", "deaf_with_participants", "deaf_after_start", "silence_out_of_call",
+    "evicted_failure", "evicted_normal_end",
+})
 
 REASON_TEXT: Dict[str, str] = {
     "speaker_start_failed": "не запустился контейнер диктора из образа бота",
@@ -231,6 +265,19 @@ REASON_TEXT: Dict[str, str] = {
     "names_missing": "бот не увидел «Тест-диктора» в списке участников (имена в протоколах могут пропасть)",
     "fallback_join": "бот вошёл только ЗАПАСНЫМ путём — основной вход сломан (Телемост поменял экран); "
                      "пока бот справляется сам, но основной путь пора чинить",
+    # Фаза 4 — второе ухо (запись всего, что играет браузер бота).
+    "primary_deaf": "основная запись бота не слышит звонок — протокол держится на втором ухе "
+                    "(запись всего, что играет браузер); пока встречи не теряются, но основную запись пора чинить",
+    "second_ear_problem": "второе ухо бота (запасная запись звука) не работает — если основная запись "
+                          "оглохнет, спасти встречу будет нечем",
+    "second_ear_missing": "второе ухо не оставило записи",
+    "second_ear_too_short": "запись второго уха слишком короткая",
+    "second_ear_silence": "во втором ухе тишина — браузер не играет звук звонка",
+    "second_ear_code_word_missing": "в расшифровке второго уха нет кодового слова",
+    "second_ear_not_used": "бот не переключил протокол на второе ухо, хотя основная запись молчала",
+    "bot_left_early": "бот ушёл из встречи сам, раньше команды самопроверки — второе ухо его не удержало",
+    "deaf_rule_not_live": "бот не объявил основную запись оглохшей по ходу встречи (правило «минута "
+                          "подряд»), переключился только в конце",
     "room_busy": "диктор ушёл, не проверив бота",
     "bot_running": "идёт настоящая встреча — проверка отложена",
     "meeting_soon": "скоро встреча — проверка отложена",
@@ -489,7 +536,7 @@ def _human_detail(code: str, detail: Any) -> str:
             return reason_human(str(detail))
         except Exception:  # noqa: BLE001
             return str(detail)
-    if code == "recording_too_short" and detail is not None:
+    if code in ("recording_too_short", "second_ear_too_short") and detail is not None:
         return f"{detail} с"
     return str(detail) if detail not in (None, "") else ""
 
@@ -578,6 +625,8 @@ class RunPlan:
     code_word: str
     meeting_id: int
     kit: Path
+    #: Фаза 4: живая проверка второго уха — основная запись бота «оглохла» по флагу.
+    force_deaf: bool = False
 
 
 def _labels(run_id: str) -> List[str]:
@@ -595,7 +644,7 @@ def speaker_docker_cmd(plan: RunPlan) -> List[str]:
         "botName": BOT_NAME,
         "phraseFile": plan.phrase_file,
         "maxSeconds": SPEAKER_MAX_SECONDS,
-        "plays": SPEAK_PLAYS,
+        "plays": SPEAK_PLAYS_DEAF if plan.force_deaf else SPEAK_PLAYS,
     }
     # Сырой BOT_CONFIG — только ради sessionUid: join-status.js и crashkit.js из
     # образа пишут статус и снимок диктора в его собственные файлы.
@@ -635,6 +684,25 @@ def force_fallback_mode(image: str) -> Optional[str]:
     return "no-testid" if raw == "no-testid" else "all"
 
 
+#: Живая проверка второго уха (фаза 4): `=1` — основная запись бота принудительно
+#: «оглохла» (сырой BOT_CONFIG.telemostForceDeaf: бот обнуляет её звук), второе ухо
+#: работает как обычно. Самопроверка тогда оценивает второе ухо: кодовое слово в
+#: его файле, бот сам объявил основную оглохшей, переключил протокол на второе ухо
+#: и не ушёл раньше команды. Только ТЕСТОВЫЙ образ; по умолчанию выключено.
+FORCE_DEAF_ENV = "MEETING_NOTARY_CANARY_FORCE_DEAF"
+
+
+def force_deaf_enabled(image: str) -> bool:
+    """Режим «оглохшей основной» для этого прогона. На боевом образе — никогда."""
+    raw = (os.environ.get(FORCE_DEAF_ENV) or "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off"):
+        return False
+    if is_production_image(image):
+        logger.warning("[canary] %s задан, но образ боевой — основную запись не глушу", FORCE_DEAF_ENV)
+        return False
+    return True
+
+
 def bot_config(plan: RunPlan) -> Dict[str, Any]:
     """BOT_CONFIG как у запускателя (`runner._launch_bot`), кроме серии и номера канала."""
     cfg: Dict[str, Any] = {
@@ -652,6 +720,10 @@ def bot_config(plan: RunPlan) -> Dict[str, Any]:
     mode = force_fallback_mode(plan.image)
     if mode:
         cfg["telemostForceFallback"] = True if mode == "all" else mode
+    # Решение принято в run_once (force_deaf_enabled) — здесь ещё раз не даём
+    # заглушить основную запись боевому образу, даже если план собран руками.
+    if plan.force_deaf and not is_production_image(plan.image):
+        cfg["telemostForceDeaf"] = True
     return cfg
 
 
@@ -697,10 +769,41 @@ class Evidence:
     #: Бот вошёл запасным путём не по флагу живой проверки (фаза 3б, цикл5 У5):
     #: строка «что сорвалось и чем обошёл» из статуса входа; None — основным путём.
     bot_fallback: Optional[str] = None
+    # --- Фаза 4: второе ухо (`*.chunk0.wav` — всё, что играл браузер бота).
+    #: Файл второго уха есть в папке прогона.
+    ear_present: bool = False
+    #: Его длительность (с; None — не измерили) и громкость (mean_db, max_db).
+    ear_duration: Optional[float] = None
+    ear_volume: Optional[Tuple[float, float]] = None
+    #: Кодовое слово во втором ухе; None — не расшифровывали или расшифровка упала.
+    ear_code_word_found: Optional[bool] = None
+    #: Из meta бота: статус второго уха (None — в meta его нет: образ до фазы 4),
+    #: откуда финализация возьмёт звук ("primary" / "second_ear"), причина конца записи.
+    ear_status: Optional[str] = None
+    audio_source: Optional[str] = None
+    end_reason: Optional[str] = None
+    #: Живая проверка «основная оглохла» (флаг, тестовый образ) и увидела ли
+    #: самопроверка, что бот объявил глухоту сам по ходу встречи.
+    force_deaf: bool = False
+    deaf_event_live: Optional[bool] = None
+
+
+def _loud_enough(volume: Optional[Tuple[float, float]]) -> bool:
+    return volume is not None and volume[1] >= SOUND_MAX_DB and volume[0] >= SOUND_MEAN_DB
 
 
 def evaluate(ev: Evidence, *, speaker_name: str = SPEAKER_NAME) -> Dict[str, Any]:
-    """Итог записи: {status, reasons, details, checks, metrics}. Чистая функция."""
+    """Итог записи: {status, reasons, details, checks, metrics}. Чистая функция.
+
+    Фаза 4 (второе ухо). Обычный прогон: основная запись судится как раньше, но если
+    она не услышала диктора, а бот сам переключил протокол на второе ухо и в нём есть
+    звук и кодовое слово, — встреча не потерялась бы: 🟡 `primary_deaf` («чини
+    основную, пока держит второе ухо»), а не 🔴. При живой основной сломанное или
+    молчащее второе ухо — 🟡 `second_ear_problem` (только если бот вообще пишет
+    второе ухо — образ после фазы 4). Живая проверка «основная оглохла» (флаг):
+    основная заглушена намеренно, судится второе ухо — его запись, звук, кодовое
+    слово, переключение протокола на него и то, что бот не ушёл сам раньше команды.
+    """
     reasons: List[str] = []
     details: Dict[str, Any] = {}
 
@@ -709,29 +812,72 @@ def evaluate(ev: Evidence, *, speaker_name: str = SPEAKER_NAME) -> Dict[str, Any
     total = round(sum(durations), 1)
     has_wav = bool(ev.wav_durations)
     recorded = total >= MIN_RECORDING_SEC
-    sound = (
-        ev.volume is not None
-        and ev.volume[1] >= SOUND_MAX_DB
-        and ev.volume[0] >= SOUND_MEAN_DB
-    )
+    sound = _loud_enough(ev.volume)
     names: Optional[bool] = None if ev.participants is None else names_contain(ev.participants, speaker_name)
+    ear_sound = ev.ear_present and _loud_enough(ev.ear_volume)
+    ear_used = ev.audio_source == "second_ear"
+    stayed: Optional[bool] = None if not ev.end_reason else ev.end_reason not in BOT_SELF_EXIT_REASONS
 
     if not joined:
         reasons.append("bot_not_joined")
         details["bot_not_joined"] = ev.bot_phase or "нет статуса"
-    if not has_wav:
-        reasons.append("no_recording")
-    elif not recorded:
-        reasons.append("recording_too_short")
-        details["recording_too_short"] = total
-    if has_wav and not sound:
-        reasons.append("silence")
-    if ev.code_word_found is False and (not has_wav or sound):
-        # При тишине корень — тишина; слово искать бессмысленно.
-        reasons.append("code_word_missing")
-    critical = bool(reasons)
-    if ev.code_word_found is None and has_wav and sound:
-        reasons.append("transcribe_failed")
+
+    if ev.force_deaf:
+        # Основная запись заглушена флагом — её тишина не поломка. Судим второе ухо.
+        if not ev.ear_present:
+            reasons.append("second_ear_missing")
+        elif (ev.ear_duration or 0.0) < MIN_RECORDING_SEC:
+            reasons.append("second_ear_too_short")
+            details["second_ear_too_short"] = round(ev.ear_duration or 0.0, 1)
+        elif not ear_sound:
+            reasons.append("second_ear_silence")
+        elif ev.ear_code_word_found is False:
+            reasons.append("second_ear_code_word_missing")
+        if ev.ear_present and not ear_used:
+            reasons.append("second_ear_not_used")
+        if stayed is False:
+            reasons.append("bot_left_early")
+            details["bot_left_early"] = ev.end_reason
+        critical = bool(reasons)
+        if ev.ear_code_word_found is None and ear_sound:
+            reasons.append("transcribe_failed")
+        if ev.deaf_event_live is False:
+            reasons.append("deaf_rule_not_live")
+    else:
+        main_fail: List[str] = []
+        if not has_wav:
+            main_fail.append("no_recording")
+        elif not recorded:
+            main_fail.append("recording_too_short")
+            details["recording_too_short"] = total
+        if has_wav and not sound:
+            main_fail.append("silence")
+        if ev.code_word_found is False and (not has_wav or sound):
+            # При тишине корень — тишина; слово искать бессмысленно.
+            main_fail.append("code_word_missing")
+        rescued = bool(main_fail) and joined and ear_used and ear_sound and ev.ear_code_word_found is True
+        if not rescued:
+            reasons.extend(main_fail)
+        critical = bool(reasons)
+        if rescued:
+            details.pop("recording_too_short", None)
+            reasons.append("primary_deaf")
+            details["primary_deaf"] = "основная: " + ", ".join(main_fail)
+        if ev.code_word_found is None and has_wav and sound:
+            reasons.append("transcribe_failed")
+        if not main_fail and ev.ear_status is not None:
+            problem = None
+            if ev.ear_status == "failed":
+                problem = "не запустилось"
+            elif not ev.ear_present:
+                problem = "нет записи"
+            elif ev.ear_volume is not None and not ear_sound:
+                problem = "тишина при живой основной"
+            elif ear_used:
+                problem = "протокол ушёл бы из второго уха, хотя основная слышала"
+            if problem:
+                reasons.append("second_ear_problem")
+                details["second_ear_problem"] = problem
     if not names:
         reasons.append("names_missing")
     # Цикл5 фазы 3 (У5): основной путь сломан, а бот зашёл запасным — это не
@@ -751,6 +897,17 @@ def evaluate(ev: Evidence, *, speaker_name: str = SPEAKER_NAME) -> Dict[str, Any
             "sound": sound if has_wav else False,
             "code_word": ev.code_word_found,
             "names": names,
+            # Фаза 4: второе ухо.
+            "second_ear": {
+                "present": ev.ear_present,
+                "sound": ear_sound,
+                "code_word": ev.ear_code_word_found,
+                "status": ev.ear_status,
+                "protocol_from_ear": ear_used,
+            },
+            "stayed_until_leave": stayed,
+            "deaf_rule_live": ev.deaf_event_live,
+            "force_deaf": ev.force_deaf,
         },
         "metrics": {
             "recording_sec": total,
@@ -758,6 +915,9 @@ def evaluate(ev: Evidence, *, speaker_name: str = SPEAKER_NAME) -> Dict[str, Any
             "mean_db": ev.volume[0] if ev.volume else None,
             "max_db": ev.volume[1] if ev.volume else None,
             "participants_count": None if ev.participants is None else len(ev.participants),
+            "ear_recording_sec": ev.ear_duration,
+            "ear_mean_db": ev.ear_volume[0] if ev.ear_volume else None,
+            "ear_max_db": ev.ear_volume[1] if ev.ear_volume else None,
         },
     }
 
@@ -1011,8 +1171,12 @@ def run_once(
     plan = RunPlan(
         run_id=run_id, run_dir=run_dir, image=image, room=room, meeting_url=meeting_url,
         phrase_file=phrase["file"], code_word=phrase["word"], meeting_id=canary_meeting_id(now), kit=kit,
+        force_deaf=force_deaf_enabled(image),
     )
     res = _new_result(plan, reason, now, telemost_version)
+    if plan.force_deaf:
+        res["force_deaf"] = True
+        logger.info("[canary] %s: живая проверка второго уха — основная запись бота заглушена флагом", run_id)
     _make_run_dir(run_dir)
     speaker, bot = speaker_container(run_id), bot_container(run_id)
     started: List[str] = []
@@ -1204,6 +1368,30 @@ def _speaker_to_bot(deps, plan, res, flow, speaker_view, red, started) -> None: 
         flow["busy"] = busy
         return None
 
+    # 4б. Фаза 4, живая проверка «основная оглохла»: ждём, пока бот САМ объявит
+    # основную запись оглохшей (правило «минута подряд» → событие primary_deaf в
+    # статусе входа). Это и есть проверка, что второе ухо держит встречу по ходу, а
+    # не только в конце. Посторонних не упускаем и здесь; бот ушёл сам — не ждём.
+    if plan.force_deaf:
+        def s4d() -> Optional[Tuple[str, Optional[str]]]:
+            sp = speaker_view()
+            if sp.get("phase") == "busy":
+                return ("busy", sp.get("reason") or "strangers")
+            if deaf_event_seen(_read_bot_status(run_dir, run_id)):
+                return ("deaf", None)
+            if deps.container_state(bot)[0] in _GONE:
+                return ("bot_gone", None)
+            return None
+
+        rd = _poll(deps, DEAF_EVENT_TIMEOUT_SEC, s4d)
+        if rd is not None and rd[0] == "busy":
+            flow["busy"] = rd[1]
+            return None
+        if rd is None:
+            flow["notes"].append("deaf_event_timeout")
+        elif rd[0] == "bot_gone":
+            flow["notes"].append("bot_left_before_leave")
+
     # 5. Штатный выход: бот — по команде leave (запись дописывается), диктор — по cmd.
     got = _safe(deps.publish, leave_channel(plan.meeting_id), LEAVE_MESSAGE)
     _write_cmd(run_dir, "leave", 2)
@@ -1239,11 +1427,38 @@ def _top_files(run_dir: Path, pattern: str) -> List[Path]:
     return out
 
 
+def deaf_event_seen(bot_status: Dict[str, Any]) -> bool:
+    """Бот сам объявил основную запись оглохшей по ходу встречи (фаза 4, «минута подряд»)."""
+    return any(
+        isinstance(e, dict) and e.get("type") == "primary_deaf" and e.get("rule") == "sustained"
+        for e in (bot_status.get("events") or [])
+    )
+
+
+def _find_code_word(deps: Deps, wav: Path, word: str) -> Tuple[Optional[bool], int]:
+    """(нашлось ли слово — None, если расшифровка упала; длина текста). Текст не живёт дальше."""
+    try:
+        text = deps.transcribe(wav)
+    except Exception as e:  # noqa: BLE001 — whisper лёг: слово не проверено, не «нет слова»
+        logger.warning("[canary] расшифровка %s не удалась (%s)", wav.name, type(e).__name__)
+        return None, 0
+    n = len(text or "")
+    hit = code_word_found(text or "", word)
+    text = ""  # текст дальше не живёт — опасная тройка
+    return hit, n
+
+
 def _evaluate_run(deps: Deps, plan: RunPlan, res: Dict[str, Any], flow: Dict[str, Any]) -> None:
     run_dir = plan.run_dir
     bs = _read_bot_status(run_dir, plan.run_id)
     phases = tuple(h.get("phase") for h in (bs.get("history") or []) if isinstance(h, dict) and h.get("phase"))
-    wavs = _top_files(run_dir, "*.wav")
+    # Фаза 4: второе ухо (`*.chunk0.wav`) судится ОТДЕЛЬНО от основной записи —
+    # иначе его звук скрыл бы оглохшую основную, и самопроверка её бы не заметила.
+    from notary.lib.second_ear import is_ear_file  # noqa: PLC0415
+
+    all_wavs = _top_files(run_dir, "*.wav")
+    ear_wavs = [w for w in all_wavs if is_ear_file(w.name)]
+    wavs = [w for w in all_wavs if not is_ear_file(w.name)]
     durations = tuple(_safe(deps.probe_duration, w) for w in wavs)
     volumes = [(w, _safe(deps.volume, w)) for w in wavs]
     measured = [(w, v) for w, v in volumes if isinstance(v, tuple) and len(v) == 2]
@@ -1251,25 +1466,53 @@ def _evaluate_run(deps: Deps, plan: RunPlan, res: Dict[str, Any], flow: Dict[str
 
     found: Optional[bool] = None
     chars = 0
-    for w, _v in sorted(measured, key=lambda wv: wv[1][1], reverse=True)[:TRANSCRIBE_MAX_FILES]:
-        try:
-            text = deps.transcribe(w)
-        except Exception as e:  # noqa: BLE001 — whisper лёг: слово не проверено, не «нет слова»
-            logger.warning("[canary] расшифровка %s не удалась (%s)", w.name, type(e).__name__)
-            continue
-        chars += len(text or "")
-        hit = code_word_found(text or "", plan.code_word)
-        found = bool(found) or hit
-        text = ""  # текст дальше не живёт — опасная тройка
-        if hit:
-            break
+    if not plan.force_deaf:  # основная заглушена флагом — её расшифровывать незачем
+        for w, _v in sorted(measured, key=lambda wv: wv[1][1], reverse=True)[:TRANSCRIBE_MAX_FILES]:
+            hit, n = _find_code_word(deps, w, plan.code_word)
+            if hit is None:
+                continue
+            chars += n
+            found = bool(found) or hit
+            if hit:
+                break
     logger.info("[canary] расшифровка: кодовое слово найдено=%s, длина текста=%d", found, chars)
 
+    def _size(p: Path) -> int:
+        try:
+            return p.stat().st_size
+        except OSError:
+            return -1
+
+    ear = max(ear_wavs, key=_size, default=None) if ear_wavs else None
+    ear_duration = _safe(deps.probe_duration, ear) if ear else None
+    ear_volume = _safe(deps.volume, ear) if ear else None
+    if not (isinstance(ear_volume, tuple) and len(ear_volume) == 2):
+        ear_volume = None
+    ear_found: Optional[bool] = None
+    ear_chars = 0
+    # Второе ухо расшифровываем, когда от него зависит итог: живая проверка
+    # «основная оглохла» или основная не услышала кодовое слово.
+    if ear is not None and _loud_enough(ear_volume) and (plan.force_deaf or found is not True):
+        ear_found, ear_chars = _find_code_word(deps, ear, plan.code_word)
+    if ear is not None:
+        logger.info("[canary] второе ухо: %s с, кодовое слово=%s, длина текста=%d",
+                    ear_duration, ear_found, ear_chars)
+
     participants: Optional[Tuple[str, ...]] = None
+    ear_status: Optional[str] = None
+    audio_source: Optional[str] = None
+    end_reason: Optional[str] = None
     for mp in _top_files(run_dir, "*.meta.json"):
         meta = _dict(read_json(mp))
         names = tuple(n for n in (meta.get("participants") or []) if isinstance(n, str))
         participants = (participants or ()) + names
+        rec = _dict(meta.get("recording"))
+        if "secondEar" in rec:
+            ear_status = str(_dict(rec.get("secondEar")).get("status") or "failed")
+        if isinstance(rec.get("audioSource"), str):
+            audio_source = rec["audioSource"]
+        if isinstance(meta.get("endReason"), str):
+            end_reason = meta["endReason"]
 
     # Запасной путь по флагу живой проверки (тестовый образ) — не поломка.
     fb = _dict(bs.get("fallback_used"))
@@ -1285,6 +1528,15 @@ def _evaluate_run(deps: Deps, plan: RunPlan, res: Dict[str, Any], flow: Dict[str
         code_word_found=found,
         participants=participants,
         bot_fallback=bot_fallback,
+        ear_present=ear is not None,
+        ear_duration=ear_duration if isinstance(ear_duration, (int, float)) else None,
+        ear_volume=ear_volume,
+        ear_code_word_found=ear_found,
+        ear_status=ear_status,
+        audio_source=audio_source,
+        end_reason=end_reason,
+        force_deaf=plan.force_deaf,
+        deaf_event_live=deaf_event_seen(bs) if plan.force_deaf else None,
     )
     out = evaluate(ev)
     reasons, details = list(out["reasons"]), dict(out["details"])
@@ -1303,7 +1555,7 @@ def _evaluate_run(deps: Deps, plan: RunPlan, res: Dict[str, Any], flow: Dict[str
         "reasons": reasons,
         "details": details,
         "checks": out["checks"],
-        "metrics": {**out["metrics"], "transcript_chars": chars},
+        "metrics": {**out["metrics"], "transcript_chars": chars, "ear_transcript_chars": ear_chars},
     })
     if out["status"] == RED:
         crash = _host_path(run_dir, bs.get("crash_kit"))

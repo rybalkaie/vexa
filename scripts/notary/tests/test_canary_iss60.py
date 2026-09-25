@@ -63,6 +63,15 @@ DEFAULT_RUN = dict(
     speaker_start_ok=True,
     bot_start_ok=True,
     bot_fallback=None,             # dict → `fallback_used` в статусе входа бота
+    # Фаза 4 — второе ухо: бот после фазы 4 пишет `*.chunk0.wav` и сведения в meta.
+    ear=False,                     # писать файл второго уха и сведения о нём в meta
+    ear_duration=None,             # None → как у основной записи
+    ear_volume=None,               # None → как у основной записи
+    ear_transcript=None,           # None → как у основной записи
+    ear_status="stopped",
+    audio_source="primary",        # откуда финализация взяла бы звук
+    end_reason="page_closed",      # page_closed — бот ушёл по команде leave
+    deaf_event_sec=None,           # через сколько с после входа бот объявит «основная оглохла»
 )
 
 
@@ -82,6 +91,7 @@ class World:
         self.pushes = []
         self.sleeps = []
         self.transcribed = 0
+        self.transcribed_files = []
         self.words = _words()
         self.run_idx = -1
         self.last_word = "нет"
@@ -160,19 +170,30 @@ class World:
                 return True
         return False
 
-    # --- звук
+    # --- звук (второе ухо `*.chunk0.wav` может звучать иначе, чем основная запись)
+    @staticmethod
+    def _is_ear(p):
+        return str(p).endswith(".chunk0.wav")
+
+    def _per_file(self, p, key):
+        cfg = self.cfg()
+        if self._is_ear(p) and cfg.get(f"ear_{key}") is not None:
+            return cfg[f"ear_{key}"]
+        return cfg[key]
+
     def probe(self, p):
-        return self.cfg()["duration"]
+        return self._per_file(p, "duration")
 
     def volume(self, p):
-        return self.cfg()["volume"]
+        return self._per_file(p, "volume")
 
     def transcribe(self, p):
         self.transcribed += 1
+        self.transcribed_files.append(Path(p).name)
         cfg = self.cfg()
         if cfg["transcribe_error"]:
             raise RuntimeError("whisper down")
-        return cfg["transcript"].format(word=self.last_word)
+        return self._per_file(p, "transcript").format(word=self.last_word)
 
     def notify(self, text, silent):
         self.pushes.append((text, silent))
@@ -252,16 +273,30 @@ class World:
         if c["leave"]:
             c["status"], c["code"] = "exited", 0
             return
+        # Фаза 4: бот сам объявляет «основная оглохла» (правило «минута подряд»).
+        if (st.get("phase") == "in_call" and cfg["deaf_event_sec"] is not None and not c.get("deaf_written")
+                and self.t - c.get("in_call_at", self.t) >= cfg["deaf_event_sec"]):
+            c["deaf_written"] = True
+            self._write(st_path, {**st, "events": [{"type": "primary_deaf", "rule": "sustained", "at": "x"}]})
         if st.get("phase") is None and self.t - c["started"] >= cfg["bot_join_sec"]:
             r = cfg["bot_result"]
             if r == "in_call":
+                c["in_call_at"] = self.t
                 self._write(st_path, {"phase": "in_call", "history": [
                     {"phase": "joining"}, {"phase": "admission"}, {"phase": "in_call"}],
                     **({"fallback_used": cfg["bot_fallback"]} if cfg.get("bot_fallback") else {})})
                 if cfg["wav"]:
                     (d / "2026-09-26-tm-1.chunk1.wav").write_bytes(b"RIFF....WAVE")
-                    self._write(d / "2026-09-26-tm-1.meta.json",
-                                {"participants": cfg["participants"], "meetingUrl": FAKE_URL})
+                    meta = {"participants": cfg["participants"], "meetingUrl": FAKE_URL}
+                    if cfg["ear"]:
+                        (d / "2026-09-26-tm-1.chunk0.wav").write_bytes(b"RIFF....WAVE-ear")
+                        meta["endReason"] = cfg["end_reason"]
+                        meta["recording"] = {
+                            "audioSource": cfg["audio_source"],
+                            "secondEar": {"status": cfg["ear_status"],
+                                          "wav": "/transcripts/2026-09-26-tm-1.chunk0.wav"},
+                        }
+                    self._write(d / "2026-09-26-tm-1.meta.json", meta)
             elif r == "failed":
                 kit = f"/transcripts/.crash-kits/{c['uid']}"
                 (d / ".crash-kits" / c["uid"]).mkdir(parents=True, exist_ok=True)
@@ -1393,6 +1428,192 @@ class SpeakerIdleVerdictTest(unittest.TestCase):
 
     def test_strict_names_switch(self):
         self.assertEqual(self.verdicts([[2, 1], [2, 1], [2, 1]], strict=False), [None, None, None])
+
+
+# ---------------------------------------------------------------------------
+# Фаза 4 — второе ухо бота (`*.chunk0.wav`, всё, что играл браузер)
+# ---------------------------------------------------------------------------
+
+QUIET = (-91.0, -91.0)   # цифровая тишина
+#: Второе ухо слышит диктора (основная при этом молчит — whisper по тишине даёт пусто).
+EAR_TEXT = DEFAULT_RUN["transcript"]
+
+
+def ear_ev(**kw):
+    """Новый бот: пишет второе ухо; основная и второе ухо слышат диктора."""
+    base = dict(ear_present=True, ear_duration=45.0, ear_volume=(-30.0, -6.0), ear_code_word_found=None,
+                ear_status="stopped", audio_source="primary", end_reason="page_closed")
+    base.update(kw)
+    return ev(**base)
+
+
+class EvaluateSecondEarTest(unittest.TestCase):
+    # --- обычный прогон: второе ухо не маскирует оглохшую основную
+    def test_rescued_by_ear_is_yellow_not_red(self):
+        r = lib.evaluate(ear_ev(volume=QUIET, code_word_found=None, audio_source="second_ear",
+                                ear_code_word_found=True))
+        self.assertEqual(r["status"], lib.YELLOW)
+        self.assertIn("primary_deaf", r["reasons"])
+        self.assertNotIn("silence", r["reasons"])
+        self.assertIn("silence", r["details"]["primary_deaf"])
+        self.assertTrue(r["checks"]["second_ear"]["protocol_from_ear"])
+
+    def test_ear_heard_but_bot_did_not_switch_is_red(self):
+        # Второе ухо слышит, но протокол ушёл бы из основной — встреча потерялась бы.
+        r = lib.evaluate(ear_ev(volume=QUIET, code_word_found=None, ear_code_word_found=True))
+        self.assertEqual(r["status"], lib.RED)
+        self.assertIn("silence", r["reasons"])
+
+    def test_switched_but_ear_has_no_code_word_is_red(self):
+        r = lib.evaluate(ear_ev(volume=QUIET, code_word_found=None, audio_source="second_ear",
+                                ear_code_word_found=False))
+        self.assertEqual(r["status"], lib.RED)
+
+    def test_rescue_needs_bot_in_call(self):
+        r = lib.evaluate(ear_ev(bot_phase="failed", bot_phases_seen=("joining", "failed"), volume=QUIET,
+                                code_word_found=None, audio_source="second_ear", ear_code_word_found=True))
+        self.assertEqual(r["status"], lib.RED)
+        self.assertNotIn("primary_deaf", r["reasons"])
+
+    def test_ear_failed_with_live_primary_is_yellow(self):
+        r = lib.evaluate(ear_ev(ear_present=False, ear_duration=None, ear_volume=None, ear_status="failed"))
+        self.assertEqual(r["status"], lib.YELLOW)
+        self.assertEqual(r["details"]["second_ear_problem"], "не запустилось")
+
+    def test_silent_ear_with_live_primary_is_yellow(self):
+        r = lib.evaluate(ear_ev(ear_volume=QUIET))
+        self.assertEqual((r["status"], r["reasons"]), (lib.YELLOW, ["second_ear_problem"]))
+
+    def test_needless_switch_is_yellow(self):
+        r = lib.evaluate(ear_ev(audio_source="second_ear"))
+        self.assertEqual((r["status"], r["reasons"]), (lib.YELLOW, ["second_ear_problem"]))
+
+    def test_old_image_without_ear_stays_green(self):
+        self.assertEqual(lib.evaluate(ev())["status"], lib.GREEN)
+        self.assertEqual(lib.evaluate(ear_ev())["status"], lib.GREEN)
+
+    # --- живая проверка «основная оглохла» (флаг)
+    def deaf(self, **kw):
+        base = dict(force_deaf=True, volume=QUIET, code_word_found=None, audio_source="second_ear",
+                    ear_code_word_found=True, deaf_event_live=True)
+        base.update(kw)
+        return lib.evaluate(ear_ev(**base))
+
+    def test_forced_deaf_all_good_is_green(self):
+        r = self.deaf()
+        self.assertEqual((r["status"], r["reasons"]), (lib.GREEN, []))
+        self.assertTrue(r["checks"]["stayed_until_leave"])
+
+    def test_forced_deaf_without_ear_file_is_red(self):
+        r = self.deaf(ear_present=False, ear_duration=None, ear_volume=None, ear_code_word_found=None)
+        self.assertEqual((r["status"], r["reasons"][0]), (lib.RED, "second_ear_missing"))
+
+    def test_forced_deaf_short_or_silent_ear_is_red(self):
+        self.assertEqual(self.deaf(ear_duration=4.0)["reasons"][0], "second_ear_too_short")
+        self.assertEqual(self.deaf(ear_volume=QUIET, ear_code_word_found=None)["reasons"][0], "second_ear_silence")
+
+    def test_forced_deaf_no_code_word_in_ear_is_red(self):
+        r = self.deaf(ear_code_word_found=False)
+        self.assertEqual((r["status"], r["reasons"]), (lib.RED, ["second_ear_code_word_missing"]))
+
+    def test_forced_deaf_not_switched_is_red(self):
+        r = self.deaf(audio_source="primary")
+        self.assertEqual((r["status"], r["reasons"]), (lib.RED, ["second_ear_not_used"]))
+
+    def test_forced_deaf_bot_left_by_itself_is_red(self):
+        r = self.deaf(end_reason="deaf_with_participants")
+        self.assertEqual((r["status"], r["reasons"]), (lib.RED, ["bot_left_early"]))
+        self.assertIn("deaf_with_participants", lib.human_reasons({**r, "status": lib.RED}))
+        self.assertFalse(r["checks"]["stayed_until_leave"])
+
+    def test_forced_deaf_rule_not_live_is_yellow(self):
+        r = self.deaf(deaf_event_live=False)
+        self.assertEqual((r["status"], r["reasons"]), (lib.YELLOW, ["deaf_rule_not_live"]))
+
+    def test_forced_deaf_ear_transcribe_failed_is_yellow(self):
+        r = self.deaf(ear_code_word_found=None)
+        self.assertEqual((r["status"], r["reasons"]), (lib.YELLOW, ["transcribe_failed"]))
+
+
+class SecondEarCycleTest(_Env):
+    def bot_cfg(self, w):
+        cmd = next(c for c in w.docker_cmds if "--name" in c and "-bot-" in c[c.index("--name") + 1])
+        return json.loads(next(a for a in cmd if a.startswith("BOT_CONFIG="))[len("BOT_CONFIG="):])
+
+    def speaker_cfg(self, w):
+        cmd = next(c for c in w.docker_cmds if "-speaker-" in c[c.index("--name") + 1])
+        return json.loads(next(a for a in cmd if a.startswith("SPEAKER_CONFIG="))[len("SPEAKER_CONFIG="):])
+
+    def test_force_deaf_live_check_green(self):
+        w = World(runs=[dict(ear=True, volume=QUIET, transcript="", ear_transcript=EAR_TEXT,
+                             audio_source="second_ear", deaf_event_sec=60,
+                             ear_volume=(-28.0, -5.0), participants=["Тест-диктор"])])
+        with mock.patch.dict(os.environ, {lib.FORCE_DEAF_ENV: "1"}):
+            res = self.cycle(w, image="vexa-bot:resil-p4", reason="manual")
+        self.assertEqual(res["status"], lib.GREEN, res.get("reasons"))
+        self.assertTrue(res["force_deaf"])
+        self.assertTrue(self.bot_cfg(w)["telemostForceDeaf"])
+        self.assertEqual(self.speaker_cfg(w)["plays"], lib.SPEAK_PLAYS_DEAF)
+        # Основная заглушена — расшифровывается только второе ухо.
+        self.assertEqual(w.transcribed_files, ["2026-09-26-tm-1.chunk0.wav"])
+        self.assertTrue(res["checks"]["deaf_rule_live"])
+        self.assertTrue(res["checks"]["second_ear"]["code_word"])
+        # Тестовый образ — боевое состояние не тронуто.
+        self.assertEqual(lib.load_health(), {})
+
+    def test_force_deaf_waits_for_bot_to_declare_then_leaves(self):
+        w = World(runs=[dict(ear=True, volume=QUIET, transcript="", ear_transcript=EAR_TEXT,
+                             ear_volume=(-28.0, -5.0), audio_source="second_ear", deaf_event_sec=None,
+                             participants=["Тест-диктор"])])
+        with mock.patch.dict(os.environ, {lib.FORCE_DEAF_ENV: "1"}):
+            res = self.cycle(w, image="vexa-bot:resil-p4", reason="manual")
+        self.assertEqual(res["status"], lib.YELLOW)
+        self.assertEqual(res["reasons"], ["deaf_rule_not_live"])
+        self.assertIn("deaf_event_timeout", res["notes"])
+        self.assertTrue(w.published, "бот выведен командой leave")
+
+    def test_force_deaf_ignored_on_production_image(self):
+        w = World(runs=[dict(ear=True, participants=["Тест-диктор"])])
+        with mock.patch.dict(os.environ, {lib.FORCE_DEAF_ENV: "1"}):
+            res = self.cycle(w)
+        self.assertNotIn("telemostForceDeaf", self.bot_cfg(w))
+        self.assertEqual(self.speaker_cfg(w)["plays"], lib.SPEAK_PLAYS)
+        self.assertEqual(res["status"], lib.GREEN)
+        self.assertNotIn("force_deaf", res)
+
+    def test_force_deaf_off_by_default(self):
+        w = World(runs=[dict(ear=True, participants=["Тест-диктор"])])
+        os.environ.pop(lib.FORCE_DEAF_ENV, None)
+        self.cycle(w, image="vexa-bot:resil-p4")
+        self.assertNotIn("telemostForceDeaf", self.bot_cfg(w))
+
+    def test_primary_deaf_rescued_by_ear_is_yellow_on_production(self):
+        # Настоящая поломка основной на боевом образе: бот сам переключился на второе ухо.
+        w = World(runs=[dict(ear=True, volume=QUIET, transcript="", ear_transcript=EAR_TEXT,
+                             audio_source="second_ear", ear_volume=(-28.0, -5.0),
+                             participants=["Тест-диктор"])])
+        res = self.cycle(w)
+        self.assertEqual(res["status"], lib.YELLOW)
+        self.assertIn("primary_deaf", res["reasons"])
+        self.assertEqual(lib.load_health()["status"], lib.YELLOW)
+        self.assertEqual(len(w.pushes), 1)
+        self.assertIn("втором ухе", w.pushes[0][0])
+        self.assertIn("2026-09-26-tm-1.chunk0.wav", w.transcribed_files)
+
+    def test_ear_does_not_mask_deaf_primary(self):
+        # Второе ухо слышит диктора, а бот протокол не переключил — это красный, как раньше.
+        w = World(runs=[dict(ear=True, volume=QUIET, transcript="", ear_transcript=EAR_TEXT,
+                             ear_volume=(-28.0, -5.0), participants=["Тест-диктор"])] * 2)
+        res = self.cycle(w)
+        self.assertEqual(res["status"], lib.RED)
+        self.assertEqual(res["reasons"][0], "silence")
+
+    def test_healthy_run_does_not_transcribe_ear(self):
+        w = World(runs=[dict(ear=True, participants=["Тест-диктор"])])
+        res = self.cycle(w)
+        self.assertEqual(res["status"], lib.GREEN)
+        self.assertEqual(w.transcribed_files, ["2026-09-26-tm-1.chunk1.wav"])
+        self.assertEqual(res["metrics"]["ear_recording_sec"], 45.0)
 
 
 def iso_(dt):

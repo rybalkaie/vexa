@@ -853,6 +853,16 @@ def main() -> int:
             return 10
         log.error("WAV not found (meta.files.wav=%s)", wav_path)
         return 3
+    # Фаза 4 (ISS-60, второе ухо): бот решил, что основная запись оглохла, и указал
+    # в meta на второе ухо (всё, что играл браузер) — звук выше уже взят из него.
+    # Владельцу — одна строка на встречу (дедуп 6 ч): встреча не потеряна, основную
+    # запись бота надо чинить. Только метаданные; сбой сообщения встречу не валит.
+    try:
+        from lib import second_ear as _second_ear  # noqa: PLC0415
+
+        _second_ear.notify_owner_if_ear(meta, session_uid=session_uid)
+    except Exception as _e:  # noqa: BLE001
+        log.warning("[second-ear] сообщение владельцу не ушло (non-fatal): %s", type(_e).__name__)
     # Ф1 A2.1: единый chokepoint — чистим панель Телемоста от UI-мусора
     # («Скопировать ссылку», монограммы «ДН») ДО union/маппинга/протокола/
     # выжимки. Иначе мусор течёт в пул имён map_all и в шапку протокола.

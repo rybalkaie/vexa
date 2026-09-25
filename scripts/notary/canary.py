@@ -13,6 +13,13 @@ docker, redis-cli (в контейнере redis), ffprobe/ffmpeg, локаль�
 `run`/`sniff` отказываются — иначе тест или случайный запуск с мака пошёл бы
 заводить контейнеры. `status` только читает файлы и работает везде.
 
+Живые проверки кандидата (только с тестовым `--image`, на боевом образе флаги
+игнорируются): `MEETING_NOTARY_CANARY_FORCE_FALLBACK=1|no-testid` — бот входит
+запасным путём (фаза 3б); `MEETING_NOTARY_CANARY_FORCE_DEAF=1` — основная запись
+бота «оглохла», оценивается второе ухо (фаза 4): кодовое слово в его файле
+`*.chunk0.wav`, бот сам объявил основную оглохшей (событие `primary_deaf`),
+переключил протокол на второе ухо и не ушёл раньше команды самопроверки.
+
 Юниты systemd — `deploy/meeting-notary-canary.{service,timer}` и
 `deploy/meeting-notary-telemost-sniff.{service,timer}` (см. deploy/README.md).
 """
@@ -312,6 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "run":
         result = lib.run_cycle(deps=deps, image=args.image, room=args.room, reason=args.reason, force=args.force)
         print(lib.summary_line(result)
+              + (" [второе ухо: основная запись заглушена флагом]" if result.get("force_deaf") else "")
               + ("" if lib.is_production_image(args.image)
                  else f" [тестовый образ {args.image}: состояние боевого бота и сообщения не трогал]"))
         return 0
