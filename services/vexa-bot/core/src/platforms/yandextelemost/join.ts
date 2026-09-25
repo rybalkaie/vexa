@@ -57,6 +57,7 @@ import { ensureDeviceOff } from "./devices";
 import { installRtcAudioHook } from "./rtc-hook";
 import { FallbackResult, fallbackStepsCode, fallbackSummary, runFallbackJoin } from "./fallback";
 import { stopSignalReceived } from "./stop-signal";
+import { captureCrashKit } from "./crashkit";
 
 const LOG_PREFIX = "[adapter-telemost]";
 
@@ -349,7 +350,11 @@ export async function joinYandexTelemost(
     // Сеть, чужая ссылка, закрытая страница, остановка — не его дело.
     if (!FALLBACK_REASONS.has(reason) || !page || page.isClosed() || stopSignalReceived()) throw error;
     logStep("primary_join_failed", { reason });
-    await joinByFallback(page, botName, reason, null, error);
+    // Цикл5 фазы 3 (У6): снимок экрана, на котором сорвался основной путь, — ДО
+    // запасного (это лобби, звонка ещё нет). Войдёт запасной или нет, чинить
+    // основной путь будут по этому снимку; путь к нему — в статусе и в строке владельцу.
+    const kit = await captureCrashKit(page, `primary_${reason}`).catch(() => null);
+    await joinByFallback(page, botName, reason, null, error, kit);
   }
 }
 
@@ -373,6 +378,7 @@ async function joinByFallback(
   reason: string | null,
   forced: FallbackForceMode | null,
   primaryError: any,
+  primaryKit: string | null = null,
 ): Promise<void> {
   const r = await runFallbackJoin(page, { botName, reason, forced });
   const detail: Record<string, unknown> = {
@@ -380,7 +386,9 @@ async function joinByFallback(
     forced,
     steps: fallbackStepsCode(r.steps),
     screen: r.screen,
-    summary: fallbackSummary(reason, forced, r.steps),
+    summary: fallbackSummary(reason, forced, r.steps, !!r.nameless),
+    ...(r.nameless ? { nameless: true } : {}),
+    ...(primaryKit ? { crash_kit: primaryKit } : {}),
   };
   if (r.ok) {
     noteJoinFallback(detail);
@@ -419,22 +427,27 @@ async function joinPrimary(page: Page, botName: string): Promise<void> {
   // 2) Lobby — ждём появления поля имени.
   await page.waitForTimeout(3000);
 
-  // Диагностика: дамп state — URL, title, testids, видимый текст.
+  // Диагностика: дамп state — URL, title, testids (текст — только у кнопок), длина
+  // видимого текста. Сам текст страницы в журнал НЕ пишем (цикл5 фазы 3, опасная
+  // тройка): в 3.0 главная — чат комнаты, а журналы сорванных входов сторож хранит
+  // на сервере без срока (logs/bot-containers) — туда ушли бы реплики людей.
   try {
     const diag = await page.evaluate(() => {
       const testids = Array.from(document.querySelectorAll("[data-testid]"))
         .slice(0, 40)
-        .map((el) => ({
-          testid: el.getAttribute("data-testid"),
-          tag: el.tagName,
-          text: ((el as HTMLElement).innerText || "").trim().substring(0, 50),
-        }));
-      const visibleText = (document.body.innerText || "").substring(0, 600);
-      return { url: location.href, title: document.title, testids, visibleText };
+        .map((el) => {
+          const isButton = el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button";
+          return {
+            testid: el.getAttribute("data-testid"),
+            tag: el.tagName,
+            text: isButton ? ((el as HTMLElement).innerText || "").trim().substring(0, 50) : "",
+          };
+        });
+      const visibleTextLen = (document.body.innerText || "").length;
+      return { url: location.href, title: document.title, testids, visibleTextLen };
     });
-    logStep("post_interstitial_state", { url: diag.url, title: diag.title });
+    logStep("post_interstitial_state", { url: diag.url, title: diag.title, visible_text_len: diag.visibleTextLen });
     log(`${LOG_PREFIX} post_interstitial_testids ${JSON.stringify(diag.testids)}`);
-    log(`${LOG_PREFIX} post_interstitial_visible_text ${JSON.stringify(diag.visibleText)}`);
   } catch (e: any) {
     logStep("post_interstitial_diag_failed", { error: e.message });
   }

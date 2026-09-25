@@ -208,7 +208,7 @@ ERROR_REASONS = frozenset({
     "speaker_setup_failed", "room_not_found", "room_url_invalid", "kit_missing", "internal_error",
 })
 #: Некритичные причины → 🟡.
-YELLOW_REASONS = frozenset({"transcribe_failed", "names_missing"})
+YELLOW_REASONS = frozenset({"transcribe_failed", "names_missing", "fallback_join"})
 
 REASON_TEXT: Dict[str, str] = {
     "speaker_start_failed": "не запустился контейнер диктора из образа бота",
@@ -229,6 +229,8 @@ REASON_TEXT: Dict[str, str] = {
     "code_word_missing": "в расшифровке нет кодового слова — бот пишет не тот звук",
     "transcribe_failed": "расшифровка не удалась — кодовое слово не проверено",
     "names_missing": "бот не увидел «Тест-диктора» в списке участников (имена в протоколах могут пропасть)",
+    "fallback_join": "бот вошёл только ЗАПАСНЫМ путём — основной вход сломан (Телемост поменял экран); "
+                     "пока бот справляется сам, но основной путь пора чинить",
     "room_busy": "диктор ушёл, не проверив бота",
     "bot_running": "идёт настоящая встреча — проверка отложена",
     "meeting_soon": "скоро встреча — проверка отложена",
@@ -692,6 +694,9 @@ class Evidence:
     code_word_found: Optional[bool]
     #: Участники из meta.json бота; None — meta.json нет.
     participants: Optional[Tuple[str, ...]]
+    #: Бот вошёл запасным путём не по флагу живой проверки (фаза 3б, цикл5 У5):
+    #: строка «что сорвалось и чем обошёл» из статуса входа; None — основным путём.
+    bot_fallback: Optional[str] = None
 
 
 def evaluate(ev: Evidence, *, speaker_name: str = SPEAKER_NAME) -> Dict[str, Any]:
@@ -729,6 +734,11 @@ def evaluate(ev: Evidence, *, speaker_name: str = SPEAKER_NAME) -> Dict[str, Any
         reasons.append("transcribe_failed")
     if not names:
         reasons.append("names_missing")
+    # Цикл5 фазы 3 (У5): основной путь сломан, а бот зашёл запасным — это не
+    # «всё хорошо». Самопроверка — ранний сигнал «чини, пока держит запасной».
+    if ev.bot_fallback:
+        reasons.append("fallback_join")
+        details["fallback_join"] = ev.bot_fallback
 
     status = RED if critical else (YELLOW if reasons else GREEN)
     return {
@@ -1261,6 +1271,12 @@ def _evaluate_run(deps: Deps, plan: RunPlan, res: Dict[str, Any], flow: Dict[str
         names = tuple(n for n in (meta.get("participants") or []) if isinstance(n, str))
         participants = (participants or ()) + names
 
+    # Запасной путь по флагу живой проверки (тестовый образ) — не поломка.
+    fb = _dict(bs.get("fallback_used"))
+    bot_fallback = None
+    if fb and not fb.get("forced"):
+        bot_fallback = str(fb.get("summary") or fb.get("steps") or "запасной путь входа")[:200]
+
     ev = Evidence(
         bot_phase=bs.get("phase") if isinstance(bs.get("phase"), str) else None,
         bot_phases_seen=phases,
@@ -1268,6 +1284,7 @@ def _evaluate_run(deps: Deps, plan: RunPlan, res: Dict[str, Any], flow: Dict[str
         volume=best,
         code_word_found=found,
         participants=participants,
+        bot_fallback=bot_fallback,
     )
     out = evaluate(ev)
     reasons, details = list(out["reasons"]), dict(out["details"])

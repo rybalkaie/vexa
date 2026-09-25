@@ -130,6 +130,8 @@ export type FallbackResult = {
   /** Чего не хватило: поля имени, кнопки «Подключиться», или нажатие не вывело из лобби. */
   missing: "name" | "join" | "lobby" | null;
   aborted: "stop_signal" | "page_closed" | "foreign_page" | null;
+  /** «Подключиться» нажата, а имя бота так и не вписано (поля имени не нашлось). */
+  nameless?: boolean;
 };
 
 export type FallbackRunOptions = {
@@ -167,7 +169,10 @@ const EVAL_TIMEOUT_MS = 1_500;
  */
 export function normLabel(s: string | null | undefined): string {
   const base = String(s ?? "")
-    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    // Невидимые форматирующие символы (мягкий перенос U+00AD, word joiner U+2060,
+    // U+200B…U+200D, BOM…) — цикл5 фазы 3: иначе «за\u00adпись» проходила бы мимо
+    // чёрного списка.
+    .replace(/\p{Cf}/gu, "")
     .replace(/\u00a0/g, " ")
     .toLowerCase()
     .replace(/ё/g, "е")
@@ -390,7 +395,12 @@ const PRIMARY_RU: Record<string, string> = {
 };
 
 /** Коротко для владельца: что сорвалось у основного пути и чем обошёл запасной. */
-export function fallbackSummary(reason: string | null, forced: FallbackForceMode | null, steps: FallbackStep[]): string {
+export function fallbackSummary(
+  reason: string | null,
+  forced: FallbackForceMode | null,
+  steps: FallbackStep[],
+  nameless = false,
+): string {
   const head = forced
     ? `принудительная проверка запасного пути${forced === "no-testid" ? " без меток" : ""}`
     : `основной путь ${PRIMARY_RU[reason || ""] || "сорвался"}`;
@@ -405,7 +415,10 @@ export function fallbackSummary(reason: string | null, forced: FallbackForceMode
     else p = `«Продолжить в браузере» — ${how}`;
     if (parts[parts.length - 1] !== p) parts.push(p);
   }
-  return `${head}; запасной: ${parts.join(", ") || "ничего не нажимал"}`.slice(0, 280);
+  // Цикл5 фазы 3 (Н7/У7): имя бота — единственная подпись «идёт протокол»;
+  // вошёл без него — владелец должен это увидеть первым делом.
+  const warn = nameless ? "⚠️ вошёл БЕЗ ИМЕНИ — люди видят гостя без подписи «протокол встречи»; " : "";
+  return `${warn}${head}; запасной: ${parts.join(", ") || "ничего не нажимал"}`.slice(0, 280);
 }
 
 /** Шаги коротко для машины: `popup_dismiss:label,name:tid,join:text`. */
@@ -785,15 +798,17 @@ export async function runFallbackJoin(page: Page, o: FallbackRunOptions): Promis
   let joinClickedAt: number | null = null;
   let joinTried = false;
   let sawName = false;
+  let nameless = false;
   let scanNo = 0;
   logStep("fallback_start", { reason: o.reason, forced: o.forced });
 
   const finish = (ok: boolean, screen: ScreenState, extra: Partial<FallbackResult> = {}): FallbackResult => {
-    const res: FallbackResult = { ok, screen, steps, missing: null, aborted: null, ...extra };
+    const res: FallbackResult = { ok, screen, steps, missing: null, aborted: null, nameless, ...extra };
     logStep("fallback_done", {
       ok,
       screen,
       steps: fallbackStepsCode(steps),
+      nameless,
       missing: res.missing,
       aborted: res.aborted,
       elapsed_ms: Date.now() - start,
@@ -850,6 +865,16 @@ export async function runFallbackJoin(page: Page, o: FallbackRunOptions): Promis
     }
 
     const target = action.m.target as FallbackButtonTarget;
+    // «Подключиться» без имени (поля имени так и не нашлось): бот — наблюдатель,
+    // микрофон и камеру в окне кнопки выключить ДО входа — в 3.0 гость входит с
+    // включёнными (цикл5 фазы 3, Н7). С именем это уже сделано после ввода имени.
+    const namelessJoin = target === "join" && !st.nameFilled &&
+      !scan.controls.some((x) => x.kind === "input" && x.isBotName);
+    if (namelessJoin) {
+      for (const device of ["mic", "camera"] as const) {
+        await ensureDeviceOff(page, device, { onlyFrame: fr, scope: "lobby_fallback_nameless" }).catch(() => null);
+      }
+    }
     const r = await clickVerified(page, fr, c, target, noTestid);
     steps.push({ target, tier: action.m.tier, frame: c.frame, method: r.method, ok: r.changed });
     logStep("fallback_step", { target, tier: action.m.tier, match: action.m.match, frame: c.frame, method: r.method, ok: r.changed });
@@ -858,7 +883,10 @@ export async function runFallbackJoin(page: Page, o: FallbackRunOptions): Promis
     const n = (clicksBySig.get(sig) || 0) + 1;
     clicksBySig.set(sig, n);
     if (!r.changed || n >= 2) st.spent.add(sig);
-    if (r.changed && target === "join") joinClickedAt = Date.now();
+    if (r.changed && target === "join") {
+      joinClickedAt = Date.now();
+      if (namelessJoin) nameless = true;
+    }
   }
 
   const v = await readTelemostScreen(page);

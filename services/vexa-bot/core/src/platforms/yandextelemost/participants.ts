@@ -32,6 +32,7 @@ import {
   telemostCallWidgetAria,
 } from "./selectors";
 import { frameKind, orderedFrames, parseParticipantCount } from "./screen";
+import { blacklistHit } from "./fallback";
 
 const LOG_PREFIX = "[adapter-telemost-participants]";
 
@@ -182,18 +183,32 @@ async function openParticipantsPanel(page: Page): Promise<Frame | null> {
     if (fr.isDetached()) continue;
     for (const sel of telemostParticipantsButtonSelectors) {
       try {
-        const loc = fr.locator(sel).first();
-        if (await loc.isVisible({ timeout: 500 })) {
-          // Playwright click + JS-fallback (тот же React-handler-issue из Ф2).
+        // Цикл5 фазы 3 (Н8/В5): `aria-label*="частник"` совпадает и с «Пригласить
+        // участников» — кнопка из чёрного списка запасного пути не нажимается и
+        // здесь; берём следующую подходящую.
+        const all = fr.locator(sel);
+        const n = Math.min(await all.count().catch(() => 0), 10);
+        for (let i = 0; i < n; i++) {
+          const loc = all.nth(i);
+          if (!(await loc.isVisible({ timeout: 500 }).catch(() => false))) continue;
+          const d = await loc
+            .evaluate((el: Element) => ({
+              tid: el.getAttribute("data-testid"),
+              aria: el.getAttribute("aria-label"),
+              title: el.getAttribute("title"),
+              text: ((el as HTMLElement).innerText || "").slice(0, 80),
+            }), undefined, { timeout: 1500 })
+            .catch(() => null);
+          if (!d || blacklistHit(d)) continue;
+          // Playwright click + JS-fallback (тот же React-handler-issue из Ф2) — по ТОЙ ЖЕ кнопке.
           await loc.click({ timeout: 2000 }).catch(() => {});
-          await fr.evaluate((s: string) => {
-            const btn = document.querySelector(s) as HTMLElement | null;
-            if (btn) {
+          await loc
+            .evaluate((btn: Element) => {
               btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
               btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
-              btn.click();
-            }
-          }, sel).catch(() => {});
+              (btn as HTMLElement).click();
+            }, undefined, { timeout: 1500 })
+            .catch(() => {});
           logStep("participants_panel_opened", { selector: sel, frame: frameKind(page, fr) });
           return fr;
         }

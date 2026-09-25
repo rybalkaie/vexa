@@ -15,8 +15,12 @@
 //   1. встречи нет / отказали          — строки текста в любом окне без панели
 //                                        звонка (в окне с панелью это чат);
 //   2. зал ожидания                    — строки текста в любом окне, точные метки;
+//      (цикл5 фазы 3: в 1–2 текст не решает, если в окне звонка видны плитки
+//      ДРУГИХ людей — это уже звонок, а строки — реплики и имена; главное окно 3.0
+//      с мини-виджетом звонка — чат комнаты, его строки не читаются);
 //   3. лобби                           — видна «Подключиться», или поле имени в
-//                                        окне без признаков звонка;
+//                                        окне без признаков звонка (в 3.0 — только
+//                                        в окне звонка: на главной чат и поиск);
 //   4. в звонке                        — 3.0: кнопки звонка или плитки участников
 //                                        во вложенном окне, либо счётчик «N
 //                                        участников» в виджете (НЕ «Завершить
@@ -32,7 +36,7 @@
 // в лог и не покидают процесс — наружу уходит только итог и имя признака.
 
 import { Frame, Page } from "playwright";
-import { isMeetingGoneText } from "./join-status";
+import { classifyJoinError, isMeetingGoneText } from "./join-status";
 import {
   telemostLobbyFrameUrlMarker,
   telemostNameInputSelectors,
@@ -155,6 +159,40 @@ function callScope(frames: FrameSignals[], ui: "3.0" | "old"): FrameSignals[] {
   return frames.filter((f) => (ui === "3.0" ? f.kind === "call" : f.kind === "main"));
 }
 
+/** Счётчик мини-виджета звонка «N участников» (главное окно 3.0) или null. */
+function widgetCount(frames: FrameSignals[]): number | null {
+  let best: number | null = null;
+  for (const f of frames) {
+    for (const w of f.widgets) {
+      const n = parseParticipantCount(w);
+      if (n !== null) best = best === null ? n : Math.max(best, n);
+    }
+  }
+  return best;
+}
+
+/**
+ * В звонке видны ДРУГИЕ люди (цикл5 фазы 3, В1): в окне звонка 3.0 две плитки с
+ * именами и больше (плитки считаются по людям — разведка 25.09). Из зала ожидания
+ * и лобби чужих плиток не видно (там максимум своя плитка предпросмотра) — значит,
+ * бот в звонке, и строки «дождитесь / встреча завершена / отказано» в окнах — это
+ * реплики чата или имена людей, а не экран. Счётчик виджета здесь не берём: в зале
+ * ожидания 3.0 (вживую не видели) он мог бы показывать тех, кто уже в звонке.
+ */
+function othersVisible(frames: FrameSignals[], ui: "3.0" | "old"): boolean {
+  return ui === "3.0" && frames.some((f) => f.kind === "call" && f.tiles >= 2);
+}
+
+/**
+ * Окна, чей ТЕКСТ говорит о состоянии входа (цикл5 фазы 3, В1). В 3.0 главное
+ * окно — чат комнаты (README адаптера): когда на нём мини-виджет звонка со
+ * счётчиком, бот уже в звонке, и строки главного окна — реплики людей, а не экран.
+ */
+function stateTextFrames(frames: FrameSignals[], ui: "3.0" | "old"): FrameSignals[] {
+  if (ui !== "3.0" || widgetCount(frames) === null) return frames;
+  return frames.filter((f) => f.kind !== "main");
+}
+
 /**
  * Что на экране — ЧИСТАЯ функция (тест: screen.test.ts). Порядок — в шапке файла.
  * «unknown» не означает «в звонке».
@@ -169,7 +207,11 @@ export function classifyTelemostScreen(frames: FrameSignals[]): ScreenVerdict {
   //    висеть «Звонок завершён» от прошлой встречи). Ошибиться в эту сторону
   //    дешевле: ложное «в звонке» кончится тишиной, ложное «встречи нет» —
   //    потерянной встречей без повтора.
-  const noControls = frames.filter((f) => !callControlsPresent(f));
+  //    Цикл5 фазы 3 (В1): текст решает экран, только пока чужих людей в звонке
+  //    не видно, и без главного окна 3.0, когда там уже виджет звонка (чат комнаты).
+  const others = othersVisible(frames, ui);
+  const textFrames = others ? [] : stateTextFrames(frames, ui);
+  const noControls = textFrames.filter((f) => !callControlsPresent(f));
   for (const f of noControls) {
     if (isMeetingGoneText(f.lines.join("\n"))) return v("gone", `${f.kind}:text_meeting_gone`);
   }
@@ -177,7 +219,9 @@ export function classifyTelemostScreen(frames: FrameSignals[]): ScreenVerdict {
   if (rej) return v("rejected", `${rej}:text_rejected`);
 
   // 2. Зал ожидания — текстом в любом окне или точной меткой (раньше «в звонке»).
-  const wait = findLine(frames, WAITING_RE, { maxLen: 160, allowQuestion: true });
+  //    Текстом — только пока чужих людей в звонке не видно (см. шаг 1): реплика
+  //    «дождитесь Ивана» или участник по имени «Ожидайте» не выгоняют бота.
+  const wait = findLine(textFrames, WAITING_RE, { maxLen: 160, allowQuestion: true });
   if (wait) return v("waiting_room", `${wait}:text_waiting`);
   for (const f of callScope(frames, ui)) {
     const tid = f.testids.find((t) => WAITING_TID_STRONG_RE.test(t));
@@ -187,7 +231,12 @@ export function classifyTelemostScreen(frames: FrameSignals[]): ScreenVerdict {
   // 3. Лобби: «Подключиться» ещё видна; или видно поле имени, а панели звонка
   //    (выход, микрофон) в этом окне нет (поле ввода рядом с идущим звонком — не
   //    лобби, а, скорее, поле чата; плитка предпросмотра лобби не в счёт).
+  //    В 3.0 лобби — только в окне звонка (цикл5 фазы 3): на главной (чат комнаты)
+  //    то же `data-testid` носит поиск чатов, а «Подключиться» может оказаться
+  //    карточкой звонка в чате — смена подсказки поиска или такая карточка не
+  //    должны превращать идущий звонок в «лобби».
   for (const f of frames) {
+    if (ui === "3.0" && f.kind !== "call") continue;
     if (f.joinButton) return v("lobby", `${f.kind}:join_button`);
     if (f.nameInput && !callControlsPresent(f)) return v("lobby", `${f.kind}:name_input`);
   }
@@ -256,7 +305,10 @@ export function removalEvidence(frames: FrameSignals[]): string | null {
 // Сбор признаков в браузере
 // ---------------------------------------------------------------------------
 
-type SnapshotArgs = { nameSel: string; joinSel: string; joinText: string; widgetAria: string; tileSel: string };
+/** Подсказки полей, которые НЕ поле имени лобби: поиск, строка сообщения чата. */
+const NOT_NAME_INPUT_RE = /(поиск|найти|search|find|сообщени|написать|напишите|message)/i;
+
+type SnapshotArgs = { nameSel: string; notNameRe: string; joinSel: string; joinText: string; widgetAria: string; tileSel: string };
 type RawSignals = Omit<FrameSignals, "kind">;
 
 /** Выполняется ВНУТРИ окна страницы — только собственные переменные. */
@@ -306,7 +358,16 @@ function snapshotSignalsInPage(a: SnapshotArgs): RawSignals {
     .slice(0, 5);
   let nameInput = false;
   try {
-    nameInput = Array.from(document.querySelectorAll(a.nameSel)).some(vis);
+    // Поиск и строка сообщения с той же меткой — не поле имени (подсказка поиска
+    // может смениться с «Поиск» на «Найти чат» — цикл5 фазы 3).
+    const notName = new RegExp(a.notNameRe, "i");
+    const nameLike = (el: Element): boolean => {
+      const type = (el.getAttribute("type") || "").toLowerCase();
+      if (type === "search" || (el.getAttribute("role") || "").toLowerCase() === "searchbox") return false;
+      const own = ["placeholder", "aria-label", "title"].map((k) => el.getAttribute(k) || "").join(" ");
+      return !notName.test(own);
+    };
+    nameInput = Array.from(document.querySelectorAll(a.nameSel)).some((el) => vis(el) && nameLike(el));
   } catch {
     nameInput = false;
   }
@@ -326,15 +387,54 @@ function snapshotSignalsInPage(a: SnapshotArgs): RawSignals {
   return { lines, testids, buttons, arias, widgets, nameInput, joinButton, tiles };
 }
 
+function safeFrameUrl(fr: Frame): string {
+  try {
+    return fr.url();
+  } catch {
+    return "";
+  }
+}
+
+/** Номер встречи из адреса главной (`/j/<цифры>`, иначе первая длинная серия цифр пути) или null. */
+export function meetingIdFromUrl(raw: string): string | null {
+  let path = "";
+  try {
+    path = new URL(raw).pathname;
+  } catch {
+    return null;
+  }
+  const m = path.match(/\/j\/(\d{6,})/) || path.match(/(\d{8,})/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Окно звонка 3.0 — ЧИСТАЯ функция. Сегодня — по куску адреса `/private-join/`.
+ * Цикл5 фазы 3 (У3): если такого окна на странице нет вовсе, окном звонка
+ * считается окно Телемоста с номером встречи в адресе — поломка 21.09 была именно
+ * переездом лобби в новое вложенное окно, и следующая может переименовать его путь:
+ * запасной путь вход пройдёт, а без этого бот не узнал бы звонок и ушёл. Пока окно
+ * `/private-join/` есть, правило прежнее, байт в байт.
+ */
+export function isCallFrameUrl(url: string, mainUrl: string, markerSeen: boolean): boolean {
+  if (url.includes(telemostLobbyFrameUrlMarker)) return true;
+  if (markerSeen) return false;
+  const id = meetingIdFromUrl(mainUrl);
+  return !!id && isTelemostMeetingUrl(url) && url.includes(id);
+}
+
 export function frameKind(page: Page, fr: Frame): FrameKind {
   if (fr === page.mainFrame()) return "main";
-  let url = "";
+  const url = safeFrameUrl(fr);
+  if (url.includes(telemostLobbyFrameUrlMarker)) return "call";
+  let markerSeen = false;
+  let mainUrl = "";
   try {
-    url = fr.url();
+    markerSeen = page.frames().some((f) => safeFrameUrl(f).includes(telemostLobbyFrameUrlMarker));
+    mainUrl = page.url();
   } catch {
-    url = "";
+    return "other";
   }
-  return url.includes(telemostLobbyFrameUrlMarker) ? "call" : "other";
+  return isCallFrameUrl(url, mainUrl, markerSeen) ? "call" : "other";
 }
 
 /** Окна страницы: сначала окна звонка 3.0, потом главное, потом прочие. */
@@ -353,6 +453,7 @@ const FRAME_EVAL_TIMEOUT_MS = 2500;
 export async function frameSignals(page: Page, fr: Frame): Promise<FrameSignals | null> {
   const args: SnapshotArgs = {
     nameSel: telemostNameInputSelectors[0],
+    notNameRe: NOT_NAME_INPUT_RE.source,
     joinSel: '[data-testid="enter-conference-button"]',
     joinText: "Подключиться",
     widgetAria: telemostCallWidgetAria,
@@ -389,4 +490,18 @@ export async function readTelemostScreen(page: Page): Promise<ScreenVerdict> {
   } catch {
     return { state: "unknown", ui: "old", evidence: "collect_failed" };
   }
+}
+
+/**
+ * Код причины сорванного входа (index.ts → статус для сторожа): по тексту нашей
+ * ошибки, а «встречи нет» — по экрану, ТЕМ ЖЕ разбором, что вход и ожидание
+ * впуска. Раньше смотрелся сырой текст всех окон (`detectMeetingGone`), и реплика
+ * чата «встреча закончилась» или «Звонок завершён» прошлой встречи рядом с идущим
+ * звонком превращала любой срыв в «встречи нет» — без повтора и без сообщения
+ * людям (цикл5 фазы 3, В1/Н1). Никогда не бросает.
+ */
+export async function joinFailureReason(page: Page | null, message: string): Promise<string> {
+  const reason = classifyJoinError(message);
+  if (reason === "admission_rejected" || reason === "meeting_not_found" || !page || page.isClosed()) return reason;
+  return (await readTelemostScreen(page)).state === "gone" ? "meeting_not_found" : reason;
 }

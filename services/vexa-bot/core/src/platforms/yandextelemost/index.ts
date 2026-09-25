@@ -25,10 +25,9 @@ import { prepareForRecording, leaveYandexTelemost } from "./leave";
 import { startYandexTelemostRemovalMonitor } from "./removal";
 import {
   writeJoinStatus,
-  classifyJoinError,
-  detectMeetingGone,
   shortMessage,
 } from "./join-status";
+import { joinFailureReason } from "./screen";
 import { captureCrashKit } from "./crashkit";
 import { armStopSignalCapture, stopSignalReceived } from "./stop-signal";
 
@@ -39,10 +38,9 @@ async function markJoinFailed(page: Page | null, step: string, error: any): Prom
   if (stopSignalReceived()) return;
   try {
     const message = error?.message || String(error);
-    let reason = classifyJoinError(message);
-    if (reason !== "admission_rejected" && (await detectMeetingGone(page))) {
-      reason = "meeting_not_found";
-    }
+    // «Встречи нет» — тем же разбором экрана, что вход и ожидание впуска
+    // (screen.ts → joinFailureReason; цикл5 фазы 3, В1).
+    const reason = await joinFailureReason(page, message);
     const kit = await captureCrashKit(page, reason);
     writeJoinStatus("failed", { reason, step, message: shortMessage(message), crash_kit: kit });
   } catch {

@@ -62,6 +62,7 @@ DEFAULT_RUN = dict(
     participants=[],
     speaker_start_ok=True,
     bot_start_ok=True,
+    bot_fallback=None,             # dict → `fallback_used` в статусе входа бота
 )
 
 
@@ -255,7 +256,8 @@ class World:
             r = cfg["bot_result"]
             if r == "in_call":
                 self._write(st_path, {"phase": "in_call", "history": [
-                    {"phase": "joining"}, {"phase": "admission"}, {"phase": "in_call"}]})
+                    {"phase": "joining"}, {"phase": "admission"}, {"phase": "in_call"}],
+                    **({"fallback_used": cfg["bot_fallback"]} if cfg.get("bot_fallback") else {})})
                 if cfg["wav"]:
                     (d / "2026-09-26-tm-1.chunk1.wav").write_bytes(b"RIFF....WAVE")
                     self._write(d / "2026-09-26-tm-1.meta.json",
@@ -390,6 +392,14 @@ class EvaluateTest(unittest.TestCase):
         self.assertTrue(lib.names_contain(["Тест\u2011диктор (вы)"]))
         self.assertTrue(lib.names_contain(["тест диктор"]))
         self.assertFalse(lib.names_contain(["Бот — протокол встречи"]))
+
+    def test_fallback_join_is_yellow(self):
+        # Цикл5 фазы 3 (У5): основной вход сломан, бот вошёл запасным → не «всё хорошо».
+        s = "основной путь не нашёл поле имени; запасной: имя — по подписи, «Подключиться» — по тексту"
+        r = lib.evaluate(ev(bot_fallback=s))
+        self.assertEqual((r["status"], r["reasons"]), (lib.YELLOW, ["fallback_join"]))
+        self.assertEqual(r["details"]["fallback_join"], s)
+        self.assertIn("ЗАПАСНЫМ", lib.human_reasons(r))
 
     def test_red_beats_yellow(self):
         r = lib.evaluate(ev(code_word_found=False, participants=()))
@@ -559,6 +569,21 @@ class CycleTest(_Env):
         w2 = World(base=NIGHT + timedelta(days=1))
         self.cycle(w2)
         self.assertEqual(w2.pushes, [])  # жёлтый повторно — без сообщений
+
+    def test_fallback_join_is_yellow_forced_is_not(self):
+        # Цикл5 фазы 3 (У5): вошёл запасным сам (основной сломан) → 🟡 и сообщение;
+        # по флагу живой проверки (forced) — это не поломка, зелёный.
+        fb = {"primary_reason": "name_input_not_found", "forced": None, "steps": "name:label,join:text",
+              "summary": "основной путь не нашёл поле имени; запасной: имя — по подписи, «Подключиться» — по тексту"}
+        w = World(runs=[{"participants": ["Тест-диктор"], "bot_fallback": fb}])
+        res = self.cycle(w)
+        self.assertEqual((res["status"], res["reasons"]), (lib.YELLOW, ["fallback_join"]), res)
+        self.assertEqual(len(w.pushes), 1)
+        self.assertIn("ЗАПАСНЫМ", w.pushes[0][0])
+        self.assertIn("не нашёл поле имени", w.pushes[0][0])
+        w2 = World(base=NIGHT + timedelta(days=1),
+                   runs=[{"participants": ["Тест-диктор"], "bot_fallback": dict(fb, forced="all")}])
+        self.assertEqual(self.cycle(w2, image="vexa-bot:resil-test")["status"], lib.GREEN)
 
     def test_red_red_alerts_once_after_retry(self):
         bad = {"bot_result": "failed", "bot_reason": "name_input_not_found"}

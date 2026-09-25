@@ -14,11 +14,22 @@
 import { Page } from "playwright";
 import { log } from "../../utils";
 import { telemostRemovalIndicators } from "./selectors";
-import { collectFrameSignals, removalEvidence } from "./screen";
+import { FrameSignals, callUiPresent, collectFrameSignals, removalEvidence } from "./screen";
 
 const LOG_PREFIX = "[adapter-telemost]";
 
 export async function checkForTelemostRemoval(page: Page): Promise<boolean> {
+  let frames: FrameSignals[] = [];
+  try {
+    frames = await collectFrameSignals(page);
+  } catch {
+    frames = []; // страница закрывается — дальше решают прежние признаки
+  }
+  // Цикл5 фазы 3: пока хоть в одном окне идёт звонок (панель, плитки), встреча
+  // идёт — и прежние признаки на главной тоже молчат. В 3.0 главная — чат комнаты:
+  // реплика «Встреча завершена» там совпала бы с `text="Встреча завершена"` и
+  // увела бы бота с живой встречи (ложный выход хуже позднего — screen.ts).
+  if (frames.some(callUiPresent)) return false;
   for (const sel of telemostRemovalIndicators) {
     try {
       const loc = page.locator(sel).first();
@@ -30,14 +41,10 @@ export async function checkForTelemostRemoval(page: Page): Promise<boolean> {
       continue;
     }
   }
-  try {
-    const hit = removalEvidence(await collectFrameSignals(page));
-    if (hit) {
-      log(`${LOG_PREFIX} removal_indicator_visible evidence=${hit}`);
-      return true;
-    }
-  } catch {
-    // страница закрывается — не наше дело
+  const hit = removalEvidence(frames);
+  if (hit) {
+    log(`${LOG_PREFIX} removal_indicator_visible evidence=${hit}`);
+    return true;
   }
   return false;
 }

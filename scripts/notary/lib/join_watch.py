@@ -402,7 +402,7 @@ def _safe(fn: Callable[..., Any], *args: Any) -> None:
         logger.warning("[join-watch] внешний вызов упал (%s)", type(e).__name__)
 
 
-def _quiet_note_text(entry: Dict[str, Any], kind: str, detail: str) -> str:
+def _quiet_note_text(entry: Dict[str, Any], kind: str, detail: str, same_marks: bool = False) -> str:
     try:
         from notary.lib.join_alert import meeting_name, when_text, reason_human  # noqa: PLC0415
 
@@ -414,6 +414,14 @@ def _quiet_note_text(entry: Dict[str, Any], kind: str, detail: str) -> str:
         return (
             f"ℹ️ Ватсон зашёл на «{name}» ({when}) со второй попытки; первая сорвалась: "
             f"{reason_human(detail)}. Если повторится — Телемост что-то меняет."
+        )
+    if same_marks:
+        # Цикл5 фазы 3 (У6): все шаги запасного пути — по прежним меткам. Это не
+        # «Телемост поменял вход», а, скорее, лишний шаг или медленная загрузка.
+        return (
+            f"ℹ️ Ватсон зашёл на «{name}» ({when}) запасным путём: {detail}. "
+            f"Запасной прошёл по тем же меткам, что основной, — похоже, Телемост добавил шаг "
+            f"или медленно грузился. Если повторится — основной путь стоит проверить."
         )
     return (
         f"ℹ️ Ватсон зашёл на «{name}» ({when}) запасным путём: {detail}. "
@@ -427,10 +435,23 @@ def _fallback_detail(fb: Dict[str, Any]) -> str:
     Бот кладёт в `fallback_used.summary` готовую строку из своих слов («основной
     путь не нашёл поле имени; запасной: …»); старый вид — пары «ключ: значение».
     """
+    # Цикл5 фазы 3 (У6): бот снимает экран, на котором сорвался основной путь, —
+    # по этому снимку его и чинить; путь к снимку не обрезается.
+    kit = fb.get("crash_kit")
+    tail = f"; снимок основного пути: {kit[:120]}" if isinstance(kit, str) and kit.strip() else ""
     summary = fb.get("summary")
     if isinstance(summary, str) and summary.strip():
-        return summary.strip()[:300]
-    return ", ".join(f"{k}: {v}" for k, v in fb.items())[:300]
+        return summary.strip()[: 300 - len(tail)] + tail
+    return ", ".join(f"{k}: {v}" for k, v in fb.items() if k != "crash_kit")[: 300 - len(tail)] + tail
+
+
+def _fallback_same_marks(fb: Dict[str, Any]) -> bool:
+    """Все удачные шаги запасного пути — по меткам (`name:tid,join:tid`): вход не менялся."""
+    steps = fb.get("steps")
+    if not isinstance(steps, str) or not steps.strip():
+        return False
+    parts = [p.strip() for p in steps.split(",") if p.strip()]
+    return bool(parts) and all(p.endswith(":tid") for p in parts)
 
 
 def _event_key(ev: Dict[str, Any]) -> str:
@@ -536,7 +557,8 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
                 prev = attempts[-2] if len(attempts) > 1 else {}
                 notes.append(_quiet_note_text(entry, "second_try", str(prev.get("reason") or "join_error")))
             if obs.fallback_used:
-                notes.append(_quiet_note_text(entry, "fallback", _fallback_detail(obs.fallback_used)))
+                notes.append(_quiet_note_text(entry, "fallback", _fallback_detail(obs.fallback_used),
+                                              same_marks=_fallback_same_marks(obs.fallback_used)))
             if not _commit(ledger, hooks):
                 entry["state"] = "watching"
                 continue

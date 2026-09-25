@@ -15,6 +15,8 @@ import {
   removalEvidence,
   parseParticipantCount,
   isTelemostMeetingUrl,
+  isCallFrameUrl,
+  meetingIdFromUrl,
 } from "./screen";
 
 let passed = 0;
@@ -117,6 +119,37 @@ expect("широкая старая метка *lobby* не перебивает
   classifyTelemostScreen([main30Call(2), frame("call", { testids: ["lobby-container", ...call30Toolbar] })]).state, "in_call");
 expect("широкая старая метка *waiting* без звонка — зал ожидания",
   classifyTelemostScreen([main30Lobby, frame("call", { testids: ["waiting-placeholder"] })]).evidence, "call:tid_weak_waiting-placeholder");
+console.log("classifyTelemostScreen — текст людей не решает экран (цикл5 фазы 3, В1)");
+// Главная 3.0 — чат комнаты: когда на ней мини-виджет звонка со счётчиком, её строки — реплики.
+const main30Chat = (n: number, chat: string[]) => ({ ...main30Call(n), lines: [...main30Call(n).lines, ...chat] });
+for (const [line, what] of [
+  ["Дождитесь Ивана, начнём через 5 минут", "зал ожидания"],
+  ["Кто впустит Сергея?", "зал ожидания"],
+  ["Звонок завершён", "встречи нет"],
+  ["Вам отказали", "отказ"],
+] as const) {
+  expect(`чат на главной «${line}», бот один в звонке — в звонке, не ${what}`,
+    classifyTelemostScreen([main30Chat(1, [line]), call30InCall(["Бот — протокол встречи"])]).state, "in_call");
+}
+expect("реплика «Дождитесь Ивана» в окне звонка, людей видно (две плитки) — в звонке",
+  classifyTelemostScreen([main30Call(2), { ...call30InCall(["Бот — протокол встречи", "Тест-диктор"]), lines: ["Бот — протокол встречи", "Тест-диктор", "Дождитесь Ивана"] }]).state, "in_call");
+expect("участник по имени «Ожидайте» — в звонке",
+  classifyTelemostScreen([main30Call(2), call30InCall(["Бот — протокол встречи", "Ожидайте"])]).state, "in_call");
+expect("«Встреча завершена» строкой при двух плитках (панель спрятана) — не «встречи нет»",
+  classifyTelemostScreen([main30Call(2), frame("call", { lines: ["Анна", "Бот — протокол встречи", "Встреча завершена"], tiles: 2 })]).state, "in_call");
+expect("зал ожидания во вложенном окне + своя плитка предпросмотра — всё ещё зал ожидания",
+  classifyTelemostScreen([main30Lobby, frame("call", { lines: ["Бот — протокол встречи", "Ожидание организатора"], tiles: 1, testids: call30Toolbar })]).state, "waiting_room");
+expect("без виджета со счётчиком главная читается (зал ожидания текстом на главной)",
+  classifyTelemostScreen([{ ...main30Lobby, lines: [...main30Lobby.lines, "Ожидание организатора"] }, frame("call", { lines: ["Загрузка"] })]).state, "waiting_room");
+expect("поле поиска на главной 3.0 с новой подсказкой — не лобби, звонок виден",
+  classifyTelemostScreen([{ ...main30Call(2), nameInput: true }, call30InCall(["Бот — протокол встречи", "Тест-диктор"])]).state, "in_call");
+expect("поле имени во вложенном окне — лобби (как было)",
+  classifyTelemostScreen([main30Lobby, frame("call", { nameInput: true })]).state, "lobby");
+expect("«Подключиться» карточкой звонка в чате главной 3.0 при идущем звонке — в звонке",
+  classifyTelemostScreen([{ ...main30Call(2), joinButton: true }, call30InCall(["Бот — протокол встречи", "Тест-диктор"])]).state, "in_call");
+expect("старый интерфейс: «Подключиться» на главной — лобби (как было)",
+  classifyTelemostScreen([frame("main", { joinButton: true, buttons: [btn(null, "Завершить звонок")] })]).state, "lobby");
+
 expect("строка про доступ к микрофону — не отказ во входе",
   classifyTelemostScreen([main30Lobby, frame("call", { lines: ["Доступ к микрофону отказано"] })]).state, "unknown");
 expect("справка с вопросом — не «встреча завершена»",
@@ -179,6 +212,20 @@ expect("чужой порт", isTelemostMeetingUrl("https://telemost.yandex.ru:8
 expect("похожий хост", isTelemostMeetingUrl("https://xtelemost.yandex.ru/j/0"), false);
 expect("javascript:", isTelemostMeetingUrl("javascript:alert(1)//telemost.yandex.ru"), false);
 expect("пусто", isTelemostMeetingUrl(""), false);
+
+console.log("isCallFrameUrl — окно звонка 3.0 (цикл5 фазы 3, У3: путь окна могут переименовать)");
+const MAIN_J = "https://telemost.yandex.ru/j/00000000000000";
+expect("номер встречи из /j/", meetingIdFromUrl(MAIN_J), "00000000000000");
+expect("номера нет — null", meetingIdFromUrl("https://telemost.yandex.ru/"), null);
+expect("не адрес — null", meetingIdFromUrl("не адрес"), null);
+expect("сегодняшнее окно /private-join/", isCallFrameUrl("https://telemost.yandex.ru/private-join/00000000000000?embed=1", MAIN_J, true), true);
+expect("путь переименован, окна /private-join/ нет — окно Телемоста с номером встречи",
+  isCallFrameUrl("https://telemost.yandex.ru/embed-call/00000000000000?embed=1", MAIN_J, false), true);
+expect("окно /private-join/ есть — правило прежнее, другое окно с номером не звонок",
+  isCallFrameUrl("https://telemost.yandex.ru/embed-call/00000000000000", MAIN_J, true), false);
+expect("чужой хост с номером встречи — не звонок", isCallFrameUrl("https://evil.example/00000000000000", MAIN_J, false), false);
+expect("окно Телемоста без номера — не звонок", isCallFrameUrl("https://telemost.yandex.ru/metrics", MAIN_J, false), false);
+expect("номер другой встречи — не звонок", isCallFrameUrl("https://telemost.yandex.ru/embed-call/11111111111111", MAIN_J, false), false);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

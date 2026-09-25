@@ -88,6 +88,7 @@ const lobby30 = (over: { name?: Partial<FbControl>; join?: Partial<FbControl> } 
 
 console.log("normLabel / blacklistHit — чёрный список сильнее белого");
 expect("нормализация", normLabel("  ПОДКЛЮЧИТЬСЯ.  "), "подключиться");
+expect("мягкий перенос и word joiner внутри слова убраны", normLabel("Под\u00adклю\u2060читься"), "подключиться");
 expect("ё = е", normLabel("Всё ясно"), "все ясно");
 expect("значки по краям отброшены", normLabel("🎥 Подключиться →"), "подключиться");
 expect("вопрос в конце", normLabel("Как вас представить?"), "как вас представить");
@@ -101,6 +102,9 @@ for (const c of [
   { tid: "hand-up-button" }, { tid: "start-demonstration-button" }, { tid: "to-home-screen-button" },
   { text: "Открыть в приложении" }, { text: "Leave call" }, { tid: "mute-audio" }, { text: "Поднять руку" },
   { tid: "close-call" }, { tid: "meeting-close" }, { text: "Закрыть звонок" }, { text: "Отключиться" },
+  // цикл5 фазы 3 (В5): невидимые символы внутри слова и новые слова
+  { text: "Начать за\u00adпись" }, { aria: "Вы\u2060йти" }, { text: "Уйти со встречи" }, { text: "Начать трансляцию" },
+  { text: "Добавить участника" }, { text: "Впустить всех" }, { text: "Admit all" }, { text: "Start video" },
 ]) {
   expect(`в чёрном списке: ${JSON.stringify(c)}`, blacklistHit({ tid: null, aria: null, title: null, text: "", ...c }) !== null, true);
 }
@@ -123,6 +127,14 @@ for (const c of [
 console.log("matchButton — ярусы: метка → подпись → текст");
 expect("метка сегодняшняя", matchButton(btn({ tid: "enter-conference-button" }), "join"), { target: "join", tier: "tid", match: "enter-conference-button" });
 expect("метка по образцу (переименовали в том же смысле)", matchButton(btn({ tid: "join-call-button" }), "join")?.tier, "tid");
+// Цикл5 фазы 3 (В2): образец метки — целиком. «Войти с камерой / микрофоном» — не «Подключиться».
+for (const tid of ["join-call-with-video", "enter-conference-with-mic", "join-meeting-camera-on", "join-call-mic-on"]) {
+  expect(`метка «${tid}» — не «Подключиться»`, matchButton(btn({ tid }), "join"), null);
+  expect(`метка «${tid}» — в чёрном списке`, blacklistHit({ tid, aria: null, title: null, text: "" }) !== null, true);
+}
+expect("метка по образцу «join-meeting» — «Подключиться»", matchButton(btn({ tid: "join-meeting" }), "join")?.tier, "tid");
+expect("метка «join-meeting-video» (кусок образца) — не «Подключиться»", matchButton(btn({ tid: "join-meeting-video" }), "join"), null);
+expect("метка по образцу «enter-conference» — «Подключиться»", matchButton(btn({ tid: "enter-conference" }), "join")?.tier, "tid");
 expect("подпись", matchButton(btn({ aria: "Подключиться" }), "join"), { target: "join", tier: "label", match: "Подключиться" });
 expect("title — тоже подпись", matchButton(btn({ title: "Присоединиться" }), "join")?.tier, "label");
 expect("текст (регистр, точка)", matchButton(btn({ text: " ПОДКЛЮЧИТЬСЯ. " }), "join"), { target: "join", tier: "text", match: "Подключиться" });
@@ -221,6 +233,11 @@ expect("«Закрыть» вне окна поверх экрана — не н
 expect("«Подключиться» — в том же окне, что поле имени (не карточка звонка в чате на главной)",
   pick([btn({ ...MAIN, text: "Подключиться", id: "chat-card" }), ...lobby30({ name: { isBotName: true }, join: { tid: "cta-x7" } })],
     state({ nameFilled: true })), ["click", "join", "text", "join"]);
+// Цикл5 фазы 3 (У7): поле «Как к вам обращаться?» / «Никнейм» — поле имени, а не вход без имени.
+for (const ph of ["Как к вам обращаться?", "Никнейм", "Ваш псевдоним"]) {
+  expect(`поле «${ph}» — поле имени`, pick([inp({ tid: "fld-9", placeholder: ph, id: "nm" }), btn({ text: "Подключиться", id: "j" })]),
+    ["fill", "name", "label", "nm"]);
+}
 {
   const renamed = [
     inp({ tid: "name-field-v4", placeholder: "Как вас представить?", id: "nm" }),
@@ -255,6 +272,9 @@ expect("строка владельцу", fallbackSummary("name_input_not_found"
   "основной путь не нашёл поле имени; запасной: закрыл всплывающее окно (по тексту), имя — по подписи, «Подключиться» — по тексту");
 expect("принудительно, без меток", fallbackSummary(null, "no-testid", []).startsWith("принудительная проверка запасного пути без меток"), true);
 expect("шаги для машины (только удачные)", fallbackStepsCode(steps), "popup_ack:text,name:label,join:text");
+expect("вошёл без имени — владелец видит это первым (цикл5 фазы 3, Н7)",
+  fallbackSummary("name_input_not_found", null, [steps[3]], true).startsWith("⚠️ вошёл БЕЗ ИМЕНИ"), true);
+expect("с именем — без предупреждения", fallbackSummary("name_input_not_found", null, steps).includes("БЕЗ ИМЕНИ"), false);
 
 console.log("fallbackForceMode — флаг живой проверки в сыром BOT_CONFIG");
 const saved = process.env.BOT_CONFIG;

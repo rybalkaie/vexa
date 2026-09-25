@@ -37,16 +37,16 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { chromium, Browser, BrowserContext, Frame, LaunchOptions, Page } from "playwright";
-import { readTelemostScreen, collectFrameSignals, removalEvidence, frameKind } from "./screen";
+import { readTelemostScreen, collectFrameSignals, removalEvidence, frameKind, joinFailureReason } from "./screen";
 import { collectTileParticipants, cleanParticipantNames, presenceFromTiles } from "./participants";
 import { ensureDeviceOff, ensureTelemostDevicesOff } from "./devices";
 import { clickTelemostLeave, leaveYandexTelemost, openCallConnections } from "./leave";
 import { checkForTelemostRemoval } from "./removal";
 import { waitForYandexTelemostAdmission } from "./admission";
 import { joinYandexTelemost } from "./join";
-import { classifyJoinError, writeJoinStatus } from "./join-status";
+import { classifyJoinError, writeJoinStatus, detectMeetingGone, ADMISSION_UNCLEAR_ERROR } from "./join-status";
 import { armStopSignalCapture, BROWSER_SIGNAL_OPTIONS } from "./stop-signal";
-import { runFallbackJoin, fallbackStepsCode } from "./fallback";
+import { runFallbackJoin, fallbackStepsCode, fallbackSummary } from "./fallback";
 import { installRtcAudioHook } from "./rtc-hook";
 
 const ROOM = "00000000000000";
@@ -198,20 +198,53 @@ const GONE_30 = mainDoc(`<div>Телемост</div><div>Войдите в ак�
 
 // Главная для полного входа: окно онбординга 3.0 и «Продолжить в браузере»,
 // после которого появляется вложенное окно лобби.
-const JOIN_MAIN = mainDoc(
-  `<div>Телемост</div>${SEARCH}<div id="widget">${WIDGET_LOBBY}</div>` +
+// Реплика чата комнаты на главной (3.0) — её текст не должен попасть в журнал бота.
+const CHAT_SECRET = "Анна Тестова: секретная реплика 7f3a";
+const joinMainAt = (callPath: string) => mainDoc(
+  `<div>Телемост</div>${SEARCH}<div class="chat"><div>${CHAT_SECRET}</div></div><div id="widget">${WIDGET_LOBBY}</div>` +
     `<div role="dialog" id="onb">Большое обновление в Телемосте ` +
     `<button data-testid="telemost-3-onboarding-close" onclick="document.getElementById('onb').remove()">×</button></div>` +
     `<div id="inter">Вы подключаетесь к видеовстрече ` +
     `<button data-testid="meeting-continue-in-browser-continue" onclick="cont()">Продолжить в браузере</button></div>`,
   `function cont(){var i=document.getElementById('inter'); if(i) i.remove(); if(document.getElementById('call')) return;` +
-    `var f=document.createElement('iframe'); f.id='call'; f.src='${CALL_PATH}?embed=1'; document.body.appendChild(f);}`,
+    `var f=document.createElement('iframe'); f.id='call'; f.src='${callPath}?embed=1'; document.body.appendChild(f);}`,
 );
+const JOIN_MAIN = joinMainAt(CALL_PATH);
 const thenJs = (next: string, nextWidget: string) =>
   `window.__nextScreen = ${JSON.stringify(next)}; window.__nextWidget = ${JSON.stringify(nextWidget)};`;
 const lobbyThen = (next: string, nextWidget: string) => callDoc(LOBBY_BODY, thenJs(next, nextWidget));
 
-type Screens = { main: string; call?: string };
+/** `callPath` — путь вложенного окна звонка (по умолчанию сегодняшний `/private-join/`). */
+type Screens = { main: string; call?: string; callPath?: string };
+
+// ---------------------------------------------------------------------------
+// Цикл5 фазы 3: главная 3.0 — чат комнаты; путь окна звонка переименован; лобби без поля имени.
+// ---------------------------------------------------------------------------
+
+// Чат комнаты на главной в звонке: реплики людей и системные строки прошлых встреч,
+// поиск чатов с НОВОЙ подсказкой, карточка «Подключиться». Ничто из этого не экран входа.
+const CHAT_MAIN =
+  `<div class="chat"><div>Анна Тестова</div><div>Дождитесь Ивана, начнём через 5 минут</div>` +
+  `<div>Звонок завершён</div><div>Встреча завершена</div><div>Вам отказали</div>` +
+  `<button data-danger="chat-card-join">Подключиться</button></div>`;
+const SEARCH_NEW = `<input data-testid="orb-textinput-input" placeholder="Найти чат" data-not-name="search-new">`;
+const main30ChatCall = (n: number) =>
+  mainDoc(`<div>Телемост</div>${SEARCH_NEW}<div id="widget">${widgetCall(n)}</div>${CHAT_MAIN}${IFRAME}`);
+// Старый интерфейс в звонке (выход — «Выйти из встречи», панель с кнопкой микрофона
+// спряталась) + поиск с новой подсказкой и меткой поля имени: не лобби.
+const OLD_CALL_SEARCH = mainDoc(
+  `<div>Встреча</div>${SEARCH_NEW}<button aria-label="Выйти из встречи" data-danger="old-leave">×</button>`,
+);
+// Телемост переименовал путь вложенного окна звонка (поломка 21.09 была того же класса).
+const RENAMED_CALL_PATH = `/embed-call/${ROOM}`;
+const main30At = (widget: string, callPath: string) =>
+  mainDoc(`<div>Телемост</div>${SEARCH}<div id="widget">${widget}</div><iframe id="call" src="${callPath}?embed=1"></iframe>`);
+// Лобби без поля имени (не узнано): вход без имени — микрофон и камера выключаются ДО «Подключиться».
+const LOBBY_NO_NAME_BODY =
+  `<div>Подключение к звонку</div>` +
+  `<button data-testid="turn-off-mic-button" onclick="toggleMic()">м</button>` +
+  `<button data-testid="turn-off-camera-button" onclick="toggleCam(this)">к</button>` +
+  `<button data-testid="enter-conference-button" onclick="window.__devAtJoin=[micOn(), !!document.querySelector('[data-testid=turn-off-camera-button]')]; joinClicked()">Подключиться</button>`;
 
 // ---------------------------------------------------------------------------
 // Фаза 3б: копии для запасного пути входа. data-danger — опасные кнопки (их не
@@ -349,7 +382,7 @@ async function routeScreens(ctx: BrowserContext, screens: Screens): Promise<void
     }
     const html = (body: string) => route.fulfill({ status: 200, contentType: "text/html; charset=utf-8", body });
     if (u.origin === ORIGIN && u.pathname === `/j/${ROOM}`) return html(screens.main);
-    if (u.origin === ORIGIN && u.pathname === CALL_PATH && screens.call !== undefined) return html(screens.call);
+    if (u.origin === ORIGIN && u.pathname === (screens.callPath || CALL_PATH) && screens.call !== undefined) return html(screens.call);
     if (u.origin === ORIGIN) return route.fulfill({ status: 404, body: "" });
     return route.abort();
   });
@@ -450,6 +483,36 @@ async function screensAndParticipants(browser: Browser): Promise<void> {
 
   await withScreens(browser, { main: GONE_30 }, async (page) => {
     expect("«Такого звонка нет» (живой экран 24.09) — встречи нет", (await readTelemostScreen(page)).state, "gone");
+  });
+
+  console.info("Цикл5 фазы 3: чат комнаты на главной, переименованный путь окна звонка");
+  for (const n of [1, 2]) {
+    const names = n === 1 ? [BOT] : [BOT, SPEAKER];
+    await withScreens(browser, { main: main30ChatCall(n), call: callDoc(IN_CALL_BODY(names)) }, async (page) => {
+      const v = await readTelemostScreen(page);
+      expect(`чат на главной (${n} в звонке): «дождитесь / звонок завершён / отказали / Подключиться / поиск» — в звонке`,
+        [v.state, v.ui], ["in_call", "3.0"]);
+      expect(`чат на главной (${n} в звонке): «Встреча завершена» в чате не выгоняет бота`, await checkForTelemostRemoval(page), false);
+    });
+  }
+  await withScreens(browser, { main: main30ChatCall(2), call: callDoc(IN_CALL_2()) }, async (page) => {
+    expect("срыв рядом с идущим звонком и «Звонок завершён» в чате — причина прежняя, не «встречи нет»",
+      await joinFailureReason(page, ADMISSION_UNCLEAR_ERROR), "admission_unclear");
+    expect("…сырой текст всех окон (старая проверка) сказал бы «встречи нет»", await detectMeetingGone(page), true);
+  });
+  await withScreens(browser, { main: GONE_30 }, async (page) => {
+    expect("экран «Такого звонка нет» — сорванный вход становится «встречи нет» (как было)",
+      await joinFailureReason(page, "Lobby: поле ввода имени не найдено в Telemost"), "meeting_not_found");
+  });
+  await withScreens(browser, { main: OLD_CALL_SEARCH }, async (page) => {
+    expect("старый звонок + поиск «Найти чат» с меткой поля имени — в звонке, не лобби",
+      (await readTelemostScreen(page)).state, "in_call");
+  });
+  await withScreens(browser, { main: main30At(widgetCall(2), RENAMED_CALL_PATH), call: callDoc(IN_CALL_2()), callPath: RENAMED_CALL_PATH }, async (page) => {
+    const v = await readTelemostScreen(page);
+    expect("путь окна звонка переименован — всё равно в звонке, 3.0", [v.state, v.ui], ["in_call", "3.0"]);
+    const snap = await collectTileParticipants(page);
+    expect("путь окна звонка переименован — имя диктора с плитки", cleanParticipantNames(snap.rawNames, BOT), [SPEAKER]);
   });
 
   console.info("Старый интерфейс (без вложенного окна)");
@@ -818,6 +881,18 @@ async function fallbackOnCopies(browser: Browser): Promise<void> {
     });
   }
   expect("на всех копиях: опасных нажатий 0", dangerTotal, 0);
+
+  // Цикл5 фазы 3 (Н7/У7): поле имени не узнано → вход без имени, но микрофон и
+  // камера выключены ДО «Подключиться», а владелец видит «без имени» первым.
+  await withScreens(browser, { main: main30(WIDGET_LOBBY), call: callDoc(LOBBY_NO_NAME_BODY, thenJs(IN_CALL_2(), widgetCall(2))) }, async (page) => {
+    const r = await runFallbackJoin(page, { botName: BOT, reason: "name_input_not_found", forced: null, budgetMs: 30_000, idleMs: 4_000 });
+    const dev = await inCall(page, () => (window as any).__devAtJoin);
+    expect("лобби без поля имени: вошёл, отметка «без имени»", [r.ok, r.screen, !!r.nameless], [true, "in_call", true]);
+    expect("лобби без поля имени: микрофон и камера выключены ДО «Подключиться»", dev, [false, false]);
+    expect("лобби без поля имени: строка владельцу начинается с предупреждения",
+      fallbackSummary("name_input_not_found", null, r.steps, !!r.nameless).startsWith("⚠️ вошёл БЕЗ ИМЕНИ"), true);
+    expect("лобби без поля имени: опасных нажатий нет", (await dangerIn(page)).what, []);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +915,12 @@ function e2eCases(): Record<string, E2E> {
     search: {
       screens: { main: JOIN_MAIN, call: sameLabelThen(IN_CALL_2(), widgetCall(2)) },
       forced: false, reason: "name_input_not_found", steps: "name:tid,join:text",
+    },
+    // Цикл5 фазы 3 (У3): Телемост переименовал путь окна звонка. Основной путь окна
+    // не нашёл, запасной вошёл — и бот узнаёт звонок (раньше: admission_unclear).
+    path: {
+      screens: { main: joinMainAt(RENAMED_CALL_PATH), call: lobbyThen(IN_CALL_2(), widgetCall(2)), callPath: RENAMED_CALL_PATH },
+      forced: false, reason: "name_input_not_found", steps: "name:tid,join:tid",
     },
     // Флаг живой проверки: сразу запасным путём, основной не трогается вовсе.
     forced: {
@@ -877,6 +958,7 @@ async function fallbackChild(sc: string): Promise<void> {
     primaryFailed: logHas(/^step=primary_join_failed /),
     forcedLog: logHas(/^step=fallback_forced /),
     primaryRan: logHas(/^step=(onboarding_closed|onboarding_not_shown|interstitial_continue_clicked|interstitial_skipped) /),
+    chatInLog: captured.some((l) => l.includes("секретная реплика 7f3a")),
   };
   process.stdout.write(`FALLBACK_CHILD_RESULT ${JSON.stringify(res)}\n`);
   await browser.close().catch(() => {});
@@ -903,7 +985,7 @@ function runFallbackChild(sc: string, dir: string, uid: string, forced: boolean)
 }
 
 async function fallbackE2E(): Promise<void> {
-  console.info("Основной путь не прошёл → бот вошёл запасным, статус это отмечает (4 процесса параллельно, до ~1,5 мин)");
+  console.info("Основной путь не прошёл → бот вошёл запасным, статус это отмечает (5 процессов параллельно, до ~1,5 мин)");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "telemost-fb-"));
   try {
     const cases = e2eCases();
@@ -933,8 +1015,12 @@ async function fallbackE2E(): Promise<void> {
         [def.reason, def.forced ? "all" : null, def.steps]);
       expect(`${sc}: строка владельцу своими словами`,
         String(fb.summary || "").startsWith(def.forced ? "принудительная проверка запасного пути" : "основной путь не нашёл поле имени"), true);
+      // Цикл5 фазы 3 (У6): снимок экрана, где сорвался основной путь, — в статусе (не при флаге).
+      const kitOk = typeof fb.crash_kit === "string" && fs.existsSync(path.join(fb.crash_kit, "kit.json"));
+      expect(`${sc}: снимок основного пути ${def.forced ? "не нужен (флаг)" : "в статусе и на диске"}`, kitOk, !def.forced);
       expect(`${sc}: опасных нажатий нет`, res.danger, []);
       expect(`${sc}: имя — в поле имени, не в поиск`, [res.name, res.leaked], [BOT, 0]);
+      expect(`${sc}: реплика чата главной не попала в журнал бота (цикл5 фазы 3)`, res.chatInLog, false);
       if (!res.joined && process.env.VERBOSE === "1") process.stdout.write(r.out.slice(-4000));
     }
   } catch (e: any) {

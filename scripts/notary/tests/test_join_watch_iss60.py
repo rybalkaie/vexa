@@ -314,6 +314,22 @@ class TickTest(unittest.TestCase):
         self.assertNotIn("primary_reason", note)
         self.assertNotIn("popup_ack", note)
 
+    def test_fallback_by_same_marks_is_not_telemost_changed(self):
+        # Цикл5 фазы 3 (У6): запасной прошёл по тем же меткам — «Телемост поменял вход»
+        # не пишем (скорее лишний шаг или медленная загрузка).
+        for steps, same in (("name:tid,join:tid", True), ("name:label,join:text", False)):
+            self.setUp()
+            fb = {"primary_reason": "name_input_not_found", "forced": None, "steps": steps, "summary": "основной путь …",
+                  "crash_kit": "/transcripts/.crash-kits/auto-x"}
+            self.w.status["auto-x"] = st("in_call", at=NOW + timedelta(seconds=40), fb=fb)
+            self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("running")
+            self.run_tick(NOW + timedelta(seconds=90))
+            self.assertEqual(len(self.w.notes), 1, steps)
+            note = self.w.notes[0]
+            self.assertEqual("по тем же меткам" in note, same, note)
+            self.assertEqual("Телемост поменял вход" in note, not same, note)
+            self.assertIn("снимок основного пути: /transcripts/.crash-kits/auto-x", note)
+
     def test_fallback_tried_but_failed_is_not_a_quiet_note(self):
         # Запасной путь не вывел — это обычный сорванный вход (повтор), не «обошёл сам».
         t1 = NOW + timedelta(seconds=60)

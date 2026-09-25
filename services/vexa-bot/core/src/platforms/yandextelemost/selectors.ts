@@ -295,7 +295,9 @@ export const telemostFallbackButtons: Record<FallbackButtonTarget, FallbackButto
   // вход в аккаунт Яндекса (уводит со страницы встречи).
   join: {
     tids: ["enter-conference-button"],
-    tidPatterns: [/enter-conference/i, /join-(call|meeting|conference)/i, /^join-button$/i],
+    // Метка целиком, а не кусок: `join-call-with-video` / `enter-conference-with-mic`
+    // — это «войти с камерой / микрофоном», их запасной путь не жмёт (цикл5 фазы 3, В2).
+    tidPatterns: [/^enter-conference(-button)?$/i, /^join-(call|meeting|conference)(-button)?$/i, /^join-button$/i],
     labels: [
       "Подключиться",
       "Присоединиться",
@@ -351,7 +353,10 @@ export const telemostFallbackButtons: Record<FallbackButtonTarget, FallbackButto
 // title, <label>. Видимый текст рядом — только если поле в окне единственное.
 export const telemostFallbackNameInput = {
   tids: ["orb-textinput-input"],
-  labelPatterns: [/имя/i, /как (вас|тебя) (зовут|представить)/i, /представьтесь/i, /\bname\b/i],
+  // Цикл5 фазы 3 (У7): «Как к вам обращаться?», «Никнейм» — тоже поле имени; не
+  // узнанное поле ведёт ко входу без имени (люди видят гостя без подписи).
+  labelPatterns: [/имя/i, /как (вас|тебя) (зовут|представить)/i, /представьтесь/i, /\bname\b/i,
+    /как к (вам|тебе) обращаться/i, /никнейм|псевдоним|nickname/i],
   // Не поле имени: поиск, чат, ссылки, коды, почта, телефон, приглашения.
   excludePatterns: [
     /поиск|найти|search|find/i,
@@ -382,6 +387,7 @@ export const telemostFallbackBlacklist: { tidPatterns: RegExp[]; labelPatterns: 
     /invite/i,
     /hand-?up/i,
     /turn-on-(mic|camera|video)/i,
+    /with-?(video|camera|cam|mic|microphone|audio|sound)|(video|camera|cam|mic)-?on([-_]|$)/i,
     /^mute-(audio|video)$/i,
     /unmute/i,
     /login|logout|sign-?in|passport|(^|[-_])auth([-_]|$)/i,
@@ -393,12 +399,13 @@ export const telemostFallbackBlacklist: { tidPatterns: RegExp[]; labelPatterns: 
   ],
   labelPatterns: [
     /заверш/i,
-    /выйти|выход|покинуть|повесить|отключиться|сбросить/i,
+    /выйти|выход|покинуть|повесить|отключиться|сбросить|уйти/i,
     /закрыть (звонок|встречу|конференцию)/i,
     /запис/i,
-    /демонстрац|показать экран|поделиться/i,
+    /демонстрац|показать экран|поделиться|трансляц/i,
     /включить (микрофон|камеру|видео|звук)/i,
-    /приглас/i,
+    /приглас|добавить участник/i,
+    /впустить|допустить/i,
     /поднять руку/i,
     /отправить/i,
     /создать|новый звонок|новая встреча|позвонить/i,
@@ -409,7 +416,7 @@ export const telemostFallbackBlacklist: { tidPatterns: RegExp[]; labelPatterns: 
     /скачать|установить|приложени/i,
     /разрешить/i,
     /для всех/i,
-    /end call|end meeting|leave|hang up|disconnect|record|share|present|invite|raise hand|send|sign in|log in|unmute|turn on|download|install|cancel|go back|for everyone/i,
+    /end call|end meeting|leave|hang up|disconnect|record|share|present|invite|raise hand|send|sign in|log in|unmute|turn on|start video|download|install|cancel|go back|for everyone|admit|broadcast|stream/i,
   ],
 };
 
