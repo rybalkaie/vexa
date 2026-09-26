@@ -128,6 +128,34 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(decide(obs("joining", status="unknown"), launched_ago=jw.UNKNOWN_FORGET_SEC + 1).action, jw.FORGET)
 
 
+class ObserveInCallAtTest(unittest.TestCase):
+    """Момент входа в звонок по истории статуса (для отметки опоздания повтора)."""
+
+    def _obs(self, phase, history, updated):
+        status = {"phase": phase, "updated_at": updated.isoformat(),
+                  "history": [{"phase": p, "at": t.isoformat()} for p, t in history]}
+        return jw.observe(status, jw.ContainerState("running"), NOW)
+
+    def test_start_of_last_in_call_block(self):
+        t = NOW - timedelta(minutes=30)
+        o = self._obs("in_call", [
+            ("joining", t), ("in_call", t + timedelta(seconds=40)),
+            ("in_call", t + timedelta(minutes=3)),                 # событие встречи
+            ("waiting_room", t + timedelta(minutes=10)),           # перезаход после выброса
+            ("in_call", t + timedelta(minutes=11)), ("in_call", t + timedelta(minutes=12)),
+        ], t + timedelta(minutes=12))
+        self.assertEqual(o.in_call_at, t + timedelta(minutes=11))
+
+    def test_no_history_falls_back_to_updated_at(self):
+        o = jw.observe({"phase": "in_call", "updated_at": NOW.isoformat()}, jw.ContainerState("running"), NOW)
+        self.assertEqual(o.in_call_at, NOW)
+
+    def test_not_in_call_has_no_join_moment(self):
+        t = NOW - timedelta(minutes=5)
+        o = self._obs("failed", [("in_call", t), ("failed", t + timedelta(seconds=5))], t + timedelta(seconds=5))
+        self.assertIsNone(o.in_call_at)
+
+
 class FakeWorld:
     """Поддельный docker + статусы + отправка, чтобы гонять tick без внешнего мира."""
 
@@ -143,6 +171,7 @@ class FakeWorld:
         self.persist_fails = False
         self.persist_failed_msgs: list = []
         self.relaunch_ok = True
+        self.retry_joins: list = []
 
     def hooks(self):
         return jw.Hooks(
@@ -156,6 +185,7 @@ class FakeWorld:
             note_owner=lambda text: self.notes.append(text),
             persist=self._persist,
             persist_failed=lambda text: self.persist_failed_msgs.append(text),
+            joined_on_retry=lambda entry, n, at: self.retry_joins.append((n, at)),
         )
 
     def _persist(self, ledger):
@@ -237,6 +267,53 @@ class TickTest(unittest.TestCase):
         self.assertEqual(self.w.alerts, [])
         self.assertEqual(len(self.w.notes), 1)
         self.assertIn("второй попытки", self.w.notes[0])
+
+    def test_second_try_join_reported_once_with_join_moment(self):
+        # Сквозной цикл5 ISS-60: удачный повтор → запускатель помечает опоздание
+        # (подпись в протоколе, Ф10b). Момент входа — начало последней серии
+        # «в звонке» в истории статуса: событие встречи дописывает туда ещё одну
+        # запись «в звонке» и переписывает updated_at.
+        t1 = NOW + timedelta(seconds=60)
+        self.fail_attempt("auto-x", t1, "still_in_lobby")
+        self.run_tick(t1)
+        joined = t1 + timedelta(seconds=45)
+        event_at = joined + timedelta(seconds=30)
+        s = st("in_call", at=event_at, events=[{"type": "primary_deaf", "rule": "sustained",
+                                                "at": event_at.isoformat()}])
+        s["history"] = [
+            {"phase": "joining", "at": (t1 + timedelta(seconds=5)).isoformat()},
+            {"phase": "admission", "at": (t1 + timedelta(seconds=30)).isoformat()},
+            {"phase": "in_call", "at": joined.isoformat()},
+            {"phase": "in_call", "at": event_at.isoformat()},
+        ]
+        self.w.status["auto-x-a2"] = s
+        self.w.containers["vexa-notarius-auto-x-a2"] = jw.ContainerState("running")
+        self.run_tick(event_at + timedelta(seconds=25))
+        self.assertEqual(self.ledger["k1"]["state"], "in_call")
+        self.assertEqual(self.w.retry_joins, [(2, joined)])
+        self.assertEqual(self.w.events, [], "primary_deaf людям не пишется")
+        self.run_tick(event_at + timedelta(minutes=5))
+        self.assertEqual(len(self.w.retry_joins), 1, "отметка — ровно один раз на встречу")
+
+    def test_first_try_join_is_not_a_retry(self):
+        t1 = NOW + timedelta(seconds=90)
+        self.w.status["auto-x"] = st("in_call", at=NOW + timedelta(seconds=40))
+        self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("running")
+        self.run_tick(t1)
+        self.assertEqual(self.ledger["k1"]["state"], "in_call")
+        self.assertEqual(self.w.retry_joins, [])
+
+    def test_retry_join_hook_failure_does_not_break_tick(self):
+        t1 = NOW + timedelta(seconds=60)
+        self.fail_attempt("auto-x", t1, "still_in_lobby")
+        self.run_tick(t1)
+        self.w.status["auto-x-a2"] = st("in_call", at=t1 + timedelta(seconds=30))
+        self.w.containers["vexa-notarius-auto-x-a2"] = jw.ContainerState("running")
+        hooks = self.w.hooks()
+        hooks.joined_on_retry = mock.Mock(side_effect=OSError("disk"))
+        jw.tick(self.ledger, now=t1 + timedelta(seconds=90), hooks=hooks)
+        self.assertEqual(self.ledger["k1"]["state"], "in_call")
+        self.assertEqual(len(self.w.notes), 1, "строка владельцу ушла, хоть отметка и упала")
 
     def test_ok_first_try_is_silent_and_watches_to_the_end(self):
         t1 = NOW + timedelta(seconds=90)

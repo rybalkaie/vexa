@@ -15,7 +15,9 @@ waiting_room → in_call / failed + причина, плюс события по
 состояние контейнера:
 
 * вход удался → молча; дальше сторож доставляет события встречи (выкинуло и не
-  вернулся, оглох) до выхода контейнера;
+  вернулся, оглох) до выхода контейнера; удался только повтор — запускатель
+  помечает опоздание, если бот вошёл позже начала встречи (крючок
+  `joined_on_retry`, подпись в протоколе — `late_join`);
 * сорвался вход → ОДНА повторная попытка новым контейнером; снова сорвался →
   сообщение туда, куда уходит протокол (`join_alert`), и разбор владельцу; у
   встречи портала — ещё событие «бот не пришёл» порталу и закрытие разового
@@ -137,6 +139,9 @@ class Observation:
     #: Сколько секунд назад бот записал текущую фазу.
     phase_age_sec: Optional[float] = None
     events: tuple = ()
+    #: Когда бот записал «в звонке» (последний раз, по истории статуса), иначе None.
+    #: События встречи переписывают `updated_at`, история — нет.
+    in_call_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -336,6 +341,23 @@ def observe(
     phase = st.get("phase")
     ts = _parse_ts(st.get("updated_at"))
     events = st.get("events") if isinstance(st.get("events"), list) else []
+    # Момент входа — начало ПОСЛЕДНЕЙ непрерывной серии «в звонке» в истории: бот
+    # дописывает туда запись с той же фазой и на каждое событие встречи
+    # (`join-status.ts`, addJoinEvent), так что последняя запись — не вход.
+    in_call_at: Optional[datetime] = None
+    history = st.get("history") if isinstance(st.get("history"), list) else []
+    for rec in history:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("phase") == "in_call":
+            if in_call_at is None:
+                in_call_at = _parse_ts(rec.get("at"))
+        else:
+            in_call_at = None
+    if phase != "in_call":
+        in_call_at = None
+    elif in_call_at is None:
+        in_call_at = ts
     return Observation(
         phase=phase if isinstance(phase, str) else None,
         reason=st.get("reason") if isinstance(st.get("reason"), str) else None,
@@ -345,6 +367,7 @@ def observe(
         crash_kit=st.get("crash_kit") if isinstance(st.get("crash_kit"), str) else None,
         phase_age_sec=(now - ts).total_seconds() if ts else None,
         events=tuple(e for e in events if isinstance(e, dict)),
+        in_call_at=in_call_at,
     )
 
 
@@ -383,6 +406,11 @@ class Hooks:
     #: бессмыслен/невозможен) — отсюда запускатель шлёт порталу `no_show` и
     #: закрывает разовый наряд «Подключить сейчас» (фаза 5, хвост У9).
     gave_up: Callable[[Dict[str, Any], str], None] = _noop
+    #: Вход подтверждён НЕ с первой попытки: (запись, номер попытки, когда бот вошёл).
+    #: Повтор заходит на минуты позже; пришлось это на время после начала встречи —
+    #: первых минут в записи нет, и протокол обязан это сказать (сквозной цикл5,
+    #: стык сторожа с отметкой опоздания Ф10b). Зовётся ровно один раз на встречу.
+    joined_on_retry: Callable[[Dict[str, Any], int, datetime], None] = _noop
 
 
 def _commit(ledger: Dict[str, Any], hooks: Hooks) -> bool:
@@ -571,6 +599,8 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
                 continue
             for text in notes:
                 _safe(hooks.note_owner, text)
+            if attempt_no > 1:
+                _safe(hooks.joined_on_retry, entry, attempt_no, obs.in_call_at or now)
             logger.info("[join-watch] %s: вход подтверждён (попытка %d)", key, attempt_no)
             changed = _deliver_events(ledger, entry, obs, hooks) or changed
             if container.status in _GONE:

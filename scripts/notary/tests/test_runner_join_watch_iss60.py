@@ -27,7 +27,7 @@ sys.path.insert(0, str(_HERE.parent.parent))
 
 import notary.cli.registry as registry_mod  # noqa: E402
 import notary.runner as runner  # noqa: E402
-from notary.lib import join_watch, state as state_lib  # noqa: E402
+from notary.lib import join_watch, late_join, state as state_lib  # noqa: E402
 
 TOKEN = "123:SECRET-TOKEN-VALUE"
 OWNER = "111"
@@ -226,6 +226,76 @@ class WatchWiringTest(_Env):
         self.assertEqual(reason, "name_input_not_found")
         self.assertEqual(kw["attempts"], 2)
         self.assertEqual(payload["series"], "anzhee-direktorat")
+
+
+class LateJoinOnRetryTest(_Env):
+    """Сквозной цикл5 ISS-60: сторож (фаза 1) × подпись опоздания (Ф10b).
+
+    Удачный повтор входа заходит на минуты позже. Пришёлся он на время после
+    начала встречи — первых минут в записи нет, и протокол обязан это сказать."""
+
+    START = datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)  # 14:00 МСК
+    SERIES = "anzhee-direktorat"
+
+    def _entry(self, start_at):
+        item = _item(self.START)
+        item["start_at"] = start_at
+        return {"item": item, "series": self.SERIES, "start_at": start_at}
+
+    def _signed(self):
+        return late_join.sign("#протоколвстречи\n\n## Итоги\n", self.SERIES, "2026-09-28")
+
+    def test_retry_after_start_is_signed_late(self):
+        runner._jw_joined_on_retry(self._entry(self.START.isoformat()), 2, self.START + timedelta(minutes=6))
+        mark = late_join.get(self.SERIES, "2026-09-28")
+        self.assertIsNotNone(mark, "удачный повтор после начала встречи обязан оставить отметку")
+        self.assertEqual((mark["reason"], mark["late_minutes"]), (late_join.REASON_JOIN_RETRY, 6))
+        signed = self._signed()
+        self.assertIn("с опозданием на 6 мин", signed)
+        self.assertIn("первая попытка войти во встречу сорвалась", signed)
+        self.assertIn("плановое начало 14:00 МСК, фактический заход 14:06 МСК", signed)
+
+    def test_calendar_start_in_moscow_offset_shows_same_clock(self):
+        # Календарь отдаёт начало с поясом +03:00, заход сторож пишет в UTC — раньше
+        # подпись резала строки как есть: «начало 14:00, заход 11:06».
+        runner._jw_joined_on_retry(self._entry("2026-09-28T14:00:00+03:00"), 2,
+                                   self.START + timedelta(minutes=6))
+        self.assertIn("плановое начало 14:00 МСК, фактический заход 14:06 МСК", self._signed())
+
+    def test_retry_before_start_is_not_marked(self):
+        runner._jw_joined_on_retry(self._entry(self.START.isoformat()), 2, self.START - timedelta(minutes=1))
+        self.assertIsNone(late_join.get(self.SERIES, "2026-09-28"))
+        self.assertEqual(self._signed(), "#протоколвстречи\n\n## Итоги\n")
+
+    def test_end_to_end_retry_after_start_marks_protocol(self):
+        start = datetime.now(timezone.utc).replace(second=0, microsecond=0) + timedelta(minutes=4)
+        state_lib.write_queue([_item(start)])
+        t0 = start - timedelta(minutes=4)
+        snapshot = {"by_series": {}, "by_room": {}, "unlabeled": [], "total": 0}
+        statuses, containers = {}, {}
+        with mock.patch.object(runner, "LOCAL_DOCKER", True), \
+             mock.patch.object(runner, "_running_bots_snapshot", return_value=snapshot), \
+             mock.patch.object(runner, "_launch_bot", return_value=True), \
+             mock.patch.object(runner, "_jw_inspect", side_effect=lambda n: containers.get(n, join_watch.ContainerState("running"))), \
+             mock.patch.object(runner, "_jw_read_status", side_effect=lambda uid: statuses.get(uid)), \
+             mock.patch.object(runner, "_jw_save_logs"), \
+             mock.patch.object(runner, "_jw_stop"), \
+             mock.patch.object(runner, "_canary_warn_tick"), \
+             mock.patch("notary.lib.join_alert.send"):
+            runner.main(now=t0)
+            uid1 = next(iter(join_watch.load_ledger().values()))["attempts"][0]["session_uid"]
+            # попытка 1 зависла в ожидании впуска — сторож остановил её уже после начала
+            t1 = start + timedelta(minutes=3)
+            statuses[uid1] = {"phase": "failed", "reason": "admission_unclear", "updated_at": (t0 + timedelta(minutes=5)).isoformat()}
+            containers["vexa-notarius-" + uid1] = join_watch.ContainerState("exited", 0)
+            runner.main(now=t1)
+            joined = start + timedelta(minutes=4, seconds=30)
+            statuses[uid1 + "-a2"] = {"phase": "in_call", "updated_at": joined.isoformat(),
+                                      "history": [{"phase": "in_call", "at": joined.isoformat()}]}
+            runner.main(now=start + timedelta(minutes=5, seconds=10))
+        mark = late_join.get(self.SERIES, str(_item(start)["start_at"])[:10])
+        self.assertIsNotNone(mark, "сторож и запускатель не связаны: повтор после начала без отметки")
+        self.assertEqual((mark["reason"], mark["late_minutes"]), (late_join.REASON_JOIN_RETRY, 4))
 
 
 if __name__ == "__main__":

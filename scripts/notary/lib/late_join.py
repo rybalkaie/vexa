@@ -39,6 +39,34 @@ KEEP_DAYS = 30
 # не имеет права дописать вторую такую же строку.
 MARKER = "<!-- notary:late-join -->"
 
+#: Причины позднего захода (поле `reason` отметки). Остальные — перенос встречи.
+REASON_SKIP_CAPACITY = "skip_capacity"
+#: Сквозной цикл5 ISS-60: первая попытка входа сорвалась, бот зашёл повтором сторожа.
+REASON_JOIN_RETRY = "join_retry"
+
+try:  # Python 3.9+
+    from zoneinfo import ZoneInfo
+
+    _MSK = ZoneInfo("Europe/Moscow")
+except Exception:  # noqa: BLE001 — нет базы поясов → фиксированный +3
+    _MSK = timezone(timedelta(hours=3))
+
+
+def _msk_hm(raw: Any) -> str:
+    """«ЧЧ:ММ» по Москве из ISO-времени отметки (без пояса — это UTC).
+
+    Раньше время брали срезом строки: начало встречи приходит в поясе календаря
+    (`+03:00`) или портала (UTC), а момент захода — всегда в UTC, и подпись могла
+    сказать «плановое начало 14:00, фактический заход 11:06»."""
+    s = str(raw or "")
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return s[11:16]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_MSK).strftime("%H:%M")
+
 
 def _registry_dir() -> Path:
     from notary.cli.registry import _resolve_registry_dir  # noqa: PLC0415
@@ -138,16 +166,18 @@ def get(series: Any, date: Any) -> Optional[Dict[str, Any]]:
 def note_text(entry: Dict[str, Any]) -> str:
     """Одна строка для протокола. Без имён и без текста разговора."""
     minutes = int(entry.get("late_minutes") or 0)
-    started = str(entry.get("scheduled_start_at") or "")[11:16]
-    joined = str(entry.get("joined_at") or "")[11:16]
-    why = (
-        "в это время шли другие записи и свободного слота у бота не было"
-        if entry.get("reason") == "skip_capacity"
-        else "встречу перенесли, и бот перезашёл в новое время"
-    )
+    started = _msk_hm(entry.get("scheduled_start_at"))
+    joined = _msk_hm(entry.get("joined_at"))
+    reason = entry.get("reason")
+    if reason == REASON_SKIP_CAPACITY:
+        why = "в это время шли другие записи и свободного слота у бота не было"
+    elif reason == REASON_JOIN_RETRY:
+        why = "первая попытка войти во встречу сорвалась, и бот зашёл со второй"
+    else:
+        why = "встречу перенесли, и бот перезашёл в новое время"
     return (
         "%s\n\n---\n\n> ⏳ **Бот подключился с опозданием на %d мин** "
-        "(плановое начало %s, фактический заход %s): %s. "
+        "(плановое начало %s МСК, фактический заход %s МСК): %s. "
         "Первые минуты разговора в запись не попали." % (MARKER, minutes, started, joined, why)
     )
 

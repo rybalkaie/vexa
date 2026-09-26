@@ -1070,6 +1070,25 @@ def _jw_gave_up(entry: dict[str, Any], reason: str) -> None:
             logger.warning("Разовый наряд %s не закрыт (%s)", order_id, type(e).__name__)
 
 
+def _jw_joined_on_retry(entry: dict[str, Any], attempt: int, joined_at: datetime) -> None:
+    """Вход подтверждён не с первой попытки — пометить опоздание для протокола.
+
+    Повтор заходит на минуты позже первой попытки (сорванный вход, остановка
+    зависшего бота, минута тика). Пришлось это на время после начала встречи
+    (порог `waitlist.LATE_THRESHOLD_MINUTES`) — первых минут разговора в записи
+    нет, и протокол обязан это сказать, как после захода из очереди ожидания
+    (`late_join`, Ф10b: «протокол без начала выглядит как протокол встречи,
+    которая так и началась»). Зашёл раньше начала — отметки нет.
+
+    Сквозной цикл5 ISS-60: сторож (фаза 1) и подпись опоздания (Ф10b) не были
+    связаны — протокол после удачного повтора молча терял начало встречи.
+    """
+    item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+    if not item.get("start_at"):
+        return
+    _mark_if_late(item, joined_at, reason=late_join.REASON_JOIN_RETRY)
+
+
 def _jw_note_owner(text: str) -> None:
     push(text, dedupe=False, silent=True)
 
@@ -1125,6 +1144,7 @@ def _join_watch_tick(now: datetime, *, allow_retry: bool) -> None:
                 persist_failed=_jw_persist_failed,
                 save_logs=_jw_save_logs,
                 gave_up=_jw_gave_up,
+                joined_on_retry=_jw_joined_on_retry,
             )
             if join_watch.tick(ledger, now=now, hooks=hooks, allow_retry=allow_retry):
                 join_watch.save_ledger(ledger)
