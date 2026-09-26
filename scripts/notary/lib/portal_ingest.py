@@ -262,6 +262,46 @@ def build_purge_event(
     }
 
 
+#: Хвост ключа события «бот не пришёл». Ровно этот ключ портал вернул бы в ACK и
+#: сам, если его не прислать (`notaryIngest.ts`: `portal:${meeting.id}#${event}`),
+#: но шлём явно — сверка ACK не должна зависеть от того, как портал его синтезирует.
+NO_SHOW_SUFFIX = "#no_show"
+
+
+def no_show_key(order_id: str) -> str:
+    """`portal:<meeting_id>#no_show` — один на наряд: второй «не пришёл» по той же
+    встрече порталу ничего не добавит (статус записи назад не ходит)."""
+    return "%s%s" % (str(order_id or "").strip(), NO_SHOW_SUFFIX)
+
+
+def build_no_show_event(
+    *,
+    meeting_id: str,
+    order_id: str,
+    company: Optional[str] = None,
+    occurred_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Событие «бот не пришёл» (диалект событий портала, `event: no_show`).
+
+    Шлётся ТОЛЬКО после окончательного срыва входа — когда сторож
+    (`lib/join_watch.py`) сдался после повтора: раньше это было бы ложное «бот не
+    пришёл» при сорвавшейся первой попытке, которую повтор ещё мог спасти. Портал
+    ставит встрече `BOT_NO_SHOW`, звонит организатору колокольчиком и открывает
+    загрузку записи вручную (`notaryIngest.ts`, `recordingUpload.ts`).
+
+    Поля — ровно схема портала `notaryEventSchema`; `delivery_key` портал
+    возвращает эхом в ACK (`validate_ack` сверяет дословно).
+    """
+    return {
+        "meeting_id": meeting_id,
+        "event": "no_show",
+        "occurred_at": occurred_at or datetime.now(timezone.utc).isoformat(),
+        "order_id": order_id,
+        "company": company,
+        "delivery_key": no_show_key(order_id),
+    }
+
+
 def encode(payload: Dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 

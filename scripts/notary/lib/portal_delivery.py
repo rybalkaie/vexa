@@ -778,6 +778,25 @@ def _alert_exhausted(item: Dict[str, Any], *, permanent: bool) -> None:
             key, reason,
         )
         return
+    if key.endswith(_NO_SHOW_SUFFIX):
+        # «Бот не пришёл» (фаза 5): записи нет вовсе, удерживать нечего — текст
+        # про «запись не удалил» здесь был бы враньём. Но и молчать нельзя: у
+        # организатора без привязанного Телеграма колокольчик портала — единственный
+        # способ узнать, что бота не было.
+        try:
+            from notary.lib import notify  # noqa: PLC0415
+
+            notify.push(
+                "⚠️ Портал не принял событие «бот не пришёл» (%s, попыток %s, последняя "
+                "ошибка: %s). Колокольчика у организатора не будет — предупреди его сам. "
+                "Наряд: %s." % (reason, item.get("attempts"), item.get("last_error"),
+                                item.get("order_id")),
+                dedupe_key="portal-delivery-dead:%s" % key,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[portal-delivery] алерт владельцу не ушёл: %s", type(e).__name__)
+        logger.error("[portal-delivery] «бот не пришёл» %s не доехал (%s)", key, reason)
+        return
     try:
         from notary.lib import notify  # noqa: PLC0415
 
@@ -836,6 +855,9 @@ def abandon(key: str, *, now: Optional[datetime] = None) -> Optional[Dict[str, A
 
 
 PURGE_SUFFIX = "#purged"
+#: Хвост ключа «бот не пришёл» — копия `portal_ingest.NO_SHOW_SUFFIX` (тот модуль
+#: импортирует этот, обратный импорт на уровне модуля дал бы цикл).
+_NO_SHOW_SUFFIX = "#no_show"
 
 
 def delivered_key_for_session(session_uid: str) -> Optional[str]:
@@ -848,7 +870,9 @@ def delivered_key_for_session(session_uid: str) -> Optional[str]:
     for item in list_items(statuses={STATUS_DELIVERED}):
         if str(item.get("session_uid") or "") != str(session_uid or ""):
             continue
-        if str(item.get("key") or "").endswith(PURGE_SUFFIX):
+        if str(item.get("key") or "").endswith((PURGE_SUFFIX, _NO_SHOW_SUFFIX)):
+            # Служебные события — не доставка результата: их ключ портал не
+            # примет как «ключ исходной доставки» для отчёта об уборке.
             continue
         stamp = str(item.get("delivered_at") or "")
         if best is None or stamp > best[0]:
@@ -907,6 +931,60 @@ def report_sources_purged(
         # панели «Запись». Алерт владельцу тут был бы шумом.
         logger.warning("[portal-delivery] отчёт об уборке не записан: %s", e)
         return None
+    return key
+
+
+def report_no_show(
+    order_id: str,
+    *,
+    meeting_id: Optional[str],
+    session_uid: str,
+    company: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Сказать порталу «бот не пришёл» (фаза 5 ISS-60). Возвращает ключ элемента.
+
+    Зовёт запускатель, когда сторож входа СДАЛСЯ окончательно (после повтора).
+    Кладётся в ТУ ЖЕ очередь, что результаты: портал может лежать в эту минуту, а
+    разбирает очередь сборщик каждые 5 минут. Идемпотентно по наряду: второй
+    «не пришёл» по той же встрече не встаёт.
+
+    Исходников у этой встречи нет, поэтому удержание не ставится и не снимается.
+    Без `meeting_id` (портал ищет встречу по нему) не шлём вовсе — 422 навсегда.
+    """
+    if not is_enabled():
+        return None
+    order = str(order_id or "").strip()
+    mid = str(meeting_id or "").strip()
+    if not order or not mid:
+        logger.warning(
+            "[portal-delivery] «бот не пришёл» не собран: нет наряда или id встречи (%s)",
+            order or "?",
+        )
+        return None
+    try:
+        from notary.lib import portal_ingest  # noqa: PLC0415
+
+        payload = portal_ingest.build_no_show_event(
+            meeting_id=mid, order_id=order, company=company, occurred_at=_iso(_now(now)),
+        )
+        key = portal_ingest.no_show_key(order)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[portal-delivery] «бот не пришёл» не собран: %s", type(e).__name__)
+        return None
+    key, created = enqueue(
+        order_id=order,
+        meeting_id=mid,
+        version=1,
+        session_uid=str(session_uid or order),
+        company=company,
+        payload=payload,
+        key=key,
+        ack_key=key,
+        now=now,
+    )
+    if created:
+        logger.info("[portal-delivery] «бот не пришёл» в очереди: %s", key)
     return key
 
 

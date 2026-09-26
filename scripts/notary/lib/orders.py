@@ -873,6 +873,66 @@ def leave_now(
     return _mutate(_apply)
 
 
+#: Почему разовый наряд закрыт машиной (не человеком): сторож входа сдался.
+CLOSE_REASON_JOIN_FAILED = "join_failed"
+
+
+def close_immediate_after_join_failure(
+    order_id: str,
+    *,
+    reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Закрыть разовый наряд «Подключить сейчас», когда бот так и не вошёл (У9).
+
+    ЧТО БЫЛО. Наряд «зайти сейчас» живёт 180 минут (`IMMEDIATE_TTL_MINUTES`) и всё
+    это время держит комнату: повторное нажатие кнопки на портале находило его же
+    (`find_active_order_for_room`) и отвечало «бот уже идёт» — хотя сторож входа
+    давно сдался. Кнопка молчала до трёх часов.
+
+    СТАЛО. Сторож сдался (после повтора) → наряд `finished` с причиной. Комната
+    свободна: новое нажатие заводит свежий наряд со своим временем старта, а значит
+    и со своим ключом старта (`<event>@<минута нажатия>`) — прежний ключ в
+    `.state.json` ему не мешает.
+
+    🔴 Прежний ключ старта НАМЕРЕННО НЕ ОСВОБОЖДАЕТСЯ. Строка этого наряда может
+    ещё жить в `.queue.json` до следующей перестройки очереди планировщиком, а
+    разовый наряд годен к запуску 20 минут после нажатия
+    (`portal_queue.IMMEDIATE_DUE_MINUTES`): освобождённый ключ поднял бы по
+    устаревшей строке ТРЕТЬЕГО бота — и третий круг сообщений людям.
+
+    Трогаем только разовый и ещё живой наряд: плановый наряд — это встреча в
+    календаре портала, её судьбу решает человек; снятый/закрытый — не воскрешаем.
+    Версию не поднимаем — это отметка исполнения, а не правка встречи (как
+    `attach_run`). Возвращает наряд после правки или None, если трогать нечего.
+    """
+    stamp = _now_iso(now)
+    target_id = str(order_id or "")
+    if not target_id:
+        return None
+
+    def _apply(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        orders = state.setdefault("orders", {})
+        existing = orders.get(target_id)
+        if not isinstance(existing, dict):
+            return None
+        if existing.get("kind") != KIND_IMMEDIATE:
+            return None
+        if existing.get("status") not in ACTIVE_STATUSES:
+            return None
+        merged = dict(existing)
+        merged["status"] = STATUS_FINISHED
+        merged["finished_at"] = stamp
+        merged["finish_reason"] = CLOSE_REASON_JOIN_FAILED
+        if reason:
+            merged["join_failure"] = str(reason)[:120]
+        merged["updated_at"] = stamp
+        orders[target_id] = merged
+        return dict(merged)
+
+    return _mutate(_apply)
+
+
 def attach_run(
     order_id: str,
     *,

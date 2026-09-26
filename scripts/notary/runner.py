@@ -1008,6 +1008,59 @@ def _jw_event_alert(entry: dict[str, Any], event_type: str, event: dict[str, Any
     join_alert.send(_jw_payload(entry), event_type, kind=event_type)
 
 
+def _jw_gave_up(entry: dict[str, Any], reason: str) -> None:
+    """Сторож сдался окончательно (фаза 5 ISS-60) — только для встреч портала.
+
+    1. Порталу — событие «бот не пришёл» (`no_show`): встреча получает статус
+       «бот не пришёл», организатору — колокольчик, на карточке открывается
+       загрузка записи. Тем же каналом, что результаты (очередь на диске, её
+       разбирает сборщик каждые 5 минут).
+    2. Разовый наряд «Подключить сейчас» закрывается — иначе повторное нажатие
+       кнопки до трёх часов отвечало бы «бот уже идёт» (хвост У9).
+
+    У личных серий владельца наряда нет — ничего не делаем. Каждое действие под
+    своим try: сбой портала не мешает закрыть наряд и наоборот.
+    """
+    item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+    order_id = str(entry.get("order_id") or item.get("order_id") or "").strip()
+    if not order_id:
+        return
+    from notary.lib import orders as orders_lib  # noqa: PLC0415
+
+    order: dict[str, Any] | None = None
+    try:
+        order = orders_lib.get_order(order_id)
+    except Exception as e:  # noqa: BLE001 — реестр нарядов не читается
+        logger.warning("Сторож сдался по наряду %s, реестр не прочитан (%s)", order_id, type(e).__name__)
+    attempts = entry.get("attempts") if isinstance(entry.get("attempts"), list) else []
+    last = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+    session_uid = str(last.get("session_uid") or "")
+    meeting_id = str((order or {}).get("meeting_id") or "").strip()
+    if not meeting_id and order_id.startswith("portal:"):
+        meeting_id = order_id[len("portal:"):]
+    try:
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        key = portal_delivery.report_no_show(
+            order_id, meeting_id=meeting_id, session_uid=session_uid,
+            company=(order or {}).get("company") or item.get("company"),
+        )
+        if key:
+            logger.warning("Наряд %s: «бот не пришёл» в очереди к порталу (%s)", order_id, reason)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("«Бот не пришёл» по наряду %s не поставлен в очередь (%s)", order_id, type(e).__name__)
+    if item.get("immediate") or (order or {}).get("kind") == orders_lib.KIND_IMMEDIATE:
+        try:
+            closed = orders_lib.close_immediate_after_join_failure(order_id, reason=reason)
+            if closed:
+                logger.warning(
+                    "Разовый наряд %s закрыт: бот не вошёл — кнопка «Подключить сейчас» "
+                    "снова заводит новый наряд", order_id,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Разовый наряд %s не закрыт (%s)", order_id, type(e).__name__)
+
+
 def _jw_note_owner(text: str) -> None:
     push(text, dedupe=False, silent=True)
 
@@ -1062,6 +1115,7 @@ def _join_watch_tick(now: datetime, *, allow_retry: bool) -> None:
                 persist=join_watch.save_ledger,
                 persist_failed=_jw_persist_failed,
                 save_logs=_jw_save_logs,
+                gave_up=_jw_gave_up,
             )
             if join_watch.tick(ledger, now=now, hooks=hooks, allow_retry=allow_retry):
                 join_watch.save_ledger(ledger)
