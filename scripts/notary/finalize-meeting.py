@@ -523,6 +523,25 @@ def _stash_into_failed(
         except OSError as e:
             log.warning("Не смог удалить исходный meta %s: %s", meta_path, e)
 
+    # Фаза 4 (ISS-60, второе ухо): спутник записи — второе ухо, пока протокол из
+    # основной; кусок основной, пока из второго уха (`lib/second_ear.companion_wavs`) —
+    # переезжает в _failed/ вместе с исходником. meta из _tmp/ только что удалена:
+    # сборщик его больше не найдёт, и файл с голосами встречи остался бы навсегда.
+    # В _failed/ его уберёт уборка `<sid>.*` после удачного повтора (5.1). Сбой
+    # переезда исходник и повтор не трогает.
+    try:
+        from lib import second_ear as _second_ear  # noqa: PLC0415
+        from lib.wav_concat import _remap_host_path  # noqa: PLC0415
+
+        if meta_dst.exists():
+            _stash_meta = json.loads(meta_dst.read_text(encoding="utf-8"))
+            _second_ear.stash_companions(
+                _stash_meta, sid, failed,
+                host_path=lambda p: Path(_remap_host_path(p)),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("[second-ear] спутник записи не перенесён в _failed (%s)", type(e).__name__)
+
     now_iso = datetime.utcnow().isoformat() + "Z"
     state = {
         "session_uid": sid,

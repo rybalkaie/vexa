@@ -11,10 +11,18 @@
     При "second_ear" `recording.chunks[]` и `files.wav` уже указывают на второе ухо —
     финализации для звука ничего делать не нужно, двойного звука нет.
   • Финализация (`finalize-meeting.py`) по "second_ear" пишет владельцу — `notify_owner_if_ear`.
-  • Сборщик (`collector.py`) после подтверждённой доставки удаляет второе ухо по тем же
+  • «Спутник» записи (`companion_wavs`) — файл встречи, который живёт и удаляется ВМЕСТЕ
+    с `files.wav`, но в нём не указан: второе ухо, пока протокол из основной; кусок
+    основной, который до фазы 4 стоял бы в `files.wav`, когда протокол из второго уха.
+  • Сборщик (`collector.py`) после подтверждённой доставки удаляет спутников по тем же
     правилам, что основную запись (`files.wav`): не раньше доставки, не под удержанием
-    портала, не при keep_audio. Иначе второе ухо копилось бы на диске навсегда (час
-    встречи ≈ 115 МБ; свободно на сервере ~25 ГБ).
+    портала, не при keep_audio. Иначе второе ухо (или заглушённая основная) копилось
+    бы на диске навсегда (час встречи ≈ 115 МБ; свободно на сервере ~25 ГБ) — метельщик
+    `meeting-notary-cleanup` куски `*.chunkN.wav` не находит.
+  • Сбой расшифровки (`finalize-meeting._stash_into_failed`): исходник переезжает в
+    `_failed/`, meta из `_tmp/` удаляется — спутники переезжают туда же
+    (`stash_companions`), иначе сборщик их больше не нашёл бы. В `_failed/` их убирает
+    та же уборка `<sid>.*` после удачного повтора, с тем же удержанием для портала.
   • Удержание для портала (`portal_delivery.session_wav_files`) и сторож зависаний
     сборщика знают файл по имени `*.chunk<цифры>.wav` — отдельного кода не нужно.
   • Самопроверка (`lib/canary.py`) отличает второе ухо от основной записи по суффиксу.
@@ -24,9 +32,11 @@
 from __future__ import annotations
 
 import logging
+import re
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("notary.second_ear")
 
@@ -34,6 +44,10 @@ logger = logging.getLogger("notary.second_ear")
 EAR_CHUNK_SUFFIX = ".chunk0.wav"
 AUDIO_SOURCE_EAR = "second_ear"
 AUDIO_SOURCE_PRIMARY = "primary"
+#: Кусок ОСНОВНОЙ записи: номер с 1 (`recording.ts`, openChunk).
+_PRIMARY_CHUNK_RE = re.compile(r"\.chunk([1-9]\d*)\.wav$")
+#: Хвост имени любого куска — с ним спутник переезжает в `_failed/<sid>.<хвост>`.
+_CHUNK_TAIL_RE = re.compile(r"\.(chunk\d+\.wav)$")
 
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo
@@ -107,18 +121,20 @@ def owner_note(meta: Any, *, series: Optional[str] = None, date: Optional[str] =
     deaf = _dict(rec.get("primaryDeaf"))
     series_lbl = series or str(m.get("series") or "встреча")
     date_lbl = date or str(m.get("startTs") or "")[:10] or "?"
-    since = _msk_hm(deaf.get("since"))
-    since_part = f" с {since}" if since else ""
     if deaf.get("rule") == "sustained":
+        since = _msk_hm(deaf.get("since"))
+        heard = "не слышала звонок" + (f" с {since}" if since else "")
         why = "основная запись молчала минуту подряд, пока второе ухо слышало речь"
     else:
+        # ear_heard_more: основная что-то слышала — «не слышала с ЧЧ:ММ» было бы неправдой.
+        heard = "слышала звонок лишь частично"
         why = (
             f"за встречу основная запись услышала {_minutes(deaf.get('primaryLoudS'))} звука, "
             f"второе ухо — {_minutes(deaf.get('earLoudS'))}"
         )
     text = (
-        f"🎧 Ватсон: встреча «{series_lbl}» {date_lbl} — основная запись бота не слышала "
-        f"звонок{since_part}. Протокол собираю со второго уха (запись всего, что играл "
+        f"🎧 Ватсон: встреча «{series_lbl}» {date_lbl} — основная запись бота {heard}. "
+        f"Протокол собираю со второго уха (запись всего, что играл "
         f"браузер бота): встреча не потеряна.\n"
         f"Почему так решил: {why}.\n"
         f"Основную запись бота надо чинить — вероятно, Телемост поменял, как отдаёт звук."
@@ -161,27 +177,108 @@ def notify_owner_if_ear(
         return False
 
 
-def cleanup_after_delivery(meta: Any, sid: str, *, host_path: Callable[[str], Path]) -> Optional[str]:
-    """Удалить второе ухо после подтверждённой доставки. Гейты — у вызывающего.
+def primary_legacy_wav(meta: Any) -> Optional[str]:
+    """Кусок ОСНОВНОЙ записи, который до фазы 4 стоял бы в `files.wav`, или None.
 
-    Зовётся ТАМ ЖЕ и ТОГДА ЖЕ, когда сборщик удаляет основную запись (`files.wav`):
-    после доставки, не под удержанием портала, не при keep_audio. Если второе ухо и
-    есть `files.wav` (основная оглохла), его уже удалил основной код — здесь ничего.
-    Возвращает путь удалённого файла или None.
+    Только когда протокол собран из второго уха (`audioSource = second_ear`): тогда бот
+    ставит в `files.wav` второе ухо, а куски основной уходят в `recording.primaryChunks`.
+    Правило выбора — как у бота (`recording.ts`, buildMeta): первый кусок с речью, иначе
+    первый. Сборщик удалял его после доставки всегда; без этого заглушённая основная
+    (при глухоте — вся встреча, при частичной — и живые голоса до поломки) лежала бы
+    на диске навсегда.
+
+    Путь проверяется строго — удаление идёт по пути из файла: кусок основной
+    (`.chunk<N≥1>.wav`), та же папка и та же сессия, что у второго уха, без `..`.
     """
+    if not uses_ear(meta):
+        return None
     ear = ear_wav(meta)
     if not ear:
         return None
+    rec = _dict(_dict(meta).get("recording"))
+    raw = rec.get("primaryChunks")
+    chunks = [c for c in (raw if isinstance(raw, list) else [])
+              if isinstance(c, dict) and isinstance(c.get("wav"), str) and c.get("wav")]
+    if not chunks:
+        return None
+    with_speech = [c for c in chunks
+                   if c.get("firstSpeechMs") is not None and c.get("lastSpeechMs") is not None]
+    wav = str((with_speech or chunks)[0]["wav"])
+    p, e = PurePosixPath(wav), PurePosixPath(ear)
+    if ".." in p.parts or p.parent != e.parent:
+        return None
+    m = _PRIMARY_CHUNK_RE.search(p.name)
+    if not m or p.name[: m.start()] != e.name[: -len(EAR_CHUNK_SUFFIX)]:
+        return None
+    return wav
+
+
+def companion_wavs(meta: Any) -> List[str]:
+    """Спутники записи: файлы встречи, которые живут и удаляются вместе с `files.wav`.
+
+    Пока протокол из основной — второе ухо. Когда из второго уха (`files.wav` = оно) —
+    кусок основной, который раньше был `files.wav` (`primary_legacy_wav`). Сам
+    `files.wav` сюда не входит: его убирает основной код сборщика.
+    """
     main = _dict(_dict(meta).get("files")).get("wav")
-    if isinstance(main, str) and PurePosixPath(main).name == PurePosixPath(ear).name:
-        return None
-    p = host_path(ear)
-    try:
-        if p.is_symlink() or not p.is_file():
-            return None
-        p.unlink()
-    except OSError as e:
-        logger.warning("Второе ухо %s не удалено (%s)", p.name, type(e).__name__)
-        return None
-    logger.info("Второе ухо удалено после доставки (sid=%s, path=%s)", sid, ear)
-    return ear
+    main_name = PurePosixPath(main).name if isinstance(main, str) and main else None
+    out: List[str] = []
+    for wav in (ear_wav(meta), primary_legacy_wav(meta)):
+        if wav and PurePosixPath(wav).name != main_name and wav not in out:
+            out.append(wav)
+    return out
+
+
+def cleanup_after_delivery(meta: Any, sid: str, *, host_path: Callable[[str], Path]) -> List[str]:
+    """Удалить спутников записи после подтверждённой доставки. Гейты — у вызывающего.
+
+    Зовётся ТАМ ЖЕ и ТОГДА ЖЕ, когда сборщик удаляет основную запись (`files.wav`):
+    после доставки, не под удержанием портала, не при keep_audio. Ссылкам не следует.
+    Возвращает пути удалённых файлов.
+    """
+    removed: List[str] = []
+    for wav in companion_wavs(meta):
+        p = host_path(wav)
+        try:
+            if p.is_symlink() or not p.is_file():
+                continue
+            p.unlink()
+        except OSError as e:
+            logger.warning("Спутник записи %s не удалён (%s)", p.name, type(e).__name__)
+            continue
+        logger.info("Спутник записи удалён после доставки (sid=%s, path=%s)", sid, wav)
+        removed.append(wav)
+    return removed
+
+
+def stash_companions(meta: Any, sid: str, failed_dir: Path, *,
+                     host_path: Callable[[str], Path]) -> List[str]:
+    """Сбой расшифровки: перенести спутников записи в `_failed/<sid>.chunkN.wav`.
+
+    `_stash_into_failed` переносит исходник в `_failed/` и удаляет meta из `_tmp/` —
+    сборщик эту встречу больше не увидит, и спутник в `_tmp/` остался бы навсегда.
+    В `_failed/` его уберёт та же уборка `<sid>.*` после удачного повтора (с тем же
+    удержанием для портала), а при ручном разборе всё лежит рядом. Перенос = копия,
+    затем удаление оригинала, только если копия целая. Не бросает (OSError — в журнал).
+    Возвращает пути перенесённых файлов.
+    """
+    safe_sid = PurePosixPath(str(sid)).name
+    moved: List[str] = []
+    for wav in companion_wavs(meta):
+        m = _CHUNK_TAIL_RE.search(PurePosixPath(wav).name)
+        if not m or not safe_sid:
+            continue
+        src = host_path(wav)
+        dst = Path(failed_dir) / f"{safe_sid}.{m.group(1)}"
+        try:
+            if src.is_symlink() or not src.is_file():
+                continue
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+                src.unlink()
+                moved.append(wav)
+                logger.info("Спутник записи перенесён в _failed (sid=%s, %s)", safe_sid, dst.name)
+        except OSError as e:
+            logger.warning("Спутник записи %s не перенесён (%s)", PurePosixPath(wav).name, type(e).__name__)
+    return moved
