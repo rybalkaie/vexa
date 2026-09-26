@@ -1159,9 +1159,14 @@ def _copy_only(session_uid: str, series: str, date_str: str) -> None:
 
 def _finalize_lock_path(session_uid: str) -> Path:
     """Путь per-session lock-файла (CG1). Имя санитизируется: session_uid
-    приходит из meta-файла и теоретически может содержать `/`."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_uid or "unknown")
-    return STATE_DIR / f"finalize-{safe}.lock"
+    приходит из meta-файла и теоретически может содержать `/`.
+
+    Имя строит `lib/finalize_lock.lock_filename` — тот же, которым берёт замок
+    ручная финализация из присланной записи (фаза 5 ISS-60): разойдутся имена —
+    сборщик не увидит ручную финализацию и запустит вторую."""
+    from notary.lib import finalize_lock  # noqa: PLC0415
+
+    return STATE_DIR / finalize_lock.lock_filename(session_uid)
 
 
 @contextlib.contextmanager
