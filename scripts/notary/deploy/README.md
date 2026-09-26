@@ -332,7 +332,7 @@ ssh meeting-notary bash -s <<'EOF'
 set -e
 B=/srv/meeting-notary/.deploy-backup; sudo mkdir -p $B
 if [ -e $B/before-iss60-scripts.tgz ] || docker image inspect vexa-bot:notarius-telemost-before-iss60 >/dev/null 2>&1; then
-  echo "СНИМОК УЖЕ ЕСТЬ — не перезаписываю"; ls -la $B/before-iss60-*; docker image ls vexa-bot:notarius-telemost-before-iss60; exit 1
+  echo "СНИМОК УЖЕ ЕСТЬ — не перезаписываю"; ls -la $B/before-iss60-* || true; docker image ls vexa-bot:notarius-telemost-before-iss60; exit 1
 fi
 sudo tar czf $B/before-iss60-scripts.tgz -C /srv/meeting-notary/vexa/scripts notary
 sudo tar czf $B/before-iss60-botsrc.tgz -C /home/dev/meeting-notary/vexa/services/vexa-bot core/src core/entrypoint.sh
@@ -387,8 +387,8 @@ make deploy-notary LOCAL_NOTARY_DIR=$TREE/scripts/notary LOCAL_VEXA_BOT_SRC=$TRE
    ```bash
    ssh meeting-notary "grep -E '^(MEETING_NOTARY_JOIN_ALERT_TO_OWNER|MEETING_NOTARY_CANARY_FORCE_FALLBACK|MEETING_NOTARY_CANARY_FORCE_DEAF|MEETING_NOTARY_CANARY_IMAGE|MEETING_NOTARY_CANARY_ROOM|MEETING_NOTARY_JOIN_WATCH|MEETING_NOTARY_CANARY_WARN)=' /srv/meeting-notary/.env.notary"
    ```
-   Ждём пустой вывод (допустимо только `…_JOIN_WATCH=1` / `…_CANARY_WARN=1`). Есть строка — удалить
-   её (`sudo sed -i '/^ИМЯ=/d' /srv/meeting-notary/.env.notary`) и показать владельцу, что было.
+   Ждём пустой вывод (допустимо только `…_JOIN_WATCH=1` / `…_CANARY_WARN=1`). Есть строка — показать
+   владельцу и с его слова удалить (`sudo sed -i '/^ИМЯ=/d' /srv/meeting-notary/.env.notary`).
 3. **Сторож видит docker локально** (иначе он молчит — так задумано для мака):
    ```bash
    ssh meeting-notary "systemctl show meeting-notary-runner -p Environment | grep -c 'MEETING_NOTARY_LOCAL_DOCKER=1'; grep -c '^MEETING_NOTARY_LOCAL_DOCKER=1' /srv/meeting-notary/.env.notary"   # хотя бы одна 1
@@ -396,7 +396,8 @@ make deploy-notary LOCAL_NOTARY_DIR=$TREE/scripts/notary LOCAL_VEXA_BOT_SRC=$TRE
 
 ## 5. Самопроверка кандидата в Т-10
 
-Юниты — по разделу «Самопроверка бота в Т-10…» выше, **без** включения таймеров:
+Юниты ставим командами ниже (справка по ним — раздел «Самопроверка бота в Т-10…» выше), **без**
+включения таймеров:
 ```bash
 ssh meeting-notary bash -s <<'EOF'
 sudo -u dev mkdir -p /srv/meeting-notary/state/canary /home/dev/meeting-notary/_tmp/canary /home/dev/meeting-notary/logs
@@ -440,7 +441,7 @@ ssh meeting-notary 'sudo systemctl enable --now meeting-notary-canary.timer meet
 ```
 Если в папке состояния осталась версия Телемоста от тестовых прогонов, «нюх» увидит «смену» и сразу
 запустит ещё одну самопроверку (владельцу — тихая строка «Телемост обновился») — это нормально,
-`start` просто дольше ждёт.
+запуск «нюха» просто дольше ждёт.
 
 Итог не «бот здоров»:
 - `skipped` (в Т-10 кто-то есть или скоро встреча) → повторить `start` позже, таймеры пока не включать;
