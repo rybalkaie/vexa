@@ -492,6 +492,85 @@ class CallClaudePrintStreamJsonTest(unittest.TestCase):
             with self.assertRaises(ClaudeCliFailed):
                 claude_cli.call_claude_print_stream_json("prompt")
 
+    # ── Цикл5 фазы 5 ISS-60: причина сбоя CLI лежит в stdout, не в stderr ──────
+    # Живой CLI при отказе API (нет входа, лимит подписки, 429) выходит с кодом 1 и
+    # ПУСТЫМ stderr, а причину пишет итоговым событием `result` (is_error) и
+    # событием `assistant` с `is_api_error_message`. Раньше stdout при ненулевом
+    # коде выбрасывался — в журнале оставалось `exit=1, stderr=''`, и два сбоя
+    # составления протокола на бою (16.09, 26.09) нечем было объяснить.
+    def _api_error_stdout(self, result: str = "Not logged in · Please run /login") -> str:
+        return "\n".join([
+            json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+            json.dumps({"type": "assistant", "is_api_error_message": True,
+                        "error": "authentication_failed",
+                        "message": {"content": [{"type": "text", "text": result}]}}),
+            _result_line(is_error=True, subtype="success", result=result,
+                         terminal_reason="api_error"),
+        ])
+
+    def test_nonzero_exit_surfaces_api_error_from_stream(self):
+        with mock.patch(
+            "lib.claude_cli.subprocess.run",
+            return_value=_FakeCompletedProcess(stdout=self._api_error_stdout(), returncode=1),
+        ):
+            with self.assertRaises(ClaudeCliFailed) as ctx:
+                claude_cli.call_claude_print_stream_json("prompt")
+        msg = str(ctx.exception)
+        self.assertIn("exit=1", msg)
+        self.assertIn("error=authentication_failed", msg)
+        self.assertIn("Not logged in", msg)
+        # Причина обязана пережить обрезку сообщения в генерации протокола (`[:200]`).
+        self.assertIn("error=authentication_failed", msg[:200])
+
+    def test_stream_error_never_carries_model_text(self):
+        """Текст ответа модели (кусок протокола) в сообщение не попадает НИКОГДА:
+        ни из `result` без is_error, ни многострочным, ни из событий `assistant`."""
+        secret = "СЕКРЕТ-РЕПЛИКА-ВСТРЕЧИ"
+        cases = [
+            ("\n".join([
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": secret}]}}),
+                _result_line(is_error=False, result=secret + " продолжение", stop_reason="max_tokens"),
+            ]), 1),
+            (_result_line(is_error=True, result="Ошибка API\n" + secret), 1),
+            # Ветка is_error при коде 0: раньше туда шли 200 знаков `result` как есть.
+            (_result_line(is_error=True, result="Ошибка API\n" + secret), 0),
+        ]
+        for stdout, rc in cases:
+            with self.subTest(stdout=stdout[:40], rc=rc):
+                with mock.patch(
+                    "lib.claude_cli.subprocess.run",
+                    return_value=_FakeCompletedProcess(stdout=stdout, returncode=rc),
+                ):
+                    with self.assertRaises(ClaudeCliFailed) as ctx:
+                        claude_cli.call_claude_print_stream_json("prompt")
+                self.assertNotIn(secret, str(ctx.exception))
+                self.assertIn(("Ошибка API" if "Ошибка API" in stdout else "result_len="),
+                              str(ctx.exception))
+
+    def test_stream_error_text_is_redacted(self):
+        # Похожая на токен строка собирается на лету: в исходниках публичного форка
+        # не должно быть ничего, что сканер секретов примет за настоящий токен.
+        prefix = "-".join(("sk", "ant", "oat01"))
+        leak = prefix + "-" + "A" * 50
+        stdout = _result_line(is_error=True, result="Invalid bearer %s rejected" % leak)
+        with mock.patch(
+            "lib.claude_cli.subprocess.run",
+            return_value=_FakeCompletedProcess(stdout=stdout, returncode=1),
+        ):
+            with self.assertRaises(ClaudeCliFailed) as ctx:
+                claude_cli.call_claude_print_stream_json("prompt")
+        self.assertNotIn("AAAAAAAAAA", str(ctx.exception))
+        self.assertNotIn(prefix + "-A", str(ctx.exception))
+
+    def test_nonzero_exit_with_garbage_stdout_keeps_old_message(self):
+        with mock.patch(
+            "lib.claude_cli.subprocess.run",
+            return_value=_FakeCompletedProcess(stdout="{не json", stderr="", returncode=1),
+        ):
+            with self.assertRaises(ClaudeCliFailed) as ctx:
+                claude_cli.call_claude_print_stream_json("prompt")
+        self.assertIn("exit=1", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

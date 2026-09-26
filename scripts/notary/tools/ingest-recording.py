@@ -68,8 +68,15 @@ R11 / Опасная тройка: текст реплик/транскрипт�
         [--transcripts-dir DIR] [--force] [--no-deliver]
 
 Коды выхода: 0 — готово и доставлено; 1 — сбой сборки или доставки (JSON с
-`protocol_path`, если протокол собран); 2 — ошибка входа или «файлы за эту дату
-уже есть»; 4 — эту встречу уже финализирует кто-то другой.
+`protocol_path`, если протокол собран; `error: protocol_not_generated` — расшифровка
+есть, протокол моделью не составлен); 2 — ошибка входа или «файлы за эту дату уже
+есть» (`target_exists`); 4 — запускать сейчас нельзя: эту встречу уже финализирует
+кто-то другой (`finalize_in_progress`), её доводит очередь повторов бота
+(`in_retry_queue`) или у серии за эту дату бот ещё собирает свою запись
+(`series_date_busy`).
+
+Итоговый JSON печатается ПОСЛЕДНЕЙ строкой вывода — после уборки рабочей папки:
+методичка читает общий журнал (`2>&1`) по `tail -1`.
 """
 from __future__ import annotations
 
@@ -83,7 +90,7 @@ import subprocess
 import sys
 import tempfile
 import wave
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -136,6 +143,31 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_INPUT = 2
 EXIT_BUSY = 4
+
+#: Очередь повторов finalize (`finalize-meeting._failed_dir`, `retry_failed`).
+FAILED_DIR_ENV = "MEETING_NOTARY_FAILED_DIR"
+FAILED_DEFAULT_DIR = "/srv/meeting-notary/_failed"
+
+
+class HandedToRetry(RuntimeError):
+    """Расшифровка сорвалась, и finalize переложил встречу в очередь повторов бота
+    (`_failed/<sid>.*`): её доведёт `retry_failed.py` и сам пришлёт протокол.
+    Второй прогон обёртки дал бы второй протокол и вторую оплату расшифровки."""
+
+
+class ProtocolNotGenerated(RuntimeError):
+    """Расшифровка на диске, а протокола нет: составить его моделью не удалось.
+
+    В finalize это не фатально (rc=0): он сам пишет владельцу «протокол не
+    сгенерировался (транскрипт сохранён)» и советует пересобрать командой
+    «протокол <серия> <дата>». Сюда — чтобы итог обёртки сказал то же самое,
+    а не «сбой, пришли другой формат» (живая проверка 26.09)."""
+
+    def __init__(self, transcript_path: "str | os.PathLike"):
+        self.transcript_path = Path(transcript_path)
+        super().__init__(
+            "протокол не составлен моделью; расшифровка сохранена: %s" % self.transcript_path
+        )
 
 # --- дословные пометки (REQ R7/R9) -------------------------------------------
 # R7: автодиаризация на нештатном пути ненадёжна (ревью ОЖИД1) — без пометки Илья
@@ -534,7 +566,10 @@ def generate_protocol_from_transcript(
 
     Имена НЕ выдумываются: метки спикеров (если есть) берутся из самого текста;
     их отсутствие caller пометит баннером `NO_SPEAKERS_BANNER`."""
-    from lib.llm_postprocess import regenerate_protocol_for_meeting  # noqa: PLC0415
+    from lib.llm_postprocess import (  # noqa: PLC0415
+        ProtocolGenerationError,
+        regenerate_protocol_for_meeting,
+    )
 
     out_protocol = Path(out_protocol)
     out_protocol.parent.mkdir(parents=True, exist_ok=True)
@@ -547,12 +582,17 @@ def generate_protocol_from_transcript(
         "expectedParticipants": list(participants or []),
         "participants": [],
     }
-    regenerate_protocol_for_meeting(
-        transcript_path=transcript_path,
-        protocol_path=out_protocol,
-        meeting_meta=meta,
-        meeting_sid=safe_session_uid(series, date),
-    )
+    try:
+        regenerate_protocol_for_meeting(
+            transcript_path=transcript_path,
+            protocol_path=out_protocol,
+            meeting_meta=meta,
+            meeting_sid=safe_session_uid(series, date),
+        )
+    except ProtocolGenerationError as e:
+        # Текст уже лежит в рабочей папке — это та же ситуация, что у звука, когда
+        # модель не составила протокол: итог скажет, как пересобрать без потерь.
+        raise ProtocolNotGenerated(transcript_path) from e
     return out_protocol
 
 
@@ -702,12 +742,139 @@ def target_collisions(output_dir: str | os.PathLike, series: str, date: str) -> 
     return found
 
 
-def replies_reachable(meta_path: str | os.PathLike) -> bool:
+def only_transcript_exists(output_dir: str | os.PathLike, series: str, date: str) -> bool:
+    """За дату у серии есть расшифровка, а протокола нет — модель его не составила.
+
+    Тогда перезапуск с `--force` заново оплатит расшифровку, а пересобрать протокол
+    можно по готовой: командой «протокол <серия> <дата>» боту-нотариусу."""
+    return (Path(output_dir) / series / f"{date}.md").is_file() and not protocol_path_for(
+        output_dir, series, date).is_file()
+
+
+def backup_before_force(paths: list[Path]) -> list[str]:
+    """Копии файлов, которые `--force` перезапишет, — в `_versions/before-recovery-<время>/`.
+
+    Правило владельца: расшифровки встреч не теряются без явной команды. «Да» на
+    вопрос «протокол за эту дату уже есть — заменить?» — согласие заменить протокол,
+    а не стереть расшифровку: за этой датой может лежать частичная запись бота с
+    тем, чего нет в присланной записи. Копируем (не переносим) рядом с каждым
+    файлом — и в рабочей папке, и в архиве. Подпапку с `_` в начале пропускают поиск
+    протоколов, индекс встреч и память серии. Не скопировалось — не перезаписываем:
+    исключение останавливает прогон."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    saved: list[str] = []
+    for src in paths:
+        src = Path(src)
+        if not src.is_file():
+            continue
+        dst = src.parent / "_versions" / f"before-recovery-{stamp}" / src.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        saved.append(str(dst))
+    if saved:
+        log.info("[preflight] прежние файлы за дату сохранены перед --force: %d", len(saved))
+    return saved
+
+
+def failed_dir() -> Path:
+    """Очередь повторов — ровно `finalize-meeting._failed_dir()`."""
+    return Path(os.environ.get(FAILED_DIR_ENV) or FAILED_DEFAULT_DIR)
+
+
+def retry_pending(sid: str, *, now: Optional[datetime] = None) -> bool:
+    """Встречу ещё доведёт очередь повторов бота (`retry_failed.py`)?
+
+    Её заводит finalize, когда сорвалась расшифровка: копия записи и meta — в
+    `_failed/`, повторы по расписанию в течение суток, протокол потом уходит сам
+    (на пути А — владельцу: адресат записан в meta). Пока так — второй прогон
+    обёртки дал бы второй протокол и вторую оплату расшифровки. Повтор, которого
+    уже не будет (отклонён сервисом, попытки или сутки кончились), не мешает."""
+    state = _read_json_file(failed_dir() / f"{sid}.retry-state.json")
+    if state is None:
+        return False
+    if state.get("rejected"):
+        return False
+    if state.get("blocked_by_killswitch"):
+        return True
+    try:
+        import retry_failed as rf  # noqa: PLC0415
+
+        if int(state.get("attempts") or 0) >= len(rf.SCHEDULE_MIN):
+            return False
+        first = rf._parse_iso(str(state.get("first_failed_at") or ""))
+        limit = rf.MAX_AGE_S
+    except Exception:  # noqa: BLE001 — не разобрали расписание: считаем, что повтор будет
+        return True
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(tzinfo=None)
+    return (moment - first).total_seconds() <= limit
+
+
+def _queue_delivery_done(meta: dict) -> bool:
+    """Ровно `collector._delivery_done`: сборщик эту meta больше не финализирует.
+
+    Копия, а не импорт сборщика в обёртку (сторож паритета — в пробах)."""
+    raw = meta.get("delivered")
+    if isinstance(raw, dict):
+        records = [raw]
+    elif isinstance(raw, list):
+        records = [r for r in raw if isinstance(r, dict)]
+    else:
+        return False
+    return any((r.get("message_ids") or []) and r.get("decision") != "partial-failure"
+               for r in records)
+
+
+def pending_same_date_meetings(
+    tdir: str | os.PathLike, series: str, date: str, own_sid: str,
+) -> list[str]:
+    """Другие встречи этой серии за эту дату, которые бот ещё доведёт сам.
+
+    Замок `finalize-<sid>.lock` у каждой встречи свой, а расшифровка и протокол
+    одни на серию и дату (`<серия>/<дата>.md`, `finalize._output_dir_for_meta`).
+    Частичную запись бота (его выбросило посреди встречи) сборщик финализирует
+    ~25 минут, а сорванную расшифровку доводит очередь повторов; прогон обёртки в
+    это окно писал бы в те же файлы, а в группу ушло бы два протокола. Смотрим
+    очередь сборщика (meta без `delivered`) и очередь повторов (живой повтор)."""
+    out: list[str] = []
+    for folder, in_retry in ((Path(tdir), False), (failed_dir(), True)):
+        if not folder.is_dir():
+            continue
+        for mp in sorted(folder.glob("*.meta.json")):
+            other = mp.name[: -len(".meta.json")]
+            if other == own_sid or other in out:
+                continue
+            meta = _read_json_file(mp)
+            if not meta or str(meta.get("series") or "").strip() != series:
+                continue
+            if str(meta.get("startTs") or "")[:10] != date or _queue_delivery_done(meta):
+                continue
+            if in_retry and not retry_pending(other):
+                continue
+            out.append(other)
+    return out
+
+
+def _replies_flag(ok: bool, meta_path: str | os.PathLike) -> Optional[bool]:
+    """Поле `replies_enabled`: False — доставки нет; иначе `replies_reachable`
+    (None — «не знаю»: папок поиска слушателя в окружении нет)."""
+    return replies_reachable(meta_path) if ok else False
+
+
+def replies_reachable(meta_path: str | os.PathLike) -> Optional[bool]:
     """Найдёт ли слушатель эту meta по ответу на протокол.
 
     Проверяем то же, что делает поиск (`feedback_worker.find_delivered_protocol`):
     meta лежит под одной из папок `MEETING_NOTARY_DELIVERED_ROOTS` и не внутри
-    подпапки с `.`/`_` в начале — такие поиск пропускает."""
+    подпапки с `.`/`_` в начале — такие поиск пропускает.
+
+    None — «не знаю»: в окружении обёртки нет `MEETING_NOTARY_DELIVERED_ROOTS`.
+    Папки поиска знает окружение СЛУШАТЕЛЯ (его юнит), а обёртку запускают из
+    ручной оболочки; в умолчаниях `_delivered_roots()` нет папки записей, и без этой
+    оговорки итог сказал бы владельцу «правка ответом не сработает» про протокол,
+    который слушатель найдёт."""
+    if not (os.environ.get("MEETING_NOTARY_DELIVERED_ROOTS") or "").strip():
+        log.info("[replies] папки поиска протоколов в окружении не заданы — проверить не могу")
+        return None
     try:
         from lib import feedback_worker  # noqa: PLC0415
 
@@ -809,6 +976,21 @@ def has_real_delivery(meta: Optional[dict]) -> bool:
     return False
 
 
+def _delivered_to_chat(meta: Optional[dict], chat: Optional[int]) -> bool:
+    """В meta уже есть доставка в этот чат так, как её видит `deliver_protocol`
+    (`_find_delivery_for_chat`: последняя запись чата с непустыми номерами) —
+    значит, повторная доставка будет пропущена."""
+    if chat is None:
+        return False
+    raw = (meta or {}).get("delivered")
+    records = [raw] if isinstance(raw, dict) else (
+        [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else [])
+    for rec in reversed(records):
+        if rec.get("chat_id") == chat:
+            return bool(rec.get("message_ids"))
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Личная доставка Илье (A1/Q5)
 # ---------------------------------------------------------------------------
@@ -848,12 +1030,18 @@ def deliver_personal_tracked(
         log.warning("[deliver] нет лички владельца или токена бота нотариуса — шлю по-старому")
         return None
     notice_ok = False
-    try:
-        from lib import notify  # noqa: PLC0415
+    if _delivered_to_chat(meta, owner):
+        # Повторный прогон той же встречи: `deliver_protocol` пропустит доставку
+        # (идемпотентность по `delivered`), и «PDF следующим сообщением» было бы
+        # неправдой — PDF не придёт.
+        log.info("[deliver] владельцу этот протокол уже доставлялся — уведомление не шлю")
+    else:
+        try:
+            from lib import notify  # noqa: PLC0415
 
-        notice_ok = bool(notify.push_via_notarius(_notice_text(series, date, degraded_note)))
-    except Exception as e:  # noqa: BLE001
-        log.warning("[deliver] личное уведомление не ушло (не критично): %s", type(e).__name__)
+            notice_ok = bool(notify.push_via_notarius(_notice_text(series, date, degraded_note)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[deliver] личное уведомление не ушло (не критично): %s", type(e).__name__)
     meeting_meta = dict(meta)
     meeting_meta.update({
         "series": series,
@@ -926,39 +1114,66 @@ def deliver_personally(
 # ---------------------------------------------------------------------------
 # Оркестрация
 # ---------------------------------------------------------------------------
-def _prepare_wav(src: Path, kind: str, dest: Path, *, own_copy: bool) -> tuple[Path, bool]:
-    """WAV для расшифровки. Возвращает (путь, создали ли мы этот файл).
+def _prepare_wav(
+    src: Path, kind: str, dest: Path, *, scratch: Optional[Path] = None,
+) -> tuple[Path, bool]:
+    """WAV для расшифровки — ВСЕГДА своя копия в `dest`. Возвращает (путь, создали ли).
 
-    `own_copy=False` (путь А): готовый WAV берём как есть. `own_copy=True`
-    (путь Б): всегда своя копия в очереди бота — её после доставки штатно убирает
-    сборщик, а файл человека остаётся нетронутым."""
-    if kind == "audio" and _is_wav(src) and not own_copy:
-        log.info("[media] вход уже WAV — STT возьмёт его напрямую")
-        return src, False
+    Путь А кладёт копию в личную папку прогона, путь Б — в очередь бота (её после
+    доставки штатно убирает сборщик). Файл человека finalize не отдаётся никогда:
+    при сбое расшифровки finalize переносит запись в `_failed/` и УДАЛЯЕТ исходник
+    (`_stash_into_failed`), а после удачного повтора чистит и `_failed/` — файла
+    человека не осталось бы нигде (правило владельца: записи сами не удаляются).
+
+    Пишем во временное имя и подменяем атомарно: сорвётся конвертация — копия
+    прошлого прогона (по ней, может быть, повторяет сборщик) останется целой. Имя с
+    точкой в начале: его не видит уборщик записей (`*.wav`) и сборщик.
+
+    🔴 Очередь бота — ОБЩАЯ папка: на запись в неё смонтирован и контейнер бота
+    (root, браузер на чужих страницах). Предсказуемое временное имя там —
+    приглашение подложить ярлык: копия или `ffmpeg -y` пошли бы по нему и
+    перезаписали чужой файл хозяина. Поэтому конвертация идёт в личной папке
+    `scratch`, временный файл заводит `mkstemp` (новое случайное имя, O_EXCL — по
+    ярлыку не пойдёт), пишем в свой дескриптор, подменяем `os.replace` (он меняет
+    саму ссылку, а не её цель)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         if src.resolve() == dest.resolve():
-            log.info("[media] вход уже лежит в очереди бота — беру его как есть")
+            log.info("[media] вход уже лежит на месте копии — беру его как есть")
             return dest, False
     except OSError:
         pass
-    # Пишем во временное имя и подменяем атомарно: сорвётся конвертация — копия
-    # прошлого прогона (по ней, может быть, повторяет сборщик) останется целой.
-    # Имя с точкой в начале: его не видит уборщик записей (`*.wav`) и сборщик.
-    part = dest.with_name(f".{dest.stem}.part.wav")
+    work = Path(scratch) if scratch is not None else dest.parent
+    converted: Optional[Path] = None
     try:
         if kind == "audio" and _is_wav(src):
-            shutil.copy2(src, part)
-            log.info("[media] вход уже WAV — своя копия для очереди бота: %s", dest.name)
+            source = src
+            log.info("[media] вход уже WAV — своя копия: %s", dest.name)
         else:
-            extract_wav(src, part)
-        os.replace(part, dest)
-    except BaseException:
+            converted = work / f".{dest.stem}.convert.wav"
+            extract_wav(src, converted)
+            source = converted
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{dest.stem}.", suffix=".part.wav", dir=str(dest.parent))
+        part = Path(tmp_name)
         try:
-            part.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+            with os.fdopen(fd, "wb") as out, open(source, "rb") as inp:
+                shutil.copyfileobj(inp, out, 1024 * 1024)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(part, dest)
+        except BaseException:
+            try:
+                part.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        if converted is not None:
+            try:
+                converted.unlink()
+            except FileNotFoundError:
+                pass
     return dest, True
 
 
@@ -966,7 +1181,7 @@ def _build_personal_media(args, kind: str, workdir: Path, output_dir: Path, sid:
     """Путь А и сухой прогон: видео/аудио → WAV → meta во временной папке →
     finalize БЕЗ доставки → протокол + баннер R7. Возвращает (протокол,
     расшифровка, meta после finalize — в ней могут появиться id расшифровки)."""
-    wav_path, _ = _prepare_wav(Path(args.input), kind, workdir / "recording.wav", own_copy=False)
+    wav_path, _ = _prepare_wav(Path(args.input), kind, workdir / "recording.wav")
     participants = resolve_participants(args.series, args.participants)
     meta = build_synthetic_meta(
         series=args.series, date=args.date, wav_path=str(wav_path),
@@ -981,10 +1196,17 @@ def _build_personal_media(args, kind: str, workdir: Path, output_dir: Path, sid:
     output_dir.mkdir(parents=True, exist_ok=True)
     rc, _report = run_finalize(meta_path, output_dir, deliver=False)
     if rc != 0:
+        if retry_pending(sid):
+            # Сорвалась расшифровка: finalize переложил встречу в очередь повторов,
+            # повтор соберёт и пришлёт протокол владельцу сам (адресат — в meta).
+            raise HandedToRetry(f"finalize вернул rc={rc}: встреча в очереди повторов")
         raise RuntimeError(f"finalize вернул rc={rc} — протокол не собран (см. логи finalize)")
 
     protocol_path = protocol_path_for(output_dir, args.series, args.date)
     if not protocol_path.is_file():
+        transcript_path = Path(output_dir) / args.series / f"{args.date}.md"
+        if transcript_path.is_file():
+            raise ProtocolNotGenerated(transcript_path)
         raise RuntimeError(f"finalize отработал (rc=0), но протокол не найден: {protocol_path}")
 
     # R7: пометка «диаризация не выверена — сверьте роли».
@@ -1028,19 +1250,20 @@ def _process_transcript(args, workdir: Path, output_dir: Optional[Path] = None) 
     return protocol_path, "⚠️ Без разбивки по спикерам — пришли видео/аудио, соберу с ролями."
 
 
-def _run_standard(args, kind: str, output_dir: Path, sid: str, tdir: Path) -> dict:
+def _run_standard(args, kind: str, output_dir: Path, sid: str, tdir: Path, workdir: Path) -> dict:
     """Путь Б: WAV и meta — в очередь бота, finalize со штатной доставкой.
 
     Всё, что дальше делает бот, — его обычный механизм: PDF в чат серии, слепок
     нумерации открытых вопросов, отметка `delivered` в ЭТОЙ meta. Сорвалась
     расшифровка — finalize сам переложит встречу в очередь повторов; сорвалась
-    доставка — meta без `delivered` осталась в очереди, сборщик повторит сам (WAV
-    для этого лежит рядом). Возвращает поля итогового JSON."""
+    доставка или составление протокола моделью — meta без `delivered` осталась в
+    очереди, сборщик повторит сам (WAV для этого лежит рядом, id расшифровки — в
+    meta, второй оплаты нет). Возвращает поля итогового JSON."""
     meta_path = standard_meta_path(tdir, sid)
     staged = Path(tdir) / f"{sid}.wav"
     previous = _read_json_file(meta_path)
     # Недописанную копию `_prepare_wav` убирает сам; файл человека не трогается.
-    wav_path, _created = _prepare_wav(Path(args.input), kind, staged, own_copy=True)
+    wav_path, _created = _prepare_wav(Path(args.input), kind, staged, scratch=workdir)
     participants = resolve_participants(args.series, args.participants)
     meta = merge_previous_delivery(
         build_synthetic_meta(
@@ -1064,14 +1287,28 @@ def _run_standard(args, kind: str, output_dir: Path, sid: str, tdir: Path) -> di
     transcript_path = Path(output_dir) / args.series / f"{args.date}.md"
     ok = rc == 0 and summary["status"] in _DELIVERED_OK and has_real_delivery(after)
     note = None
+    error = None
     if rc != 0 and after is None:
         note = ("расшифровка сорвалась — встреча переложена в очередь повторов бота, "
                 "он доведёт её и доставит сам")
     elif rc != 0:
         note = "finalize упал — встреча осталась в очереди сборщика, он повторит сам"
+    elif not protocol_path.is_file() and transcript_path.is_file():
+        # Живая проверка 26.09: расшифровка есть, а модель протокол не составила.
+        error = "protocol_not_generated"
+        note = ("протокол не собрался: составить его моделью не удалось (бот отдельно "
+                "написал об этом владельцу), расшифровка сохранена — встреча осталась в "
+                "очереди сборщика: он повторит сборку и доставку сам, расшифровку возьмёт "
+                "готовую")
+    elif summary["status"] == "skipped-failed-recording":
+        note = ("запись оказалась пустой или сорванной — такие протоколы бот не шлёт, "
+                "владельцу он написал сам")
     elif not ok:
         note = (f"доставка не прошла (статус {summary['status']}) — встреча осталась в "
-                "очереди сборщика; пустую запись бот не шлёт вовсе")
+                "очереди сборщика, он повторит сам")
+    # Без протокола в архив не копируем: встречу доведёт сборщик и сам положит
+    # расшифровку и протокол в архив (дата — из имени `recovery-…-<дата>`); наша
+    # копия заняла бы там `<дата>.md`, и его досборка легла бы дублем `<дата>-<sid>.md`.
     archive = sync_to_archive(protocol_path, transcript_path, args.date) if (
         rc == 0 and protocol_path.is_file()) else []
     if ok:
@@ -1081,11 +1318,13 @@ def _run_standard(args, kind: str, output_dir: Path, sid: str, tdir: Path) -> di
     return {
         "ok": ok,
         "protocol_path": str(protocol_path) if protocol_path.is_file() else None,
+        **({"transcript_path": str(transcript_path)} if transcript_path.is_file() else {}),
         "delivery": summary,
         "meta_path": str(meta_path),
-        "replies_enabled": bool(ok and replies_reachable(meta_path)),
+        "replies_enabled": _replies_flag(ok, meta_path),
         "archive_synced": archive,
         "finalize_rc": rc,
+        **({"error": error} if error else {}),
         **({"note": note} if note else {}),
     }
 
@@ -1148,7 +1387,7 @@ def _run_personal(args, kind: str, workdir: Path, output_dir: Path, sid: str, td
             "delivered_personally": {"notice": tracked["notice"], "document": delivered_ok},
             "delivery": summary,
             "meta_path": str(final_meta_path),
-            "replies_enabled": bool(delivered_ok and replies_reachable(final_meta_path)),
+            "replies_enabled": _replies_flag(delivered_ok, final_meta_path),
         }
     out["protocol_path"] = str(protocol_path)
     # Расшифровка — исходные данные встречи: в долговечный архив в любом случае.
@@ -1161,12 +1400,51 @@ def _run_personal(args, kind: str, workdir: Path, output_dir: Path, sid: str, td
     return out
 
 
+#: Итог прогона ждёт здесь и печатается ПОСЛЕДНИМ — после уборки рабочей папки.
+_PENDING_OUTPUT: list[dict] = []
+
+
 def _emit(payload: dict) -> None:
-    """Итоговый JSON — одной строкой в stdout (его парсит Альфред)."""
-    print(json.dumps(payload, ensure_ascii=False))
+    """Итоговый JSON — одной строкой в stdout (его парсит Альфред).
+
+    Печатается не сразу, а в самом конце `main`: уборка рабочей папки пишет строку
+    в журнал уже ПОСЛЕ ответа, и в общем журнале (`2>&1`, как запускает методичка:
+    итог — `tail -1`) последней строкой оказывалась она, стоило выводу быть
+    небуферизованным (`PYTHONUNBUFFERED`, `python -u`)."""
+    _PENDING_OUTPUT[:] = [payload]
+
+
+def _flush_emit() -> None:
+    if not _PENDING_OUTPUT:
+        return
+    payload = _PENDING_OUTPUT.pop()
+    _PENDING_OUTPUT.clear()
+    try:
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Точка входа: прогон + итоговый JSON последней строкой вывода."""
+    _PENDING_OUTPUT.clear()
+    try:
+        return _main(argv)
+    finally:
+        _flush_emit()
+
+
+#: Что сказать, когда встречу доводит очередь повторов бота (пути А и Б).
+RETRY_QUEUE_NOTE = (
+    "расшифровка этой встречи сорвалась, и её доводит очередь повторов бота: он сам "
+    "соберёт протокол и пришлёт его (на пути А — лично владельцу, без пометки «роли не "
+    "выверены»). Запускать заново не нужно — будет второй протокол и вторая оплата "
+    "расшифровки"
+)
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Восстановление протокола встречи из ручной записи (видео/аудио/транскрипт).",
     )
@@ -1258,17 +1536,44 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 _emit({"ok": False, "error": "finalize_in_progress", "mode": mode, "kind": kind})
                 return EXIT_BUSY
-            if durable_output and not args.force:
-                clashes = target_collisions(output_dir, args.series, args.date)
-                if clashes:
+            if retry_pending(sid):
+                log.error("[ingest] встречу %s доводит очередь повторов бота — второй прогон не "
+                          "запускаю", sid)
+                _emit({"ok": False, "error": "in_retry_queue", "mode": mode, "kind": kind,
+                       "note": RETRY_QUEUE_NOTE})
+                return EXIT_BUSY
+            if durable_output:
+                busy = pending_same_date_meetings(tdir, args.series, args.date, sid)
+                if busy:
                     log.error(
-                        "[preflight] у серии %s за %s уже есть расшифровка/протокол (%d файл(ов)) — "
-                        "не перезаписываю; если это та же встреча и так и надо — запусти с --force",
-                        args.series, args.date, len(clashes),
+                        "[preflight] у серии %s за %s бот ещё доводит свою запись (%d) — пишет в те "
+                        "же файлы; не запускаю", args.series, args.date, len(busy),
                     )
-                    _emit({"ok": False, "error": "target_exists", "mode": mode, "kind": kind,
-                           "existing": [str(p) for p in clashes]})
-                    return EXIT_INPUT
+                    _emit({"ok": False, "error": "series_date_busy", "mode": mode, "kind": kind,
+                           "pending": len(busy),
+                           "note": "у серии за эту дату бот ещё собирает свою запись встречи — "
+                                   "дождись его протокола; если потом нужно заменить его "
+                                   "собранным из присланной записи — запуск с --force"})
+                    return EXIT_BUSY
+            backup: list[str] = []
+            clashes = target_collisions(output_dir, args.series, args.date) if durable_output else []
+            if clashes and not args.force:
+                log.error(
+                    "[preflight] у серии %s за %s уже есть расшифровка/протокол (%d файл(ов)) — "
+                    "не перезаписываю; если это та же встреча и так и надо — запусти с --force",
+                    args.series, args.date, len(clashes),
+                )
+                refusal = {"ok": False, "error": "target_exists", "mode": mode, "kind": kind,
+                           "existing": [str(p) for p in clashes]}
+                if only_transcript_exists(output_dir, args.series, args.date):
+                    refusal["note"] = (
+                        "за эту дату есть только расшифровка, протокол по ней не собрался — "
+                        "пересобрать без новой оплаты расшифровки: «протокол %s %s» боту-нотариусу; "
+                        "--force заново оплатит расшифровку" % (args.series, args.date))
+                _emit(refusal)
+                return EXIT_INPUT
+            if clashes:
+                backup = backup_before_force(clashes)
 
             if not deliver:
                 if kind in ("video", "audio"):
@@ -1281,12 +1586,35 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_OK
 
             if mode == MODE_STANDARD:
-                out = _run_standard(args, kind, output_dir, sid, tdir)
+                out = _run_standard(args, kind, output_dir, sid, tdir, workdir)
             else:
                 out = _run_personal(args, kind, workdir, output_dir, sid, tdir)
             out.update({"kind": kind, "mode": mode})
+            if backup:
+                out["replaced_backup"] = backup
             _emit(out)
             return EXIT_OK if out.get("ok") else EXIT_FAILED
+    except HandedToRetry as e:
+        log.error("[ingest] %s", e)
+        _emit({"ok": False, "error": "in_retry_queue", "mode": mode, "kind": kind,
+               "note": RETRY_QUEUE_NOTE})
+        return EXIT_BUSY
+    except ProtocolNotGenerated as e:
+        log.error("[ingest] %s", e)
+        archived = sync_to_archive(
+            protocol_path_for(output_dir, args.series, args.date), e.transcript_path, args.date,
+        ) if durable_output else []
+        # Про звук finalize сам пишет владельцу «протокол не сгенерировался»; текст
+        # (R9) идёт мимо finalize — там сказать некому, кроме этого итога.
+        told = " (бот отдельно написал об этом владельцу)" if kind != "transcript" else ""
+        force = "заново оплатит расшифровку" if kind != "transcript" else "повторит сборку целиком"
+        _emit({"ok": False, "error": "protocol_not_generated", "mode": mode, "kind": kind,
+               "transcript_path": str(e.transcript_path), "archive_synced": archived,
+               "note": "расшифровка готова и сохранена, а протокол не собрался — составить его "
+                       "моделью не удалось%s. Пересобрать по готовой расшифровке: «протокол %s %s» "
+                       "боту-нотариусу; перезапуск обёртки упрётся в target_exists, а с --force %s"
+                       % (told, args.series, args.date, force)})
+        return EXIT_FAILED
     except Exception as e:  # noqa: BLE001
         # Класс ошибки + сообщение БЕЗ текста реплик (R11/опасная тройка).
         log.error("[ingest] восстановление не удалось: %s: %s", type(e).__name__, e)

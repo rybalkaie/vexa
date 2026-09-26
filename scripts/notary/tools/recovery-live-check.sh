@@ -11,21 +11,31 @@
 #       find_delivered_protocol`, её вызывает `route_feedback_reply`), с папками
 #       песочницы; плюс перевыпуск находит расшифровку и протокол.
 #
-# Запуск на сервере (из тестовой копии, не из /srv):
+# Запуск на сервере (из тестовой копии, не из /srv) — ТОЛЬКО bash (запускать как
+# исполняемый файл или `bash <скрипт>`; `sh` не годится: `pipefail`, `BASH_SOURCE`,
+# раскрытие `{a,b}`):
 #   WAV=/путь/к/синтетической/записи.wav /home/dev/resil-test/scripts/notary/tools/recovery-live-check.sh
 # Необязательно: SANDBOX=<папка песочницы> PY=<python> DATE=YYYY-MM-DD ENV_FILE=<.env.notary>
+#
+# Тестовая копия — это корень репозитория целиком, а не одна `scripts/`: finalize
+# берёт шаблон протокола из `<копия>/templates/meeting-protocol.md` (по умолчанию
+# `--template`); без него он падает уже ПОСЛЕ платной расшифровки. Скрипт это
+# проверяет до запуска.
 #
 # Расшифровка — тем же движком, что у бота (STT из .env.notary: центы за короткую
 # запись). Побочные записи финализатора вне песочницы выключены флагами ниже
 # (словарь, задачи, знания, уточнения). Остаётся одна строка метаданных в боевом
 # журнале скорости расшифровки (`/srv/meeting-notary/logs/bench-*-prod.log`, путь
 # зашит в finalize) — без текста встречи.
+[ -n "${BASH_VERSION:-}" ] || { echo "Нужен bash: запусти как ./recovery-live-check.sh или bash recovery-live-check.sh" >&2; exit 2; }
 set -euo pipefail
 
 NOTARY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "$NOTARY" in
   /srv/*) echo "Это боевая копия скриптов ($NOTARY) — запускай из тестовой." >&2; exit 2 ;;
 esac
+TEMPLATE="$(dirname "$(dirname "$NOTARY")")/templates/meeting-protocol.md"
+[ -f "$TEMPLATE" ] || { echo "нет шаблона протокола $TEMPLATE — скопируй в тестовую копию и templates/ (finalize упадёт после платной расшифровки)" >&2; exit 2; }
 WAV="${WAV:?укажи WAV=<путь к тестовой записи .wav>}"
 [ -f "$WAV" ] || { echo "нет файла записи: $WAV" >&2; exit 2; }
 # Каждый прогон — своя новая папка: ничего не удаляем и не упираемся в файлы прошлого прогона.

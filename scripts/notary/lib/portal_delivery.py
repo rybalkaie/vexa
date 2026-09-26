@@ -940,14 +940,17 @@ def report_no_show(
     meeting_id: Optional[str],
     session_uid: str,
     company: Optional[str] = None,
+    round_mark: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Optional[str]:
     """Сказать порталу «бот не пришёл» (фаза 5 ISS-60). Возвращает ключ элемента.
 
     Зовёт запускатель, когда сторож входа СДАЛСЯ окончательно (после повтора).
     Кладётся в ТУ ЖЕ очередь, что результаты: портал может лежать в эту минуту, а
-    разбирает очередь сборщик каждые 5 минут. Идемпотентно по наряду: второй
-    «не пришёл» по той же встрече не встаёт.
+    разбирает очередь сборщик каждые 5 минут. Идемпотентно по ЗАХОДУ бота
+    (`round_mark` — минута его старта): второй «не пришёл» того же захода не
+    встаёт, а срыв следующего захода по той же встрече — встаёт (см.
+    `portal_ingest.no_show_key`).
 
     Исходников у этой встречи нет, поэтому удержание не ставится и не снимается.
     Без `meeting_id` (портал ищет встречу по нему) не шлём вовсе — 422 навсегда.
@@ -967,8 +970,9 @@ def report_no_show(
 
         payload = portal_ingest.build_no_show_event(
             meeting_id=mid, order_id=order, company=company, occurred_at=_iso(_now(now)),
+            round_mark=round_mark,
         )
-        key = portal_ingest.no_show_key(order)
+        key = portal_ingest.no_show_key(order, round_mark)
     except Exception as e:  # noqa: BLE001
         logger.warning("[portal-delivery] «бот не пришёл» не собран: %s", type(e).__name__)
         return None

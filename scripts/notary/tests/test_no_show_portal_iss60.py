@@ -301,7 +301,9 @@ class _PortalEnv(unittest.TestCase):
         return entry
 
     def no_show_item(self, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return portal_delivery.load_item(portal_ingest.no_show_key(order["id"]))
+        """Элемент «бот не пришёл» ЗАХОДА этого наряда (ключ — наряд + минута старта)."""
+        mark = state_lib.normalized_start_key(portal_queue.queue_item(order).get("start_at"))
+        return portal_delivery.load_item(portal_ingest.no_show_key(order["id"], mark))
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +335,34 @@ class TestNoShowToPortal(_PortalEnv):
         portal = _FakePortal()
         portal_ingest.drain(transport=portal)
         self.assertEqual(len(portal.received), 1)
+
+    def test_next_round_of_same_meeting_reports_again(self):
+        """Цикл5: бота по той же встрече позвали снова — портал снял «бот не пришёл»
+        (`retractBotNoShow`: снова «наряд размещён», колокольчик удалён). Срыв этого
+        захода обязан дойти до портала снова, а не схлопнуться с первым по ключу наряда."""
+        order = self.order(now=NOW)
+        runner._jw_gave_up(self.entry_for(order, now=NOW), "name_input_not_found")
+        portal = _FakePortal()
+        portal_ingest.drain(transport=portal)
+        later = NOW + timedelta(minutes=9)
+        again = self.order(now=later)
+        self.assertEqual(again["id"], order["id"], "та же встреча портала — тот же наряд")
+        runner._jw_gave_up(self.entry_for(again, now=later), "name_input_not_found")
+        portal_ingest.drain(transport=portal)
+        keys = [p["delivery_key"] for p in portal.received]
+        self.assertEqual(portal.rejected, [])
+        self.assertEqual(len(keys), 2, "второй срыв после нового вызова не дошёл до портала: %s" % keys)
+        self.assertEqual(len(set(keys)), 2, keys)
+        for key in keys:
+            self.assertTrue(key.startswith(order["id"] + "@") and key.endswith("#no_show"), key)
+
+    def test_cancelled_order_sends_no_no_show(self):
+        """Цикл5: встречу сняли, пока бот пытался войти, — колокольчик «бот не пришёл»
+        про отменённую встречу был бы ложным."""
+        order = self.order()
+        orders_lib.cancel_order(order["id"], reason="отменили")
+        runner._jw_gave_up(self.entry_for(order), "crashed")
+        self.assertEqual(portal_delivery.list_items(), [])
 
     def test_owner_series_sends_nothing(self):
         entry = {"item": {"meeting_id": "anzhee-direktorat", "series": "anzhee-direktorat",
@@ -399,7 +429,14 @@ class TestPortalContract(unittest.TestCase):
         self.assertEqual(set(ev), {"meeting_id", "event", "occurred_at", "order_id", "company", "delivery_key"})
         self.assertEqual(portal_event_issues(ev, now=datetime.now(timezone.utc)), [])
         self.assertEqual(ev["delivery_key"], "portal:cmabc123#no_show",
-                         "ключ обязан совпадать с тем, что портал синтезирует сам")
+                         "без времени захода — ключ, который портал синтезирует сам")
+        # Цикл5: ключ одного ЗАХОДА бота — наряд + минута старта; портал его не
+        # разбирает, а возвращает эхом, так что форма свободна в пределах 300 знаков.
+        ev2 = self.event(round_mark="20260928T0800")
+        self.assertEqual(ev2["delivery_key"], "portal:cmabc123@20260928T0800#no_show")
+        self.assertEqual(portal_event_issues(ev2, now=datetime.now(timezone.utc)), [])
+        self.assertEqual(self.event(round_mark="raw:мусор")["delivery_key"], "portal:cmabc123#no_show",
+                         "неразобранное время старта — прежний ключ, не мусор в ключе")
         for key in ev:
             self.assertEqual(key, key.lower(), "camelCase в теле: %s" % key)
 
@@ -463,6 +500,8 @@ class TestPortalContract(unittest.TestCase):
             got = parse(self.event())
             self.assertEqual((got["ok"], got["kind"], got["audio"], got["renamed"]),
                              (True, "event", [], []), got)
+            got_round = parse(self.event(round_mark="20260928T0800"))
+            self.assertEqual((got_round["ok"], got_round["kind"]), (True, "event"), got_round)
             broken = parse(dict(self.event(), event="bot_left"))
             self.assertFalse(broken["ok"], "контроль: сломанное событие портал обязан отвергнуть")
 

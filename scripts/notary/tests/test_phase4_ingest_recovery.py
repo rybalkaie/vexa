@@ -367,6 +367,8 @@ class _RecoveryEnv(unittest.TestCase):
             "MEETING_NOTARY_DELIVERED_ROOTS": os.pathsep.join(map(str, (self.T, self.W, self.A))),
             "MEETING_NOTARY_REGISTRY_DIR": str(self.R),
             "MEETING_NOTARY_FINALIZE_LOCK_DIRS": str(self.S),
+            # Очередь повторов — песочная: на сервере `/srv/.../_failed` живая.
+            "MEETING_NOTARY_FAILED_DIR": str(self.tmp / "failed"),
             "MEETING_NOTARY_LOG_DIR": str(self.tmp / "logs"),
             "TELEGRAM_NOTARIUS_BOT_TOKEN": "test-token",
             "TELEGRAM_NOTARIUS_CHAT_ID": str(OWNER),
@@ -761,6 +763,236 @@ class TestModeAndSeams(_RecoveryEnv):
         self.assertNotIn("ENABLE_PROTOCOL_DELIVERY", seen[1])
         self.assertEqual(rep_b["delivery"]["status"], "sent")
         self.assertEqual((rc_a, rc_b), (0, 0))
+
+
+
+class TestCycle5Fixes(_RecoveryEnv):
+    """Цикл из 5 ходов по фазе 5: что обёртка говорит и делает, когда что-то пошло
+    не так, — и чтобы при этом не было второго протокола, второй оплаты расшифровки
+    и потерянных записей."""
+
+    # --- двойники finalize: сбой модели и сбой расшифровки ---
+    def finalize_without_protocol(self):
+        """finalize на живой проверке 26.09: расшифровка записана, протокол моделью не
+        составлен (в finalize это не фатально, rc=0), доставки не было."""
+        def run(meta_path, output_dir, *, deliver=False):
+            self.finalize_calls.append({"meta": str(meta_path), "deliver": deliver})
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+            sdir = Path(output_dir) / meta["series"]
+            sdir.mkdir(parents=True, exist_ok=True)
+            (sdir / f"{DATE}.md").write_text(TRANSCRIPT, encoding="utf-8")
+            return 0, {"ok": True, "series": meta["series"], "protocol_path": str(sdir / f"{DATE}.md"),
+                       "delivery": {"status": "not-run"}}
+        return run
+
+    def finalize_stashing(self):
+        """Сбой расшифровки — ровно `_stash_into_failed`: копия записи и meta в `_failed/`,
+        ИСХОДНИКИ УДАЛЕНЫ, заведено состояние повторов; rc=4."""
+        from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+
+        failed = Path(os.environ["MEETING_NOTARY_FAILED_DIR"])
+
+        def run(meta_path, output_dir, *, deliver=False):
+            self.finalize_calls.append({"meta": str(meta_path), "deliver": deliver})
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+            sid = meta["sessionUid"]
+            failed.mkdir(parents=True, exist_ok=True)
+            wav = Path(meta["files"]["wav"])
+            shutil.copy2(wav, failed / f"{sid}.wav")
+            (failed / f"{sid}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            (failed / f"{sid}.retry-state.json").write_text(json.dumps({
+                "session_uid": sid, "attempts": 0, "rejected": False,
+                "first_failed_at": _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }), encoding="utf-8")
+            wav.unlink()
+            Path(meta_path).unlink()
+            return 4, None
+        return run
+
+    # --- сбой модели: честный итог, расшифровка не теряется ---
+    def test_personal_protocol_not_generated_is_reported_and_kept(self):
+        rc, out = self.run_main("--series", "dm-series", "--mode", "personal",
+                                finalize=self.finalize_without_protocol())
+        self.assertEqual(rc, ing.EXIT_FAILED)
+        self.assertIsNotNone(out, "итога нет — Альфред скажет «сбой, пришли другой формат»")
+        self.assertEqual(out["error"], "protocol_not_generated")
+        self.assertIn("протокол dm-series %s" % DATE, out["note"])
+        self.assertTrue((self.A / "dm-series" / f"{DATE}.md").is_file(), "расшифровка не попала в архив")
+        self.assertEqual(self.sent, [])
+        rc2, out2 = self.run_main("--series", "dm-series", "--mode", "personal")
+        self.assertEqual((rc2, out2["error"]), (ing.EXIT_INPUT, "target_exists"))
+        self.assertIn("только расшифровка", out2["note"])
+
+    def test_standard_protocol_not_generated_note_tells_the_truth(self):
+        rc, out = self.run_main("--series", "grp-series", "--mode", "standard",
+                                finalize=self.finalize_without_protocol())
+        self.assertEqual(rc, ing.EXIT_FAILED)
+        self.assertEqual(out["error"], "protocol_not_generated")
+        self.assertNotIn("пустую", out["note"])
+        self.assertIn("расшифровку возьмёт готовую", out["note"])
+        self.assertTrue(out["transcript_path"].endswith(f"{DATE}.md"))
+        self.assertTrue(Path(out["transcript_path"]).is_file(), "расшифровка потеряна")
+        # В архив её положит сборщик, когда доведёт встречу (иначе там лёг бы дубль).
+        self.assertFalse((self.A / "grp-series" / f"{DATE}.md").exists())
+        self.assertTrue((self.T / f"{ing.safe_session_uid('grp-series', DATE)}.meta.json").is_file(),
+                        "встреча ушла из очереди сборщика — доводить её некому")
+
+    # --- сбой расшифровки: встречу доводит очередь повторов, второго прогона нет ---
+    def test_stt_failure_on_personal_path_is_left_to_retry_queue(self):
+        rc, out = self.run_main("--series", "dm-series", "--mode", "personal",
+                                finalize=self.finalize_stashing())
+        self.assertEqual((rc, out["error"]), (ing.EXIT_BUSY, "in_retry_queue"))
+        self.assertIn("очередь повторов", out["note"])
+        self.assertTrue(self.rec.exists(), "файл человека удалён вместе с исходником прогона")
+        calls = len(self.finalize_calls)
+        for mode in ("personal", "standard"):
+            with self.subTest(mode=mode):
+                rc2, out2 = self.run_main("--series", "dm-series", "--mode", mode)
+                self.assertEqual((rc2, out2["error"]), (ing.EXIT_BUSY, "in_retry_queue"))
+        self.assertEqual(len(self.finalize_calls), calls, "второй прогон запустил вторую финализацию")
+        self.assertEqual(self.sent, [])
+
+    def test_retry_that_will_not_happen_does_not_block(self):
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: PLC0415
+
+        sid = ing.safe_session_uid("dm-series", DATE)
+        failed = Path(os.environ["MEETING_NOTARY_FAILED_DIR"])
+        failed.mkdir(parents=True, exist_ok=True)
+        old = (_dt.now(_tz.utc) - _td(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for state in ({"rejected": True, "attempts": 99, "first_failed_at": old},
+                      {"rejected": False, "attempts": 3, "first_failed_at": old}):
+            with self.subTest(state=state):
+                (failed / f"{sid}.retry-state.json").write_text(json.dumps(state), encoding="utf-8")
+                self.assertFalse(ing.retry_pending(sid))
+        (failed / f"{sid}.retry-state.json").write_text(json.dumps(
+            {"rejected": False, "attempts": 3, "first_failed_at": old, "blocked_by_killswitch": True}),
+            encoding="utf-8")
+        self.assertTrue(ing.retry_pending(sid), "стоп-флаг держит встречу — повтор будет")
+
+    # --- бот ещё доводит свою запись той же серии и даты ---
+    def test_bot_still_finishing_same_series_and_date_blocks(self):
+        bot_sid = f"{DATE}-tm-1"
+        bot_meta = self.T / f"{bot_sid}.meta.json"
+        meta = {"sessionUid": bot_sid, "series": "grp-series", "startTs": f"{DATE}T07:00:00Z",
+                "files": {"wav": str(self.T / f"{bot_sid}.wav")}}
+        bot_meta.write_text(json.dumps(meta), encoding="utf-8")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "standard")
+        self.assertEqual((rc, out["error"]), (ing.EXIT_BUSY, "series_date_busy"))
+        self.assertEqual(self.finalize_calls, [])
+        # Другая дата той же серии — не мешает.
+        meta["startTs"] = "2026-09-22T07:00:00Z"
+        bot_meta.write_text(json.dumps(meta), encoding="utf-8")
+        self.assertEqual(ing.pending_same_date_meetings(self.T, "grp-series", DATE, "x"), [])
+        # Доставленная встреча бота не мешает (дальше решает target_exists).
+        meta["startTs"] = f"{DATE}T07:00:00Z"
+        meta["delivered"] = [{"chat_id": GROUP, "message_ids": [5], "decision": "pdf"}]
+        bot_meta.write_text(json.dumps(meta), encoding="utf-8")
+        rc2, out2 = self.run_main("--series", "grp-series", "--mode", "standard")
+        self.assertEqual(rc2, 0, out2)
+
+    def test_queue_done_matches_collector(self):
+        """Копия критерия «доставлено» сборщика в обёртке — сторож паритета."""
+        samples = [
+            {}, {"delivered": []}, {"delivered": None},
+            {"delivered": {"chat_id": GROUP, "message_ids": [1]}},
+            {"delivered": [{"chat_id": 0, "message_ids": [0], "decision": "owner-alert-failed-recording"}]},
+            {"delivered": [{"chat_id": GROUP, "message_ids": [3], "decision": "partial-failure"}]},
+            {"delivered": [{"chat_id": GROUP, "message_ids": []}, {"chat_id": OWNER, "message_ids": [9]}]},
+        ]
+        for m in samples:
+            with self.subTest(meta=m):
+                self.assertEqual(ing._queue_delivery_done(m), collector._delivery_done(m))
+
+    # --- --force: прежние файлы не теряются ---
+    def test_force_keeps_copies_of_replaced_files(self):
+        sdir = self.W / "grp-series"
+        sdir.mkdir(parents=True)
+        (sdir / f"{DATE}.md").write_text("частичная запись бота", encoding="utf-8")
+        (sdir / f"{DATE}-protokol.md").write_text("протокол бота", encoding="utf-8")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "standard", "--force")
+        self.assertEqual(rc, 0, out)
+        backups = sorted((sdir / "_versions").glob("before-recovery-*/*"))
+        self.assertEqual(sorted(p.name for p in backups), [f"{DATE}-protokol.md", f"{DATE}.md"])
+        saved = next(p for p in backups if p.name == f"{DATE}.md")
+        self.assertEqual(saved.read_text(encoding="utf-8"), "частичная запись бота")
+        self.assertEqual(len(out["replaced_backup"]), 2)
+        self.assertEqual((sdir / f"{DATE}.md").read_text(encoding="utf-8"), TRANSCRIPT)
+
+    # --- повтор пути А не обещает PDF, который не придёт ---
+    def test_rerun_personal_does_not_promise_pdf_again(self):
+        with mock.patch("lib.notify.push_via_notarius", return_value=True) as notice:
+            self.run_main("--series", "dm-series", "--mode", "personal")
+            rc, out = self.run_main("--series", "dm-series", "--mode", "personal", "--force")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["delivery"]["status"], "skipped")
+        self.assertEqual(notice.call_count, 1, "второе «PDF следующим сообщением» без PDF")
+
+    # --- правка ответом: «не знаю» — не «не сработает» ---
+    def test_replies_unknown_without_listener_roots(self):
+        os.environ.pop("MEETING_NOTARY_DELIVERED_ROOTS", None)
+        rc, out = self.run_main("--series", "dm-series", "--mode", "personal")
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(out["replies_enabled"],
+                          "без папок поиска слушателя обёртка не знает — и не должна пугать «не сработает»")
+
+    # --- замок: «не смог завести» — не «уже собирают» ---
+    def test_lock_unavailable_is_not_reported_as_busy(self):
+        os.environ[finalize_lock.DIRS_ENV] = "/nonexistent-root-dir-cycle5/locks"
+        rc, out = self.run_main("--series", "dm-series")
+        self.assertEqual(rc, ing.EXIT_FAILED)
+        self.assertIsNone(out, "«уже собирает бот» — неправда: не собирает никто")
+        self.assertEqual(self.finalize_calls, [])
+
+    # --- итог — последняя строка общего журнала (методичка читает tail -1) ---
+    def test_json_is_last_line_of_combined_output(self):
+        import subprocess  # noqa: PLC0415
+
+        sid = ing.safe_session_uid("dm-series", DATE)
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        with finalize_lock.hold(sid) as held:
+            self.assertTrue(held)
+            proc = subprocess.run(
+                [sys.executable, str(_NOTARY / "tools" / "ingest-recording.py"), str(self.rec),
+                 "--series", "dm-series", "--date", DATE, "--kind", "audio"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+            )
+        self.assertEqual(proc.returncode, ing.EXIT_BUSY, proc.stdout[-400:])
+        last = proc.stdout.strip().splitlines()[-1]
+        self.assertEqual(json.loads(last)["error"], "finalize_in_progress")
+
+    # --- общая папка очереди: подложенный ярлык не срабатывает ---
+    def test_planted_link_in_queue_is_not_followed(self):
+        sid = ing.safe_session_uid("grp-series", DATE)
+        victim = self.tmp / "victim.txt"
+        victim.write_text("чужой файл хозяина", encoding="utf-8")
+        (self.T / f".{sid}.part.wav").symlink_to(victim)
+        rc, out = self.run_main("--series", "grp-series", "--mode", "standard")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "чужой файл хозяина")
+        self.assertEqual([p.name for p in self.T.iterdir() if p.name.endswith(".part.wav")
+                          and not p.is_symlink()], [], "недописанная копия осталась в очереди")
+
+    # --- сборщик: дата встречи из имени и уборка под замком ---
+    def test_collector_dates_recovered_meeting_by_its_name(self):
+        for series in ("grp-series", "проект"):
+            with self.subTest(series=series):
+                self.assertEqual(collector._date_from_filename_uid(ing.safe_session_uid(series, DATE)), DATE)
+        self.assertEqual(collector._date_from_filename_uid(f"{DATE}-tm-1"), DATE)
+
+    def test_collector_does_not_wipe_recording_under_manual_lock(self):
+        sid = ing.safe_session_uid("grp-series", DATE)
+        wav = self.T / f"{sid}.wav"
+        wav.write_bytes(b"RIFFxxxxWAVEfresh")
+        meta = {"sessionUid": sid, "files": {"wav": str(wav)}, "keepAudio": False,
+                "delivered": [{"chat_id": GROUP, "message_ids": [7], "decision": "pdf"}]}
+        with mock.patch.object(collector, "LOCAL_FINALIZE", True), \
+                mock.patch.object(collector, "_portal_sources_held", return_value=False):
+            with finalize_lock.hold(sid) as held:
+                self.assertTrue(held)
+                collector._cleanup_delivered_under_lock(meta, sid)
+                self.assertTrue(wav.exists(), "сборщик стёр свежую запись посреди ручной финализации")
+            collector._cleanup_delivered_under_lock(meta, sid)
+        self.assertFalse(wav.exists(), "после ручной финализации уборка идёт как раньше")
 
 
 if __name__ == "__main__":

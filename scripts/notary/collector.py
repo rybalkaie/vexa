@@ -301,7 +301,7 @@ def main() -> int:
         # прошлой итерации, см. ниже).
         if meta is not None and _delivery_done(meta):
             logger.info("Скип %s — уже доставлен (meta.delivered непустой)", sid)
-            _maybe_cleanup_wav_after_delivered(meta, sid)
+            _cleanup_delivered_under_lock(meta, sid)
             continue
         _finalize_and_collect(sid)
 
@@ -1009,6 +1009,21 @@ def _portal_delivery_tick() -> None:
         logger.warning("Тик доставки в портал упал (%s) — записи не тронуты", type(e).__name__)
 
 
+def _cleanup_delivered_under_lock(meta: dict, sid: str) -> None:
+    """Уборка записи доставленной встречи — под тем же замком, что финализация.
+
+    Цикл5 фазы 5 ISS-60: повторный прогон восстановления из присланной записи
+    (`tools/ingest-recording.py --force`, путь Б) кладёт в очередь СВЕЖУЮ копию
+    записи рядом с прежней отметкой `delivered` и держит замок встречи, пока идёт
+    расшифровка. Без замка тик сборщика видел «уже доставлено» и стирал запись
+    посреди работы. Замок занят — уборка ждёт следующего тика."""
+    with _session_finalize_lock(sid) as locked:
+        if not locked:
+            logger.info("Уборка %s отложена — встречу сейчас финализируют (замок занят)", sid)
+            return
+        _maybe_cleanup_wav_after_delivered(meta, sid)
+
+
 def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
     """Удаляет WAV, если delivery УЖЕ подтверждена И WAV ещё на диске.
 
@@ -1701,10 +1716,27 @@ def _parse_series_from_finalize_stdout(stdout: str) -> str | None:
     return val if isinstance(val, str) and val else None
 
 
+_RECOVERY_UID_DATE_RE = re.compile(r"^recovery-(?:.*-)?(\d{4}-\d{2}-\d{2})$")
+
+
 def _date_from_filename_uid(filename_uid: str) -> str:
-    """Имя meta-файла на диске: 2026-05-27-tm-<id>. Первые 10 символов = дата."""
+    """Имя meta-файла на диске: 2026-05-27-tm-<id>. Первые 10 символов = дата.
+
+    Встреча, восстановленная из присланной записи (путь Б `tools/ingest-recording.py`,
+    фаза 5 ISS-60), лежит в очереди как `recovery-<серия>-<дата>` — дата в КОНЦЕ.
+    Без этой ветки получалось «сегодня», и сборщик, доводя такую встречу (сорвалась
+    доставка или составление протокола), клал её расшифровку в архив и на мак под
+    сегодняшним числом — занимая имя настоящей встречи серии за сегодня, — а
+    протокол-сводку не находил вовсе."""
     if len(filename_uid) >= 10 and filename_uid[4] == "-" and filename_uid[7] == "-":
         return filename_uid[:10]
+    m = _RECOVERY_UID_DATE_RE.match(filename_uid or "")
+    if m:
+        try:
+            datetime.strptime(m.group(1), "%Y-%m-%d")
+            return m.group(1)
+        except ValueError:
+            pass
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 

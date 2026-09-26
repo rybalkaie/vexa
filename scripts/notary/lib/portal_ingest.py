@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -262,16 +263,31 @@ def build_purge_event(
     }
 
 
-#: Хвост ключа события «бот не пришёл». Ровно этот ключ портал вернул бы в ACK и
-#: сам, если его не прислать (`notaryIngest.ts`: `portal:${meeting.id}#${event}`),
-#: но шлём явно — сверка ACK не должна зависеть от того, как портал его синтезирует.
+#: Хвост ключа события «бот не пришёл». Портал ключ события не разбирает, а
+#: возвращает эхом в ACK (`notaryIngest.ts`: `body.delivery_key ??
+#: portal:${meeting.id}#${event}`); шлём явно — сверка ACK дословная.
 NO_SHOW_SUFFIX = "#no_show"
+_ROUND_MARK_RE = re.compile(r"^\d{8}T\d{4}$")
 
 
-def no_show_key(order_id: str) -> str:
-    """`portal:<meeting_id>#no_show` — один на наряд: второй «не пришёл» по той же
-    встрече порталу ничего не добавит (статус записи назад не ходит)."""
-    return "%s%s" % (str(order_id or "").strip(), NO_SHOW_SUFFIX)
+def no_show_key(order_id: str, round_mark: Optional[str] = None) -> str:
+    """`portal:<meeting_id>@<минута старта UTC>#no_show` — один на ЗАХОД бота.
+
+    Не один на встречу (цикл5 фазы 5 ISS-60): повторный вызов бота по той же
+    встрече портал встречает снятием вердикта («Подключить сейчас» →
+    `retractBotNoShow`: встреча снова «наряд размещён», колокольчик удалён). Сорвись
+    бот и во второй раз — портал обязан узнать об этом снова, иначе встреча так и
+    останется «наряд размещён», потом станет «запись прервана», а загрузка записи
+    вручную оттуда закрыта. Ключ по наряду молча схлопнул бы второй срыв с первым.
+    Внутри одного захода — один ключ: второй «не пришёл» не встаёт.
+
+    `round_mark` — минута старта захода (`state.normalized_start_key`, как в ключе
+    старта и журнале сторожа). Нет или не той формы — прежний `<наряд>#no_show`."""
+    base = str(order_id or "").strip()
+    mark = str(round_mark or "").strip()
+    if mark and _ROUND_MARK_RE.match(mark):
+        base = "%s@%s" % (base, mark)
+    return base + NO_SHOW_SUFFIX
 
 
 def build_no_show_event(
@@ -280,6 +296,7 @@ def build_no_show_event(
     order_id: str,
     company: Optional[str] = None,
     occurred_at: Optional[str] = None,
+    round_mark: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Событие «бот не пришёл» (диалект событий портала, `event: no_show`).
 
@@ -298,7 +315,7 @@ def build_no_show_event(
         "occurred_at": occurred_at or datetime.now(timezone.utc).isoformat(),
         "order_id": order_id,
         "company": company,
-        "delivery_key": no_show_key(order_id),
+        "delivery_key": no_show_key(order_id, round_mark),
     }
 
 

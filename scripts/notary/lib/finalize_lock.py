@@ -51,6 +51,14 @@ STATE_DIR_ENV = "MEETING_NOTARY_STATE_DIR"
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+class LockUnavailable(OSError):
+    """Ни в одной папке замков файл завести не удалось (права, нет родителя).
+
+    Это НЕ «встречу уже финализируют» (тогда `hold` отдаёт False): прикинься мы
+    занятостью — вызывающий ответил бы «бот уже собирает, дождусь», и встречу не
+    собрал бы никто. Отдельная ошибка — отдельный честный ответ."""
+
+
 def lock_filename(session_uid: str) -> str:
     """Имя файла замка, как его строит сборщик (единый источник)."""
     safe = _UNSAFE_RE.sub("_", session_uid or "unknown")
@@ -112,8 +120,9 @@ def hold(session_uid: str, *, dirs: Optional[List[Path]] = None) -> Iterator[boo
     один занят (тогда отпускаем уже взятые и ничего не делаем).
 
     Папку, которую создать нельзя (права, нет родителя), пропускаем с
-    предупреждением: там замок никто и не возьмёт. Но если не взялся НИ ОДИН
-    замок — это False: без замка ручная финализация столкнулась бы со сборщиком.
+    предупреждением: там замок никто и не возьмёт. Но если не завёлся НИ ОДИН
+    файл замка — `LockUnavailable`: без замка ручная финализация столкнулась бы со
+    сборщиком, а ответ «занято» был бы неправдой.
     """
     fds: List[int] = []
     acquired = True
@@ -137,8 +146,8 @@ def hold(session_uid: str, *, dirs: Optional[List[Path]] = None) -> Iterator[boo
                 break
             fds.append(fd)
         if acquired and not fds:
-            logger.error("[finalize-lock] ни одного замка взять не удалось — финализацию не начинаю")
-            acquired = False
+            logger.error("[finalize-lock] ни одного файла замка завести не удалось — финализацию не начинаю")
+            raise LockUnavailable("ни в одной папке замков файл завести не удалось")
         yield acquired
     finally:
         for fd in fds:

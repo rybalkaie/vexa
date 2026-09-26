@@ -1038,17 +1038,26 @@ def _jw_gave_up(entry: dict[str, Any], reason: str) -> None:
     meeting_id = str((order or {}).get("meeting_id") or "").strip()
     if not meeting_id and order_id.startswith("portal:"):
         meeting_id = order_id[len("portal:"):]
-    try:
-        from notary.lib import portal_delivery  # noqa: PLC0415
+    if (order or {}).get("status") == orders_lib.STATUS_CANCELLED:
+        # Встречу сняли, пока бот пытался войти: «бот не пришёл» было бы ложным —
+        # портал позвонил бы организатору про встречу, которую тот сам отменил.
+        logger.info("Сторож сдался по наряду %s, но наряд уже снят — порталу не пишу", order_id)
+    else:
+        try:
+            from notary.lib import portal_delivery  # noqa: PLC0415
+            from notary.lib.state import normalized_start_key  # noqa: PLC0415
 
-        key = portal_delivery.report_no_show(
-            order_id, meeting_id=meeting_id, session_uid=session_uid,
-            company=(order or {}).get("company") or item.get("company"),
-        )
-        if key:
-            logger.warning("Наряд %s: «бот не пришёл» в очереди к порталу (%s)", order_id, reason)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("«Бот не пришёл» по наряду %s не поставлен в очередь (%s)", order_id, type(e).__name__)
+            key = portal_delivery.report_no_show(
+                order_id, meeting_id=meeting_id, session_uid=session_uid,
+                company=(order or {}).get("company") or item.get("company"),
+                # Заход бота — минута его старта (как ключ журнала сторожа): срыв
+                # следующего захода по той же встрече — новое событие порталу.
+                round_mark=normalized_start_key(entry.get("start_at") or item.get("start_at")),
+            )
+            if key:
+                logger.warning("Наряд %s: «бот не пришёл» в очереди к порталу (%s)", order_id, reason)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("«Бот не пришёл» по наряду %s не поставлен в очередь (%s)", order_id, type(e).__name__)
     if item.get("immediate") or (order or {}).get("kind") == orders_lib.KIND_IMMEDIATE:
         try:
             closed = orders_lib.close_immediate_after_join_failure(order_id, reason=reason)

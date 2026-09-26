@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -20,6 +21,92 @@ from typing import Optional
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Причина сбоя из потока `stream-json` (цикл5 фазы 5 ISS-60)
+# ---------------------------------------------------------------------------
+# 🔴 ЗАЧЕМ. Живой CLI при отказе API (нет входа, лимит подписки, 429, перегрузка)
+# выходит с кодом 1 и ПУСТЫМ stderr, а причину пишет в stdout: итоговым событием
+# `result` (`is_error: true`, `terminal_reason: api_error`, строка ошибки в
+# `result`) и событием `assistant` с `is_api_error_message: true` и кодом `error`
+# (проверено на CLI 2.1.283 без входа: `authentication_failed`, «Not logged in ·
+# Please run /login»). Раньше stdout при ненулевом коде выбрасывался, и в журнале
+# оставалось `exit=1, stderr=''` — так на бою 16.09 две встречи остались без
+# протокола, а причину восстановить было нечем.
+#
+# 🔴 ОПАСНАЯ ТРОЙКА. В потоке лежит и ответ модели — то есть протокол встречи.
+# Отсюда берутся ТОЛЬКО: коды (`subtype`, `terminal_reason`, `error` — строго
+# `[a-z_]`), число `api_error_status` и строка ошибки — лишь при `is_error: true`,
+# только первая строка, не длиннее 160 знаков, с вычищенными похожими на секреты
+# кусками. Текст `assistant` не читается никогда; `result` без `is_error` (это
+# ответ модели, в том числе обрывок протокола) — только длина.
+_STREAM_CODE_RE = re.compile(r"^[a-z_]{1,40}$")
+_STREAM_SECRET_RES = (
+    re.compile(r"sk-ant-\S+"),
+    re.compile(r"(?i)bearer\s+\S+"),
+    re.compile(r"://[^/\s@]+@"),
+    re.compile(r"[A-Za-z0-9_\-]{40,}"),
+)
+_STREAM_TAIL_LINES = 50
+_STREAM_MSG_MAX = 160
+
+
+def _redact_secret_like(text: str) -> str:
+    for rx in _STREAM_SECRET_RES:
+        text = rx.sub("***", text)
+    return text
+
+
+def stream_error_summary(stdout: Optional[str]) -> Optional[str]:
+    """Короткая причина сбоя из вывода `stream-json` — без текста ответа модели.
+
+    Разбирает не больше 50 последних строк: последнее событие `result` и последнее
+    `assistant` с `is_api_error_message: true`. Возвращает, например,
+    `subtype=success terminal_reason=api_error error=authentication_failed
+    msg='Not logged in · Please run /login'`, или None, если разбирать нечего.
+    """
+    import json as _json  # локально, как у остальных вариантов вызова
+
+    lines = [ln for ln in (stdout or "").splitlines() if ln.strip()][-_STREAM_TAIL_LINES:]
+    final = None
+    api_error = None
+    for ln in reversed(lines):
+        try:
+            ev = _json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if final is None and ev.get("type") == "result":
+            final = ev
+        elif (api_error is None and ev.get("type") == "assistant"
+              and ev.get("is_api_error_message") is True):
+            api_error = ev
+        if final is not None and api_error is not None:
+            break
+    parts: list[str] = []
+    for src in (final, api_error):
+        if not isinstance(src, dict):
+            continue
+        for key in ("subtype", "terminal_reason", "error"):
+            val = src.get(key)
+            item = f"{key}={val}"
+            if isinstance(val, str) and _STREAM_CODE_RE.match(val) and item not in parts:
+                parts.append(item)
+        status = src.get("api_error_status")
+        if isinstance(status, int) and not isinstance(status, bool):
+            item = f"api_error_status={status}"
+            if item not in parts:
+                parts.append(item)
+    if isinstance(final, dict):
+        res = final.get("result")
+        if final.get("is_error") is True and isinstance(res, str) and res.strip():
+            first = res.strip().splitlines()[0]
+            parts.append("msg=%r" % _redact_secret_like(first)[:_STREAM_MSG_MAX])
+        elif isinstance(res, str):
+            parts.append(f"result_len={len(res)}")
+    return " ".join(parts) or None
 
 
 class ClaudeCliError(RuntimeError):
@@ -323,8 +410,13 @@ def call_claude_print_stream_json(
 
     if result.returncode != 0:
         stderr_snippet = (result.stderr or "").strip()[:200]
+        # Причину — ДО stderr: генерация протокола режет сообщение до 200 знаков,
+        # а при отказе API stderr пуст и вся суть лежит в потоке (см. выше).
+        cause = stream_error_summary(result.stdout)
         raise ClaudeCliFailed(
-            f"claude --print (stream-json) exit={result.returncode}, stderr={stderr_snippet!r}"
+            f"claude --print (stream-json) exit={result.returncode}"
+            + (f" [{cause}]" if cause else "")
+            + f", stderr={stderr_snippet!r}"
         )
     lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
     if not lines:
@@ -343,8 +435,11 @@ def call_claude_print_stream_json(
             f"claude --print (stream-json) терминальная строка не result (type={got})"
         )
     if final.get("is_error"):
+        # Раньше сюда шли первые 200 знаков `result` как есть; теперь — тем же
+        # разбором, что при ненулевом коде: одна строка ошибки, без секретов.
         raise ClaudeCliFailed(
-            f"claude --print (stream-json) is_error: {str(final.get('result'))[:200]!r}"
+            "claude --print (stream-json) is_error: [%s]"
+            % (stream_error_summary(result.stdout) or "причина не разобрана")
         )
     text = final.get("result") or ""
     if not isinstance(text, str) or not text.strip():

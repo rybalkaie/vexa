@@ -186,6 +186,30 @@ class PortalTest(Base):
         self.assertIn("Организатору написать не смог", sent[0][1])
         self.assertNotIn("обработай запись", sent[0][1])
 
+    def test_portal_owner_tech_never_sends_to_alfred(self):
+        """Цикл5 фазы 5: Альфред встречи сотрудников не собирает (отвечает отказом) —
+        совет «скажи Альфреду „обработай запись“» в тех. разборе по встрече портала
+        был ловушкой. Куда девать запись — зависит от того, открыл ли портал загрузку:
+        после срыва входа («бот не пришёл») — да, после обрыва записи — нет."""
+        routes = (self.route("group", chat=-2002, owner_user=ORG),
+                  self.route("dm", chat=ORG, owner_user=ORG),
+                  self.route("portal_only", owner_user=ORG))
+        for route in routes:
+            for kind, reason, expected in (
+                    (ja.KIND_JOIN_FAILED, "still_in_lobby", "карточку встречи на портале"),
+                    (ja.KIND_EVICTED, "evicted_failure", "портал загрузку не открывает")):
+                with self.subTest(mode=route.mode, kind=kind):
+                    sent, _p, _r = self.run_portal(route, reason, kind=kind)
+                    owner = [t for c, t in sent if c == OWNER]
+                    self.assertEqual(len(owner), 1, sent)
+                    self.assertNotIn("обработай запись", owner[0])
+                    self.assertIn(expected, owner[0])
+
+    def test_owner_series_tech_still_sends_to_alfred(self):
+        """Личная серия владельца — прежний совет: Альфред её соберёт штатно."""
+        sent, _p, _r = self.run_send(entry())
+        self.assertIn("обработай запись", sent[-1][1])
+
     def test_missing_order_goes_to_owner(self):
         sent, _p, _r = self.run_portal(None, order=False)
         self.assertEqual([c for c, _ in sent], [OWNER])
