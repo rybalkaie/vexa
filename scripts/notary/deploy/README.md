@@ -494,6 +494,16 @@ git -C ~/Projects/me commit -m "Методичка восстановления 
   `plans/compass-inbox.md`.
 - **Слияние:** когда в `vexa/` никто не работает (`git -C vexa status --short` без чужих правок) —
   `git -C vexa merge telemost-resilience` в `notary-f2-bot-notarius-full` (план: «слияние в конце»).
+- **Уборка тестового на сервере — после приёмки** (всё создано планом ISS-60 для живых проверок,
+  боевое не трогает): тестовые образы `vexa-bot:resil-*`, папки `/home/dev/resil-build/` (их
+  сборка) и `/home/dev/resil-test/` (тестовая копия скриптов и песочница проверки восстановления).
+  `resil-test` — **не раньше**, чем повторена живая проверка восстановленного протокола (фаза 5
+  плана, `tools/recovery-live-check.sh` запускается оттуда). Сначала список, потом удаление:
+  ```bash
+  ssh meeting-notary 'docker image ls vexa-bot --format "{{.Repository}}:{{.Tag}}" | grep ":resil-"; du -sh /home/dev/resil-build /home/dev/resil-test'
+  ssh meeting-notary 'docker image ls vexa-bot --format "{{.Repository}}:{{.Tag}}" | grep ":resil-" | xargs -r docker image rm && rm -rf /home/dev/resil-build /home/dev/resil-test'
+  ```
+  Теги отката (`notarius-telemost-before-iss60`, `notarius-telemost-pre3-20260923`) не трогать.
 
 ## 10. Как откатить (каждую часть отдельно)
 
