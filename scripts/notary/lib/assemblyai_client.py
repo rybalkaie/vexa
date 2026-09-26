@@ -577,9 +577,13 @@ def transcribe_diarize_wav(
                         f"новый сабмит запрещён ({killswitch_path()})"
                     )
                 upload_url = _upload_audio(client, headers, p)
+                # `max_speakers` подставляем ТОЛЬКО когда он задан: иначе
+                # ломаются подменённые в тестах фейки `_create_transcript` со
+                # старой сигнатурой, а смысла в явном None нет.
+                _extra = {"max_speakers": max_speakers} if max_speakers else {}
                 transcript_id = _create_transcript(
                     client, headers, upload_url, keyterms_prompt=keyterms_prompt,
-                    max_speakers=max_speakers,
+                    **_extra,
                 )
                 logger.info("AssemblyAI transcript created: %s", transcript_id)
                 # Отдать id наверх ДО поллинга (переживает краш/рестарт).
