@@ -184,9 +184,11 @@ def run_one(tr_path: Path, expected: list[str], *, expand_first_word: bool,
     turns = to_aligned_turns(utts)
     pool = expand_expected(expected, expand_first_word=expand_first_word)
     # Боевое правило (Ф5): строгий режим включается САМ на встречах вдвоём.
+    # Боевое правило (26.09): на встрече вдвоём якорь не применяется ВООБЩЕ —
+    # номера голосов между записями не совпадают, и перенос это монетка.
     pair = len([n for n in expected if n]) == 2
-    anchor = previous_anchor(tr_path.parent.parent, date,
-                             confirmed_only=confirmed_anchor_only or pair)
+    anchor = {} if pair else previous_anchor(tr_path.parent.parent, date,
+                                             confirmed_only=confirmed_anchor_only)
 
     res = map_all(turns, pool, anchor=anchor, roster=None)
     clusters = sorted({t.speaker for t in turns if t.speaker})
