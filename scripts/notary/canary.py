@@ -5,6 +5,10 @@
     python -m notary.canary sniff [--image …] [--room t10]
     python -m notary.canary status
 
+«Нюх» (`sniff`) — раз в час; смена версии Телемоста проверяется утром, пока в Т-10
+никого нет: ежедневной самопроверкой в 04:40 МСК или, если она не закрыла проверку,
+внеплановой в 07:00–08:00 МСК (решение владельца 26.09, фаза 6б).
+
 Логика и её объяснение — `lib/canary.py`. Здесь только настоящий внешний мир:
 docker, redis-cli (в контейнере redis), ffprobe/ffmpeg, локальный whisper,
 главная страница Телемоста и tg-send владельцу.
@@ -297,7 +301,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_run.add_argument("--room", default=default_room)
     p_run.add_argument("--reason", default="manual", choices=["daily", "version-change", "manual"])
     p_run.add_argument("--force", action="store_true", help="не смотреть на очередь встреч (идущий бот — всё равно стоп)")
-    p_sniff = sub.add_parser("sniff", help="проверить версию Телемоста; сменилась — внеплановый прогон")
+    p_sniff = sub.add_parser("sniff", help="проверить версию Телемоста; сменилась — прогон утром "
+                                           "07:00–08:00 МСК, если его не закрыла ежедневная в 04:40")
     p_sniff.add_argument("--image", default=default_image)
     p_sniff.add_argument("--room", default=default_room)
     sub.add_parser("status", help="состояние самопроверки")

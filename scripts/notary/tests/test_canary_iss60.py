@@ -33,6 +33,8 @@ FAKE_URL = "https://telemost.yandex.ru/j/00000000000000"
 TOKEN = "123:SECRET-TOKEN-VALUE"
 NIGHT = datetime(2026, 9, 26, 1, 40, tzinfo=timezone.utc)   # 04:40 МСК
 DAY = datetime(2026, 9, 26, 7, 0, tzinfo=timezone.utc)      # 10:00 МСК
+#: «Нюх» в утреннем окне проверки после обновления (07:00–08:00 МСК, фаза 6б).
+MORNING = datetime(2026, 9, 26, 4, 2, tzinfo=timezone.utc)  # 07:02 МСК
 
 
 def _words():
@@ -1077,6 +1079,35 @@ class ApplyFinalTest(unittest.TestCase):
         self.assertEqual([lib._times(n) for n in (3, 10, 17, 22, 24, 12, 31)],
                          ["раза", "раз", "раз", "раза", "раза", "раз", "раз"])
 
+    # --- фаза 6б (№12): итог прогона закрывает проверку после обновления Телемоста
+
+    def test_last_verdict_only_when_run_reached_result(self):
+        started = iso_(DAY - timedelta(minutes=10))
+        for st in (lib.GREEN, lib.YELLOW, lib.RED):
+            h, _ = lib.apply_final({}, self.final(st, ["silence"] if st != lib.GREEN else [], started_at=started), DAY)
+            self.assertEqual((h["last_verdict"]["started_at"], h["last_verdict"]["status"]), (started, st))
+        for st in (lib.SKIPPED, lib.ERROR, lib.RED_UNCONFIRMED):
+            h, _ = lib.apply_final({}, self.final(st, ["internal_error"], started_at=started), DAY)
+            self.assertNotIn("last_verdict", h, st)
+
+    def test_daily_closing_version_check_reports_result(self):
+        fin = self.final(lib.GREEN, telemost_version="212.0.0", reason="daily")
+        _h, msgs = lib.apply_final({"status": lib.GREEN}, fin, NIGHT, version_check=True)
+        self.assertEqual(len(msgs), 1)
+        self.assertTrue(msgs[0][0].startswith("✅ Самопроверка после обновления Телемоста до 212.0.0 прошла"))
+        _h, msgs = lib.apply_final({"status": lib.GREEN}, fin, NIGHT)
+        self.assertEqual(msgs, [], "обычная ежедневная без смены версии — молча")
+
+    def test_closes_version_check_needs_run_after_change(self):
+        seen = DAY
+        st = {"pending_check": True, "seen_at": iso_(seen)}
+        self.assertTrue(lib.closes_version_check(st, iso_(seen)))
+        self.assertTrue(lib.closes_version_check(st, iso_(seen + timedelta(hours=14))))
+        self.assertFalse(lib.closes_version_check(st, iso_(seen - timedelta(seconds=1))))
+        self.assertFalse(lib.closes_version_check({"seen_at": iso_(seen)}, iso_(seen + timedelta(hours=1))))
+        self.assertFalse(lib.closes_version_check({"pending_check": True}, iso_(seen)))
+        self.assertFalse(lib.closes_version_check(st, None))
+
 
 # ---------------------------------------------------------------------------
 # «Нюх»
@@ -1123,10 +1154,19 @@ class SniffTest(_Env):
         self.assertEqual(w.pushes, [])
         self.assertEqual(lib.load_version_state()["version"], "211.3.0")
 
-    def test_change_triggers_run(self):
-        w, d = self.deps()
-        lib.sniff(deps=d, run=self.fake_run([])[0])
-        w2, d2 = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=1))
+    NEW = HTML.replace("211.3.0", "212.0.0")
+
+    def sniff_at(self, now, *, html=None, results=None, image=None):
+        """Один «нюх» в момент `now` (UTC). Возвращает (вызовы прогона, сообщения)."""
+        w, d = self.deps(html=html or self.NEW, now=now)
+        run, calls = self.fake_run(list(results or []))
+        kw = {"image": image} if image else {}
+        lib.sniff(deps=d, run=run, **kw)
+        return calls, w.pushes
+
+    def test_change_in_morning_window_runs_now(self):
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        w2, d2 = self.deps(html=self.NEW, now=MORNING)
         run, calls = self.fake_run([{"status": lib.GREEN, "run_id": "r1"}])
         out = lib.sniff(deps=d2, run=run)
         self.assertTrue(out["changed"])
@@ -1137,45 +1177,145 @@ class SniffTest(_Env):
         self.assertFalse(st["pending_check"])
         self.assertEqual([h["version"] for h in st["history"]], ["211.3.0", "212.0.0"])
 
-    def test_guards_keep_pending_then_next_sniff_runs(self):
-        lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
-        _w, d = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=1))
-        run, calls = self.fake_run([{"status": lib.SKIPPED, "skip_reason": "meeting_soon", "run_id": "r"}])
-        lib.sniff(deps=d, run=run)
+    def test_guards_keep_pending_then_next_morning_runs(self):
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        calls, _p = self.sniff_at(MORNING, results=[{"status": lib.SKIPPED, "skip_reason": "meeting_soon", "run_id": "r"}])
+        self.assertEqual(len(calls), 1)
         self.assertTrue(lib.load_version_state()["pending_check"])
-        w3, d3 = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=2))
-        run3, calls3 = self.fake_run([{"status": lib.GREEN, "run_id": "r2"}])
-        out = lib.sniff(deps=d3, run=run3)
-        self.assertFalse(out["changed"])
+        calls2, _p = self.sniff_at(MORNING + timedelta(hours=1))          # 08:02 — окно прошло
+        self.assertEqual(calls2, [])
+        calls3, pushes3 = self.sniff_at(MORNING + timedelta(days=1), results=[{"status": lib.GREEN, "run_id": "r2"}])
         self.assertEqual(len(calls3), 1)
-        self.assertEqual(w3.pushes, [])  # о смене уже сказали
+        self.assertEqual(pushes3, [])  # о смене уже сказали
         self.assertFalse(lib.load_version_state()["pending_check"])
 
     def test_room_busy_backs_off_two_hours(self):
+        # Перепроверка красного (в любое время): занято → через 2 часа, не раньше.
         lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
-        _w, d = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=1))
-        lib.sniff(deps=d, run=self.fake_run([{"status": lib.SKIPPED, "skip_reason": "room_busy", "run_id": "r"}])[0])
-        _w, d2 = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=2))
-        run2, calls2 = self.fake_run([])
-        lib.sniff(deps=d2, run=run2)
-        self.assertEqual(calls2, [])
-        _w, d3 = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=3, minutes=1))
-        run3, calls3 = self.fake_run([])
-        lib.sniff(deps=d3, run=run3)
-        self.assertEqual(len(calls3), 1)
+        lib.save_health({"status": lib.GREEN, "pending_recheck": True})
+        busy = [{"status": lib.SKIPPED, "skip_reason": "room_busy", "run_id": "r"}]
+        self.assertEqual(len(self.sniff_at(DAY + timedelta(hours=1), html=HTML, results=busy)[0]), 1)
+        self.assertEqual(self.sniff_at(DAY + timedelta(hours=2), html=HTML)[0], [])
+        self.assertEqual(len(self.sniff_at(DAY + timedelta(hours=3, minutes=1), html=HTML)[0]), 1)
+
+    def test_room_busy_in_morning_window_retries_next_morning(self):
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        busy = [{"status": lib.SKIPPED, "skip_reason": "room_busy", "run_id": "r"}]
+        self.assertEqual(len(self.sniff_at(MORNING, results=busy)[0]), 1)
+        for h in range(1, 24):                                             # весь день и ночь — тихо
+            self.assertEqual(self.sniff_at(MORNING + timedelta(hours=h))[0], [], h)
+        self.assertEqual(len(self.sniff_at(MORNING + timedelta(days=1))[0]), 1)
 
     def test_candidate_sniff_does_not_consume_version_check(self):
-        lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
-        _w, d = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=1))
-        run, calls = self.fake_run([{"status": lib.GREEN, "run_id": "r"}])
-        lib.sniff(deps=d, image="vexa-bot:resil-candidate", run=run)
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        calls, _p = self.sniff_at(MORNING, image="vexa-bot:resil-candidate", results=[{"status": lib.GREEN, "run_id": "r"}])
         self.assertEqual(len(calls), 1)
         self.assertTrue(lib.load_version_state()["pending_check"])   # боевой образ ещё должен пройти
-        _w, d2 = self.deps(html=HTML.replace("211.3.0", "212.0.0"), now=DAY + timedelta(hours=2))
-        run2, calls2 = self.fake_run([{"status": lib.GREEN, "run_id": "r2"}])
-        lib.sniff(deps=d2, run=run2)
+        calls2, _p = self.sniff_at(MORNING + timedelta(minutes=30), results=[{"status": lib.GREEN, "run_id": "r2"}])
         self.assertEqual(calls2[0]["image"], lib.DEFAULT_IMAGE)
         self.assertFalse(lib.load_version_state()["pending_check"])
+
+    # --- фаза 6б (копилка владельца №12, 26.09): проверка после обновления — только утром
+
+    def test_daytime_change_waits_for_next_morning(self):
+        """Смена версии в 14:00 → днём прогона нет, он в 07:0x следующего утра."""
+        lib.sniff(deps=self.deps(now=DAY)[1], run=self.fake_run([])[0])       # 10:00 — запомнил версию
+        change = datetime(2026, 9, 26, 11, 0, tzinfo=timezone.utc)              # 14:00 МСК
+        calls, pushes = self.sniff_at(change)
+        self.assertEqual(calls, [], "внеплановая самопроверка днём")
+        self.assertEqual(len(pushes), 1)
+        self.assertIn("ежедневной самопроверкой в 04:40 МСК", pushes[0][0])
+        self.assertIn("07:00–08:00 МСК", pushes[0][0])
+        for h in range(1, 17):                                                  # 15:00 … 06:00 МСК
+            self.assertEqual(self.sniff_at(change + timedelta(hours=h))[0], [], h)
+        calls, pushes = self.sniff_at(change + timedelta(hours=17, minutes=2),   # 07:02 МСК
+                                      results=[{"status": lib.GREEN, "run_id": "r"}])
+        self.assertEqual([c["reason"] for c in calls], ["version-change"])
+        self.assertEqual(pushes, [])
+        self.assertFalse(lib.load_version_state()["pending_check"])
+
+    def test_night_change_closed_by_daily_run_no_second_run(self):
+        """Смена в 02:00 → ежедневная в 04:40 закрывает ожидание, в 07:00 второго прогона нет."""
+        lib.sniff(deps=self.deps(now=NIGHT - timedelta(hours=3, minutes=40))[1], run=self.fake_run([])[0])
+        calls, pushes = self.sniff_at(NIGHT - timedelta(hours=2, minutes=40))   # 02:00 МСК
+        self.assertEqual(calls, [])
+        self.assertIn("ежедневной самопроверкой в 04:40 МСК", pushes[0][0])
+        w = World(base=NIGHT, runs=[{"participants": ["Тест-диктор"]}])         # ежедневная 04:40
+        res = lib.run_cycle(deps=w.deps(), image=lib.DEFAULT_IMAGE, room="t10", reason="daily")
+        self.assertEqual(res["status"], lib.GREEN)
+        self.assertEqual(len(w.pushes), 1, w.pushes)
+        self.assertTrue(w.pushes[0][0].startswith("✅ Самопроверка после обновления Телемоста до 212.0.0 прошла"),
+                        w.pushes[0][0])
+        self.assertFalse(lib.version_check_pending(lib.load_version_state(), lib.load_health()))
+        for when in (NIGHT + timedelta(minutes=22), NIGHT + timedelta(hours=1, minutes=22), MORNING):
+            calls, pushes = self.sniff_at(when)
+            self.assertEqual((calls, pushes), ([], []), when)
+        self.assertFalse(lib.load_version_state()["pending_check"])
+
+    def test_change_seen_after_daily_started_checks_this_morning(self):
+        lib.sniff(deps=self.deps(now=NIGHT - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        w = World(base=NIGHT, runs=[{"participants": ["Тест-диктор"]}])         # ежедневная 04:40 — старая версия
+        lib.run_cycle(deps=w.deps(), image=lib.DEFAULT_IMAGE, room="t10", reason="daily")
+        calls, pushes = self.sniff_at(NIGHT + timedelta(minutes=22))            # 05:02 — «нюх» увидел смену
+        self.assertEqual(calls, [])
+        self.assertIn("сегодня в 07:00–08:00 МСК", pushes[0][0])
+        self.assertEqual(self.sniff_at(NIGHT + timedelta(hours=1, minutes=22))[0], [])   # 06:02
+        calls, _p = self.sniff_at(MORNING, results=[{"status": lib.GREEN, "run_id": "r"}])
+        self.assertEqual([c["reason"] for c in calls], ["version-change"])
+
+    def test_skipped_daily_does_not_close_check(self):
+        lib.sniff(deps=self.deps(now=NIGHT - timedelta(hours=3))[1], run=self.fake_run([])[0])
+        self.sniff_at(NIGHT - timedelta(hours=2))                                # смена в 02:40
+        w = World(base=NIGHT, runs=[{"speaker_result": "busy"}])                # в Т-10 кто-то есть
+        self.assertEqual(lib.run_cycle(deps=w.deps(), image=lib.DEFAULT_IMAGE, room="t10",
+                                       reason="daily")["status"], lib.SKIPPED)
+        calls, _p = self.sniff_at(MORNING, results=[{"status": lib.GREEN, "run_id": "r"}])
+        self.assertEqual(len(calls), 1, "пропущенная ежедневная закрыла проверку после обновления")
+
+    def test_error_or_unconfirmed_red_keeps_check_pending(self):
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        for status in (lib.ERROR, lib.RED_UNCONFIRMED):
+            with self.subTest(status=status):
+                self.sniff_at(MORNING, results=[{"status": status, "run_id": "r"}])
+                self.assertTrue(lib.load_version_state()["pending_check"], status)
+        self.sniff_at(MORNING + timedelta(days=1), results=[{"status": lib.RED, "run_id": "r"}])
+        self.assertFalse(lib.load_version_state()["pending_check"], "красный с итогом — проверка сделана")
+
+    def test_plan_words_by_time_of_day(self):
+        def plan(h, m=0):
+            return lib._version_check_plan(datetime(2026, 9, 26, h, m, tzinfo=timezone.utc) - timedelta(hours=3))
+        self.assertEqual(plan(7, 0), "Запускаю внеплановую самопроверку.")
+        self.assertEqual(plan(7, 59), "Запускаю внеплановую самопроверку.")
+        for h, m in ((8, 0), (14, 0), (23, 30), (0, 30), (4, 39)):
+            self.assertIn("ежедневной самопроверкой в 04:40 МСК", plan(h, m), (h, m))
+        for h, m in ((4, 40), (5, 30), (6, 59)):
+            self.assertIn("сегодня в 07:00–08:00 МСК", plan(h, m), (h, m))
+
+    def test_status_says_waiting_until_covered(self):
+        import notary.canary as cli
+
+        lib.sniff(deps=self.deps(now=DAY)[1], run=self.fake_run([])[0])
+        self.sniff_at(DAY + timedelta(hours=4))
+        with mock.patch("builtins.print") as pr:
+            cli.main(["status"])
+        self.assertIn("ждёт проверки бота утром", pr.call_args[0][0])
+        lib.save_health({"status": lib.GREEN, "last_verdict": {
+            "started_at": (DAY + timedelta(hours=18)).isoformat(), "status": lib.GREEN}})
+        with mock.patch("builtins.print") as pr:
+            cli.main(["status"])
+        self.assertNotIn("ждёт проверки", pr.call_args[0][0])
+
+    def test_window_and_daily_time_match_timers(self):
+        deploy = _HERE.parent / "deploy"
+        daily = (deploy / "meeting-notary-canary.timer").read_text(encoding="utf-8")
+        self.assertIn("\nOnCalendar=*-*-* 01:40:00 UTC\n", daily)       # 01:40 UTC = 04:40 МСК
+        self.assertEqual(lib.DAILY_RUN_MSK, (4, 40))
+        sniff = (deploy / "meeting-notary-telemost-sniff.timer").read_text(encoding="utf-8")
+        self.assertIn("\nOnCalendar=hourly\n", sniff)
+        self.assertTrue(lib.in_version_check_window(MORNING))
+        self.assertTrue(lib.in_version_check_window(MORNING + timedelta(minutes=57)))   # 07:59
+        self.assertFalse(lib.in_version_check_window(MORNING + timedelta(minutes=58)))  # 08:00
+        self.assertFalse(lib.in_version_check_window(MORNING - timedelta(minutes=3)))   # 06:59
 
     def test_pending_recheck_from_health_runs(self):
         lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])

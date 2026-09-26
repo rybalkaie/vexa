@@ -3,10 +3,11 @@
 ЗАЧЕМ. Телемост меняет вход без предупреждения примерно раз в 1–2 месяца; 21–23.09
 бот три дня не заходил ни на одну встречу, и тревоги не было. Сторож входа
 (фаза 1, `join_watch`) ловит срыв на НАСТОЯЩЕЙ встрече — когда она уже теряется.
-Самопроверка ловит поломку заранее: каждое утро (04:40 МСК) и сразу после
-обновления Телемоста в запасную переговорку Т-10 (решение владельца 23.09: ни одна
-серия там не сидит) заходят «Тест-диктор» и бот, диктор говорит фразу с кодовым
-словом, бот её записывает, мы ищем слово в расшифровке.
+Самопроверка ловит поломку заранее: каждое утро (04:40 МСК), а после обновления
+Телемоста — ещё и утром в 07:00–08:00 МСК, если ежедневная новую версию ещё не
+проверила, в запасную переговорку Т-10 (решение владельца 23.09: ни одна серия там не
+сидит) заходят «Тест-диктор» и бот, диктор говорит фразу с кодовым словом, бот её
+записывает, мы ищем слово в расшифровке.
 
 КАК (один прогон, `run_once`).
   1. Защиты (`guard_reason`): идёт настоящий бот → не мешаем; встреча в очереди
@@ -35,8 +36,15 @@
      второе ухо — запись, звук, кодовое слово, переключение, «не ушёл раньше команды».
 
 ЧТО ЕЩЁ. `sniff` раз в час смотрит версию Телемоста на главной странице;
-сменилась → внеплановая самопроверка, её итог владелец получает и тогда, когда
-всё хорошо. `warn_tick` (из тика запускателя): пока самопроверка красная — за
+сменилась → проверка бота на новой версии, её итог владелец получает и тогда, когда
+всё хорошо. Только утром, пока в Т-10 никого нет (решение владельца 26.09: «почему
+днём? можем утром, часов в 7–8»): днём «нюх» лишь запоминает, что проверка нужна.
+Её закрывает любая самопроверка на боевом образе, дошедшая до итога (🟢/🟡/🔴) и
+начатая после того, как «нюх» увидел новую версию, — обычно ежедневная в 04:40
+(`version_check_covered`); не закрыла → внеплановая в 07:00–08:00 МСК
+(`in_version_check_window`). Перепроверка неподтверждённого красного
+(`pending_recheck`) этим окном не ограничена: бот, возможно, сломан, и ждать утра
+нельзя. `warn_tick` (из тика запускателя): пока самопроверка красная — за
 ~10 минут до каждой встречи предупредить владельца, чтобы он включил запись в
 Телемосте сам; и раз в сутки тихо сказать, если самопроверка больше суток не
 доходила до итога (умерла молча / не сработал таймер).
@@ -212,8 +220,16 @@ TELEMOST_HOME = "https://telemost.yandex.ru/"
 VERSION_HISTORY = 20
 SNIFF_ERROR_ALERT_AFTER = 6
 #: Комната была занята при внеплановой проверке → следующая попытка не раньше,
-#: чем через 2 часа: днём Т-10 бывает занята, а заходить к людям каждый час — нет.
+#: чем через 2 часа: заходить к людям каждый час — нет. Для проверки после обновления
+#: это значит «завтра утром» (окно ниже — час), для перепроверки красного — через 2 ч.
 BUSY_RETRY_BACKOFF_MIN = 120
+#: Проверка после обновления Телемоста — только утром, пока в Т-10 никого нет (решение
+#: владельца 26.09: «можем утром, часов в 7–8»): [07:00, 08:00) МСК. «Нюх» раз в час
+#: (таймер hourly + до 5 мин разброса) попадает в окно один раз — в 07:0x.
+VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H = 7, 8
+#: Ежедневная самопроверка — `meeting-notary-canary.timer`, 01:40 UTC = 04:40 МСК
+#: (тест сверяет с юнитом). Нужна здесь только для слов владельцу «когда проверю».
+DAILY_RUN_MSK = (4, 40)
 
 # Предупреждение перед встречами.
 WARN_FROM_MIN, WARN_TO_MIN = 8, 12
@@ -1589,8 +1605,14 @@ def apply_final(
     now: datetime,
     *,
     first: Optional[Dict[str, Any]] = None,
+    version_check: bool = False,
 ) -> Tuple[Dict[str, Any], List[Tuple[str, bool]]]:
-    """Новое состояние «бот здоров/сломан» + сообщения владельцу [(текст, беззвучно)]."""
+    """Новое состояние «бот здоров/сломан» + сообщения владельцу [(текст, беззвучно)].
+
+    `version_check` — этот прогон закрывает ожидающую проверку после обновления
+    Телемоста (`closes_version_check`: например, ежедневный в 04:40 после смены версии
+    накануне): владелец получает её итог так же, как от внеплановой.
+    """
     h = dict(health or {})
     msgs: List[Tuple[str, bool]] = []
     status = final.get("status")
@@ -1631,6 +1653,11 @@ def apply_final(
 
     h["consecutive_skips"] = 0
     h["pending_recheck"] = False
+    if status in (GREEN, YELLOW, RED):
+        # Прогон дошёл до итога. Время его НАЧАЛА — по нему «нюх» решает, проверена ли
+        # уже новая версия Телемоста (`version_check_covered`, фаза 6б).
+        h["last_verdict"] = {"at": iso(now), "started_at": final.get("started_at") or iso(now),
+                             "status": status}
     h["reasons"] = list(final.get("reasons") or [])
     h["reasons_human"] = human_reasons(final) if final.get("reasons") else ""
     if status != prev or not h.get("since"):
@@ -1662,11 +1689,12 @@ def apply_final(
             f"Не срочно: бот заходит и пишет.",
             True,
         ))
-    # «Нюх» уже написал «Телемост обновился… запускаю внеплановую самопроверку» —
-    # обещанный итог обязан прийти и тогда, когда всё хорошо (цикл5 фазы 2, У3).
-    # Если выше уже ушло 🟢/🟡 — оно и есть итог, второе не шлём.
+    # «Нюх» уже написал «Телемост обновился… проверю бота» — обещанный итог обязан
+    # прийти и тогда, когда всё хорошо (цикл5 фазы 2, У3), и тогда, когда проверку
+    # закрыла ежедневная самопроверка (фаза 6б). Если выше уже ушло 🟢/🟡 — оно и есть
+    # итог, второе не шлём.
     why = str(final.get("reason") or "")
-    if why.startswith("version-change") and status in (GREEN, YELLOW) and not msgs:
+    if (why.startswith("version-change") or version_check) and status in (GREEN, YELLOW) and not msgs:
         ver = final.get("telemost_version")
         remark = f" Замечание: {human_reasons(final)}." if status == YELLOW else ""
         msgs.append((
@@ -1767,7 +1795,9 @@ def _run_cycle_locked(*, deps, image, room, reason, force, kit) -> Dict[str, Any
 
     def finish(final: Dict[str, Any], first: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if production:
-            new_h, msgs = apply_final(health, final, deps.now(), first=first)
+            closes = closes_version_check(load_version_state(), final.get("started_at")) \
+                and final.get("status") in (GREEN, YELLOW, RED)
+            new_h, msgs = apply_final(health, final, deps.now(), first=first, version_check=closes)
             try:
                 save_health(new_h)
             except OSError as e:
@@ -1860,6 +1890,55 @@ def parse_version(html: str) -> Optional[str]:
     return None
 
 
+def in_version_check_window(now: datetime) -> bool:
+    """Сейчас утреннее окно проверки после обновления Телемоста: [07:00, 08:00) МСК."""
+    return VERSION_CHECK_FROM_H <= now.astimezone(_MSK).hour < VERSION_CHECK_TO_H
+
+
+def closes_version_check(vstate: Optional[Dict[str, Any]], started_at: Any) -> bool:
+    """Прогон, начатый в `started_at`, проверил новую версию Телемоста.
+
+    Проверка ждёт (`pending_check`), а прогон начался не раньше, чем «нюх» увидел новую
+    версию (`seen_at`). Итог прогона (🟢/🟡/🔴) проверяет вызывающий.
+    """
+    st = _dict(vstate)
+    if not st.get("pending_check"):
+        return False
+    seen = parse_ts(st.get("seen_at"))
+    started = parse_ts(started_at)
+    return bool(seen and started and started >= seen)
+
+
+def version_check_covered(vstate: Optional[Dict[str, Any]], health: Optional[Dict[str, Any]]) -> bool:
+    """Ожидающую проверку после обновления уже закрыла самопроверка с итогом.
+
+    Решение владельца 26.09: если после смены версии прошла ежедневная самопроверка
+    (04:40 МСК), отдельная не нужна. Закрывает любой прогон боевого образа с итогом
+    (`health.last_verdict` пишет `apply_final`), начатый после того, как «нюх» увидел
+    версию; пропуск или сбой самой проверки — не закрывает.
+    """
+    return closes_version_check(vstate, _dict(_dict(health).get("last_verdict")).get("started_at"))
+
+
+def version_check_pending(vstate: Optional[Dict[str, Any]], health: Optional[Dict[str, Any]]) -> bool:
+    """Проверка после обновления Телемоста ещё нужна."""
+    return bool(_dict(vstate).get("pending_check")) and not version_check_covered(vstate, health)
+
+
+def _version_check_plan(now: datetime) -> str:
+    """Слова владельцу: когда бот будет проверен на новой версии Телемоста."""
+    if in_version_check_window(now):
+        return "Запускаю внеплановую самопроверку."
+    local = now.astimezone(_MSK)
+    daily_h, daily_m = DAILY_RUN_MSK
+    if (daily_h, daily_m) <= (local.hour, local.minute) and local.hour < VERSION_CHECK_FROM_H:
+        return (f"Бота проверю сегодня в {VERSION_CHECK_FROM_H:02d}:00–{VERSION_CHECK_TO_H:02d}:00 МСК, "
+                f"пока в Т-10 никого нет.")
+    return (f"Бота проверю утром, пока в Т-10 никого нет: ежедневной самопроверкой в "
+            f"{daily_h:02d}:{daily_m:02d} МСК, а если она не пройдёт до конца — внеплановой в "
+            f"{VERSION_CHECK_FROM_H:02d}:00–{VERSION_CHECK_TO_H:02d}:00 МСК.")
+
+
 def sniff_update(
     state: Dict[str, Any], version: Optional[str], error: Optional[str], now: datetime
 ) -> Tuple[Dict[str, Any], List[Tuple[str, bool]], bool]:
@@ -1893,7 +1972,7 @@ def sniff_update(
         return st, msgs, False  # первое наблюдение — только записать
     st["pending_check"] = True
     st.pop("retry_after", None)
-    msgs.append((f"Телемост обновился: {prev} → {version}. Запускаю внеплановую самопроверку.", True))
+    msgs.append((f"Телемост обновился: {prev} → {version}. {_version_check_plan(now)}", True))
     return st, msgs, True
 
 
@@ -1904,7 +1983,13 @@ def sniff(
     room: str = DEFAULT_ROOM,
     run: Optional[Callable[..., Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Посмотреть версию; сменилась или висит отложенная проверка → прогон."""
+    """Посмотреть версию; сменилась или висит отложенная проверка → прогон.
+
+    Фаза 6б (решение владельца 26.09): проверка после обновления — только в утреннем
+    окне 07:00–08:00 МСК и только если её ещё не закрыла самопроверка с итогом, начатая
+    после смены версии (обычно ежедневная в 04:40). Перепроверка неподтверждённого
+    красного (`pending_recheck`) — как раньше, на ближайшем «нюхе».
+    """
     now = deps.now()
     version: Optional[str] = None
     error: Optional[str] = None
@@ -1921,20 +2006,32 @@ def sniff(
     except Exception as e:  # noqa: BLE001
         error = type(e).__name__
     st, msgs, changed = sniff_update(load_version_state(), version, error, now)
+    health = load_health()
+    if st.get("pending_check") and version_check_covered(st, health):
+        # Самопроверка с итогом (обычно ежедневная в 04:40) прошла ПОСЛЕ того, как «нюх»
+        # увидел новую версию, — отдельная не нужна (решение владельца 26.09). Её итог
+        # владелец уже получил из `apply_final`.
+        st["pending_check"] = False
+        st.pop("retry_after", None)
+        logger.info("[canary] проверку после обновления закрыла самопроверка %s",
+                    _dict(health.get("last_verdict")).get("started_at"))
     write_json(version_path(), st)
     _notify_all(deps, msgs)
     logger.info("[canary] нюх: версия=%s ошибка=%s смена=%s", version, error, changed)
 
     out: Dict[str, Any] = {"version": version, "error": error, "changed": changed, "run": None}
-    health = load_health()
-    pending = bool(st.get("pending_check")) or bool(health.get("pending_recheck"))
-    if not pending:
+    version_due = bool(st.get("pending_check")) and in_version_check_window(now)
+    recheck = bool(health.get("pending_recheck"))
+    if not (version_due or recheck):
+        if st.get("pending_check"):
+            logger.info("[canary] проверка после обновления ждёт утра (%02d:00–%02d:00 МСК)",
+                        VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H)
         return out
     retry_after = parse_ts(st.get("retry_after"))
     if retry_after and now < retry_after:
         logger.info("[canary] внеплановая проверка отложена до %s (комната была занята)", st["retry_after"])
         return out
-    why = "version-change" if st.get("pending_check") else "recheck"
+    why = "version-change" if version_due else "recheck"
     result = (run or run_cycle)(deps=deps, image=image, room=room, reason=why, force=False)
     out["run"] = _mini(result)
     st = load_version_state()
@@ -1942,8 +2039,12 @@ def sniff(
     if status == SKIPPED:
         if result.get("skip_reason") == "room_busy":
             st["retry_after"] = iso(now + timedelta(minutes=BUSY_RETRY_BACKOFF_MIN))
-        # остальные защиты (идёт бот, скоро встреча, замок) — просто попробуем через час
-    elif is_production_image(image):
+        # остальные защиты (идёт бот, скоро встреча, замок) — просто попробуем на
+        # следующем «нюхе» (проверка после обновления — в следующее утреннее окно)
+    elif is_production_image(image) and status in (GREEN, YELLOW, RED):
+        # Закрывает только прогон с итогом: сбой самой проверки (error) и красный без
+        # перепроверки (red_unconfirmed) проверку после обновления не закрывают —
+        # её закроет перепроверка или следующее утро (фаза 6б).
         st["pending_check"] = False
         st.pop("retry_after", None)
     # Ручной `sniff --image <кандидат>` проверку после обновления не «съедает»:
@@ -2124,7 +2225,8 @@ def status_text() -> str:
     if h.get("image"):
         lines.append(f"Образ: {h['image']}")
     lines.append(f"Телемост: версия {v.get('version') or '?'}"
-                 + (" — ждёт внеплановой проверки" if v.get("pending_check") else "")
+                 + (f" — ждёт проверки бота утром ({VERSION_CHECK_FROM_H:02d}:00–{VERSION_CHECK_TO_H:02d}:00 МСК, "
+                    f"если раньше не пройдёт ежедневная)" if version_check_pending(v, h) else "")
                  + (f", ошибок загрузки подряд: {v['consecutive_errors']}" if v.get("consecutive_errors") else ""))
     return "\n".join(lines)
 

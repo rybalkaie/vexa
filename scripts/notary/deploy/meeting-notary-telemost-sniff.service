@@ -1,5 +1,5 @@
 [Unit]
-Description=Ватсон: «нюх» версии Телемоста; сменилась — внеплановая самопроверка (ISS-60, фаза 2)
+Description=Ватсон: «нюх» версии Телемоста; сменилась — самопроверка утром 07:00–08:00 МСК (ISS-60)
 Documentation=file:///srv/meeting-notary/vexa/scripts/notary/lib/canary.py
 After=network-online.target docker.service
 Wants=network-online.target
@@ -19,7 +19,8 @@ Environment=MEETING_NOTARY_CANARY_DIR=/home/dev/meeting-notary/_tmp/canary
 # Значения по умолчанию: если то же задано в .env.notary — выигрывает файл.
 Environment=MEETING_NOTARY_LOG_DIR=/home/dev/meeting-notary/logs
 ExecStart=/home/dev/meeting-notary/venv/bin/python -m notary.canary sniff
-# Сам запрос — секунды; срок — под внеплановую самопроверку, если версия сменилась.
+# Сам запрос — секунды; срок — под внеплановую самопроверку (утром 07:00–08:00 МСК
+# после смены версии) или перепроверку красного.
 TimeoutStartSec=45min
 # Как у meeting-notary-canary.service: SIGTERM — только питону (он выводит бота и
 # диктора внепланового прогона из комнаты), остальным SIGKILL после TimeoutStopSec.
