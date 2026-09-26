@@ -1046,10 +1046,11 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
             "WAV сохранён (sid=%s): результат ещё не подтверждён порталом (R13.4)", sid,
         )
         return
-    # Фаза 4 (ISS-60): спутник записи (второе ухо / заглушённая основная) — по тем же
-    # гейтам, что основная запись, и даже если основную уже убрали прошлым тиком
+    # Фаза 4 (ISS-60) + фаза 6б (копилка владельца №3): остальной звук встречи —
+    # спутник (второе ухо / заглушённая основная) и куски основной записи 2…N — по тем
+    # же гейтам, что основная запись, и даже если основную уже убрали прошлым тиком
     # (иначе он остался бы навсегда).
-    _cleanup_second_ear(meta, sid)
+    _cleanup_extra_wavs(meta, sid)
     wav_path = (meta.get("files") or {}).get("wav")
     if not wav_path:
         return
@@ -1088,17 +1089,21 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
         logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
 
 
-def _cleanup_second_ear(meta: dict | None, sid: str) -> None:
-    """Фаза 4 (ISS-60): удалить спутников записи встречи (`second_ear.companion_wavs`).
+def _cleanup_extra_wavs(meta: dict | None, sid: str) -> None:
+    """Удалить весь звук встречи, кроме `files.wav` (`second_ear.extra_recording_wavs`).
 
-    Спутник — второе ухо (`<дата>-<сессия>.chunk0.wav`), пока протокол из основной;
-    а когда протокол собран из второго уха (`files.wav` = оно, его удаляет основной
-    код) — кусок основной, который до фазы 4 был `files.wav` и удалялся здесь всегда.
+    Фаза 4 (ISS-60): спутник — второе ухо (`<дата>-<сессия>.chunk0.wav`), пока протокол
+    из основной; а когда протокол собран из второго уха (`files.wav` = оно, его удаляет
+    основной код) — кусок основной, который до фазы 4 был `files.wav`. Фаза 6б (копилка
+    владельца №3, 26.09): и все остальные куски основной записи — длинная встреча с
+    паузами пишется кусками `.chunk1…N.wav`, а в `files.wav` стоит только первый кусок
+    с речью; остальные раньше не удалял никто.
     Подчиняется ТЕМ ЖЕ правилам хранения, что основная запись: зовётся только там,
     где сборщик удаляет `files.wav`, и только после тех же гейтов — доставка
-    подтверждена, keep_audio нет, портал не держит исходники. Путь — из meta бота,
-    со строгой проверкой имени. Только на сервере (LOCAL_FINALIZE): с мака по ssh
-    не удаляется никогда.
+    подтверждена, keep_audio нет, портал не держит исходники. Пути — из meta бота,
+    со строгой проверкой: только куски `.wav` ЭТОЙ встречи (`sid` — имя её meta), та же
+    папка, номер куска. Транскрипты, протоколы и meta не трогаются. Только на сервере
+    (LOCAL_FINALIZE): с мака по ssh не удаляется никогда.
     """
     if not LOCAL_FINALIZE or not isinstance(meta, dict):
         return
@@ -1107,7 +1112,7 @@ def _cleanup_second_ear(meta: dict | None, sid: str) -> None:
 
         second_ear.cleanup_after_delivery(meta, sid, host_path=Path)
     except Exception as e:  # noqa: BLE001 — уборка не должна ронять сбор встреч
-        logger.warning("Второе ухо не убрано (sid=%s): %s", sid, type(e).__name__)
+        logger.warning("Куски записи не убраны (sid=%s): %s", sid, type(e).__name__)
 
 
 def _read_series_from_meta(filename_uid: str) -> str | None:
@@ -1631,9 +1636,10 @@ def _do_finalize_and_collect(session_uid: str) -> None:
             _portal_report_purged(session_uid)
         except OSError as e:
             logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
-    # Фаза 4 (ISS-60): спутник записи (второе ухо / заглушённая основная) — те же
+    # Фаза 4 (ISS-60) + фаза 6б (копилка владельца №3): остальной звук встречи —
+    # спутник (второе ухо / заглушённая основная) и куски основной записи 2…N — те же
     # гейты, та же минута, что у основной записи.
-    _cleanup_second_ear(meta_obj, session_uid)
+    _cleanup_extra_wavs(meta_obj, session_uid)
 
 
 _SESSION_RE = re.compile(r"^auto-(?P<mid>[^-]+(?:-[^-]+)*?)-(?P<dt>\d{4}\d{2}\d{2}T\d{6}Z)$")

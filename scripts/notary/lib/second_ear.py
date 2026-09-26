@@ -19,10 +19,18 @@
     портала, не при keep_audio. Иначе второе ухо (или заглушённая основная) копилось
     бы на диске навсегда (час встречи ≈ 115 МБ; свободно на сервере ~25 ГБ) — метельщик
     `meeting-notary-cleanup` куски `*.chunkN.wav` не находит.
+  • Фаза 6б (копилка владельца №3, 26.09): там же и тогда же удаляются ВСЕ остальные
+    куски основной записи этой встречи (`extra_recording_wavs`: длинная встреча с
+    паузами пишется кусками `.chunk1…N.wav`, а в `files.wav` стоит только первый кусок
+    с речью). Раньше их не удалял никто — полные голоса участников лежали вечно.
   • Сбой расшифровки (`finalize-meeting._stash_into_failed`): исходник переезжает в
     `_failed/`, meta из `_tmp/` удаляется — спутники переезжают туда же
     (`stash_companions`), иначе сборщик их больше не нашёл бы. В `_failed/` их убирает
     та же уборка `<sid>.*` после удачного повтора, с тем же удержанием для портала.
+    Остальные куски основной записи НЕ переезжают: из них повтор заново склеивает звук
+    (`wav_concat.resolve_wav_for_stt`), и полупереехавший набор дал бы протокол без
+    части встречи. Их удаляет та же уборка после удачного повтора
+    (`primary_chunk_wavs`, finalize 5.1) — с тем же удержанием для портала.
   • Удержание для портала (`portal_delivery.session_wav_files`) и сторож зависаний
     сборщика знают файл по имени `*.chunk<цифры>.wav` — отдельного кода не нужно.
   • Самопроверка (`lib/canary.py`) отличает второе ухо от основной записи по суффиксу.
@@ -36,7 +44,7 @@ import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("notary.second_ear")
 
@@ -48,6 +56,11 @@ AUDIO_SOURCE_PRIMARY = "primary"
 _PRIMARY_CHUNK_RE = re.compile(r"\.chunk([1-9]\d*)\.wav$")
 #: Хвост имени любого куска — с ним спутник переезжает в `_failed/<sid>.<хвост>`.
 _CHUNK_TAIL_RE = re.compile(r"\.(chunk\d+\.wav)$")
+#: Полное имя куска записи бота: `<ГГГГ-ММ-ДД>-<сессия>.chunk<N>.wav` (`recording.ts`,
+#: chunkWavPath). N = 0 — второе ухо, N ≥ 1 — основная запись.
+_CHUNK_NAME_RE = re.compile(r"^(?P<stem>\d{4}-\d{2}-\d{2}-.+?)\.chunk(?P<n>0|[1-9]\d*)\.wav$")
+#: Основа имени куска: дата встречи + sessionUid бота.
+_DATED_STEM_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-(?P<uid>.+)$")
 
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo
@@ -229,26 +242,134 @@ def companion_wavs(meta: Any) -> List[str]:
     return out
 
 
-def cleanup_after_delivery(meta: Any, sid: str, *, host_path: Callable[[str], Path]) -> List[str]:
-    """Удалить спутников записи после подтверждённой доставки. Гейты — у вызывающего.
+def _chunk_parts(wav: Any) -> Optional[Tuple[PurePosixPath, str, int]]:
+    """(папка, основа `<дата>-<сессия>`, номер куска) для пути куска записи бота, иначе None."""
+    if not isinstance(wav, str) or not wav:
+        return None
+    p = PurePosixPath(wav)
+    if ".." in p.parts:
+        return None
+    m = _CHUNK_NAME_RE.match(p.name)
+    if not m:
+        return None
+    return p.parent, m.group("stem"), int(m.group("n"))
 
-    Зовётся ТАМ ЖЕ и ТОГДА ЖЕ, когда сборщик удаляет основную запись (`files.wav`):
-    после доставки, не под удержанием портала, не при keep_audio. Ссылкам не следует.
-    Возвращает пути удалённых файлов.
+
+def _session_matches(stem: str, sid: Any) -> bool:
+    """Основа имени куска принадлежит ЭТОЙ встрече.
+
+    `sid` сборщика — имя meta-файла (`<дата>-<сессия>`), `sid` финализации — sessionUid
+    без даты: принимаем ровно эти две формы.
     """
+    s = str(sid or "")
+    if not s or "/" in s or s in (".", ".."):
+        return False
+    if stem == s:
+        return True
+    m = _DATED_STEM_RE.match(stem)
+    return bool(m) and m.group("uid") == s
+
+
+def _chunk_entries(meta: Any) -> List[Any]:
+    """Пути из `recording.chunks[]` и `recording.primaryChunks[]` (как есть, без проверки)."""
+    rec = _dict(_dict(meta).get("recording"))
+    out: List[Any] = []
+    for key in ("chunks", "primaryChunks"):
+        raw = rec.get(key)
+        for c in raw if isinstance(raw, list) else []:
+            if isinstance(c, dict):
+                out.append(c.get("wav"))
+    return out
+
+
+def _meeting_anchor(meta: Any, sid: Any) -> Optional[Tuple[PurePosixPath, str]]:
+    """Папка и основа имени записи ЭТОЙ встречи — с ними сверяется каждый кусок.
+
+    Берётся из второго уха, иначе из `files.wav` (если это кусок), иначе из первого куска
+    в meta. Основа обязана принадлежать встрече `sid`, иначе None: meta не той встречи
+    не даёт удалить ничего.
+    """
+    m = _dict(meta)
+    for wav in (ear_wav(m), _dict(m.get("files")).get("wav"), *_chunk_entries(m)):
+        parts = _chunk_parts(wav)
+        if parts is None:
+            continue
+        folder, stem, _n = parts
+        return (folder, stem) if _session_matches(stem, sid) else None
+    return None
+
+
+def primary_chunk_wavs(meta: Any, sid: Any) -> List[str]:
+    """Все куски ОСНОВНОЙ записи встречи `sid`, известные из meta (номер куска ≥ 1).
+
+    Источники: `files.wav`, `recording.chunks[]`, `recording.primaryChunks[]` (последнее —
+    когда протокол собран из второго уха). Путь проверяется строго, потому что удаление
+    идёт по пути из файла: имя `<дата>-<сессия>.chunk<N≥1>.wav` этой встречи, та же папка,
+    что у остальной её записи, без `..`. Что не прошло проверку — пропускается молча.
+    """
+    anchor = _meeting_anchor(meta, sid)
+    if anchor is None:
+        return []
+    m = _dict(meta)
+    out: List[str] = []
+    for wav in (_dict(m.get("files")).get("wav"), *_chunk_entries(m)):
+        parts = _chunk_parts(wav)
+        if parts is None or parts[2] < 1 or (parts[0], parts[1]) != anchor:
+            continue
+        if wav not in out:
+            out.append(str(wav))
+    return out
+
+
+def extra_recording_wavs(meta: Any, sid: Any) -> List[str]:
+    """Весь звук встречи `sid`, кроме `files.wav`, — удаляется вместе с ним после доставки.
+
+    Спутники (`companion_wavs`: второе ухо / заглушённая основная) и, с фазы 6б
+    (копилка владельца №3, 26.09), все остальные куски основной записи
+    (`primary_chunk_wavs`). Сам `files.wav` убирает основной код сборщика. Каждый путь —
+    кусок ЭТОЙ встречи в её папке (`_meeting_anchor`); meta не той встречи → пусто.
+    """
+    anchor = _meeting_anchor(meta, sid)
+    if anchor is None:
+        return []
+    main = _dict(_dict(meta).get("files")).get("wav")
+    main_name = PurePosixPath(main).name if isinstance(main, str) and main else None
+    out: List[str] = []
+    for wav in (*companion_wavs(meta), *primary_chunk_wavs(meta, sid)):
+        parts = _chunk_parts(wav)
+        if parts is None or (parts[0], parts[1]) != anchor:
+            continue
+        if PurePosixPath(wav).name != main_name and wav not in out:
+            out.append(wav)
+    return out
+
+
+def remove_wavs(paths: List[str], sid: str, *, host_path: Callable[[str], Path], why: str) -> List[str]:
+    """Удалить файлы звука по списку. Ссылкам не следует, только обычные файлы. Не бросает."""
     removed: List[str] = []
-    for wav in companion_wavs(meta):
+    for wav in paths:
         p = host_path(wav)
         try:
             if p.is_symlink() or not p.is_file():
                 continue
             p.unlink()
         except OSError as e:
-            logger.warning("Спутник записи %s не удалён (%s)", p.name, type(e).__name__)
+            logger.warning("Кусок записи %s не удалён (%s)", p.name, type(e).__name__)
             continue
-        logger.info("Спутник записи удалён после доставки (sid=%s, path=%s)", sid, wav)
+        logger.info("Кусок записи удалён %s (sid=%s, path=%s)", why, sid, wav)
         removed.append(wav)
     return removed
+
+
+def cleanup_after_delivery(meta: Any, sid: str, *, host_path: Callable[[str], Path]) -> List[str]:
+    """Удалить весь звук встречи, кроме `files.wav`, после подтверждённой доставки.
+
+    Гейты — у вызывающего. Зовётся ТАМ ЖЕ и ТОГДА ЖЕ, когда сборщик удаляет основную
+    запись (`files.wav`): после доставки, не под удержанием портала, не при keep_audio.
+    Список — `extra_recording_wavs`: спутники и куски основной записи 2…N. Ссылкам не
+    следует. Возвращает пути удалённых файлов.
+    """
+    return remove_wavs(extra_recording_wavs(meta, sid), sid, host_path=host_path, why="после доставки")
 
 
 def stash_companions(meta: Any, sid: str, failed_dir: Path, *,
@@ -261,6 +382,11 @@ def stash_companions(meta: Any, sid: str, failed_dir: Path, *,
     удержанием для портала), а при ручном разборе всё лежит рядом. Перенос = копия,
     затем удаление оригинала, только если копия целая. Не бросает (OSError — в журнал).
     Возвращает пути перенесённых файлов.
+
+    Остальные куски основной записи сюда НЕ входят и остаются на месте (фаза 6б): из
+    них повтор заново склеивает звук, а набор, переехавший наполовину (кончилось место),
+    дал бы протокол без части встречи. Их удаляет finalize после удачного повтора
+    (`primary_chunk_wavs`).
     """
     safe_sid = PurePosixPath(str(sid)).name
     moved: List[str] = []

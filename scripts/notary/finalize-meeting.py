@@ -434,6 +434,37 @@ def _keep_sources_until_portal_ack(session_uid: str, meta: dict) -> bool:
         return True
 
 
+def _remove_primary_chunks_after_retry(
+    meta: dict, session_uid: str, log: logging.Logger, *, hold: bool,
+) -> list[str]:
+    """Удачный повтор после сбоя расшифровки (5.1): удалить куски основной записи встречи.
+
+    ISS-60 фаза 6б (копилка владельца №3, 26.09). После сбоя куски остаются в папке
+    записей бота (из них повтор заново склеивает звук), meta оттуда удалена — сборщик
+    их больше не видит, и они лежали вечно. Зовётся там же, где 5.1 удаляет
+    `_failed/<sid>.*`, и при том же условии: `hold` (портал не подтвердил приём —
+    `_keep_sources_until_portal_ack`) → не удаляем ничего.
+
+    Только звук: куски `<дата>-<сессия>.chunk<N≥1>.wav` ЭТОЙ встречи из её meta, со
+    строгой проверкой путей (`second_ear.primary_chunk_wavs`); расшифровки, протоколы и
+    meta не трогаются. Ссылкам не следует. Не бросает: уборка не валит финализацию.
+    """
+    if hold:
+        log.info("[portal] куски записи %s оставлены: результат ещё не подтверждён порталом", session_uid)
+        return []
+    try:
+        from lib import second_ear as _second_ear  # noqa: PLC0415
+        from lib.wav_concat import _remap_host_path  # noqa: PLC0415
+
+        return _second_ear.remove_wavs(
+            _second_ear.primary_chunk_wavs(meta, session_uid), session_uid,
+            host_path=lambda p: Path(_remap_host_path(p)), why="после удачного повтора",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("[retry] куски записи не убраны (%s)", type(e).__name__)
+        return []
+
+
 def _push_telegram(message: str, *, silent: bool = False) -> None:
     """Тонкая обёртка над `/srv/meeting-notary/bin/tg-send` (он сам читает .env.notary).
 
@@ -528,7 +559,8 @@ def _stash_into_failed(
     # переезжает в _failed/ вместе с исходником. meta из _tmp/ только что удалена:
     # сборщик его больше не найдёт, и файл с голосами встречи остался бы навсегда.
     # В _failed/ его уберёт уборка `<sid>.*` после удачного повтора (5.1). Сбой
-    # переезда исходник и повтор не трогает.
+    # переезда исходник и повтор не трогает. Остальные куски основной записи остаются
+    # на месте (фаза 6б): из них повтор заново склеивает звук; их удаляет 5.1.
     try:
         from lib import second_ear as _second_ear  # noqa: PLC0415
         from lib.wav_concat import _remap_host_path  # noqa: PLC0415
@@ -2064,6 +2096,12 @@ def main() -> int:
                 f.unlink()
             except OSError:
                 pass
+        # ISS-60 фаза 6б (копилка владельца №3, 26.09): куски основной записи этой
+        # встречи, оставшиеся в папке записей бота после сбоя расшифровки, — вместе с
+        # остальными её файлами, при том же условии (портал не держит исходники).
+        # `_stash_into_failed` переложил в `_failed/` склейку и спутников, а сами куски
+        # оставил: из них повтор склеивал звук. Раньше их не удалял никто.
+        _remove_primary_chunks_after_retry(meta, session_uid, log, hold=_hold_sources)
         series_label = meta.get("series") or session_uid
         n = (attempts_count or 0) + 1
         _stt_friendly = {

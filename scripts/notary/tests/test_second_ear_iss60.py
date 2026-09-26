@@ -270,20 +270,25 @@ class CollectorCleanupTest(_Tmp):
         return self.meta(source="second_ear", chunks=[{"idx": 0, "wav": str(self.ear)}], files_wav=self.ear,
                          primaryChunks=prim)
 
-    def test_ear_as_protocol_source_primary_legacy_deleted_other_chunks_kept(self):
+    def test_ear_as_protocol_source_all_primary_chunks_deleted(self):
         # Цикл5 фазы 4 (Н1): до фазы 4 кусок основной стоял в files.wav и удалялся после
         # доставки. Теперь files.wav — ухо, а тот же кусок основной — спутник: удаляется
-        # так же; прочие куски основной — как незапрошенные куски сегодня.
+        # так же. Фаза 6б (копилка владельца №3, 26.09): и прочие куски основной тоже —
+        # раньше они оставались на диске навсегда.
         self.main2.write_bytes(b"RIFF")
         collector._maybe_cleanup_wav_after_delivered(self.ear_source_meta(), SID)
         self.assertFalse(self.ear.exists())
         self.assertFalse(self.main1.exists())
-        self.assertTrue(self.main2.exists())
+        self.assertFalse(self.main2.exists())
 
     def test_ear_source_primary_legacy_is_first_chunk_with_speech(self):
+        # Какой кусок основной — «спутник» (переезжает в _failed/ при сбое расшифровки):
+        # первый с речью. После доставки удаляются все куски (фаза 6б).
         self.main2.write_bytes(b"RIFF")
-        collector._maybe_cleanup_wav_after_delivered(self.ear_source_meta(speech_in=(2,)), SID)
-        self.assertTrue(self.main1.exists())
+        meta = self.ear_source_meta(speech_in=(2,))
+        self.assertEqual(second_ear.companion_wavs(meta), [str(self.main2)])
+        collector._maybe_cleanup_wav_after_delivered(meta, SID)
+        self.assertFalse(self.main1.exists())
         self.assertFalse(self.main2.exists())
 
     def test_ear_source_keep_audio_and_hold_keep_everything(self):
@@ -297,7 +302,7 @@ class CollectorCleanupTest(_Tmp):
 
     def test_finalize_path_cleanup_deletes_primary_legacy_too(self):
         # Вторая точка уборки (после финализации, collector.py «# 3. WAV cleanup»).
-        collector._cleanup_second_ear(self.ear_source_meta(), SID)
+        collector._cleanup_extra_wavs(self.ear_source_meta(), SID)
         self.assertFalse(self.main1.exists())
         self.assertTrue(self.ear.exists())  # files.wav убирает основной код, не спутник
 
@@ -310,12 +315,13 @@ class CollectorCleanupTest(_Tmp):
         self.assertTrue(target.exists())
 
     def test_both_cleanup_sites_call_ear_cleanup(self):
-        # Сборщик удаляет основную запись в двух местах — второе ухо обязано быть в обоих.
+        # Сборщик удаляет основную запись в двух местах — остальной звук встречи (второе
+        # ухо, куски основной 2…N) обязан уходить в обоих.
         src = (_NOTARY / "collector.py").read_text(encoding="utf-8")
         fn = src.split("def _maybe_cleanup_wav_after_delivered", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("_cleanup_second_ear(meta, sid)", fn)
+        self.assertIn("_cleanup_extra_wavs(meta, sid)", fn)
         tail = src.split("# 3. WAV cleanup", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("_cleanup_second_ear(meta_obj, session_uid)", tail)
+        self.assertIn("_cleanup_extra_wavs(meta_obj, session_uid)", tail)
 
 
 class CompanionTest(_Tmp):
