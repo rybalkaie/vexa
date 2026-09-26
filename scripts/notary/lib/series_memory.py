@@ -52,6 +52,17 @@ SCHEMA_VERSION = 1
 MEMORY_FILE_SUFFIX = "-memory.json"
 PROTOCOL_FILE_SUFFIX = "-protokol.md"
 
+# ISS-60 фаза 6б (копилка владельца №6, 26.09): встреча, собранная «лично мне» из
+# присланной записи по серии с групповым чатом (путь А `tools/ingest-recording.py`),
+# НЕ идёт в память серии: группа этот протокол не получала (владелец проверяет его
+# сам — роли не выверены), и следующие протоколы группы не должны на него опираться.
+# Пометку ставит обёртка в meta (`META_EXCLUDE_KEY`), `build_digest` переносит её в
+# выжимку (`EXCLUDED_KEY`), `list_series_digests` — единственная дверь чтения прошлых
+# встреч (память, открытые вопросы, кросс-фон, утренний дайджест, сверщик) — такие
+# выжимки пропускает. Файл выжимки остаётся: он нужен перевыпуску этой же встречи.
+META_EXCLUDE_KEY = "excludeFromSeriesMemory"
+EXCLUDED_KEY = "excluded_from_series_memory"
+
 # Дефолты (переопределяются env, см. ниже).
 DEFAULT_DEPTH = 3
 DEFAULT_RETENTION_DAYS = 180
@@ -1378,7 +1389,16 @@ def build_digest(
         digest["speaker_mapping"] = sm
     if isinstance(publication, dict) and publication:
         digest["publication"] = publication
+    # ISS-60 фаза 6б (№6): «лично мне» по серии с группой — не в память серии.
+    # Ленивый ключ: только когда пометка есть (старые выжимки без ключа — как раньше).
+    if meta.get(META_EXCLUDE_KEY) is True:
+        digest[EXCLUDED_KEY] = True
     return digest
+
+
+def is_excluded_digest(digest: Optional[dict]) -> bool:
+    """Выжимка встречи, которая не идёт в память серии (фаза 6б, №6)."""
+    return isinstance(digest, dict) and digest.get(EXCLUDED_KEY) is True
 
 
 # ---------------------------------------------------------------------------
@@ -1505,11 +1525,16 @@ def list_series_digests(
 
     `exclude_date` — пропустить выжимку текущей встречи (чтобы не подмешивать
     её саму в собственный контекст). Битые/нечитаемые файлы пропускаем молча.
+
+    ISS-60 фаза 6б (№6): выжимки встреч «лично мне» по серии с группой
+    (`is_excluded_digest`) в память серии не идут — их не видит ни один читатель
+    прошлых встреч (все читают через эту функцию).
     """
     d = Path(series_dir)
     if not d.is_dir():
         return []
     items: list[tuple[str, dict]] = []
+    skipped_personal = 0
     for entry in d.iterdir():
         if not entry.is_file():
             continue
@@ -1521,8 +1546,14 @@ def list_series_digests(
         dig = load_digest(entry)
         if dig is None:
             continue
+        if is_excluded_digest(dig):
+            skipped_personal += 1
+            continue
         dig.setdefault("date", date)
         items.append((date, dig))
+    if skipped_personal:
+        logger.debug("[series-memory] %s: встреч «лично мне» вне памяти серии: %d",
+                     d.name, skipped_personal)
     items.sort(key=lambda x: x[0])
     return [dig for _, dig in items]
 
@@ -3416,6 +3447,10 @@ def backfill_series(
             "date": date,
             # participants возьмёт из шапки протокола (meta пуст по составу).
         }
+        # ISS-60 фаза 6б (№6): пересборка (`overwrite`) не возвращает встречу «лично
+        # мне» в память серии — пометка живёт в выжимке, протокол её не несёт.
+        if mem_path.exists() and is_excluded_digest(load_digest(mem_path)):
+            meta[META_EXCLUDE_KEY] = True
         digest = build_digest(protocol_text, meta, date=date,
                               participant_filter=participant_filter)
         if save_digest(d, date, digest):

@@ -1153,5 +1153,102 @@ class TestRecoveryNoteInFinalize(unittest.TestCase):
                         "синтетика обёртки и признак в finalize разошлись")
 
 
+class TestPersonalRecoveryOutOfSeriesMemory(_RecoveryEnv):
+    """Фаза 6б (копилка владельца №6, 26.09): встреча, собранная «лично мне» (путь А) по
+    серии с групповым чатом, не идёт в память серии — следующие протоколы группы её не
+    видят. Путь Б — идёт, как обычная встреча; серия без группы — как обычно.
+
+    Двойник finalize пишет выжимку ровно как боевой блок 4.0.2d: из готового протокола,
+    с meta встречи целиком (`_digest_meta = dict(meta)`)."""
+
+    PREV = "2026-09-16"
+    NEXT = "2026-09-30"
+    PEOPLE = ["Иван Петров", "Мария Сидорова"]
+
+    def finalize_with_memory(self, seen: list | None = None):
+        base = self.fake_finalize(during=(lambda mp: seen.append(json.loads(Path(mp).read_text(
+            encoding="utf-8")))) if seen is not None else None)
+
+        def run(meta_path, output_dir, *, deliver=False):
+            rc, report = base(meta_path, output_dir, deliver=deliver)
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+            date = meta["startTs"][:10]
+            digest_meta = dict(meta)
+            digest_meta["date"] = date
+            digest_meta["participants"] = list(self.PEOPLE)
+            series_memory.save_meeting_digest(Path(output_dir) / meta["series"], date, PROTOCOL, digest_meta)
+            return rc, report
+        return run
+
+    def prev_group_meeting(self, series: str) -> Path:
+        sdir = self.W / series
+        series_memory.save_digest(sdir, self.PREV, {
+            "schema": 1, "date": self.PREV, "series": series, "participants": list(self.PEOPLE),
+            "themes": ["бюджет"], "key_points": [], "open_tasks": ["Иван Петров: подготовить отчёт"]})
+        return sdir
+
+    def memory_dates(self, sdir: Path) -> list:
+        return [d["date"] for d in series_memory.list_series_digests(sdir)]
+
+    def next_protocol_memory(self, sdir: Path) -> list:
+        return [d["date"] for d in series_memory.resolve_memory(
+            sdir, self.W, current_participants=list(self.PEOPLE), current_date=self.NEXT)]
+
+    def test_personal_by_group_series_stays_out_of_series_memory(self):
+        sdir = self.prev_group_meeting("grp-series")
+        seen: list = []
+        rc, out = self.run_main("--series", "grp-series", "--mode", "personal",
+                                finalize=self.finalize_with_memory(seen))
+        self.assertEqual((rc, out["mode"]), (0, "personal"), out)
+        self.assertIs(seen[0].get(ing.SERIES_MEMORY_EXCLUDE_KEY), True,
+                      "meta для finalize без пометки — повтор после сбоя расшифровки её потеряет")
+        self.assertTrue((sdir / f"{DATE}-memory.json").is_file(), "выжимка нужна перевыпуску этой встречи")
+        self.assertTrue(series_memory.is_excluded_digest(
+            series_memory.load_digest(sdir / f"{DATE}-memory.json")))
+        self.assertEqual(self.memory_dates(sdir), [self.PREV], "память серии взяла встречу «лично мне»")
+        self.assertEqual(self.next_protocol_memory(sdir), [self.PREV],
+                         "следующий протокол группы опирается на встречу «лично мне»")
+        meta = json.loads(Path(out["meta_path"]).read_text(encoding="utf-8"))
+        self.assertIs(meta.get(ing.SERIES_MEMORY_EXCLUDE_KEY), True)
+
+    def test_standard_by_group_series_goes_into_series_memory(self):
+        sdir = self.prev_group_meeting("grp-series")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "standard",
+                                finalize=self.finalize_with_memory())
+        self.assertEqual((rc, out["mode"]), (0, "standard"), out)
+        self.assertEqual(self.memory_dates(sdir), [self.PREV, DATE])
+        self.assertEqual(self.next_protocol_memory(sdir), [self.PREV, DATE])
+
+    def test_auto_withheld_from_group_stays_out_of_series_memory(self):
+        sdir = self.prev_group_meeting("grp-series")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "auto",
+                                finalize=self.finalize_with_memory())
+        self.assertEqual((rc, out["mode"]), (0, "personal"), out)
+        self.assertIn("mode_note", out)
+        self.assertEqual(self.memory_dates(sdir), [self.PREV])
+
+    def test_personal_by_series_without_group_is_ordinary_memory(self):
+        sdir = self.prev_group_meeting("dm-series")
+        rc, out = self.run_main("--series", "dm-series", "--mode", "personal",
+                                finalize=self.finalize_with_memory())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.memory_dates(sdir), [self.PREV, DATE])
+
+    def test_unreadable_registry_excludes(self):
+        self.assertTrue(ing.personal_excluded_from_series_memory("grp-series"))
+        self.assertFalse(ing.personal_excluded_from_series_memory("dm-series"))
+        with mock.patch("notary.cli.registry.load_watched", side_effect=OSError("disk")):
+            self.assertTrue(ing.personal_excluded_from_series_memory("dm-series"))
+            self.assertIsNone(ing.series_group_chat("grp-series"), "в группу без реестра не шлём")
+
+    def test_meta_key_matches_series_memory(self):
+        self.assertEqual(ing.SERIES_MEMORY_EXCLUDE_KEY, series_memory.META_EXCLUDE_KEY)
+        plain = ing.build_synthetic_meta(series="s", date=DATE, wav_path="/w.wav", participants=[], sid="x")
+        self.assertNotIn(ing.SERIES_MEMORY_EXCLUDE_KEY, plain)
+
+
+from lib import series_memory  # noqa: E402
+
+
 if __name__ == "__main__":
     unittest.main()

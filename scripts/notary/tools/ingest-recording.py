@@ -135,6 +135,10 @@ MODE_PERSONAL = "personal"   # путь А: лично владельцу
 MODE_STANDARD = "standard"   # путь Б: штатная доставка бота (чат серии)
 MODE_AUTO = "auto"           # группа у серии → standard, иначе personal
 MODES = (MODE_PERSONAL, MODE_STANDARD, MODE_AUTO)
+#: Пометка meta «встреча не идёт в память серии» — ровно `series_memory.META_EXCLUDE_KEY`
+#: (фаза 6б, копилка владельца №6; равенство сверяет тест). Ставится на пути А по серии
+#: с групповым чатом: группа этот протокол не получала.
+SERIES_MEMORY_EXCLUDE_KEY = "excludeFromSeriesMemory"
 
 # --- откуда взята серия (фаза 6: в группу — только по надёжной серии) ---------
 SOURCE_JOURNAL = "journal"            # журнал сторожа: бот сам шёл на эту серию в этот день
@@ -285,6 +289,7 @@ def safe_series_segment(series: str) -> str:
 def build_synthetic_meta(
     *, series: str, date: str, wav_path: str, participants: list[str], sid: str,
     keep_audio: bool = True, owner_chat_id: Optional[int] = None,
+    exclude_from_series_memory: bool = False,
 ) -> dict:
     """Синтетическая meta для finalize — минимально достаточный набор полей,
     сличённый с боевой meta (runner.py BOT_CONFIG + collector): `sessionUid`,
@@ -304,7 +309,12 @@ def build_synthetic_meta(
     `owner_chat_id` — путь А: адресат ЗАПИСАН в meta. Если сборка сорвётся на
     расшифровке, finalize переложит meta в `_failed/`, и повтор соберёт протокол
     уже сам — с этим полем он уйдёт владельцу, а не в группу серии мимо проверки
-    (решение A1/Q5)."""
+    (решение A1/Q5).
+
+    `exclude_from_series_memory` — путь А по серии с группой (фаза 6б, копилка
+    владельца №6): встреча не идёт в память серии (`series_memory.META_EXCLUDE_KEY`),
+    следующие протоколы группы на неё не опираются — группа её не получала. Пометка
+    едет в meta и потому переживает и повтор после сбоя расшифровки."""
     meta = {
         "sessionUid": sid,
         "series": series,
@@ -319,6 +329,8 @@ def build_synthetic_meta(
     }
     if isinstance(owner_chat_id, int) and not isinstance(owner_chat_id, bool):
         meta["telegram_chat_id"] = owner_chat_id
+    if exclude_from_series_memory:
+        meta[SERIES_MEMORY_EXCLUDE_KEY] = True
     return meta
 
 
@@ -665,24 +677,43 @@ def owner_chat_id() -> Optional[int]:
         return None
 
 
+def _series_chat(series: str) -> tuple[Optional[int], bool]:
+    """(чат серии из реестра `watched.yaml`, прочитан ли реестр)."""
+    try:
+        from notary.cli.registry import (  # noqa: PLC0415
+            get_telegram_chat_id_for_series, load_watched,
+        )
+
+        return get_telegram_chat_id_for_series(series, load_watched()), True
+    except Exception as e:  # noqa: BLE001
+        log.warning("[mode] реестр серий не прочитан (%s)", type(e).__name__)
+        return None, False
+
+
+def _is_group_chat(chat: Any) -> bool:
+    return isinstance(chat, int) and not isinstance(chat, bool) and chat < 0
+
+
 def series_group_chat(series: str) -> Optional[int]:
     """Групповой чат серии из реестра (`watched.yaml`) или None.
 
     Тот же резолв, что у доставки протокола (`get_telegram_chat_id_for_series`):
     отрицательный id — группа. Сбой чтения реестра → None, то есть путь А —
     лично владельцу: в группу без уверенности не шлём."""
-    try:
-        from notary.cli.registry import (  # noqa: PLC0415
-            get_telegram_chat_id_for_series, load_watched,
-        )
+    chat, _read = _series_chat(series)
+    return chat if _is_group_chat(chat) else None
 
-        chat = get_telegram_chat_id_for_series(series, load_watched())
-    except Exception as e:  # noqa: BLE001
-        log.warning("[mode] реестр серий не прочитан (%s) — считаю, что группы нет", type(e).__name__)
-        return None
-    if isinstance(chat, int) and not isinstance(chat, bool) and chat < 0:
-        return chat
-    return None
+
+def personal_excluded_from_series_memory(series: str) -> bool:
+    """Путь А: не пускать эту встречу в память серии? (фаза 6б, копилка владельца №6)
+
+    Да, если у серии групповой чат: протокол ушёл лично владельцу, группа его не
+    получала, и следующие её протоколы не должны на него опираться. У серии без группы
+    протокол и так уходит владельцу — встреча идёт в память как обычно. Реестр не
+    прочитан → да (осторожная сторона: лишнее исключение из памяти дешевле, чем
+    протокол «лично мне», просочившийся в протоколы группы)."""
+    chat, read = _series_chat(series)
+    return (not read) or _is_group_chat(chat)
 
 
 def _msk_date(raw: Any) -> Optional[str]:
@@ -1311,15 +1342,18 @@ def _build_personal_media(args, kind: str, workdir: Path, output_dir: Path, sid:
     расшифровка, meta после finalize — в ней могут появиться id расшифровки)."""
     wav_path, _ = _prepare_wav(Path(args.input), kind, workdir / "recording.wav")
     participants = resolve_participants(args.series, args.participants)
+    # Фаза 6б (№6): протокол «лично мне» по серии с группой — не в память серии.
+    excluded = personal_excluded_from_series_memory(args.series)
     meta = build_synthetic_meta(
         series=args.series, date=args.date, wav_path=str(wav_path),
         participants=participants, sid=sid, keep_audio=True, owner_chat_id=owner_chat_id(),
+        exclude_from_series_memory=excluded,
     )
     meta_path = workdir / f"{sid}.meta.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info(
-        "[media] синтетическая meta: series=%s date=%s participants=%d sid=%s",
-        args.series, args.date, len(participants), sid,
+        "[media] синтетическая meta: series=%s date=%s participants=%d sid=%s в памяти серии=%s",
+        args.series, args.date, len(participants), sid, "нет" if excluded else "да",
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     rc, _report = run_finalize(meta_path, output_dir, deliver=False)
@@ -1475,6 +1509,7 @@ def _run_personal(
             series=args.series, date=args.date, wav_path="",
             participants=resolve_participants(args.series, args.participants),
             sid=sid, keep_audio=True, owner_chat_id=owner_chat_id(),
+            exclude_from_series_memory=personal_excluded_from_series_memory(args.series),
         )
         meta.pop("files", None)
     log.info("[ingest] протокол готов: %s", protocol_path)
