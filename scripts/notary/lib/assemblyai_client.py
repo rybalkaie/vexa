@@ -64,6 +64,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -274,6 +275,7 @@ def _create_transcript(
     audio_url: str,
     *,
     keyterms_prompt: list[str] | None = None,
+    max_speakers: int | None = None,
 ) -> str:
     """Шаг 2. POST /v2/transcript — создать задание с конфигом → id.
 
@@ -297,6 +299,16 @@ def _create_transcript(
         "language_code": LANGUAGE_CODE,
         "speaker_labels": True,
     }
+    # Ф6 (план 2026-09-25): ПОТОЛОК числа голосов, а не точное число. Без него
+    # потолок по умолчанию 30, и движок дробит одного человека на несколько
+    # голосов: 02.09 на разговоре вдвоём вышло ЧЕТЫРЕ голоса, лишние обрывки
+    # разобрали случайные имена. Почему не `speakers_expected`: тот задаёт ТОЧНОЕ
+    # число, документация предостерегает ставить его без уверенности, и решение
+    # владельца AA2 от 13.06 — «не форсируем». Потолок мягче: движок вправе найти
+    # меньше. Запас «+1» кладёт вызыватель: при впритык-потолке неожиданный
+    # участник МОЛЧА сольётся с чужим именем — это хуже нынешней болезни.
+    if isinstance(max_speakers, int) and max_speakers > 1:
+        body["speaker_options"] = {"max_speakers_expected": max_speakers}
     # S4: keyterms и prompt взаимоисключающи. `prompt` мы не задаём — гард на случай
     # будущей правки конфига, чтобы не отправить невалидную пару (keyterms уступает).
     if keyterms_prompt and not body.get("prompt"):
@@ -399,6 +411,7 @@ def parse_utterances(raw: dict) -> list[Utterance]:
             continue
         text = u.get("text")
         text = text.strip() if isinstance(text, str) else ""
+        text = strip_hallucination_prefix(text)
         if not text:
             continue
         out.append(Utterance(
@@ -408,6 +421,65 @@ def parse_utterances(raw: dict) -> list[Utterance]:
             text=text,
         ))
     return out
+
+
+# --- галлюцинации распознавания (25.09, план 2026-09-25-speaker-attribution-fix) ---
+# На тишине в начале записи движок выдаёт «титры» — на 4 встречах в протокол уехало
+# «Редактор субтитров А.Семкин Корректор А.Егорова», приклеенное к началу настоящей
+# реплики («…А.Егорова Да, Илья, привет»). Готовый список фраз в проекте есть
+# (`lib/hallucinations/ru.txt`), но был подключён ТОЛЬКО к ветке Whisper
+# (`lib/transcribe.py`) — на боевой ветке AssemblyAI фильтра не было вовсе.
+# Здесь вырезаем такую фразу ИЗ ЛЮБОГО МЕСТА реплики, СОХРАНЯЯ остальной текст:
+# сравнение «вся реплика == фраза», как в whisper-ветке, этот случай не ловит.
+#
+# 🔴 Правки цикла5 (25.09) — две находки на реальных данных, обе исправлены здесь:
+#   1. МЕСТО. Первая версия резала только начало (якорь `^`). Замер по 41 архивной
+#      расшифровке: совпадений три, и в начале стоит ЛИШЬ ОДНО — остальные в конце
+#      («Хорошего дня. Редактор субтитров А.Семкин Корректор А.Егорова») и в середине.
+#      То есть две трети реальных случаев фильтр пропускал. Теперь ищем где угодно.
+#   2. ЛОЖНЫЕ СРАБАТЫВАНИЯ. Было «ключевое слово + любое следующее слово» под флагом
+#      `re.IGNORECASE`, а он обнуляет класс `[А-ЯЁA-Z]` — заглавная буква перестаёт
+#      быть требованием. Живая речь теряла два слова: «Корректор цвета надо поправить»
+#      → «надо поправить», «Редактор субтитров у нас Аня» → «нас Аня». Для склада
+#      светового оборудования «корректор цвета» — штатный термин, не галлюцинация.
+#      Теперь регистронезависимость применяется ТОЛЬКО к ключевой фразе (`(?i:...)`),
+#      а за ней обязателен ИНИЦИАЛ С ТОЧКОЙ («А.Семкин», «А. Егорова») — ровно та
+#      форма, в которой движок выдаёт титры во всех трёх реальных случаях. Обычное
+#      слово («цвета», «Марина», «у») этому не соответствует и речь остаётся целой.
+_HALLUCINATION_PREFIXES: tuple[str, ...] = (
+    "редактор субтитров",
+    "корректор",
+    "субтитры создавал",
+    "субтитры сделал",
+    "субтитры делал",
+    "субтитры подогнал",
+)
+# Одно повторение = «ключевая фраза + подпись». Подпись — либо инициал с точкой и
+# фамилия («А.Семкин», «А. Егорова»), либо склеенный ник латиницей («DimaTorzok»,
+# как в lib/hallucinations/ru.txt). Повторений может быть несколько подряд:
+# «Редактор субтитров А.Семкин Корректор А.Егорова» — это два.
+_HALLU_SIGNATURE = r"(?:[А-ЯЁA-Z]\.\s*[А-ЯЁA-Z][\w\-]+|[A-Z][a-z]+[A-Z][\w\-]*)"
+_HALLU_TAIL_RE = re.compile(
+    r"(?:\s*(?i:" + "|".join(_HALLUCINATION_PREFIXES) + r")\s+" + _HALLU_SIGNATURE + r"[\s.!?]*)+"
+)
+
+
+def strip_hallucination_prefix(text: str) -> str:
+    """Вырезает «титровую» галлюцинацию из реплики, остальной текст оставляет.
+
+    Ищет не только в начале: по замеру на 41 архивной расшифровке две трети реальных
+    случаев стоят в конце или в середине реплики. Не трогает текст, где таких фраз
+    нет, и не трогает обычную речь со словом «корректор» — за ключевой фразой
+    обязательна подпись вида «А.Семкин». Если после вырезки ничего не осталось —
+    вернёт пустую строку, и caller такую реплику отбросит."""
+    if not text:
+        return text
+    low = text.lower()
+    if not any(p in low for p in _HALLUCINATION_PREFIXES):
+        return text
+    cleaned = _HALLU_TAIL_RE.sub(" ", text)
+    # Двойные пробелы после вырезки из середины реплики.
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
 def _extract_audio_duration_s(raw: dict, utterances: list[Utterance]) -> float:
@@ -448,6 +520,7 @@ def transcribe_diarize_wav(
     existing_transcript_id: str | None = None,
     on_transcript_created=None,
     keyterms_prompt: list[str] | None = None,
+    max_speakers: int | None = None,
     sleep=time.sleep,
 ) -> TranscriptionResult:
     """Прогнать WAV через AssemblyAI и вернуть TranscriptionResult.
@@ -504,8 +577,13 @@ def transcribe_diarize_wav(
                         f"новый сабмит запрещён ({killswitch_path()})"
                     )
                 upload_url = _upload_audio(client, headers, p)
+                # `max_speakers` подставляем ТОЛЬКО когда он задан: иначе
+                # ломаются подменённые в тестах фейки `_create_transcript` со
+                # старой сигнатурой, а смысла в явном None нет.
+                _extra = {"max_speakers": max_speakers} if max_speakers else {}
                 transcript_id = _create_transcript(
-                    client, headers, upload_url, keyterms_prompt=keyterms_prompt
+                    client, headers, upload_url, keyterms_prompt=keyterms_prompt,
+                    **_extra,
                 )
                 logger.info("AssemblyAI transcript created: %s", transcript_id)
                 # Отдать id наверх ДО поллинга (переживает краш/рестарт).

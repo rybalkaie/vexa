@@ -329,6 +329,7 @@ def _run_assemblyai(
     existing_transcript_id: str | None = None,
     on_transcript_created=None,
     series_slug: str | None = None,
+    expected_speakers: int | None = None,
 ):
     """AssemblyAI-ветка: upload → create → poll вместо whisper+pyannote.
 
@@ -361,8 +362,16 @@ def _run_assemblyai(
     log.info("AssemblyAI keyterms: %d терминов словаря серии", len(keyterms_prompt))
 
     log.info("Step 1/3 — AssemblyAI upload + transcribe + diarize (один job)")
+    # Ф6: ПОТОЛОК голосов = ожидаемых + 1. Запас обязателен — при впритык-потолке
+    # неожиданный участник не получит своего номера, а молча сольётся с чужим
+    # именем. Ставим только когда состав серии известен и людей больше одного.
+    _max_speakers = (expected_speakers + 1) if isinstance(expected_speakers, int) and expected_speakers > 1 else None
+    if _max_speakers:
+        log.info("AssemblyAI: потолок числа голосов = %d (ожидаем %d человек + запас)",
+                 _max_speakers, expected_speakers)
     aai_result = transcribe_diarize_wav(
         wav_path,
+        max_speakers=_max_speakers,
         existing_transcript_id=existing_transcript_id,
         on_transcript_created=on_transcript_created,
         keyterms_prompt=keyterms_prompt,
@@ -940,15 +949,21 @@ def main() -> int:
     # выжимки. Иначе мусор течёт в пул имён map_all и в шапку протокола.
     participants = filter_participant_names(meta.get("participants") or [])
     expected = meta.get("expectedParticipants") or []
+    # 🔴 Короткую форму имени («Илья» из «Илья Рыбалка») в пул кандидатов НЕ кладём.
+    # Раньше клали — и это порождало ДВОЙНИКА: один человек становился двумя
+    # кандидатами. Последствия (разбор 25.09, план 2026-09-25-speaker-attribution-fix):
+    #   • на 1:1 кандидатов 4 вместо 2 → спец-разбор двух говорящих
+    #     (`name_mapping._resolve_two_speakers`, условие «ровно 2 и 2») не включался
+    #     НИКОГДА, управление уходило в жадный перебор, который переворачивает авторство;
+    #   • оба голоса могли получить одного человека под разными написаниями — на 08.07,
+    #     15.07, 29.07 собеседник исчезал из протокола целиком (все реплики «Илья»).
+    # Короткие имена из ПАНЕЛИ Телемоста при этом не теряются: они приходят в
+    # `participants` и остаются в пуле. А поиск обращений в речи и так ведётся по
+    # первому слову (`name_mapping`), так что «Илью» внутри «Ильи Рыбалки» мы находим.
     expanded_expected: list[str] = []
     for full in expected:
-        if not full:
-            continue
-        if full not in expanded_expected:
+        if full and full not in expanded_expected:
             expanded_expected.append(full)
-        first_word = full.split()[0] if full.split() else ""
-        if first_word and first_word not in expanded_expected:
-            expanded_expected.append(first_word)
     participants_union: list[str] = list(dict.fromkeys(participants + expanded_expected))
     language = meta.get("language") or "ru"
 
@@ -996,7 +1011,31 @@ def main() -> int:
                 if nm not in expected_enriched:
                     expected_enriched.append(nm)
             series_memory_block = series_memory.format_memory_block(series_memory_digests)
-            series_speaker_anchor = series_memory.resolve_speaker_anchor(series_memory_digests)
+            # Ф5 (план 2026-09-25): на встрече ВДВОЁМ наследуем только разметку,
+            # подтверждённую человеком. Метки S1/S2 между запусками нестабильны, и на
+            # двоих наследование — монетка: промах переворачивает весь протокол
+            # (23.09 инверсия ушла в групповой чат команды). На встречах большего
+            # состава якорь полезен и остаётся как был — отключение его ВЕЗДЕ на
+            # стенде отняло у планёрок МПервого по 2–3 имени из трёх.
+            _pair_meeting = len({n for n in _expected_base if n}) == 2
+            if _pair_meeting:
+                # 🔴 Найдено боем 26.09: на встрече ВДВОЁМ якорь не применяем ВООБЩЕ,
+                # даже подтверждённый человеком. Подтверждение говорит «эта разметка
+                # верна для ТОЙ встречи» — но метки SPEAKER_00/01 между запусками
+                # нестабильны, и на двух говорящих перенос остаётся монеткой 50/50
+                # независимо от того, кто её подтвердил. Проверено на боевых данных:
+                # выверенная карта 09.09 легла на 23.09 и дала ровно ту инверсию,
+                # от которой защита и заводилась. Авторство на парных встречах решают
+                # обращения в ТЕКУЩЕЙ записи, ростер и LLM по смыслу — на стенде это
+                # даёт 2 верных из 3 при нуле ошибок (с якорем было 0 верных, 1 инверсия).
+                series_speaker_anchor = {}
+                log.info("[name-mapping] встреча вдвоём: якорь прошлой встречи не применяю "
+                         "(номера голосов между записями не совпадают) — авторство решают "
+                         "обращения в текущей записи / LLM")
+            else:
+                series_speaker_anchor = series_memory.resolve_speaker_anchor(
+                    series_memory_digests, confirmed_only=False,
+                )
             # Ф6 (G6/G7/G11): ШИРОКИЙ кросс-встречный фон из ДРУГИХ серий (приоритет
             # своей компании, кросс-компания при релевантности — A7, не стена).
             # Главный guard — фильтр чувствительного G11 (LLM) + ручной маркер серии
@@ -1086,6 +1125,7 @@ def main() -> int:
                 existing_transcript_id=existing_transcript_id,
                 on_transcript_created=_on_transcript_created,
                 series_slug=(meta.get("series") if isinstance(meta, dict) else None),
+                expected_speakers=expected_speaker_count,
             )
         else:
             turns, extra = _run_whisper_pyannote(args, meta, audio_path, language, log)

@@ -635,5 +635,126 @@ class TestReissueAuthorshipRemap(unittest.TestCase):
         self.assertEqual(self.transcript_path.read_text(encoding="utf-8"), TRANSCRIPT_INVERTED)
 
 
+# ---------------------------------------------------------------------------
+# Сторожа правок цикла5 (25.09, план 2026-09-25-speaker-attribution-fix).
+# Каждый тест ниже привязан к находке, которую цикл нашёл и починил: без него
+# правка тихо откатится соседним изменением, как уже было с инверсией авторства.
+# ---------------------------------------------------------------------------
+class Cycle5SpeakerAttributionGuards(unittest.TestCase):
+    """Пробы на починки цикла из 5 ходов по авторству реплик."""
+
+    # --- фильтр «титровых» галлюцинаций (assemblyai_client) ---------------
+    def test_hallucination_stripped_anywhere_not_only_at_start(self):
+        """Мусор ловится в начале, в конце и в середине реплики.
+
+        Первая версия резала только начало: по замеру на 41 архивной расшифровке
+        из трёх реальных случаев в начале стоял ОДИН, два уезжали в протокол.
+        """
+        from lib.assemblyai_client import strip_hallucination_prefix as strip
+
+        self.assertEqual(
+            strip("Редактор субтитров А.Семкин Корректор А.Егорова Да, Илья, привет"),
+            "Да, Илья, привет")
+        self.assertEqual(
+            strip("Хорошего дня. Редактор субтитров А.Семкин Корректор А.Егорова"),
+            "Хорошего дня.")
+        self.assertEqual(
+            strip("Так что... Редактор субтитров А.Синецкая Корректор А.Егорова Александра, дальше"),
+            "Так что... Александра, дальше")
+
+    def test_hallucination_filter_keeps_live_speech(self):
+        """Живую речь со словом «корректор» фильтр не трогает.
+
+        Было: `re.IGNORECASE` обнулял требование заглавной буквы, и шаблон съедал
+        любое следующее слово — «Корректор цвета надо поправить» теряло два слова.
+        Для склада светового оборудования «корректор цвета» — штатный термин.
+        """
+        from lib.assemblyai_client import strip_hallucination_prefix as strip
+
+        for live in (
+            "Корректор цвета надо поправить, там зелёный уходит",
+            "Корректор Марина прислала макет, посмотри пожалуйста",
+            "Редактор субтитров у нас Аня",
+            "Субтитры делал Андрей, он же монтировал ролик",
+            "Корректор, посмотри правки",
+        ):
+            self.assertEqual(strip(live), live, f"фильтр съел живую речь: {live!r}")
+
+    # --- метка «подтвердил человек» (series_memory) -----------------------
+    def test_confirmed_flag_survives_reissue_when_mapping_unchanged(self):
+        """Перевыпуск протокола не гасит подтверждение авторства.
+
+        `save_digest` пишет файл целиком, `build_digest` собирает его с нуля —
+        любая повторная финализация стирала метку молча, и якорь Ф5 на встречах
+        вдвоём переставал работать без единой строки в логе.
+        """
+        from lib import series_memory as sm
+
+        proto = "# П\n\n**Илья Рыбалка:** раз\n\n**Михаил Еремеев:** два\n"
+        meta = {"series": "s1", "participants": ["Илья Рыбалка", "Михаил Еремеев"]}
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            sm.save_meeting_digest(d, "2026-09-25", proto, meta,
+                                   speaker_mapping={"SPEAKER_00": "Илья Рыбалка",
+                                                    "SPEAKER_01": "Михаил Еремеев"})
+            sm.update_digest_speaker_mapping(d, "2026-09-25", {"Илья Рыбалка": "Михаил Еремеев"})
+            saved = json.loads(sm.digest_path(d, "2026-09-25").read_text(encoding="utf-8"))
+            self.assertTrue(saved.get("speaker_mapping_confirmed"))
+            sm.save_meeting_digest(d, "2026-09-25", proto, meta,
+                                   speaker_mapping=saved["speaker_mapping"])
+            again = json.loads(sm.digest_path(d, "2026-09-25").read_text(encoding="utf-8"))
+            self.assertTrue(again.get("speaker_mapping_confirmed"),
+                            "перевыпуск стёр подтверждение человека")
+
+    def test_confirmed_flag_dropped_when_mapping_changed(self):
+        """А если разметка изменилась — подтверждение к ней уже не относится."""
+        from lib import series_memory as sm
+
+        proto = "# П\n\n**Илья Рыбалка:** раз\n\n**Михаил Еремеев:** два\n"
+        meta = {"series": "s1", "participants": ["Илья Рыбалка", "Михаил Еремеев"]}
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            sm.save_meeting_digest(d, "2026-09-25", proto, meta,
+                                   speaker_mapping={"SPEAKER_00": "Илья Рыбалка",
+                                                    "SPEAKER_01": "Михаил Еремеев"})
+            sm.update_digest_speaker_mapping(d, "2026-09-25", {"Илья Рыбалка": "Михаил Еремеев"})
+            sm.save_meeting_digest(d, "2026-09-25", proto, meta,
+                                   speaker_mapping={"SPEAKER_00": "Михаил Еремеев",
+                                                    "SPEAKER_01": "Илья Рыбалка"})
+            again = json.loads(sm.digest_path(d, "2026-09-25").read_text(encoding="utf-8"))
+            self.assertFalse(again.get("speaker_mapping_confirmed"))
+
+    def test_anchor_confirmed_only_ignores_unconfirmed_digests(self):
+        """Ф5: строгий режим берёт ТОЛЬКО помеченные человеком выжимки."""
+        from lib import series_memory as sm
+
+        digests = [
+            {"date": "2026-09-01", "speaker_mapping": {"SPEAKER_00": "Илья Рыбалка"}},
+            {"date": "2026-09-08", "speaker_mapping": {"SPEAKER_00": "Михаил Еремеев"},
+             "speaker_mapping_confirmed": True},
+            {"date": "2026-09-15", "speaker_mapping": {"SPEAKER_00": "Сона Енгибарян"}},
+        ]
+        self.assertEqual(sm.resolve_speaker_anchor(digests),
+                         {"SPEAKER_00": "Сона Енгибарян"})
+        self.assertEqual(sm.resolve_speaker_anchor(digests, confirmed_only=True),
+                         {"SPEAKER_00": "Михаил Еремеев"})
+        self.assertEqual(
+            sm.resolve_speaker_anchor([digests[0], digests[2]], confirmed_only=True), {})
+
+    # --- пул кандидатов: короткая форма больше не второй кандидат ---------
+    def test_namesakes_keep_full_form_short_names_collapse(self):
+        """Тёзки («Михаил Еремеев» + «Михаил Саргин») не сокращаются до первого слова.
+
+        Иначе одно «Михаил,» в речи дало бы голос обоим сразу.
+        """
+        from lib.name_mapping import _first_word_lower, _namesake_groups
+
+        pool = ["Михаил Еремеев", "Михаил Саргин", "Илья Рыбалка"]
+        amb = {k for k, v in _namesake_groups(pool).items() if len(v) > 1}
+        self.assertIn("михаил", amb)
+        self.assertNotIn("илья", amb)
+        self.assertEqual(_first_word_lower("Илья Рыбалка"), "илья")
+
+
 if __name__ == "__main__":
     unittest.main()

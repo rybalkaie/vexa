@@ -193,7 +193,18 @@ def map_from_speech_regex(
         return {}
 
     # Разворачиваем формы имён и считаем голоса (вынесено в _scan_speech_votes).
-    name_forms: dict[str, set[str]] = {n: _expand_name_forms(n) for n in available_names}
+    # По ПЕРВОМУ СЛОВУ, а не по полному имени: в речи зовут «Илья», а не «Илья
+    # Рыбалка» — от полного имени детектор не находил обращений почти никогда
+    # (25.09: на 14 встречах из 22 не срабатывал ни один сигнал). Так же уже
+    # сделано в соседних источниках (`_first` на 364, `_first_word_lower` на 504).
+    # Исключение — тёзки: если первым словом владеют РАЗНЫЕ люди («Михаил Еремеев»
+    # и «Михаил Саргин»), сокращать нельзя, иначе одно «Михаил,» даст сигнал против
+    # обоих сразу. Для них оставляем полную форму, как было.
+    _ambiguous_first = {k for k, v in _namesake_groups(available_names).items() if len(v) > 1}
+    name_forms: dict[str, set[str]] = {
+        n: _expand_name_forms(n if _first_word_lower(n) in _ambiguous_first else _first_word_lower(n))
+        for n in available_names
+    }
     votes, anti_votes, strict_anti_votes = _scan_speech_votes(turns, name_forms)
 
     # Ф4а: спец-случай ровно 2 спикера и 2 имени. Forward-голос («следующий
@@ -628,7 +639,15 @@ def _apply_series_anchor(
         return {}
 
     # Строгий vocative текущей встречи — для проверки на противоречие.
-    name_forms = {n: _expand_name_forms(n) for n in set(cands.values())}
+    # По первому слову (см. тот же разбор 25.09): защита якоря искала в речи
+    # «илья рыбалка,» — так не говорят, поэтому она молчала и пропускала
+    # перевёрнутый якорь в протокол (инверсия 23.09). Тёзки — исключение.
+    _anchor_names = set(cands.values())
+    _anchor_ambiguous = {k for k, v in _namesake_groups(sorted(_anchor_names)).items() if len(v) > 1}
+    name_forms = {
+        n: _expand_name_forms(n if _first_word_lower(n) in _anchor_ambiguous else _first_word_lower(n))
+        for n in _anchor_names
+    }
     _, _, strict_anti_votes = _scan_speech_votes(turns, name_forms)
     contradicted = any(strict_anti_votes.get((c, n), 0.0) > 0 for c, n in cands.items())
     if contradicted:
