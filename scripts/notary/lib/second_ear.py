@@ -31,6 +31,9 @@
     (`wav_concat.resolve_wav_for_stt`), и полупереехавший набор дал бы протокол без
     части встречи. Их удаляет та же уборка после удачного повтора
     (`primary_chunk_wavs`, finalize 5.1) — с тем же удержанием для портала.
+  • `keep_audio` (не удалять звук вовсе) — `keep_audio_requested`: флаг ставят серии в
+    реестре (`watched.yaml`) и наряды портала, бот в meta его не пишет (цикл5 фазы 6б, Н1);
+    сборщик и повтор 5.1 спрашивают именно эту функцию.
   • Удержание для портала (`portal_delivery.session_wav_files`) и сторож зависаний
     сборщика знают файл по имени `*.chunk<цифры>.wav` — отдельного кода не нужно.
   • Самопроверка (`lib/canary.py`) отличает второе ухо от основной записи по суффиксу.
@@ -359,6 +362,73 @@ def remove_wavs(paths: List[str], sid: str, *, host_path: Callable[[str], Path],
         logger.info("Кусок записи удалён %s (sid=%s, path=%s)", why, sid, wav)
         removed.append(wav)
     return removed
+
+
+_KEEP_AUDIO_WARNED = False
+#: Разобранный реестр серий: тот же файл (путь, время изменения, размер) — прежний разбор.
+#: Сборщик спрашивает флаг для каждой доставленной встречи на каждом тике, а meta копятся;
+#: разбор YAML — десятки миллисекунд (замер цикла5: 300 встреч без кэша ≈ 14 с на тик).
+_WATCHED_CACHE: Dict[str, Any] = {}
+
+
+def _watched_cached(load_watched: Callable[..., Any], watched_file: Callable[..., Any]) -> Any:
+    """Реестр серий, разобранный один раз, пока файл не изменился. Ошибку разбора — наверх."""
+    try:
+        p = Path(watched_file())
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return load_watched()  # файла нет — реестр пуст, кэшировать нечего
+    if _WATCHED_CACHE.get("key") == key:
+        return _WATCHED_CACHE["data"]
+    data = load_watched()
+    _WATCHED_CACHE.clear()
+    _WATCHED_CACHE.update(key=key, data=data)
+    return data
+
+
+def _registry_api() -> Tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
+    """(load_watched, series_records, watched_file) реестра серий — любым из двух путей импорта.
+
+    Сборщик видит пакет `notary` (PYTHONPATH=scripts), finalize кладёт в sys.path только
+    свою папку — там виден `cli`, а не `notary.cli` (тот же приём, что у доставки
+    протокола, `llm_postprocess._load_watched_for_series`).
+    """
+    try:
+        from notary.cli.registry import load_watched, series_records, watched_file  # noqa: PLC0415
+    except ImportError:
+        from cli.registry import load_watched, series_records, watched_file  # noqa: PLC0415
+    return load_watched, series_records, watched_file
+
+
+def keep_audio_requested(meta: Any, *, order: Any = None, watched: Any = None) -> bool:
+    """Звук этой встречи велено сохранять (`keep_audio`) — после доставки не удаляется ничего.
+
+    Флаг ставят люди, и живёт он там, где его ставят: запись серии в реестре
+    (`watched.yaml`, `meeting_watch --keep-audio`) и наряд портала (`keep_audio` из запроса
+    портала, `order`). Бот его в meta не пишет, а запускатель боту не передаёт, поэтому
+    сверка только с meta флаг серии молча не видела — и после доставки стирался весь звук
+    (цикл5 фазы 6б, Н1). В meta он есть лишь у обёртки восстановления (`keepAudio`).
+
+    Реестр не прочитался → сохраняем (FAIL-CLOSED): удаление необратимо, а лишний файл
+    на диске чинится одной командой. Нет файла реестра — это «флагов нет», не сбой.
+    `watched` — подстановка реестра для проб.
+    """
+    global _KEEP_AUDIO_WARNED
+    m = _dict(meta)
+    if m.get("keepAudio") or m.get("keep_audio") or _dict(order).get("keep_audio"):
+        return True
+    try:
+        load_watched, series_records, watched_file = _registry_api()
+        reg = watched if watched is not None else _watched_cached(load_watched, watched_file)
+        return any(isinstance(r, dict) and r.get("keep_audio") is True
+                   for r in series_records(m.get("series"), reg))
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — SystemExit: так реестр говорит о битом файле
+        if not _KEEP_AUDIO_WARNED:
+            logger.warning("keep_audio серии не прочитан из реестра (%s) — звук встреч оставляю",
+                           type(e).__name__)
+            _KEEP_AUDIO_WARNED = True
+        return True
 
 
 def cleanup_after_delivery(meta: Any, sid: str, *, host_path: Callable[[str], Path]) -> List[str]:

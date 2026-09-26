@@ -1032,13 +1032,14 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
          успели чистить WAV (например, finalize упал в момент очистки).
       2. Перепрогон с другого хоста: meta.delivered есть, но WAV не убрался.
 
-    keepAudio / keep_audio в meta — пропускаем cleanup (как и раньше).
+    `keep_audio` — пропускаем cleanup целиком. Флаг — не только в meta (там он есть лишь у
+    обёртки восстановления): серия в реестре и наряд портала (`_keep_audio`, цикл5 фазы 6б).
 
     Ф10c: третье условие — портал подтвердил приём результата (или встреча
     вообще не порталовая). Доставка в Telegram больше не даёт права стирать
     исходники в одиночку.
     """
-    if meta.get("keepAudio") or meta.get("keep_audio"):
+    if _keep_audio(meta, sid):
         logger.info("WAV cleanup skip (sid=%s) — keep_audio=true", sid)
         return
     if _portal_sources_held(sid, meta):
@@ -1087,6 +1088,21 @@ def _maybe_cleanup_wav_after_delivered(meta: dict, sid: str) -> None:
         _portal_report_purged(sid)
     except OSError as e:
         logger.warning("Не смог удалить WAV %s: %s", wav_path, e)
+
+
+def _keep_audio(meta: dict | None, sid: str) -> bool:
+    """Звук встречи велено сохранять (`second_ear.keep_audio_requested`): флаг в meta, у
+    серии в реестре или у наряда портала. Цикл5 фазы 6б (Н1): раньше смотрели только meta,
+    а бот флаг серии туда не пишет — `keep_audio: true` в `watched.yaml` не спасал звук.
+    Сбой самой проверки → сохраняем: удаление необратимо.
+    """
+    try:
+        from notary.lib import second_ear  # noqa: PLC0415
+
+        return second_ear.keep_audio_requested(meta, order=_portal_order_for(sid, meta))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("keep_audio не проверен (sid=%s, %s) — звук оставляю", sid, type(e).__name__)
+        return True
 
 
 def _cleanup_extra_wavs(meta: dict | None, sid: str) -> None:
@@ -1601,9 +1617,9 @@ def _do_finalize_and_collect(session_uid: str) -> None:
     # защищены удержанием до ACK портала — проверка ниже.
     success_statuses = {"sent", "skipped", "portal-only"}
     meta_obj = _read_meta_obj(session_uid) or {}
-    keep_audio_flag = bool(meta_obj.get("keepAudio") or meta_obj.get("keep_audio"))
-    if keep_audio_flag:
-        logger.info("WAV cleanup пропущен (sid=%s): keep_audio=true в meta", session_uid)
+    if _keep_audio(meta_obj, session_uid):
+        logger.info("WAV cleanup пропущен (sid=%s): keep_audio (meta, серия или наряд портала)",
+                    session_uid)
         return
     if not md_placed:
         logger.info(

@@ -75,6 +75,13 @@ class _Meeting(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="chunks6b-"))
         self.rec = self.tmp / "transcripts"
         self.rec.mkdir()
+        # Свой пустой реестр серий: флаг keep_audio серии читается из него (цикл5 фазы 6б,
+        # Н1), и проба не должна зависеть от реестра машины.
+        self.registry_dir = self.tmp / "registry"
+        self.registry_dir.mkdir()
+        self._reg_env = mock.patch.dict(os.environ, {"MEETING_NOTARY_REGISTRY_DIR": str(self.registry_dir)})
+        self._reg_env.start()
+        self.addCleanup(self._reg_env.stop)
         self.chunks = [_wav(self.rec / f"{SID}.chunk{i}.wav", SR * (i + 1), value=100 * i)
                        for i in range(1, self.N + 1)]
         self.ear = _wav(self.rec / f"{SID}.chunk0.wav", SR * 2, value=7)
@@ -112,6 +119,9 @@ class _Meeting(unittest.TestCase):
         for p in self.keep + [self.meta_path]:
             self.assertTrue(p.exists(), f"тронут чужой/не звуковой файл: {p.name}")
 
+    def registry(self, body: str) -> None:
+        (self.registry_dir / "watched.yaml").write_text(body, encoding="utf-8")
+
 
 class CollectorChunksTest(_Meeting):
     """Сборщик: после доставки на диске нет ни одного куска этой встречи."""
@@ -142,6 +152,41 @@ class CollectorChunksTest(_Meeting):
         collector._maybe_cleanup_wav_after_delivered(self.meta(keep_audio=True), SID)
         collector._maybe_cleanup_wav_after_delivered(self.meta(keepAudio=True), SID)
         self.assertEqual(self.meeting_chunks(), before)
+
+    def test_series_keep_audio_in_registry_keeps_everything(self):
+        # Цикл5 фазы 6б (Н1): флаг keep_audio ставят серии в реестре (`meeting_watch
+        # --keep-audio`), бот его в meta не пишет — сверка только с meta его не видела,
+        # и после доставки стирался весь звук встречи.
+        self.registry("watched:\n  - id: k\n    series: koordinatsiya\n    keep_audio: true\n")
+        before = self.meeting_chunks()
+        collector._maybe_cleanup_wav_after_delivered(self.meta(), SID)
+        self.assertEqual(self.meeting_chunks(), before)
+        self.assertTrue(collector._keep_audio(self.meta(), SID))
+
+    def test_series_keep_audio_false_or_other_series_cleans_as_usual(self):
+        self.registry("watched:\n  - id: k\n    series: koordinatsiya\n    keep_audio: false\n"
+                      "  - id: o\n    series: other\n    keep_audio: true\n")
+        collector._maybe_cleanup_wav_after_delivered(self.meta(), SID)
+        self.assertEqual(self.meeting_chunks(), [])
+
+    def test_unreadable_registry_keeps_everything(self):
+        self.registry("- not: a mapping\n")      # верх — список: реестр отвечает SystemExit
+        before = self.meeting_chunks()
+        collector._maybe_cleanup_wav_after_delivered(self.meta(), SID)
+        self.assertEqual(self.meeting_chunks(), before)
+
+    def test_portal_order_keep_audio_keeps_everything(self):
+        before = self.meeting_chunks()
+        with mock.patch.object(collector, "_portal_order_for", return_value={"keep_audio": True}):
+            collector._maybe_cleanup_wav_after_delivered(self.meta(), SID)
+        self.assertEqual(self.meeting_chunks(), before)
+
+    def test_post_finalize_site_asks_the_same_keep_audio(self):
+        # Вторая точка уборки (сразу после финализации) спрашивает тот же признак.
+        src = (_NOTARY / "collector.py").read_text(encoding="utf-8")
+        tail = src.split("# 3. WAV cleanup", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("if _keep_audio(meta_obj, session_uid):", tail)
+        self.assertNotIn('meta_obj.get("keepAudio")', tail)
 
     def test_portal_hold_keeps_every_chunk(self):
         self.held = True
@@ -234,6 +279,29 @@ class StrictPathsTest(_Meeting):
                          [p.name for p in self.chunks[1:]])
 
 
+class KeepAudioRegistryTest(_Meeting):
+    """Флаг keep_audio серии читается из реестра — один разбор, пока файл не изменился."""
+
+    def test_registry_parsed_once_until_it_changes(self):
+        # Сборщик спрашивает флаг для каждой доставленной встречи на каждом тике (цикл5
+        # фазы 6б: 300 встреч без кэша ≈ 14 с на тик) — разбор не повторяется зря.
+        self.registry("watched:\n  - id: k\n    series: koordinatsiya\n    keep_audio: false\n")
+        load, records, wfile = second_ear._registry_api()
+        loader = mock.Mock(side_effect=load)
+        with mock.patch.object(second_ear, "_registry_api", return_value=(loader, records, wfile)):
+            for _ in range(50):
+                self.assertFalse(second_ear.keep_audio_requested({"series": "koordinatsiya"}))
+            self.assertEqual(loader.call_count, 1)
+            self.registry("watched:\n  - id: k\n    series: koordinatsiya\n    keep_audio: true\n")
+            self.assertTrue(second_ear.keep_audio_requested({"series": "koordinatsiya"}))
+            self.assertEqual(loader.call_count, 2)
+
+    def test_meta_or_order_flag_needs_no_registry(self):
+        self.assertTrue(second_ear.keep_audio_requested({"keepAudio": True}))
+        self.assertTrue(second_ear.keep_audio_requested({}, order={"keep_audio": True}))
+        self.assertFalse(second_ear.keep_audio_requested({"series": "x"}, watched={"watched": []}))
+
+
 class RetryChunksTest(_Meeting):
     """Сбой расшифровки → куски — источник повтора; удачный повтор (5.1) их удаляет."""
 
@@ -267,7 +335,8 @@ class RetryChunksTest(_Meeting):
         self.assertEqual(len(pcm) // 2, SR * sum(range(2, self.N + 2)), "повтор склеил не всю встречу")
         if temp:
             Path(path).unlink()
-        removed = self.finalize._remove_primary_chunks_after_retry(failed_meta, UID, self.log, hold=False)
+        removed = self.finalize._remove_primary_chunks_after_retry(failed_meta, UID, self.log, hold=False,
+                                                           keep_audio=False, delivery_status="sent")
         self.assertEqual(len(removed), self.N)
         self.assertEqual(self.meeting_chunks(), [])
         self.assertTrue(self.txt.exists() and self.md.exists() and self.other.exists())
@@ -276,7 +345,8 @@ class RetryChunksTest(_Meeting):
 
     def test_portal_hold_keeps_chunks(self):
         failed_meta = self.stash(self.meta())
-        self.assertEqual(self.finalize._remove_primary_chunks_after_retry(failed_meta, UID, self.log, hold=True), [])
+        self.assertEqual(self.finalize._remove_primary_chunks_after_retry(failed_meta, UID, self.log, hold=True,
+                                                           keep_audio=False, delivery_status="sent"), [])
         self.assertEqual(self.meeting_chunks(), [p.name for p in self.chunks])
 
     def test_protocol_from_ear_rest_of_primary_goes_after_retry(self):
@@ -292,19 +362,50 @@ class RetryChunksTest(_Meeting):
         self.assertTrue((self.failed / f"{UID}.wav").exists())
         self.assertTrue((self.failed / f"{UID}.chunk2.wav").exists())
         self.assertEqual(self.meeting_chunks(), sorted(p.name for i, p in enumerate(self.chunks, start=1) if i != 2))
-        self.finalize._remove_primary_chunks_after_retry(failed_meta, UID, self.log, hold=False)
+        self.finalize._remove_primary_chunks_after_retry(failed_meta, UID, self.log, hold=False,
+                                                           keep_audio=False, delivery_status="sent")
+        self.assertEqual(self.meeting_chunks(), [])
+
+    def test_keep_audio_keeps_chunks_after_retry(self):
+        failed_meta = self.stash(self.meta())
+        self.assertEqual(self.finalize._remove_primary_chunks_after_retry(
+            failed_meta, UID, self.log, hold=False, keep_audio=True, delivery_status="sent"), [])
+        self.registry("watched:\n  - id: k\n    series: koordinatsiya\n    keep_audio: true\n")
+        self.assertEqual(self.finalize._remove_primary_chunks_after_retry(
+            failed_meta, UID, self.log, hold=False, keep_audio=False, delivery_status="sent"), [])
+        self.assertEqual(self.meeting_chunks(), [p.name for p in self.chunks])
+
+    def test_chunks_stay_until_delivery_confirmed(self):
+        # Цикл5 фазы 6б (Н2): «после доставки». Повтор, у которого протокол не доставлен
+        # (сбой отправки, спросили владельца, доставка выключена, протокол не составился),
+        # звук не трогает; подтверждённая доставка — убирает.
+        failed_meta = self.stash(self.meta())
+        for status in ("error", "asked", "disabled", "not-run", None, ""):
+            self.assertEqual(self.finalize._remove_primary_chunks_after_retry(
+                failed_meta, UID, self.log, hold=False, keep_audio=False, delivery_status=status), [], status)
+        self.assertEqual(self.meeting_chunks(), [p.name for p in self.chunks])
+        self.assertEqual(self.finalize._AUDIO_CLEANUP_DELIVERY_OK,
+                         {"sent", "skipped", "portal-only", "skipped-failed-recording"})
+        self.assertEqual(len(self.finalize._remove_primary_chunks_after_retry(
+            failed_meta, UID, self.log, hold=False, keep_audio=False,
+            delivery_status="skipped-failed-recording")), self.N)
         self.assertEqual(self.meeting_chunks(), [])
 
     def test_cleanup_failure_never_raises(self):
         with mock.patch.object(second_ear, "remove_wavs", side_effect=RuntimeError("boom")):
             self.assertEqual(
-                self.finalize._remove_primary_chunks_after_retry(self.meta(), UID, self.log, hold=False), [])
+                self.finalize._remove_primary_chunks_after_retry(self.meta(), UID, self.log, hold=False,
+                                                           keep_audio=False, delivery_status="sent"), [])
 
     def test_retry_success_block_wires_the_cleanup_under_portal_gate(self):
         src = (_NOTARY / "finalize-meeting.py").read_text(encoding="utf-8")
         block = src.split("# 5.1. Если этот sid был в _failed/", 1)[1].split("# 6. Краткий результат", 1)[0]
         i_glob = block.index("for f in sid_files:")
-        i_call = block.index("_remove_primary_chunks_after_retry(meta, session_uid, log, hold=_hold_sources)")
+        i_call = block.index("_remove_primary_chunks_after_retry(")
+        call = block[i_call:i_call + 320]
+        for kw in ("hold=_hold_sources", "keep_audio=bool(args.keep_audio or keep_audio_from_meta)",
+                   'delivery_status=delivery_result.get("status")'):
+            self.assertIn(kw, call)
         self.assertLess(block.index("_hold_sources = _keep_sources_until_portal_ack"), i_call)
         self.assertLess(i_glob, i_call)
 

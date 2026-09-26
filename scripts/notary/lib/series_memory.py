@@ -1401,6 +1401,30 @@ def is_excluded_digest(digest: Optional[dict]) -> bool:
     return isinstance(digest, dict) and digest.get(EXCLUDED_KEY) is True
 
 
+def mark_excluded_from_series_memory(series_dir: Path, date: str, *,
+                                     series: Optional[str] = None) -> Optional[Path]:
+    """Пометить встречу даты `date` «не в памяти серии» (фаза 6б, №6; цикл5 — Н5, Н6).
+
+    Путь А обёртки восстановления зовёт это для встречи «лично мне». Выжимка уже есть
+    (сборка из записи строит её сама, с пометкой из meta) → пометка подтверждается;
+    выжимки нет (протокол из присланного текста сборка не выжимает) → кладётся заглушка
+    с одной пометкой. По ней встречу пропускают все читатели прошлых встреч
+    (`list_series_digests`), пересборка бэкфиллом (`backfill_series`) и «пришлите
+    протокол» не из лички владельца (`meetings_listener._latest_protocol_path`).
+    Только пометка — текста встречи тут нет. Не бросает: сбой → None.
+    """
+    try:
+        dig = load_digest(digest_path(series_dir, date)) or {"schema": SCHEMA_VERSION, "date": date}
+        if series and not dig.get("series"):
+            dig["series"] = series
+        dig[EXCLUDED_KEY] = True
+        return save_digest(Path(series_dir), date, dig)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[series-memory] пометка «не в памяти серии» не записана date=%s: %s",
+                       date, type(e).__name__)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # хранилище
 # ---------------------------------------------------------------------------

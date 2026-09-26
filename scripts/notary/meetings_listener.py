@@ -1043,29 +1043,46 @@ def _chat_context_series(cid: int, allowed_chat: int) -> tuple[list[str], Option
 
 
 # ── ISS-45: переотправка артефакта (протокол / дайджест) по просьбе участника ──
-def _latest_protocol_path(series: str) -> Optional[tuple]:
+def _latest_protocol_path(series: str, *, skip_personal: bool = False) -> Optional[tuple]:
     """Последний `<date>-protokol.md` серии → (Path, дата). Имена ISO-датой →
-    лексикографический max == хронологический. None, если протоколов нет."""
+    лексикографический max == хронологический. None, если протоколов нет.
+
+    `skip_personal` — просьба пришла НЕ из лички владельца: протокол, собранный «лично
+    мне» из присланной записи (путь А восстановления; его дата помечена «не в памяти
+    серии» — ISS-60 фаза 6б), получателям серии не отдаём: они его не получали, его
+    проверяет владелец (цикл5 фазы 6б, Н5). Тогда — последний протокол, который они видели.
+    """
     try:
         from notary.lib import series_memory  # noqa: PLC0415
         series_dir = _protokol_root() / series
         best = None
         for p in series_dir.glob(f"*{series_memory.PROTOCOL_FILE_SUFFIX}"):
             d = series_memory._date_from_protocol_filename(p.name)
-            if d and (best is None or d > best[1]):
-                best = (p, d)
+            if not d or (best is not None and d <= best[1]):
+                continue
+            if skip_personal and series_memory.is_excluded_digest(
+                    series_memory.load_digest(series_memory.digest_path(series_dir, d))):
+                logger.info("[send-artifact] протокол серии %s за %s собран лично владельцу — "
+                            "сюда не отдаю", series, d)
+                continue
+            best = (p, d)
         return best
     except Exception as e:  # noqa: BLE001
         logger.debug("[send-artifact] поиск протокола не удался: %s", type(e).__name__)
         return None
 
 
-def _resend_protocol(token: str, cid: int, series: str, msg: dict[str, Any]) -> bool:
+def _resend_protocol(token: str, cid: int, series: str, msg: dict[str, Any], *,
+                     owner_chat: bool = False) -> bool:
     """Переотправить ПОСЛЕДНИЙ протокол серии PDF-вложением. Идемпотентный
     `deliver_protocol` обходим (не трогаем bookkeeping доставки) — читаем md с диска,
-    рендерим PDF, шлём напрямую. Опасная тройка: тексты НЕ логируем."""
+    рендерим PDF, шлём напрямую. Опасная тройка: тексты НЕ логируем.
+
+    `owner_chat` — просьба из лички владельца: только ему отдаём и протокол «лично мне»
+    (цикл5 фазы 6б, Н5); в остальных чатах — последний протокол, который видели получатели.
+    """
     reply_to_id = msg.get("message_id")
-    found = _latest_protocol_path(series)
+    found = _latest_protocol_path(series, skip_personal=not owner_chat)
     if not found:
         # Протокола ещё нет: встреча прошла, но сборка не завершилась (или это первая
         # встреча серии). Не пугаем «потерялся» — честно про «ещё не готов».
@@ -1307,7 +1324,7 @@ def maybe_route_to_send_artifact(
         return True
     if kind == "digest":
         return _resend_digest(token, cid, series, msg)
-    return _resend_protocol(token, cid, series, msg)
+    return _resend_protocol(token, cid, series, msg, owner_chat=(cid == allowed_chat))
 
 
 def maybe_route_to_set_chat_command(

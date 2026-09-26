@@ -1241,6 +1241,74 @@ class TestPersonalRecoveryOutOfSeriesMemory(_RecoveryEnv):
             self.assertTrue(ing.personal_excluded_from_series_memory("dm-series"))
             self.assertIsNone(ing.series_group_chat("grp-series"), "в группу без реестра не шлём")
 
+    def test_personal_by_series_with_someone_elses_dm_is_excluded(self):
+        # Цикл5 фазы 6б (Н4): получатель серии — не только группа, но и личка другого
+        # человека; личка владельца (или нет привязки) — встреча остаётся в памяти.
+        (self.R / "watched.yaml").write_text(
+            "watched:\n"
+            "  - id: emp-series\n    series: emp-series\n    telegram_chat_id: 222\n"
+            "  - id: own-series\n    series: own-series\n    telegram_chat_id: %d\n"
+            "  - id: dm-series\n    series: dm-series\n" % OWNER, encoding="utf-8")
+        self.assertTrue(ing.personal_excluded_from_series_memory("emp-series"))
+        self.assertFalse(ing.personal_excluded_from_series_memory("own-series"))
+        self.assertFalse(ing.personal_excluded_from_series_memory("dm-series"))
+        self.assertFalse(ing.personal_excluded_from_series_memory("unknown-series"))
+
+    def test_broken_registry_is_unreadable_not_a_crash(self):
+        # Цикл5 фазы 6б (Н7): битый watched.yaml реестр сообщает SystemExit — обёртка не
+        # падает посреди прогона без итоговой строки, а считает реестр непрочитанным.
+        (self.R / "watched.yaml").write_text("- not: a mapping\n", encoding="utf-8")
+        self.assertTrue(ing.personal_excluded_from_series_memory("dm-series"))
+        self.assertIsNone(ing.series_group_chat("grp-series"))
+
+    def test_personal_from_transcript_is_marked_out_of_memory(self):
+        # Цикл5 фазы 6б (Н5, Н6): протокол из присланного текста выжимку не строит — дата
+        # всё равно помечена, её не берут ни память, ни «пришлите протокол» из группы.
+        sdir = self.prev_group_meeting("grp-series")
+        (sdir / f"{self.PREV}-protokol.md").write_text(PROTOCOL, encoding="utf-8")
+        txt = self.tmp / "t.txt"
+        txt.write_text("Иван: раз\nМария: два\n", encoding="utf-8")
+        self.rec = txt
+
+        def _gen(*, transcript_text, series, date, participants, out_protocol):
+            out_protocol = Path(out_protocol)
+            out_protocol.parent.mkdir(parents=True, exist_ok=True)
+            (out_protocol.parent / f"{date}.md").write_text(transcript_text, encoding="utf-8")
+            out_protocol.write_text(PROTOCOL, encoding="utf-8")
+            return out_protocol
+
+        with mock.patch.object(ing, "generate_protocol_from_transcript", side_effect=_gen):
+            rc, out = self.run_main("--series", "grp-series", "--mode", "personal")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(series_memory.is_excluded_digest(
+            series_memory.load_digest(sdir / f"{DATE}-memory.json")))
+        self.assertEqual(self.memory_dates(sdir), [self.PREV])
+        import notary.meetings_listener as ml  # noqa: PLC0415
+
+        self.assertEqual(ml._latest_protocol_path("grp-series", skip_personal=True)[1], self.PREV)
+        self.assertEqual(ml._latest_protocol_path("grp-series")[1], DATE)
+
+    def test_personal_protocol_not_generated_still_marked(self):
+        # Цикл5 фазы 6б: расшифровка есть, протокол Claude не составил (лимит, ISS-61). Его
+        # соберут позже «протокол <серия> <дата>» — дата уже помечена «лично мне».
+        sdir = self.prev_group_meeting("grp-series")
+
+        def no_protocol(meta_path, output_dir, *, deliver=False):
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+            d = Path(output_dir) / meta["series"]
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{meta['startTs'][:10]}.md").write_text(TRANSCRIPT, encoding="utf-8")
+            return 0, {"ok": True, "series": meta["series"], "delivery": {"status": "disabled"}}
+
+        rc, out = self.run_main("--series", "grp-series", "--mode", "personal", finalize=no_protocol)
+        self.assertEqual(out.get("error"), "protocol_not_generated", out)
+        self.assertTrue(series_memory.is_excluded_digest(
+            series_memory.load_digest(sdir / f"{DATE}-memory.json")))
+        # Серия без получателей кроме владельца — пометки нет.
+        dsdir = self.prev_group_meeting("dm-series")
+        self.run_main("--series", "dm-series", "--mode", "personal", finalize=no_protocol)
+        self.assertFalse((dsdir / f"{DATE}-memory.json").exists())
+
     def test_meta_key_matches_series_memory(self):
         self.assertEqual(ing.SERIES_MEMORY_EXCLUDE_KEY, series_memory.META_EXCLUDE_KEY)
         plain = ing.build_synthetic_meta(series="s", date=DATE, wav_path="/w.wav", participants=[], sid="x")

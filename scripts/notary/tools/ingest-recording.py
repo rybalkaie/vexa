@@ -678,14 +678,18 @@ def owner_chat_id() -> Optional[int]:
 
 
 def _series_chat(series: str) -> tuple[Optional[int], bool]:
-    """(чат серии из реестра `watched.yaml`, прочитан ли реестр)."""
+    """(чат серии из реестра `watched.yaml`, прочитан ли реестр).
+
+    `SystemExit` — тоже «не прочитан»: так реестр сообщает о битом `watched.yaml`
+    (`registry._read_yaml`), и без этого обёртка упала бы посреди прогона без итоговой
+    строки для Альфреда (цикл5 фазы 6б, Н7)."""
     try:
         from notary.cli.registry import (  # noqa: PLC0415
             get_telegram_chat_id_for_series, load_watched,
         )
 
         return get_telegram_chat_id_for_series(series, load_watched()), True
-    except Exception as e:  # noqa: BLE001
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         log.warning("[mode] реестр серий не прочитан (%s)", type(e).__name__)
         return None, False
 
@@ -707,13 +711,30 @@ def series_group_chat(series: str) -> Optional[int]:
 def personal_excluded_from_series_memory(series: str) -> bool:
     """Путь А: не пускать эту встречу в память серии? (фаза 6б, копилка владельца №6)
 
-    Да, если у серии групповой чат: протокол ушёл лично владельцу, группа его не
-    получала, и следующие её протоколы не должны на него опираться. У серии без группы
-    протокол и так уходит владельцу — встреча идёт в память как обычно. Реестр не
-    прочитан → да (осторожная сторона: лишнее исключение из памяти дешевле, чем
-    протокол «лично мне», просочившийся в протоколы группы)."""
+    Да, если протоколы серии обычно получает кто-то, кроме владельца: групповой чат или
+    личка другого человека (привязка серии в реестре — не личка владельца; цикл5 фазы 6б,
+    Н4 — раньше только группа). Этот протокол ушёл лично владельцу, получатели серии его
+    не видели, и следующие протоколы серии не должны на него опираться. Привязки нет или
+    она — личка владельца: протокол и так уходит ему, встреча идёт в память как обычно.
+    Реестр не прочитан → да (осторожная сторона: лишнее исключение из памяти дешевле, чем
+    протокол «лично мне», просочившийся в протоколы получателей)."""
     chat, read = _series_chat(series)
-    return (not read) or _is_group_chat(chat)
+    if not read:
+        return True
+    if not isinstance(chat, int) or isinstance(chat, bool):
+        return False
+    return chat != owner_chat_id()
+
+
+def mark_personal_out_of_series_memory(series_dir: Path, date: str, series: str) -> bool:
+    """Путь А: пометить дату встречи «не в памяти серии» (`series_memory`). Не бросает."""
+    try:
+        from lib.series_memory import mark_excluded_from_series_memory  # noqa: PLC0415
+
+        return mark_excluded_from_series_memory(series_dir, date, series=series) is not None
+    except Exception as e:  # noqa: BLE001
+        log.warning("[memory] пометка «не в памяти серии» не записана (%s)", type(e).__name__)
+        return False
 
 
 def _msk_date(raw: Any) -> Optional[str]:
@@ -1513,6 +1534,12 @@ def _run_personal(
         )
         meta.pop("files", None)
     log.info("[ingest] протокол готов: %s", protocol_path)
+    if meta.get(SERIES_MEMORY_EXCLUDE_KEY) is True:
+        # Фаза 6б (№6) + цикл5 (Н5, Н6): дата встречи «лично мне» помечена в памяти серии и
+        # тогда, когда выжимку не строит сама сборка (протокол из присланного текста): её не
+        # возьмёт ни память серии, ни пересборка бэкфиллом, ни «пришлите протокол» из чата
+        # получателей серии.
+        mark_personal_out_of_series_memory(Path(protocol_path).parent, args.date, args.series)
     if withheld_note:
         line = "⚠️ " + withheld_note[:1].upper() + withheld_note[1:] + "."
         degraded_note = f"{degraded_note}\n{line}" if degraded_note else line
@@ -1788,6 +1815,11 @@ def _main(argv: list[str] | None = None) -> int:
         return EXIT_BUSY
     except ProtocolNotGenerated as e:
         log.error("[ingest] %s", e)
+        if mode == MODE_PERSONAL and durable_output and personal_excluded_from_series_memory(args.series):
+            # Цикл5 фазы 6б: протокол соберут позже по готовой расшифровке («протокол <серия>
+            # <дата>»), и он будет «лично мне» — дату помечаем уже сейчас, иначе он ушёл бы
+            # получателям серии по «пришлите протокол» (сборка по расшифровке выжимку не строит).
+            mark_personal_out_of_series_memory(Path(output_dir) / args.series, args.date, args.series)
         archived = sync_to_archive(
             protocol_path_for(output_dir, args.series, args.date), e.transcript_path, args.date,
         ) if durable_output else []

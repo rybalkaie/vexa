@@ -739,7 +739,10 @@ class CycleTest(_Env):
         with mock.patch.object(lib, "CYCLE_BUDGET_SEC", 60):
             res = self.cycle(w)
         self.assertEqual(res["status"], lib.RED_UNCONFIRMED)
-        self.assertEqual(w.pushes, [])
+        self.assertEqual(len(w.pushes), 1, w.pushes)                      # цикл5 фазы 6б (У10)
+        self.assertTrue(w.pushes[0][1], "строка тихая: тревога — только после перепроверки")
+        self.assertIn("один раз не прошла", w.pushes[0][0])
+        self.assertIn("перепроверю утром", w.pushes[0][0])
         self.assertTrue(lib.load_health()["pending_recheck"])
         self.assertNotIn(lib.RETRY_PAUSE_SEC, w.sleeps)
 
@@ -756,7 +759,10 @@ class CycleTest(_Env):
         w.sleep = sleep
         res = self.cycle(w)
         self.assertEqual((res["status"], res["skip_reason"]), (lib.RED_UNCONFIRMED, "bot_running"))
-        self.assertEqual(w.pushes, [])
+        self.assertEqual(len(w.pushes), 1, w.pushes)                      # цикл5 фазы 6б (У10)
+        self.assertTrue(w.pushes[0][1], "строка тихая: тревога — только после перепроверки")
+        self.assertIn("один раз не прошла", w.pushes[0][0])
+        self.assertIn("перепроверю утром", w.pushes[0][0])
         self.assertTrue(lib.load_health()["pending_recheck"])
 
     # --- посторонние в комнате
@@ -1098,6 +1104,20 @@ class ApplyFinalTest(unittest.TestCase):
         _h, msgs = lib.apply_final({"status": lib.GREEN}, fin, NIGHT)
         self.assertEqual(msgs, [], "обычная ежедневная без смены версии — молча")
 
+    def test_unconfirmed_red_says_once_a_day_and_waits_for_morning(self):
+        # Цикл5 фазы 6б (У10): перепроверка ждёт утра — владельцу тихая строка, раз в сутки
+        # на причину; состояние «бот здоров» не меняется, тревоги 🔴 нет.
+        first = self.final(lib.RED, ["bot_join_failed"])
+        fin = dict(first, status=lib.RED_UNCONFIRMED, skip_reason="meeting_soon")
+        h, msgs = lib.apply_final({"status": lib.GREEN}, fin, DAY, first=first)
+        self.assertEqual(len(msgs), 1)
+        self.assertTrue(msgs[0][1])
+        self.assertIn("скоро встреча", msgs[0][0])
+        self.assertIn("перепроверю утром", msgs[0][0])
+        self.assertEqual((h["status"], h["pending_recheck"]), (lib.GREEN, True))
+        h, msgs = lib.apply_final(h, fin, DAY + timedelta(hours=3), first=first)
+        self.assertEqual(msgs, [], "та же причина в те же сутки — второй раз не пишем")
+
     def test_closes_version_check_needs_run_after_change(self):
         seen = DAY
         st = {"pending_check": True, "seen_at": iso_(seen)}
@@ -1189,14 +1209,16 @@ class SniffTest(_Env):
         self.assertEqual(pushes3, [])  # о смене уже сказали
         self.assertFalse(lib.load_version_state()["pending_check"])
 
-    def test_room_busy_backs_off_two_hours(self):
-        # Перепроверка красного (в любое время): занято → через 2 часа, не раньше.
-        lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
+    def test_room_busy_recheck_backs_off_to_next_morning(self):
+        # Перепроверка красного — тоже только утром (цикл5 фазы 6б): занято в 07:02 →
+        # не через 2 часа днём, а следующим утром (окно — час, отсрочка — 2 часа).
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
         lib.save_health({"status": lib.GREEN, "pending_recheck": True})
         busy = [{"status": lib.SKIPPED, "skip_reason": "room_busy", "run_id": "r"}]
-        self.assertEqual(len(self.sniff_at(DAY + timedelta(hours=1), html=HTML, results=busy)[0]), 1)
-        self.assertEqual(self.sniff_at(DAY + timedelta(hours=2), html=HTML)[0], [])
-        self.assertEqual(len(self.sniff_at(DAY + timedelta(hours=3, minutes=1), html=HTML)[0]), 1)
+        self.assertEqual(len(self.sniff_at(MORNING, html=HTML, results=busy)[0]), 1)
+        for h in range(1, 24):                                             # весь день и ночь — тихо
+            self.assertEqual(self.sniff_at(MORNING + timedelta(hours=h), html=HTML)[0], [], h)
+        self.assertEqual(len(self.sniff_at(MORNING + timedelta(days=1), html=HTML)[0]), 1)
 
     def test_room_busy_in_morning_window_retries_next_morning(self):
         lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
@@ -1251,6 +1273,19 @@ class SniffTest(_Env):
             calls, pushes = self.sniff_at(when)
             self.assertEqual((calls, pushes), ([], []), when)
         self.assertFalse(lib.load_version_state()["pending_check"])
+
+    def test_daily_run_closes_version_check_without_sniff(self):
+        # Цикл5 фазы 6б (У12): проверку после обновления закрывает сам прогон — без «нюха»
+        # наутро второе «✅ после обновления» не приходит.
+        lib.sniff(deps=self.deps(now=NIGHT - timedelta(hours=3, minutes=40))[1], run=self.fake_run([])[0])
+        self.sniff_at(NIGHT - timedelta(hours=2, minutes=40))                   # смена в 02:00 МСК
+        w = World(base=NIGHT, runs=[{"participants": ["Тест-диктор"]}])
+        lib.run_cycle(deps=w.deps(), image=lib.DEFAULT_IMAGE, room="t10", reason="daily")
+        self.assertEqual(len(w.pushes), 1, w.pushes)
+        self.assertFalse(lib.load_version_state()["pending_check"], "закрыл сам прогон, без «нюха»")
+        w2 = World(base=NIGHT + timedelta(days=1), runs=[{"participants": ["Тест-диктор"]}])
+        lib.run_cycle(deps=w2.deps(), image=lib.DEFAULT_IMAGE, room="t10", reason="daily")
+        self.assertEqual(w2.pushes, [], "наутро второе «✅ после обновления»")
 
     def test_change_seen_after_daily_started_checks_this_morning(self):
         lib.sniff(deps=self.deps(now=NIGHT - timedelta(hours=1))[1], run=self.fake_run([])[0])
@@ -1317,12 +1352,46 @@ class SniffTest(_Env):
         self.assertFalse(lib.in_version_check_window(MORNING + timedelta(minutes=58)))  # 08:00
         self.assertFalse(lib.in_version_check_window(MORNING - timedelta(minutes=3)))   # 06:59
 
-    def test_pending_recheck_from_health_runs(self):
+    def test_pending_recheck_runs_only_in_morning_window(self):
+        # Цикл5 фазы 6б (решение дирижёра по смыслу ответа владельца №12): днём в Т-10 не
+        # заходим и с перепроверкой красного — только 07:00–08:00 МСК.
         lib.sniff(deps=self.deps()[1], run=self.fake_run([])[0])
         lib.save_health({"status": lib.GREEN, "pending_recheck": True})
-        run, calls = self.fake_run([])
-        lib.sniff(deps=self.deps(now=DAY + timedelta(hours=1))[1], run=run)
+        for when in (DAY + timedelta(hours=1), DAY + timedelta(hours=8),          # 11:00, 18:00
+                     NIGHT - timedelta(hours=3), NIGHT + timedelta(minutes=22),     # 01:40, 05:02
+                     NIGHT + timedelta(hours=1, minutes=22), MORNING + timedelta(hours=1)):  # 06:02, 08:02
+            self.assertEqual(self.sniff_at(when, html=HTML)[0], [], when)
+        calls, _p = self.sniff_at(MORNING, html=HTML)
         self.assertEqual([c["reason"] for c in calls], ["recheck"])
+
+    def test_unconfirmed_red_in_daytime_waits_for_next_morning(self):
+        # Красный не удалось перепроверить сразу (не успеть в срок юнита / скоро встреча)
+        # днём — перепроверка не днём, а в 07:0x следующего утра.
+        lib.sniff(deps=self.deps(now=DAY - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        bad = {"bot_result": "failed"}
+        w = World(base=DAY, runs=[bad, bad])
+        with mock.patch.object(lib, "CYCLE_BUDGET_SEC", 60):
+            res = self.cycle(w, reason="manual")
+        self.assertEqual(res["status"], lib.RED_UNCONFIRMED)
+        self.assertTrue(lib.load_health()["pending_recheck"])
+        for h in range(1, 21):                                             # 11:00 … 06:00 МСК
+            self.assertEqual(self.sniff_at(DAY + timedelta(hours=h), html=HTML)[0], [], h)
+        calls, _p = self.sniff_at(MORNING + timedelta(days=1), html=HTML)  # 07:02 следующего дня
+        self.assertEqual([c["reason"] for c in calls], ["recheck"])
+
+    def test_version_check_and_recheck_together_run_once(self):
+        lib.sniff(deps=self.deps(now=MORNING - timedelta(hours=1))[1], run=self.fake_run([])[0])
+        lib.save_health({"status": lib.GREEN, "pending_recheck": True})
+        calls, _p = self.sniff_at(MORNING, results=[{"status": lib.GREEN, "run_id": "r"}])
+        self.assertEqual([c["reason"] for c in calls], ["version-change"])
+
+    def test_status_says_recheck_waits_for_morning(self):
+        import notary.canary as cli
+
+        lib.save_health({"status": lib.GREEN, "pending_recheck": True})
+        with mock.patch("builtins.print") as pr:
+            cli.main(["status"])
+        self.assertIn("Ждёт перепроверки красного — утром 07:00–08:00 МСК", pr.call_args[0][0])
 
     def test_six_errors_one_message_then_reset(self):
         pushes = []

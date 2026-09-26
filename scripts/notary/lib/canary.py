@@ -25,7 +25,10 @@
      критично (провал = 🔴); «Тест-диктор» в участниках — не критично (🟡: в 3.0
      список участников пока не собирается, фаза 3).
   6. 🔴 перепроверяется вторым полным прогоном через 3 минуты (`run_cycle`);
-     сообщение владельцу — только если красный оба раза.
+     тревога владельцу — только если красный оба раза. Перепроверить сразу не
+     вышло (не успеть в срок юнита, скоро встреча) → тихая строка «один раз не
+     прошла, перепроверю утром» (раз в сутки на причину, цикл5 фазы 6б): днём
+     перепроверки нет, и возможная поломка не должна молчать до утра.
   7. Фаза 4 — второе ухо бота (`*.chunk0.wav`, всё, что играл браузер) судится
      отдельно от основной записи: основная не услышала диктора, а бот сам
      переключил протокол на второе ухо и в нём кодовое слово → 🟡 `primary_deaf`
@@ -42,9 +45,13 @@
 Её закрывает любая самопроверка на боевом образе, дошедшая до итога (🟢/🟡/🔴) и
 начатая после того, как «нюх» увидел новую версию, — обычно ежедневная в 04:40
 (`version_check_covered`); не закрыла → внеплановая в 07:00–08:00 МСК
-(`in_version_check_window`). Перепроверка неподтверждённого красного
-(`pending_recheck`) этим окном не ограничена: бот, возможно, сломан, и ждать утра
-нельзя. `warn_tick` (из тика запускателя): пока самопроверка красная — за
+(`in_version_check_window`). Тем же окном ограничена и перепроверка красного, который
+не удалось перепроверить сразу (`pending_recheck`; цикл5 фазы 6б, по смыслу ответа
+владельца): сама самопроверка днём в Т-10 не заходит никогда — только таймер в 04:40 и
+«нюх» в 07:00–08:00 МСК; ручной `run --reason manual` осознанный, его это не касается.
+Пока красный ждёт утра, предупреждений перед встречами нет (они — по подтверждённому
+красному): встречи страхует сторож входа.
+`warn_tick` (из тика запускателя): пока самопроверка красная — за
 ~10 минут до каждой встречи предупредить владельца, чтобы он включил запись в
 Телемосте сам; и раз в сутки тихо сказать, если самопроверка больше суток не
 доходила до итога (умерла молча / не сработал таймер).
@@ -172,7 +179,8 @@ TRANSCRIBE_EAR_FILES = 1
 # Повтор перед тревогой.
 RETRY_PAUSE_SEC = 180
 #: Юнит самопроверки живёт ≤ 40 мин (TimeoutStartSec); повтор не начинаем, если
-#: худший второй прогон не успеет — красный тогда перепроверит часовой «нюх».
+#: худший второй прогон не успеет — красный тогда перепроверит «нюх» в утреннем окне
+#: 07:00–08:00 МСК (днём в Т-10 не заходим).
 CYCLE_BUDGET_SEC = 38 * 60
 #: Худший обычный прогон (для решения «успеет ли перепроверка в срок юнита»).
 #: Ожидание «основная оглохла» (DEAF_EVENT_TIMEOUT_SEC) сюда не входит: режим
@@ -220,12 +228,13 @@ TELEMOST_HOME = "https://telemost.yandex.ru/"
 VERSION_HISTORY = 20
 SNIFF_ERROR_ALERT_AFTER = 6
 #: Комната была занята при внеплановой проверке → следующая попытка не раньше,
-#: чем через 2 часа: заходить к людям каждый час — нет. Для проверки после обновления
-#: это значит «завтра утром» (окно ниже — час), для перепроверки красного — через 2 ч.
+#: чем через 2 часа: заходить к людям каждый час — нет. Окно внеплановых прогонов
+#: ниже — час, так что это значит «завтра утром».
 BUSY_RETRY_BACKOFF_MIN = 120
-#: Проверка после обновления Телемоста — только утром, пока в Т-10 никого нет (решение
-#: владельца 26.09: «можем утром, часов в 7–8»): [07:00, 08:00) МСК. «Нюх» раз в час
-#: (таймер hourly + до 5 мин разброса) попадает в окно один раз — в 07:0x.
+#: Внеплановые прогоны «нюха» — проверка после обновления Телемоста и перепроверка
+#: красного — только утром, пока в Т-10 никого нет (решение владельца 26.09: «можем
+#: утром, часов в 7–8»; перепроверка — цикл5 фазы 6б): [07:00, 08:00) МСК. «Нюх» раз в
+#: час (таймер hourly + до 5 мин разброса) попадает в окно один раз — в 07:0x.
 VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H = 7, 8
 #: Ежедневная самопроверка — `meeting-notary-canary.timer`, 01:40 UTC = 04:40 МСК
 #: (тест сверяет с юнитом). Нужна здесь только для слов владельцу «когда проверю».
@@ -1632,6 +1641,22 @@ def apply_final(
         if status == RED_UNCONFIRMED:
             h["pending_recheck"] = True
             h["last_unconfirmed_red"] = {"at": iso(now), **_mini(first or final)}
+            # Цикл5 фазы 6б (У10): перепроверка ждёт утреннего окна — днём в Т-10 не
+            # заходим. Чтобы возможная поломка не пролежала молча до утра (предупреждения
+            # перед встречами — только по подтверждённому красному), владельцу тихая
+            # строка, раз в сутки на причину; тревога 🔴 — только после перепроверки.
+            src = first or final
+            if _alert_due(h, "unconfirmed:" + ((src.get("reasons") or ["unknown"])[0]), now):
+                skip_code = str(final.get("skip_reason") or "retry_deferred")
+                why_not = REASON_TEXT.get(skip_code) or skip_code
+                msgs.append((
+                    f"🟠 Самопроверка бота в {room} один раз не прошла: {human_reasons(src)}. "
+                    f"Перепроверить сразу не вышло ({why_not}). Днём в Т-10 не захожу — "
+                    f"перепроверю утром ({DAILY_RUN_MSK[0]:02d}:{DAILY_RUN_MSK[1]:02d} или "
+                    f"{VERSION_CHECK_FROM_H:02d}:00–{VERSION_CHECK_TO_H:02d}:00 МСК). До этого бот "
+                    f"может не зайти на встречу — на важной подстрахуйся записью в Телемосте.",
+                    True,
+                ))
         h["consecutive_skips"] = int(h.get("consecutive_skips") or 0) + 1
         n = h["consecutive_skips"]
         if _skip_note_due(n):
@@ -1795,13 +1820,24 @@ def _run_cycle_locked(*, deps, image, room, reason, force, kit) -> Dict[str, Any
 
     def finish(final: Dict[str, Any], first: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if production:
-            closes = closes_version_check(load_version_state(), final.get("started_at")) \
+            vstate = load_version_state()
+            closes = closes_version_check(vstate, final.get("started_at")) \
                 and final.get("status") in (GREEN, YELLOW, RED)
             new_h, msgs = apply_final(health, final, deps.now(), first=first, version_check=closes)
             try:
                 save_health(new_h)
             except OSError as e:
                 logger.warning("[canary] health.json не сохранён (%s)", type(e).__name__)
+            if closes:
+                # Цикл5 фазы 6б (У12): проверку после обновления закрывает сам прогон, а не
+                # следующий «нюх»: без работающего «нюха» «✅ после обновления» уходило бы
+                # владельцу каждое утро. «Нюх» по-прежнему закрывает её и сам.
+                vstate["pending_check"] = False
+                vstate.pop("retry_after", None)
+                try:
+                    write_json(version_path(), vstate)
+                except OSError as e:
+                    logger.warning("[canary] telemost-version.json не сохранён (%s)", type(e).__name__)
             _notify_all(deps, msgs)
         else:
             # Кандидат правки: итог — в runs/, журнал и вывод команды; боевое
@@ -1847,12 +1883,14 @@ def _run_cycle_locked(*, deps, image, room, reason, force, kit) -> Dict[str, Any
     # Красный — перепроверяем, прежде чем тревожить владельца.
     elapsed = (deps.now() - start).total_seconds()
     if elapsed + RETRY_PAUSE_SEC + MAX_RUN_SEC > CYCLE_BUDGET_SEC:
-        logger.warning("[canary] перепроверку не успеть в срок юнита — отложена до «нюха»")
+        logger.warning("[canary] перепроверку не успеть в срок юнита — отложена до утреннего окна "
+                       "«нюха» (%02d:00–%02d:00 МСК)", VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H)
         return finish({**first, "status": RED_UNCONFIRMED, "skip_reason": "retry_deferred"}, first)
     deps.sleep(RETRY_PAUSE_SEC)
     g = guards()
     if g:
-        logger.warning("[canary] перепроверка не начата (%s) — отложена до «нюха»", g)
+        logger.warning("[canary] перепроверка не начата (%s) — отложена до утреннего окна «нюха» "
+                       "(%02d:00–%02d:00 МСК)", g, VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H)
         return finish({**first, "status": RED_UNCONFIRMED, "skip_reason": g}, first)
     try:
         second = run_once(deps=deps, image=image, room=room, meeting_url=url, reason=reason + "-recheck",
@@ -1891,7 +1929,11 @@ def parse_version(html: str) -> Optional[str]:
 
 
 def in_version_check_window(now: datetime) -> bool:
-    """Сейчас утреннее окно проверки после обновления Телемоста: [07:00, 08:00) МСК."""
+    """Сейчас утреннее окно внеплановых прогонов: [07:00, 08:00) МСК.
+
+    Только в нём «нюх» сам заходит в Т-10 — и проверкой после обновления Телемоста, и
+    перепроверкой красного (решение владельца 26.09; перепроверка — цикл5 фазы 6б).
+    """
     return VERSION_CHECK_FROM_H <= now.astimezone(_MSK).hour < VERSION_CHECK_TO_H
 
 
@@ -1988,7 +2030,7 @@ def sniff(
     Фаза 6б (решение владельца 26.09): проверка после обновления — только в утреннем
     окне 07:00–08:00 МСК и только если её ещё не закрыла самопроверка с итогом, начатая
     после смены версии (обычно ежедневная в 04:40). Перепроверка неподтверждённого
-    красного (`pending_recheck`) — как раньше, на ближайшем «нюхе».
+    красного (`pending_recheck`) — в том же окне (цикл5 фазы 6б): днём в Т-10 не заходим.
     """
     now = deps.now()
     version: Optional[str] = None
@@ -2020,12 +2062,19 @@ def sniff(
     logger.info("[canary] нюх: версия=%s ошибка=%s смена=%s", version, error, changed)
 
     out: Dict[str, Any] = {"version": version, "error": error, "changed": changed, "run": None}
-    version_due = bool(st.get("pending_check")) and in_version_check_window(now)
-    recheck = bool(health.get("pending_recheck"))
+    # Днём в Т-10 не заходим (решение владельца 26.09 «почему днём? можем утром, часов в
+    # 7–8»; по его смыслу — и перепроверка неподтверждённого красного, цикл5 фазы 6б): сам
+    # «нюх» запускает самопроверку только в утреннем окне. Ежедневная в 04:40 — свой таймер;
+    # ручной `run --reason manual` осознанный, окно его не касается.
+    morning = in_version_check_window(now)
+    version_due = bool(st.get("pending_check")) and morning
+    recheck = bool(health.get("pending_recheck")) and morning
     if not (version_due or recheck):
-        if st.get("pending_check"):
-            logger.info("[canary] проверка после обновления ждёт утра (%02d:00–%02d:00 МСК)",
-                        VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H)
+        waiting = [what for what, on in (("проверка после обновления", st.get("pending_check")),
+                                         ("перепроверка красного", health.get("pending_recheck"))) if on]
+        if waiting:
+            logger.info("[canary] %s ждёт утра (%02d:00–%02d:00 МСК): днём в Т-10 не заходим",
+                        " и ".join(waiting), VERSION_CHECK_FROM_H, VERSION_CHECK_TO_H)
         return out
     retry_after = parse_ts(st.get("retry_after"))
     if retry_after and now < retry_after:
@@ -2221,7 +2270,8 @@ def status_text() -> str:
         s = h["last_skip"]
         lines.append(f"Последний пропуск: {s.get('status')} {s.get('reason')} ({s.get('at')})")
     if h.get("pending_recheck"):
-        lines.append("Ждёт перепроверки красного (сделает часовой «нюх»).")
+        lines.append(f"Ждёт перепроверки красного — утром {VERSION_CHECK_FROM_H:02d}:00–"
+                     f"{VERSION_CHECK_TO_H:02d}:00 МСК (днём в Т-10 не заходим).")
     if h.get("image"):
         lines.append(f"Образ: {h['image']}")
     lines.append(f"Телемост: версия {v.get('version') or '?'}"

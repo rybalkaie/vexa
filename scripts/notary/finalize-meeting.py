@@ -434,16 +434,30 @@ def _keep_sources_until_portal_ack(session_uid: str, meta: dict) -> bool:
         return True
 
 
+#: Итоги доставки, после которых звук встречи можно убирать (копилка владельца №3: «после
+#: доставки»). Те же, при которых сборщик удаляет запись (`collector._do_finalize_and_collect`:
+#: sent / skipped / portal-only), и подавленный обрывок (`skipped-failed-recording`: встреча
+#: помечена обработанной — сборщик убрал бы её звук следующим тиком). Остальное (спросили
+#: владельца, доставка выключена или упала, протокол не составился) — звук остаётся.
+_AUDIO_CLEANUP_DELIVERY_OK = frozenset({"sent", "skipped", "portal-only", "skipped-failed-recording"})
+
+
 def _remove_primary_chunks_after_retry(
-    meta: dict, session_uid: str, log: logging.Logger, *, hold: bool,
+    meta: dict, session_uid: str, log: logging.Logger, *,
+    hold: bool, keep_audio: bool, delivery_status: str | None,
 ) -> list[str]:
     """Удачный повтор после сбоя расшифровки (5.1): удалить куски основной записи встречи.
 
     ISS-60 фаза 6б (копилка владельца №3, 26.09). После сбоя куски остаются в папке
     записей бота (из них повтор заново склеивает звук), meta оттуда удалена — сборщик
     их больше не видит, и они лежали вечно. Зовётся там же, где 5.1 удаляет
-    `_failed/<sid>.*`, и при том же условии: `hold` (портал не подтвердил приём —
-    `_keep_sources_until_portal_ack`) → не удаляем ничего.
+    `_failed/<sid>.*`, но по правилу владельца «после доставки» — строже неё, как
+    сборщик (цикл5 фазы 6б, Н2): `hold` (портал не подтвердил приём —
+    `_keep_sources_until_portal_ack`) → ничего; `keep_audio` (флаг запуска, meta, серия
+    в реестре — `second_ear.keep_audio_requested`) → ничего; доставка протокола не
+    подтверждена (`delivery_status` не из `_AUDIO_CLEANUP_DELIVERY_OK`) → ничего. Куски,
+    оставленные так, после 5.1 никто больше не уберёт (meta из `_failed/` удалена) —
+    об этом строка в журнале.
 
     Только звук: куски `<дата>-<сессия>.chunk<N≥1>.wav` ЭТОЙ встречи из её meta, со
     строгой проверкой путей (`second_ear.primary_chunk_wavs`); расшифровки, протоколы и
@@ -456,6 +470,13 @@ def _remove_primary_chunks_after_retry(
         from lib import second_ear as _second_ear  # noqa: PLC0415
         from lib.wav_concat import _remap_host_path  # noqa: PLC0415
 
+        if keep_audio or _second_ear.keep_audio_requested(meta):
+            log.info("[retry] куски записи %s оставлены: keep_audio", session_uid)
+            return []
+        if delivery_status not in _AUDIO_CLEANUP_DELIVERY_OK:
+            log.warning("[retry] куски записи %s оставлены: доставка протокола не подтверждена (%s)",
+                        session_uid, delivery_status)
+            return []
         return _second_ear.remove_wavs(
             _second_ear.primary_chunk_wavs(meta, session_uid), session_uid,
             host_path=lambda p: Path(_remap_host_path(p)), why="после удачного повтора",
@@ -2098,10 +2119,15 @@ def main() -> int:
                 pass
         # ISS-60 фаза 6б (копилка владельца №3, 26.09): куски основной записи этой
         # встречи, оставшиеся в папке записей бота после сбоя расшифровки, — вместе с
-        # остальными её файлами, при том же условии (портал не держит исходники).
+        # остальными её файлами, если портал не держит исходники, звук не велено
+        # сохранять и протокол доставлен (цикл5 фазы 6б, Н2: «после доставки»).
         # `_stash_into_failed` переложил в `_failed/` склейку и спутников, а сами куски
         # оставил: из них повтор склеивал звук. Раньше их не удалял никто.
-        _remove_primary_chunks_after_retry(meta, session_uid, log, hold=_hold_sources)
+        _remove_primary_chunks_after_retry(
+            meta, session_uid, log, hold=_hold_sources,
+            keep_audio=bool(args.keep_audio or keep_audio_from_meta),
+            delivery_status=delivery_result.get("status"),
+        )
         series_label = meta.get("series") or session_uid
         n = (attempts_count or 0) + 1
         _stt_friendly = {

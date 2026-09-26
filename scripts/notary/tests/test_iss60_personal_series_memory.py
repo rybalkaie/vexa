@@ -21,11 +21,13 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
@@ -115,6 +117,76 @@ class DigestMarkTest(_Dirs):
         self.assertTrue(sm.is_excluded_digest(sm.load_digest(sm.digest_path(self.grp, "2026-09-23"))))
         self.assertFalse(sm.is_excluded_digest(sm.load_digest(sm.digest_path(self.grp, "2026-09-24"))))
         self.assertEqual([d["date"] for d in sm.list_series_digests(self.grp)], ["2026-09-24"])
+
+    # --- цикл5 фазы 6б (Н6): путь А без выжимки (протокол из присланного текста)
+
+    def test_mark_without_digest_leaves_stub_that_everyone_skips(self):
+        self.save(self.grp, "2026-09-16")
+        self.assertIsNotNone(sm.mark_excluded_from_series_memory(self.grp, "2026-09-23", series="grp"))
+        self.assertTrue(sm.is_excluded_digest(sm.load_digest(sm.digest_path(self.grp, "2026-09-23"))))
+        self.assertEqual([d["date"] for d in sm.list_series_digests(self.grp)], ["2026-09-16"])
+        # Ручная пересборка бэкфиллом не возвращает встречу в память.
+        (self.grp / "2026-09-16-protokol.md").write_text(PROTOCOL, encoding="utf-8")
+        (self.grp / "2026-09-23-protokol.md").write_text(PROTOCOL, encoding="utf-8")
+        sm.backfill_series(self.grp, overwrite=True)
+        self.assertEqual([d["date"] for d in sm.list_series_digests(self.grp)], ["2026-09-16"])
+
+    def test_mark_keeps_existing_digest_content(self):
+        self.save(self.grp, "2026-09-23", personal=True)
+        before = sm.load_digest(sm.digest_path(self.grp, "2026-09-23"))
+        sm.mark_excluded_from_series_memory(self.grp, "2026-09-23")
+        self.assertEqual(sm.load_digest(sm.digest_path(self.grp, "2026-09-23")), before)
+
+
+class ResendToRecipientsTest(_Dirs):
+    """Цикл5 фазы 6б (Н5): «пришлите протокол» не из лички владельца не отдаёт протокол
+    «лично мне» — получатели серии его не получали. Владельцу — отдаёт."""
+
+    GROUP, OWNER = -100500, 111
+
+    def setUp(self) -> None:
+        super().setUp()
+        sys.path.insert(0, str(_HERE.parent.parent))
+        import notary.meetings_listener as ml  # noqa: PLC0415
+
+        self.ml = ml
+        self._env = mock.patch.dict(os.environ, {"MEETING_NOTARY_PROTOCOLS_DIR": str(self.root)})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.save(self.grp, "2026-09-16")
+        (self.grp / "2026-09-16-protokol.md").write_text(PROTOCOL, encoding="utf-8")
+        self.save(self.grp, "2026-09-23", personal=True)
+        (self.grp / "2026-09-23-protokol.md").write_text(PROTOCOL, encoding="utf-8")
+
+    def test_latest_protocol_skips_personal_for_recipients(self):
+        self.assertEqual(self.ml._latest_protocol_path("grp")[1], "2026-09-23")
+        self.assertEqual(self.ml._latest_protocol_path("grp", skip_personal=True)[1], "2026-09-16")
+        # Протокол из присланного текста — выжимки нет, только пометка-заглушка.
+        (self.grp / "2026-09-30-protokol.md").write_text(PROTOCOL, encoding="utf-8")
+        sm.mark_excluded_from_series_memory(self.grp, "2026-09-30")
+        self.assertEqual(self.ml._latest_protocol_path("grp", skip_personal=True)[1], "2026-09-16")
+
+    def test_only_personal_protocols_gives_nothing_to_recipients(self):
+        (self.grp / "2026-09-16-protokol.md").unlink()
+        self.assertIsNone(self.ml._latest_protocol_path("grp", skip_personal=True))
+
+    def test_resend_passes_whose_chat(self):
+        for owner_chat, skip in ((False, True), (True, False)):
+            with mock.patch.object(self.ml, "_latest_protocol_path", return_value=None) as lp, \
+                    mock.patch.object(self.ml, "send_message"):
+                self.ml._resend_protocol("tok", self.GROUP, "grp", {"message_id": 1}, owner_chat=owner_chat)
+            self.assertEqual(lp.call_args.kwargs, {"skip_personal": skip}, owner_chat)
+
+    def test_route_marks_owner_chat_only_for_owner(self):
+        msg = {"from": {"id": 42, "first_name": "Илья"}, "message_id": 1000, "date": 1718000000,
+               "text": "пришли протокол", "reply_to_message": {"message_id": 900, "text": "протокол"}}
+        for cid, owner_chat in ((self.GROUP, False), (self.OWNER, True)):
+            with mock.patch.object(self.ml, "_reply_context_series", return_value="grp"), \
+                    mock.patch.object(self.ml, "_reply_context_series_digest", return_value=None), \
+                    mock.patch.object(self.ml, "_resend_protocol", return_value=True) as rp:
+                self.assertTrue(self.ml.maybe_route_to_send_artifact(
+                    "tok", cid, self.OWNER, dict(msg, chat={"id": cid})))
+            self.assertEqual(rp.call_args.kwargs, {"owner_chat": owner_chat}, cid)
 
 
 if __name__ == "__main__":
