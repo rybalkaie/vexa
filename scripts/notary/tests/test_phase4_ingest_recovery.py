@@ -299,6 +299,7 @@ import tempfile  # noqa: E402
 import types  # noqa: E402
 from unittest import mock  # noqa: E402
 
+from lib import delivery_gate  # noqa: E402
 from lib import feedback_worker  # noqa: E402
 from lib import finalize_lock  # noqa: E402
 from lib import llm_postprocess as lp  # noqa: E402
@@ -386,8 +387,15 @@ class _RecoveryEnv(unittest.TestCase):
             self.sent.append((chat_id, self.next_mid))
             return {"message_id": self.next_mid}
 
+        #: Текст, из которого собран каждый отправленный PDF (что увидели люди).
+        self.rendered: list = []
+
+        def _render(md_text, out_pdf, **kw):
+            self.rendered.append(md_text)
+            return _fake_render(md_text, out_pdf, **kw)
+
         self.patches = [
-            mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_fake_render),
+            mock.patch.object(lp.protocol_to_pdf, "render_pdf_from_markdown", side_effect=_render),
             mock.patch.object(lp.telegram_api, "send_document", side_effect=_send_document),
             mock.patch("lib.notify.push_via_notarius", return_value=True),
             mock.patch("lib.notify.push", return_value=True),
@@ -423,13 +431,16 @@ class _RecoveryEnv(unittest.TestCase):
                 return rc, None
             delivery = {"status": "disabled"}
             if deliver:
-                # Ровно блок доставки finalize-meeting.py: пути в meta доставки и
-                # `delivered` — в ИСХОДНУЮ meta (`_delivery_marker_meta_path`).
+                # Ровно блок доставки finalize-meeting.py: пометка «собран из
+                # присланной записи» (фаза 6), пути в meta доставки и `delivered` —
+                # в ИСХОДНУЮ meta (`_delivery_marker_meta_path`).
+                text = delivery_gate.with_recovery_note(PROTOCOL, meta, delivery_enabled=True)
+                proto.write_text(text, encoding="utf-8")
                 dm = dict(meta)
                 dm.update({"date": date, "sessionUid": meta["sessionUid"],
                            "transcript_path": str(md), "protocol_path": str(proto)})
                 delivery = lp.deliver_protocol(
-                    meeting_meta=dm, protocol_text=PROTOCOL,
+                    meeting_meta=dm, protocol_text=text,
                     meta_json_path=Path(meta_path), meeting_sid=meta["sessionUid"],
                 )
             return rc, {"ok": rc == 0, "series": series, "protocol_path": str(md), "delivery": delivery}
@@ -704,10 +715,20 @@ class TestManualFinalizeLock(_RecoveryEnv):
 
 class TestModeAndSeams(_RecoveryEnv):
     def test_auto_mode_by_series_group(self):
-        self.assertEqual(ing.resolve_mode("auto", kind="audio", series="grp-series"), "standard")
-        self.assertEqual(ing.resolve_mode("auto", kind="video", series="dm-series"), "personal")
+        # Фаза 6: в группу — только группа у серии И надёжная серия (журнал / календарь).
+        for src in ("journal", "calendar"):
+            self.assertEqual(ing.resolve_mode("auto", kind="audio", series="grp-series", source=src),
+                             "standard")
+        for src in (None, "name", "calendar_mismatch"):
+            self.assertEqual(ing.resolve_mode("auto", kind="audio", series="grp-series", source=src),
+                             "personal", "серия, угаданная по названию, ушла бы в группу")
+        self.assertEqual(ing.resolve_mode("auto", kind="video", series="dm-series", source="journal"),
+                         "personal")
         self.assertEqual(ing.resolve_mode("auto", kind="audio", series="no-such"), "personal")
-        self.assertEqual(ing.resolve_mode("auto", kind="transcript", series="grp-series"), "personal")
+        self.assertEqual(ing.resolve_mode("auto", kind="transcript", series="grp-series",
+                                          source="journal"), "personal")
+        self.assertEqual(ing.resolve_mode("standard", kind="audio", series="grp-series"), "standard",
+                         "явный путь Б человека не ужесточается")
         with self.assertRaises(ValueError):
             ing.resolve_mode("standard", kind="transcript", series="grp-series")
 
@@ -993,6 +1014,143 @@ class TestCycle5Fixes(_RecoveryEnv):
                 self.assertTrue(wav.exists(), "сборщик стёр свежую запись посреди ручной финализации")
             collector._cleanup_delivered_under_lock(meta, sid)
         self.assertFalse(wav.exists(), "после ручной финализации уборка идёт как раньше")
+
+
+class TestAutoModeNeedsReliableSeries(_RecoveryEnv):
+    """Фаза 6 (копилка владельца п.5): `--mode auto` шлёт в группу серии, только если
+    серию подтверждает журнал сторожа или событие календаря, привязанное к серии.
+    23.09.2026 протокол ушёл в группу по серии, угаданной по названию, — и имена в нём
+    были перепутаны. Угаданная серия → лично владельцу, с понятной строкой."""
+
+    GROUP_NOTE_MARK = "Протокол собран из присланной записи"
+
+    def write_journal(self, **entries) -> None:
+        """Журнал сторожа входа (`lib/join_watch.ledger_path`) — рядом с реестром."""
+        data = {}
+        for key, (series, start_at, extra) in entries.items():
+            data[key] = {"series": series, "start_at": start_at, "state": "alerted",
+                         "attempts": [], "created_at": "2026-09-23T07:00:00+00:00", **extra}
+        (self.R / ".join-watch.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def bind_event(self, event_id: str) -> None:
+        (self.R / "watched.yaml").write_text(
+            "watched:\n"
+            "  - id: grp-series\n    series: grp-series\n    type: google-calendar\n"
+            "    calendar_id: cal-test\n    recurring_event_id: %s\n    telegram_chat_id: %d\n"
+            "  - id: dm-series\n    series: dm-series\n" % (event_id, GROUP),
+            encoding="utf-8",
+        )
+
+    def test_journal_confirms_series_goes_to_group_with_note(self):
+        self.write_journal(k1=("grp-series", f"{DATE}T07:00:00Z", {}))
+        rc, out = self.run_main("--series", "grp-series", "--mode", "auto")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((out["mode"], out["series_source"]), ("standard", "journal"))
+        self.assertNotIn("mode_note", out)
+        self.assertEqual([c for c, _ in self.sent], [GROUP])
+        self.assertIn(self.GROUP_NOTE_MARK, self.rendered[-1],
+                      "в группу ушёл протокол из записи без пометки «собран из присланной записи»")
+        proto = Path(out["protocol_path"]).read_text(encoding="utf-8")
+        self.assertIn(self.GROUP_NOTE_MARK, proto, "пометки нет в файле — перевыпуск её потеряет")
+
+    def test_journal_date_is_moscow_date(self):
+        # 22.09 22:30 UTC = 23.09 01:30 МСК — встреча 23-го.
+        self.write_journal(k1=("grp-series", "2026-09-22T22:30:00Z", {}))
+        self.assertTrue(ing.series_in_join_journal("grp-series", DATE))
+        # 23.09 21:30 UTC = 24.09 00:30 МСК — это уже другая встреча.
+        self.write_journal(k1=("grp-series", "2026-09-23T21:30:00Z", {}))
+        self.assertFalse(ing.series_in_join_journal("grp-series", DATE))
+
+    def test_journal_not_evidence_for_other_date_series_or_portal(self):
+        self.write_journal(
+            other_date=("grp-series", "2026-09-22T07:00:00Z", {}),
+            other_series=("dm-series", f"{DATE}T07:00:00Z", {}),
+            portal=("grp-series", f"{DATE}T09:00:00Z", {"order_id": "portal:1"}),
+        )
+        self.assertFalse(ing.series_in_join_journal("grp-series", DATE))
+        rc, out = self.run_main("--series", "grp-series", "--mode", "auto")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((out["mode"], out["series_source"]), ("personal", "name"))
+        self.assertEqual([c for c, _ in self.sent], [OWNER])
+
+    def test_series_by_name_goes_to_owner_with_plain_line(self):
+        with mock.patch("lib.notify.push_via_notarius", return_value=True) as notice:
+            rc, out = self.run_main("--series", "grp-series", "--mode", "auto")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["mode"], "personal", "угаданная по названию серия ушла в группу")
+        self.assertEqual(out["series_source"], "name")
+        self.assertIn("серию определил по названию — в группу не отправляю", out["mode_note"])
+        self.assertEqual([c for c, _ in self.sent], [OWNER], "протокол ушёл не только владельцу")
+        self.assertEqual([c["deliver"] for c in self.finalize_calls], [False])
+        self.assertIn("Серию определил по названию — в группу не отправляю",
+                      notice.call_args[0][0], "владелец не узнал, почему не в группу")
+        proto = Path(out["protocol_path"]).read_text(encoding="utf-8")
+        self.assertIn("Диаризация не выверена", proto)
+        self.assertNotIn(self.GROUP_NOTE_MARK, proto, "на пути А пометка была бы двойной")
+
+    def test_calendar_event_bound_to_series_goes_to_group(self):
+        self.bind_event("evtgrp123")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "auto",
+                                "--calendar-event", "evtgrp123_20260923T070000Z")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((out["mode"], out["series_source"]), ("standard", "calendar"))
+        self.assertEqual([c for c, _ in self.sent], [GROUP])
+
+    def test_calendar_event_of_other_series_is_not_overridden_by_journal(self):
+        self.bind_event("evtgrp123")
+        self.write_journal(k1=("grp-series", f"{DATE}T07:00:00Z", {}))
+        rc, out = self.run_main("--series", "grp-series", "--mode", "auto",
+                                "--calendar-event", "evt-another-series")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual((out["mode"], out["series_source"]), ("personal", "calendar_mismatch"))
+        self.assertIn("не привязано к этой серии", out["mode_note"])
+        self.assertEqual([c for c, _ in self.sent], [OWNER])
+        self.assertFalse(ing.series_bound_to_calendar_event("grp-series", "evtgrp123; rm -rf /"))
+
+    def test_series_without_group_and_explicit_standard_unchanged(self):
+        rc, out = self.run_main("--series", "dm-series", "--mode", "auto")
+        self.assertEqual((rc, out["mode"]), (0, "personal"))
+        self.assertNotIn("mode_note", out, "у серии нет группы — «не отправляю в группу» лишнее")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "standard", "--force")
+        self.assertEqual((rc, out["mode"]), (0, "standard"))
+        self.assertNotIn("series_source", out)
+
+
+class TestRecoveryNoteInFinalize(unittest.TestCase):
+    """Пометка «собран из присланной записи» — только у протокола из записи и только
+    когда его шлёт finalize (доставка включена): путь А ставит свою пометку сам."""
+
+    META = {"recovery": True, "endReason": "manual_recovery", "series": "s"}
+
+    def test_note_after_header_once(self):
+        text = "# Протокол\n\nтело\n"
+        once = delivery_gate.with_recovery_note(text, self.META, delivery_enabled=True)
+        self.assertTrue(once.startswith("# Протокол\n\n> ♻️ **Протокол собран из присланной записи**"))
+        self.assertTrue(once.endswith("тело\n"))
+        self.assertEqual(delivery_gate.with_recovery_note(once, self.META, delivery_enabled=True), once)
+        no_header = delivery_gate.with_recovery_note("тело", self.META, delivery_enabled=True)
+        self.assertTrue(no_header.startswith(delivery_gate.RECOVERED_FROM_RECORDING_NOTE))
+
+    def test_no_note_for_bot_meetings_or_personal_path(self):
+        text = "# Протокол\n\nтело\n"
+        for meta in ({}, {"endReason": "manual_recovery"}, {"recovery": True, "endReason": "left"},
+                     {"recovery": "yes", "endReason": "manual_recovery"}, None):
+            with self.subTest(meta=meta):
+                self.assertEqual(delivery_gate.with_recovery_note(text, meta, delivery_enabled=True), text)
+        self.assertEqual(delivery_gate.with_recovery_note(text, self.META, delivery_enabled=False), text)
+
+    def test_finalize_marks_before_delivery(self):
+        """Шов: боевой finalize ставит пометку ДО `deliver_protocol` и по включённой доставке."""
+        src = (_NOTARY / "finalize-meeting.py").read_text(encoding="utf-8")
+        hook = src.index("delivery_gate.with_recovery_note(")
+        self.assertLess(hook, src.index("delivery_result = deliver_protocol("))
+        self.assertIn("delivery_enabled=_is_protocol_delivery_enabled()", src[hook:hook + 300])
+        self.assertIn("protocol_path.write_text(_noted", src[hook:hook + 600])
+        self.assertTrue(callable(getattr(lp, "_is_protocol_delivery_enabled", None)))
+        synthetic = ing.build_synthetic_meta(series="s", date=DATE, wav_path="/w.wav",
+                                             participants=[], sid="recovery-s-" + DATE)
+        self.assertTrue(delivery_gate.is_recovered_meeting(synthetic),
+                        "синтетика обёртки и признак в finalize разошлись")
 
 
 if __name__ == "__main__":

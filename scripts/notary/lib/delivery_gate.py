@@ -115,3 +115,48 @@ def evaluate_delivery(
         substantial=substantial,
         bot_already_alerted=bot_alerted,
     )
+
+
+# ---------------------------------------------------------------------------
+# Пометка «собран из присланной записи» (ISS-60, фаза 6, копилка владельца п.5)
+# ---------------------------------------------------------------------------
+#: Протокол, собранный из записи, которую прислали люди (бот встречу не записал), и
+#: отправленный ботом ШТАТНО — путь Б обёртки восстановления (`tools/ingest-recording.py
+#: --mode standard|auto`) или очередь повторов после сбоя расшифровки. 23.09.2026 такой
+#: протокол ушёл в группу без пометки, и перепутанные имена приняли за выверенные.
+#: Путь А обёртка доставляет сама со своей пометкой («диаризация не выверена»), поэтому
+#: при выключенной доставке finalize пометку не ставит — иначе их было бы две.
+RECOVERED_FROM_RECORDING_NOTE = (
+    "> ♻️ **Протокол собран из присланной записи** — бот встречу не записал. Кто что "
+    "сказал, определено автоматически и может быть перепутано: заметили ошибку — "
+    "ответьте на этот протокол правкой."
+)
+#: Причина конца, которую ставит обёртка восстановления в синтетической meta.
+RECOVERY_END_REASON = "manual_recovery"
+
+
+def is_recovered_meeting(meta: dict | None) -> bool:
+    """meta встречи, собранной из присланной записи (синтетика обёртки восстановления)."""
+    m = meta if isinstance(meta, dict) else {}
+    reason = str(m.get("endReason") or m.get("end_reason") or "").strip()
+    return m.get("recovery") is True and reason == RECOVERY_END_REASON
+
+
+def with_recovery_note(protocol_text: str, meta: dict | None, *, delivery_enabled: bool) -> str:
+    """Текст протокола с пометкой «собран из присланной записи» — если это такая встреча
+    и протокол уходит из finalize (доставка включена). Иначе — текст без изменений.
+
+    Пометка идёт после первой строки-заголовка (шапка остаётся первой), иначе — в
+    начало. Уже есть — не дублируется (повторная финализация той же встречи)."""
+    text = protocol_text or ""
+    if not delivery_enabled or not is_recovered_meeting(meta) or not text.strip():
+        return text
+    if RECOVERED_FROM_RECORDING_NOTE in text:
+        return text
+    stripped = text.lstrip("\n")
+    first, _, rest = stripped.partition("\n")
+    if first.startswith("#"):
+        body = rest.lstrip("\n")
+        return f"{first}\n\n{RECOVERED_FROM_RECORDING_NOTE}\n\n{body}" if body else (
+            f"{first}\n\n{RECOVERED_FROM_RECORDING_NOTE}\n")
+    return f"{RECOVERED_FROM_RECORDING_NOTE}\n\n{stripped}"

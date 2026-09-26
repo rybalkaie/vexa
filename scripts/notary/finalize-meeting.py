@@ -1866,6 +1866,24 @@ def main() -> int:
             log.warning("[delivery] protocol read failed: %s", e)
             protocol_text_for_delivery = ""
         if protocol_text_for_delivery.strip():
+            # ISS-60 фаза 6 (копилка владельца п.5): протокол из присланной записи,
+            # который уходит отсюда (путь Б обёртки восстановления, очередь повторов),
+            # несёт пометку «собран из присланной записи» — и в файле тоже: по нему
+            # потом перевыпуск по правке, архив и зеркало на мак.
+            try:
+                from lib.llm_postprocess import _is_protocol_delivery_enabled  # noqa: PLC0415
+
+                _noted = delivery_gate.with_recovery_note(
+                    protocol_text_for_delivery, meta,
+                    delivery_enabled=_is_protocol_delivery_enabled(),
+                )
+                if _noted != protocol_text_for_delivery:
+                    protocol_text_for_delivery = _noted  # уйдёт с пометкой, даже если файл не запишется
+                    protocol_path.write_text(_noted, encoding="utf-8")
+                    log.info("[delivery] протокол из присланной записи — пометка добавлена")
+            except Exception as e:  # noqa: BLE001 — пометка не должна срывать доставку
+                log.warning("[delivery] пометка «из присланной записи» не добавлена: %s",
+                            type(e).__name__)
             delivery_meta = dict(meta)
             delivery_meta["date"] = date_part
             delivery_meta["sessionUid"] = session_uid

@@ -44,8 +44,15 @@
     (`MEETING_NOTARY_DELIVERED_ROOTS`, корень А: meta в `/srv/.../state` делала
     правки невидимыми). finalize идёт с включённой доставкой: PDF в чат серии,
     слепок нумерации открытых вопросов, `delivered` — всё штатно.
-  • `auto` — серия привязана к групповому чату → `standard`, иначе `personal`
-    (так выбирает Альфред по «обработай запись»).
+  • `auto` — так выбирает Альфред по «обработай запись». `standard` — только
+    если у серии есть групповой чат И серия НАДЁЖНА: её подтверждает журнал
+    сторожа (бот сам шёл на эту серию в этот день по Москве) или повторяющееся
+    событие календаря (`--calendar-event`), привязанное к этой серии в реестре.
+    Серия, угаданная по названию, → `personal` с понятной строкой «серию определил
+    по названию — в группу не отправляю» (фаза 6, копилка владельца п.5: 23.09
+    протокол ушёл в группу по угаданной серии, и имена в нём были перепутаны).
+    Протокол, который бот шлёт сам (путь Б), несёт пометку «собран из присланной
+    записи» — её ставит finalize (`delivery_gate.with_recovery_note`).
 
 ЗАМОК. Финализация идёт под замком встречи `finalize-<sid>.lock` — тем же, что
 берут сборщик и повторы (`lib/finalize_lock.py`). Без него сборщик раз в 5 минут
@@ -63,7 +70,8 @@ R11 / Опасная тройка: текст реплик/транскрипт�
 
 Запуск:
     python3 tools/ingest-recording.py <файл> --series <slug> --date YYYY-MM-DD \
-        [--mode personal|standard|auto] [--participants "Имя1,Имя2"] \
+        [--mode personal|standard|auto] [--calendar-event <id события>] \
+        [--participants "Имя1,Имя2"] \
         [--kind auto|video|audio|transcript] [--output-dir DIR] \
         [--transcripts-dir DIR] [--force] [--no-deliver]
 
@@ -127,6 +135,24 @@ MODE_PERSONAL = "personal"   # путь А: лично владельцу
 MODE_STANDARD = "standard"   # путь Б: штатная доставка бота (чат серии)
 MODE_AUTO = "auto"           # группа у серии → standard, иначе personal
 MODES = (MODE_PERSONAL, MODE_STANDARD, MODE_AUTO)
+
+# --- откуда взята серия (фаза 6: в группу — только по надёжной серии) ---------
+SOURCE_JOURNAL = "journal"            # журнал сторожа: бот сам шёл на эту серию в этот день
+SOURCE_CALENDAR = "calendar"          # событие календаря привязано к этой серии в реестре
+SOURCE_NAME = "name"                  # по названию / подписи — может оказаться чужая серия
+SOURCE_CALENDAR_MISMATCH = "calendar_mismatch"  # названное событие к серии не привязано
+RELIABLE_SOURCES = frozenset({SOURCE_JOURNAL, SOURCE_CALENDAR})
+#: Строка владельцу (в итог обёртки и в сообщение бота), когда `auto` не пустил в группу.
+GROUP_WITHHELD_NOTES = {
+    SOURCE_NAME: "серию определил по названию — в группу не отправляю: проверь, та ли это "
+                 "встреча, и перешли сам",
+    SOURCE_CALENDAR_MISMATCH: "событие календаря не привязано к этой серии в реестре — в группу "
+                              "не отправляю: проверь, та ли это встреча, и перешли сам",
+}
+#: id события Google-календаря: латиница, цифры, `_@.-`. Экземпляр повторяющегося
+#: события несёт хвост `_20260923T110000Z` — его срезаем до id серии событий.
+_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_@.\-]{1,256}$")
+_EVENT_INSTANCE_RE = re.compile(r"_\d{8}(?:T\d{6}Z?)?$")
 
 #: Папка записей и meta бота на сервере — ровно `collector.VPS_TRANSCRIPTS` и первая
 #: папка `MEETING_NOTARY_DELIVERED_ROOTS` слушателя (сторож — проба шва).
@@ -659,11 +685,101 @@ def series_group_chat(series: str) -> Optional[int]:
     return None
 
 
-def resolve_mode(requested: str, *, kind: str, series: str) -> str:
-    """Путь доставки. `auto`: у серии есть групповой чат → standard, иначе personal.
+def _msk_date(raw: Any) -> Optional[str]:
+    """Дата по Москве (`YYYY-MM-DD`) из ISO-времени журнала; без пояса — это UTC."""
+    try:
+        moment = datetime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+        msk = ZoneInfo("Europe/Moscow")
+    except Exception:  # noqa: BLE001 — нет базы поясов: Москва без перехода, +3
+        from datetime import timedelta  # noqa: PLC0415
+
+        msk = timezone(timedelta(hours=3))
+    return moment.astimezone(msk).strftime("%Y-%m-%d")
+
+
+def series_in_join_journal(series: str, date: str) -> bool:
+    """Журнал сторожа входа подтверждает серию: бот сам запускался на ЭТУ серию в
+    этот день по Москве (`lib/join_watch.py`, записи живут 12 часов).
+
+    Серию там пишет запускатель из очереди встреч — она взята из реестра по
+    календарю, а не угадана по названию. Встречи портала (`order_id`) не считаются:
+    их Альфред не собирает. Журнал не прочитан — «не подтверждает»."""
+    try:
+        from lib import join_watch  # noqa: PLC0415
+
+        ledger = join_watch.load_ledger()
+    except Exception as e:  # noqa: BLE001
+        log.warning("[mode] журнал сторожа не прочитан (%s) — серию он не подтверждает",
+                    type(e).__name__)
+        return False
+    for entry in (ledger or {}).values():
+        if not isinstance(entry, dict) or entry.get("order_id"):
+            continue
+        if str(entry.get("series") or "").strip() != series:
+            continue
+        if _msk_date(entry.get("start_at")) == date:
+            return True
+    return False
+
+
+def series_bound_to_calendar_event(series: str, event_id: Optional[str]) -> bool:
+    """В реестре (`watched.yaml`) у этой серии записано ровно это событие календаря —
+    `recurring_event_id` (или `event_id` разовой привязки).
+
+    Альфред находит встречу в календаре бота за нужный день и передаёт id события;
+    id экземпляра (`<id>_20260923T110000Z`) сводится к id повторяющегося события.
+    Сбой чтения реестра или странный id — «не привязано»."""
+    raw = (event_id or "").strip()
+    if not raw or not _EVENT_ID_RE.match(raw):
+        return False
+    wanted = {raw, _EVENT_INSTANCE_RE.sub("", raw)}
+    try:
+        from notary.cli.registry import load_watched  # noqa: PLC0415
+
+        watched = load_watched()
+    except Exception as e:  # noqa: BLE001
+        log.warning("[mode] реестр серий не прочитан (%s) — событие не сверено", type(e).__name__)
+        return False
+    for rec in (watched or {}).get("watched", []) or []:
+        if not isinstance(rec, dict) or str(rec.get("series") or "").strip() != series:
+            continue
+        ids = {str(rec.get(k) or "").strip() for k in ("recurring_event_id", "event_id")} - {""}
+        if ids & wanted:
+            return True
+    return False
+
+
+def series_source(series: str, date: str, calendar_event: Optional[str] = None) -> str:
+    """Откуда известна серия: `journal` / `calendar` — надёжно, `name` — угадана.
+
+    Названное событие календаря, которое к серии не привязано, — противоречие
+    (`calendar_mismatch`): журнал его не перекрывает, в группу такое не уходит."""
+    if calendar_event:
+        if series_bound_to_calendar_event(series, calendar_event):
+            return SOURCE_CALENDAR
+        log.warning("[mode] событие календаря не привязано к серии %s в реестре", series)
+        return SOURCE_CALENDAR_MISMATCH
+    if series_in_join_journal(series, date):
+        return SOURCE_JOURNAL
+    return SOURCE_NAME
+
+
+def resolve_mode(
+    requested: str, *, kind: str, series: str, source: Optional[str] = None,
+) -> str:
+    """Путь доставки. `auto`: групповой чат у серии И серия надёжна (`source` из
+    `RELIABLE_SOURCES`) → standard, иначе personal.
 
     Транскрипт (R9) — только лично: путь Б — это finalize по звуку, а у текста
-    звука нет. Явный `standard` для транскрипта — ошибка входа."""
+    звука нет. Явный `standard` для транскрипта — ошибка входа. Явный `standard`
+    от человека не ужесточается: это осознанный путь Б по методичке."""
     if requested not in MODES:
         raise ValueError(f"--mode: ожидалось {'/'.join(MODES)}, получено {requested!r}")
     if kind == "transcript":
@@ -673,8 +789,20 @@ def resolve_mode(requested: str, *, kind: str, series: str) -> str:
             )
         return MODE_PERSONAL
     if requested == MODE_AUTO:
-        return MODE_STANDARD if series_group_chat(series) is not None else MODE_PERSONAL
+        if series_group_chat(series) is None:
+            return MODE_PERSONAL
+        return MODE_STANDARD if source in RELIABLE_SOURCES else MODE_PERSONAL
     return requested
+
+
+def group_withheld_note(requested: str, mode: str, *, kind: str, series: str,
+                        source: Optional[str]) -> Optional[str]:
+    """Строка владельцу, если `auto` мог бы отправить в группу, но серия ненадёжна."""
+    if requested != MODE_AUTO or mode != MODE_PERSONAL or kind == "transcript":
+        return None
+    if source in RELIABLE_SOURCES or series_group_chat(series) is None:
+        return None
+    return GROUP_WITHHELD_NOTES.get(source or SOURCE_NAME, GROUP_WITHHELD_NOTES[SOURCE_NAME])
 
 
 def standard_meta_path(tdir: str | os.PathLike, sid: str) -> Path:
@@ -1329,8 +1457,14 @@ def _run_standard(args, kind: str, output_dir: Path, sid: str, tdir: Path, workd
     }
 
 
-def _run_personal(args, kind: str, workdir: Path, output_dir: Path, sid: str, tdir: Path) -> dict:
-    """Путь А: собрать без доставки, затем лично владельцу с отметкой `delivered`."""
+def _run_personal(
+    args, kind: str, workdir: Path, output_dir: Path, sid: str, tdir: Path,
+    withheld_note: Optional[str] = None,
+) -> dict:
+    """Путь А: собрать без доставки, затем лично владельцу с отметкой `delivered`.
+
+    `withheld_note` — почему `auto` не отправил в группу (серия угадана по названию):
+    строка уходит владельцу в сообщении бота рядом с протоколом."""
     degraded_note: Optional[str] = None
     if kind in ("video", "audio"):
         protocol_path, transcript_path, meta = _build_personal_media(args, kind, workdir, output_dir, sid)
@@ -1344,6 +1478,9 @@ def _run_personal(args, kind: str, workdir: Path, output_dir: Path, sid: str, td
         )
         meta.pop("files", None)
     log.info("[ingest] протокол готов: %s", protocol_path)
+    if withheld_note:
+        line = "⚠️ " + withheld_note[:1].upper() + withheld_note[1:] + "."
+        degraded_note = f"{degraded_note}\n{line}" if degraded_note else line
 
     final_meta_path = personal_meta_path(tdir, sid)
     final_meta = merge_previous_delivery(meta, _read_json_file(final_meta_path))
@@ -1438,9 +1575,9 @@ def main(argv: list[str] | None = None) -> int:
 #: Что сказать, когда встречу доводит очередь повторов бота (пути А и Б).
 RETRY_QUEUE_NOTE = (
     "расшифровка этой встречи сорвалась, и её доводит очередь повторов бота: он сам "
-    "соберёт протокол и пришлёт его (на пути А — лично владельцу, без пометки «роли не "
-    "выверены»). Запускать заново не нужно — будет второй протокол и вторая оплата "
-    "расшифровки"
+    "соберёт протокол и пришлёт его (на пути А — лично владельцу, с пометкой «собран из "
+    "присланной записи»). Запускать заново не нужно — будет второй протокол и вторая "
+    "оплата расшифровки"
 )
 
 
@@ -1457,8 +1594,12 @@ def _main(argv: list[str] | None = None) -> int:
                         help="Тип входа (default auto — по расширению)")
     parser.add_argument("--mode", default=MODE_PERSONAL, choices=list(MODES),
                         help="personal — лично владельцу (путь А, по умолчанию); standard — "
-                             "штатная доставка бота в чат серии (путь Б); auto — группа у серии → "
+                             "штатная доставка бота в чат серии (путь Б); auto — группа у серии "
+                             "и серия подтверждена журналом сторожа или --calendar-event → "
                              "standard, иначе personal")
+    parser.add_argument("--calendar-event", default=None,
+                        help="id события календаря бота, по которому определена серия (для "
+                             "--mode auto: событие должно быть привязано к серии в реестре)")
     parser.add_argument("--output-dir", default=None,
                         help="Куда положить расшифровку и протокол (по умолчанию — рабочая папка "
                              "протоколов бота, при --no-deliver — временная папка прогона)")
@@ -1501,12 +1642,18 @@ def _main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         log.error("%s", e)
         return EXIT_INPUT
+    source: Optional[str] = None
+    if args.mode == MODE_AUTO and kind != "transcript":
+        source = series_source(args.series, args.date, args.calendar_event)
     try:
-        mode = resolve_mode(args.mode, kind=kind, series=args.series)
+        mode = resolve_mode(args.mode, kind=kind, series=args.series, source=source)
     except ValueError as e:
         log.error("%s", e)
         _emit({"ok": False, "error": "mode_invalid", "kind": kind})
         return EXIT_INPUT
+    withheld = group_withheld_note(args.mode, mode, kind=kind, series=args.series, source=source)
+    if withheld:
+        log.warning("[mode] серия не подтверждена (%s) — в группу не отправляю, путь А", source)
 
     deliver = not args.no_deliver
     sid = safe_session_uid(args.series, args.date)
@@ -1588,8 +1735,13 @@ def _main(argv: list[str] | None = None) -> int:
             if mode == MODE_STANDARD:
                 out = _run_standard(args, kind, output_dir, sid, tdir, workdir)
             else:
-                out = _run_personal(args, kind, workdir, output_dir, sid, tdir)
+                out = _run_personal(args, kind, workdir, output_dir, sid, tdir,
+                                    withheld_note=withheld)
             out.update({"kind": kind, "mode": mode})
+            if source:
+                out["series_source"] = source
+            if withheld:
+                out["mode_note"] = withheld
             if backup:
                 out["replaced_backup"] = backup
             _emit(out)
