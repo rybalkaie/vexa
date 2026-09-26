@@ -189,6 +189,11 @@ git-репозитория бота, рядом положена копия `.de
 
 ## Установка (при выкатке, фаза 7 — сейчас не ставим)
 
+> 🔴 При выкатке ISS-60 ставить **не по этому блоку, а по разделу «Выкатка ISS-60» ниже** (шаги 5–7):
+> самопроверка судит бота по статусу входа, который пишет только новый образ, — на старом образе
+> она красная и начнёт предупреждать владельца перед каждой встречей. Таймеры — только после
+> переключения образа. Этот блок — справка по командам.
+
 ```bash
 # на VPS, от dev; скрипты уже привезены обычной выкаткой скриптов нотариуса
 sudo -u dev mkdir -p /srv/meeting-notary/state/canary /home/dev/meeting-notary/_tmp/canary /home/dev/meeting-notary/logs
@@ -271,6 +276,10 @@ TREE=vexa-resilience
 SHA=$(git -C $TREE rev-parse --short HEAD)
 ```
 
+Команды идут отдельными вызовами оболочки (так работает агент) — переменные и папка между ними
+**не сохраняются**: начинай каждый блок с этих трёх строк, иначе `$TREE` и `$SHA` окажутся пустыми
+и команды упадут или возьмут не ту папку.
+
 ## 0. Перед началом
 
 1. **Слово владельца** «выкатывай» в этом чате (правило проекта: прод бота — только интерактивом).
@@ -313,10 +322,18 @@ EOF
 
 ## 1. Снимок для отката
 
+Ровно один раз. Повтор после шага 3 или 6 записал бы в снимок уже новый код и новый образ — откатывать
+стало бы не на что; поэтому команда сама отказывается, если снимок уже есть. Отказалась, а шаги 3 и 6
+ещё не делались (прошлая попытка оборвалась раньше) и в выводе оба архива и тег — снимок годен, иди
+к шагу 2; чего-то из трёх нет — стоп, показать владельцу.
+
 ```bash
 ssh meeting-notary bash -s <<'EOF'
 set -e
 B=/srv/meeting-notary/.deploy-backup; sudo mkdir -p $B
+if [ -e $B/before-iss60-scripts.tgz ] || docker image inspect vexa-bot:notarius-telemost-before-iss60 >/dev/null 2>&1; then
+  echo "СНИМОК УЖЕ ЕСТЬ — не перезаписываю"; ls -la $B/before-iss60-*; docker image ls vexa-bot:notarius-telemost-before-iss60; exit 1
+fi
 sudo tar czf $B/before-iss60-scripts.tgz -C /srv/meeting-notary/vexa/scripts notary
 sudo tar czf $B/before-iss60-botsrc.tgz -C /home/dev/meeting-notary/vexa/services/vexa-bot core/src core/entrypoint.sh
 docker tag vexa-bot:notarius-telemost vexa-bot:notarius-telemost-before-iss60
@@ -364,10 +381,14 @@ make deploy-notary LOCAL_NOTARY_DIR=$TREE/scripts/notary LOCAL_VEXA_BOT_SRC=$TRE
    ```bash
    ssh meeting-notary "echo 'MEETING_NOTARY_FINALIZE_LOCK_DIRS=<папка сборщика>:/srv/meeting-notary/state' | sudo tee -a /srv/meeting-notary/.env.notary >/dev/null"
    ```
-2. **Тестовых флагов нет** (иначе сообщения людям уйдут владельцу или бот пойдёт запасным путём):
+2. **Тестовых флагов и выключателей нет** (иначе сообщения людям уйдут владельцу, бот пойдёт
+   запасным путём, ежедневная самопроверка будет гонять тестовый образ или чужую комнату, а сторож
+   или предупреждения молча выключены). Это флаги, не секреты — строки печатаются целиком:
    ```bash
-   ssh meeting-notary "grep -cE '^(MEETING_NOTARY_JOIN_ALERT_TO_OWNER|MEETING_NOTARY_CANARY_FORCE_FALLBACK|MEETING_NOTARY_CANARY_FORCE_DEAF)=' /srv/meeting-notary/.env.notary"   # ждём 0
+   ssh meeting-notary "grep -E '^(MEETING_NOTARY_JOIN_ALERT_TO_OWNER|MEETING_NOTARY_CANARY_FORCE_FALLBACK|MEETING_NOTARY_CANARY_FORCE_DEAF|MEETING_NOTARY_CANARY_IMAGE|MEETING_NOTARY_CANARY_ROOM|MEETING_NOTARY_JOIN_WATCH|MEETING_NOTARY_CANARY_WARN)=' /srv/meeting-notary/.env.notary"
    ```
+   Ждём пустой вывод (допустимо только `…_JOIN_WATCH=1` / `…_CANARY_WARN=1`). Есть строка — удалить
+   её (`sudo sed -i '/^ИМЯ=/d' /srv/meeting-notary/.env.notary`) и показать владельцу, что было.
 3. **Сторож видит docker локально** (иначе он молчит — так задумано для мака):
    ```bash
    ssh meeting-notary "systemctl show meeting-notary-runner -p Environment | grep -c 'MEETING_NOTARY_LOCAL_DOCKER=1'; grep -c '^MEETING_NOTARY_LOCAL_DOCKER=1' /srv/meeting-notary/.env.notary"   # хотя бы одна 1
@@ -390,9 +411,11 @@ sudo -u dev bash -c 'set -a; . /srv/meeting-notary/.env.notary; set +a; cd /srv/
 EOF
 ```
 Итог прогона — в выводе: **зелёный** → дальше. `skipped` (в Т-10 кто-то есть) → повторить позже.
-Жёлтый или красный → **образ не переключать**; скрипты можно оставить (они совместимы со старым
-образом) или откатить (ниже). Прогон кандидата боевое состояние самопроверки и сообщения
-владельцу не трогает.
+Жёлтый или красный → **образ не переключать**, шаги 6–7 пропустить; скрипты можно оставить (они
+совместимы со старым образом) или откатить (ниже). **Оставил скрипты — шаг 8 всё равно сделать:**
+инструкции Альфреда зависят от скриптов, а не от образа (новый сторож советует людям «скажи
+Альфреду „обработай запись“», новая обёртка ждёт `--mode auto`). Откатил скрипты — шаг 8 не делать.
+Прогон кандидата боевое состояние самопроверки и сообщения владельцу не трогает.
 
 ## 6. Переключить боевой образ
 
@@ -415,6 +438,17 @@ EOF
 ```bash
 ssh meeting-notary 'sudo systemctl enable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer && sudo systemctl start meeting-notary-telemost-sniff.service && systemctl list-timers "meeting-notary-*"'
 ```
+Если в папке состояния осталась версия Телемоста от тестовых прогонов, «нюх» увидит «смену» и сразу
+запустит ещё одну самопроверку (владельцу — тихая строка «Телемост обновился») — это нормально,
+`start` просто дольше ждёт.
+
+Итог не «бот здоров»:
+- `skipped` (в Т-10 кто-то есть или скоро встреча) → повторить `start` позже, таймеры пока не включать;
+- красный → таймеры **не** включать, откатить образ и выключить самопроверку (§10, первые две строки:
+  красный итог на боевом образе уже включил предупреждения перед встречами), показать владельцу вывод
+  `status`. Скрипты и шаг 8 — как в шаге 5;
+- жёлтый (бот входит, но что-то второстепенное: имена, вход запасным путём, сбой расшифровки у самой
+  проверки) → таймеры пока не включать, показать владельцу причину из `status` и ждать его слова.
 
 ## 8. Инструкция Альфреда и методичка восстановления
 
@@ -427,9 +461,14 @@ sed -i '' '/^> \*\*Версия к выкатке ISS-60\*\*/,/^$/d' ~/.claude/m
 git -C ~/.claude commit -m "Альфред: восстановление протокола из записи — версия ISS-60 (выкатка)" -- methods/telegram-daemon/notary-recovery-from-recording.md
 git -C ~/Projects/me commit -m "Методичка восстановления протокола — версия ISS-60 (выкатка)" -- methods/recover-meeting-protocol-from-recording.md
 ```
-Если владелец дал «ок» на строку маршрутизации Альфреда (копилка плана, п.4) — в
-`~/.claude/channels/telegram/daemon-cwd/CLAUDE.md` строка про восстановление протокола должна
-вести в метод и по одной фразе «обработай запись», без файла; коммит поимённо.
+Строка маршрутизации Альфреда (`~/.claude/channels/telegram/daemon-cwd/CLAUDE.md`, абзац
+«Восстановление протокола из присланной записи») после выкатки расходится с методом дважды: ведёт в
+метод только по «файл + просьба о протоколе» (фраза «обработай запись» без файла туда не попадёт) и
+утверждает «доставку делает обёртка, ЛИЧНО Илье», а метод теперь запускает `--mode auto` (серия с
+группой, подтверждённая журналом сторожа или календарём, → в чат серии). Правка этой строки — только с
+«ок» владельца (копилка плана, п.4); дал «ок» — поправить оба места, коммит поимённо. Не дал — сказать
+ему прямо: «обработай запись» без файла Альфред не поймёт, а про путь доставки у него два
+противоречащих текста.
 
 ## 9. Что смотреть после
 
@@ -443,6 +482,14 @@ git -C ~/Projects/me commit -m "Методичка восстановления 
 - **Через сутки:** все службы живы (§7 выше) — одна реальная встреча записалась, протокол пришёл.
   Протоколы составляет Claude подписки бота: пока её недельный лимит исчерпан (ISS-61), протокол
   не соберётся независимо от этой выкатки — расшифровка сохранится, сборка повторится.
+- **Первое «обработай запись» после выкатки:** живая доставка восстановленного протокола и правка
+  ответом на нём до выкатки не проверены (упёрлись в лимит Claude, ISS-61) — первый реальный случай
+  досмотреть глазами: протокол пришёл туда, куда сказал Альфред, правка ответом сработала. Не
+  сработала — ISS в журнал косяков.
+- **Документы в ту же сессию:** `docs/how-it-works.md` — раздел 7 из «готово к выкатке» в «в бою» (с
+  датой и что не подтвердилось), запись журнала с отметкой выкатки, пометки «⏭ после выкатки» у
+  записей 30.06; `plans/notary-issues-log.md` — статус ISS-60; фаза 7 плана; строка штурману в
+  `plans/compass-inbox.md`.
 - **Слияние:** когда в `vexa/` никто не работает (`git -C vexa status --short` без чужих правок) —
   `git -C vexa merge telemost-resilience` в `notary-f2-bot-notarius-full` (план: «слияние в конце»).
 
@@ -453,8 +500,8 @@ git -C ~/Projects/me commit -m "Методичка восстановления 
 | Образ бота | `ssh meeting-notary 'docker tag vexa-bot:notarius-telemost-before-iss60 vexa-bot:notarius-telemost'` + **обязательно выключить самопроверку** (строка ниже) — на старом образе она красная | бот не входит / входит хуже прежнего |
 | Самопроверка и предупреждения | `sudo systemctl disable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer` + строка `MEETING_NOTARY_CANARY_WARN=0` в `.env.notary` | ложные тревоги, мешает |
 | Только сторож входа | строка `MEETING_NOTARY_JOIN_WATCH=0` в `.env.notary` — со следующего тика запускателя сторож молчит, остальное работает | сторож шлёт лишнее людям |
-| Скрипты целиком | `ssh meeting-notary 'sudo rm -rf /srv/meeting-notary/vexa/scripts/notary && sudo tar xzf /srv/meeting-notary/.deploy-backup/before-iss60-scripts.tgz -C /srv/meeting-notary/vexa/scripts && sudo chown -R dev:dev /srv/meeting-notary/vexa/scripts/notary && sudo systemctl restart meeting-notary-listener meeting-notary-gateway'` + выключить самопроверку (её скриптов больше нет) | ошибки в журналах служб после выкатки |
-| Исходники образа (для пересборки прежнего) | `ssh meeting-notary 'tar xzf /srv/meeting-notary/.deploy-backup/before-iss60-botsrc.tgz -C /home/dev/meeting-notary/vexa/services/vexa-bot'` | нужен прежний образ, а тег отката потерян |
+| Скрипты целиком | `ssh meeting-notary 'sudo rm -rf /srv/meeting-notary/vexa/scripts/notary && sudo tar xzf /srv/meeting-notary/.deploy-backup/before-iss60-scripts.tgz -C /srv/meeting-notary/vexa/scripts && sudo chown -R dev:dev /srv/meeting-notary/vexa/scripts/notary && sudo systemctl restart meeting-notary-listener meeting-notary-gateway'` + выключить самопроверку (её скриптов больше нет) + **откатить и образ, если он уже новый**: второе ухо нового образа пишет файл записи, который старые скрипты после доставки не удаляют, — голоса людей копились бы на диске | ошибки в журналах служб после выкатки |
+| Исходники образа (для пересборки прежнего) | `ssh meeting-notary 'cd /home/dev/meeting-notary/vexa/services/vexa-bot && rm -rf core/src && tar xzf /srv/meeting-notary/.deploy-backup/before-iss60-botsrc.tgz'` (сначала убрать `core/src`: иначе новые файлы ветки останутся рядом со старыми и сборка возьмёт смесь), затем `make build-bot TAG=notarius-telemost-before-iss60 GIT_SHA=1851f95` и первая строка таблицы | нужен прежний образ, а тег отката потерян |
 | Замки ручной финализации | удалить строку `MEETING_NOTARY_FINALIZE_LOCK_DIRS=…` из `.env.notary` — замок вернётся к папкам по умолчанию | не должно понадобиться |
 | Инструкция Альфреда / методичка | `git -C ~/.claude revert <коммит>` / `git -C ~/Projects/me revert <коммит>` (коммиты шага 8) | откатили скрипты — откатить и их: они ссылаются на `--mode auto` новой обёртки |
 

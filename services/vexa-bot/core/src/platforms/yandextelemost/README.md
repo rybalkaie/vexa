@@ -223,3 +223,7 @@ docker run --rm --network vexa_vexa \
 
 Обычно ботов поднимает запускатель (`scripts/notary/runner.py`), а самопроверку —
 `scripts/notary/canary.py`.
+
+⚠️ Папка `_tmp/transcripts` в примере — боевая: её раз в 5 минут обходит сборщик, и ручная запись с
+`meta.json` уйдёт в расшифровку (платную) и протоколом владельцу. Для проверок монтируй отдельную
+папку (`-v /home/dev/meeting-notary/_tmp/manual:/transcripts`) — так делает и самопроверка.
