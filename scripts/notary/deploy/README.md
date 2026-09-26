@@ -236,3 +236,225 @@ MEETING_NOTARY_CANARY_WARN=0
 `meeting-notary.role=canary`; запускатель, сборщик и сторож их не видят. Прерванный
 прогон (SIGTERM/SIGHUP, Ctrl-C) убирает свои контейнеры сам; если питон убили
 SIGKILL — следующий прогон убирает оставшиеся контейнеры с этой меткой.
+
+---
+
+# Выкатка ISS-60 (устойчивость к Телемосту) — по одному слову владельца
+
+**Что выкатывается.** Всё из ветки `telemost-resilience` (план
+`plans/2026-09-23-telemost-update-resilience.md`, фазы 1–6): сторож входа (повтор, сообщение
+туда же, куда протокол, «бот не пришёл» порталу), самопроверка в Т-10 и «нюх» версии Телемоста,
+предупреждение перед встречами, пока бот сломан, новый образ бота (экран Телемоста 3.0, участники
+с плиток, микрофон, выход кнопкой, запасной путь входа, второе ухо, `exec node`), замок ручной
+финализации и новая обёртка восстановления, инструкция Альфреда и методичка восстановления. Три
+части: **скрипты** (`scripts/notary`), **образ бота** (`vexa-bot:notarius-telemost`), **таймеры
+самопроверки** — плюс строка в `.env.notary` и два файла инструкций на маке.
+
+**Порядок важен.** Самопроверка судит бота по статусу входа, который пишет только новый образ:
+на старом образе она покраснеет и начнёт предупреждать владельца перед каждой встречей. Поэтому
+таймеры самопроверки включаются **после** переключения образа. Скрипты со старым образом
+безопасны: без статуса входа сторож только сообщает о выходе бота с ошибкой и никого не
+останавливает (журнал решений плана, 23.09). Шаги 3–7 — одним заходом, примерно за час.
+
+Все команды — с мака из `~/Projects/meeting-notary`. Выкатываем из рабочего дерева
+`vexa-resilience/` (ветка `telemost-resilience`), **не** из `vexa/`: основное дерево грязное от
+соседних планов, а в его ветке `notary-f2-bot-notarius-full` лежат четыре коммита «авторства
+реплик» (план `2026-09-25-speaker-attribution-fix`), на выкатку которых слова не было. Цели
+Makefile берут дерево из переменных — переопределяем их.
+
+```bash
+cd ~/Projects/meeting-notary
+TREE=vexa-resilience
+SHA=$(git -C $TREE rev-parse --short HEAD)
+```
+
+## 0. Перед началом
+
+1. **Слово владельца** «выкатывай» в этом чате (правило проекта: прод бота — только интерактивом).
+2. **Дерево чистое, коммит известен:** `git -C $TREE status --short` — пусто; `echo $SHA`
+   записать (понадобится для отката и журнала).
+3. **Окно без встреч** — ни одного бота в комнате и ни одной встречи в ближайшие 90 минут
+   (есть строки в выводе — ждать окна; heredoc ниже — без отступов, иначе `EOF` не сработает):
+
+```bash
+ssh meeting-notary bash -s <<'EOF'
+docker ps --filter name=vexa-notarius --format '{{.Names}}'
+cd /srv/meeting-notary/vexa && PYTHONPATH=scripts MEETING_NOTARY_REGISTRY_DIR=/srv/meeting-notary/registry \
+  /home/dev/meeting-notary/venv/bin/python - <<'PY'
+from datetime import datetime, timedelta, timezone
+from notary.lib.state import read_queue
+now = datetime.now(timezone.utc)
+for it in read_queue():
+    s = datetime.fromisoformat(str(it.get("start_at")).replace("Z", "+00:00"))
+    s = s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+    if now - timedelta(hours=2) <= s <= now + timedelta(minutes=90):
+        print("ВСТРЕЧА", it.get("series") or it.get("meeting_id"), s.isoformat())
+PY
+EOF
+```
+
+4. **Что изменится на сервере — сверить заранее** (сравнение по содержимому, ничего не пишет):
+   ```bash
+   rsync -avnc --delete --exclude '__pycache__' --exclude '*.pyc' --exclude '.*' \
+     $TREE/scripts/notary/ meeting-notary:/srv/meeting-notary/vexa/scripts/notary/ | grep -v '/$'
+   rsync -avnc --delete --exclude '__pycache__' \
+     $TREE/services/vexa-bot/core/src/ meeting-notary:/home/dev/meeting-notary/vexa/services/vexa-bot/core/src/ | grep -v '/$'
+   git -C $TREE diff --name-only 1851f95 HEAD -- scripts/notary services/vexa-bot/core/src   # что меняла ветка
+   ```
+   В выводе rsync должны быть **только** файлы из списка `git diff`. Есть строка `deleting …` или
+   файл, которого ветка не меняла, — **стоп**: на сервере лежит код, которого нет в ветке (или
+   старее её основы), и выкатка его откатит либо заодно включит чужое. Показать список владельцу;
+   если это «авторство реплик» и владелец дал слово выкатить и его — сначала
+   `git -C $TREE merge notary-f2-bot-notarius-full` (пробное слияние 26.09 — без конфликтов),
+   прогнать набор тестов и повторить сверку.
+
+## 1. Снимок для отката
+
+```bash
+ssh meeting-notary bash -s <<'EOF'
+set -e
+B=/srv/meeting-notary/.deploy-backup; sudo mkdir -p $B
+sudo tar czf $B/before-iss60-scripts.tgz -C /srv/meeting-notary/vexa/scripts notary
+sudo tar czf $B/before-iss60-botsrc.tgz -C /home/dev/meeting-notary/vexa/services/vexa-bot core/src core/entrypoint.sh
+docker tag vexa-bot:notarius-telemost vexa-bot:notarius-telemost-before-iss60
+ls -la $B/before-iss60-*; docker image ls vexa-bot --format '{{.Tag}} {{.ID}}' | head
+EOF
+```
+
+## 2. Образ-кандидат (боевой ещё не тронут)
+
+Цель выкатки скриптов везёт только `core/src`, а ветка поменяла и `core/entrypoint.sh` (`exec
+node` — без него сигнал остановки до бота не доходит): его везём отдельно. Цель сборки образа
+сама берёт номер сборки из `vexa/` — задаём его явно.
+
+```bash
+rsync -av --delete --exclude '__pycache__' \
+  $TREE/services/vexa-bot/core/src/ meeting-notary:/home/dev/meeting-notary/vexa/services/vexa-bot/core/src/
+rsync -av $TREE/services/vexa-bot/core/entrypoint.sh \
+  meeting-notary:/home/dev/meeting-notary/vexa/services/vexa-bot/core/entrypoint.sh
+make build-bot TAG=notarius-telemost-iss60 GIT_SHA=$SHA
+ssh meeting-notary "docker run --rm --entrypoint sh vexa-bot:notarius-telemost-iss60 -c 'echo \$NOTARY_BOT_GIT_SHA; grep -c \"exec node\" /app/entrypoint.sh'"
+```
+Ждём `$SHA` и `1`. Сборка упала (проверка типов) — дальше не идём, на бою ничего не менялось.
+
+## 3. Скрипты
+
+```bash
+make deploy-notary LOCAL_NOTARY_DIR=$TREE/scripts/notary LOCAL_VEXA_BOT_SRC=$TREE/services/vexa-bot/core/src
+```
+Цель везёт `scripts/notary` (с копией заменённого в `.deploy-backup/notary-<время>/`), заново
+везёт `core/src` (то же содержимое) и перезапускает слушателя и шлюз. С этой минуты сторож входа
+работает — пока со старым образом, в осторожном режиме.
+
+## 4. Настройки в `/srv/meeting-notary/.env.notary`
+
+Файл с секретами: не печатать его целиком, только `grep` по именам.
+
+1. **Папки замков ручной финализации.** Обёртка восстановления держит замок встречи там же, где
+   его ищут сборщик и повторы. Где замки у сборщика — видит только его юнит:
+   ```bash
+   ssh meeting-notary 'systemctl show meeting-notary-collector -p Environment | tr " " "\n" | grep STATE_DIR; grep -E "^MEETING_NOTARY_STATE_DIR=" /srv/meeting-notary/.env.notary'
+   ```
+   Нашлось значение — это папка сборщика; пусто — у сборщика умолчание
+   `/home/dev/Library/Logs/meeting-notary`. Прописываем **обе** папки — сборщика и повторов
+   (`/srv/meeting-notary/state`): явный список перебивает все умолчания.
+   ```bash
+   ssh meeting-notary "echo 'MEETING_NOTARY_FINALIZE_LOCK_DIRS=<папка сборщика>:/srv/meeting-notary/state' | sudo tee -a /srv/meeting-notary/.env.notary >/dev/null"
+   ```
+2. **Тестовых флагов нет** (иначе сообщения людям уйдут владельцу или бот пойдёт запасным путём):
+   ```bash
+   ssh meeting-notary "grep -cE '^(MEETING_NOTARY_JOIN_ALERT_TO_OWNER|MEETING_NOTARY_CANARY_FORCE_FALLBACK|MEETING_NOTARY_CANARY_FORCE_DEAF)=' /srv/meeting-notary/.env.notary"   # ждём 0
+   ```
+3. **Сторож видит docker локально** (иначе он молчит — так задумано для мака):
+   ```bash
+   ssh meeting-notary "systemctl show meeting-notary-runner -p Environment | grep -c 'MEETING_NOTARY_LOCAL_DOCKER=1'; grep -c '^MEETING_NOTARY_LOCAL_DOCKER=1' /srv/meeting-notary/.env.notary"   # хотя бы одна 1
+   ```
+
+## 5. Самопроверка кандидата в Т-10
+
+Юниты — по разделу «Самопроверка бота в Т-10…» выше, **без** включения таймеров:
+```bash
+ssh meeting-notary bash -s <<'EOF'
+sudo -u dev mkdir -p /srv/meeting-notary/state/canary /home/dev/meeting-notary/_tmp/canary /home/dev/meeting-notary/logs
+grep -c "name: t10" /srv/meeting-notary/registry/rooms.yaml
+cd /srv/meeting-notary/vexa
+sudo cp scripts/notary/deploy/meeting-notary-canary.{service,timer} scripts/notary/deploy/meeting-notary-telemost-sniff.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo -u dev bash -c 'set -a; . /srv/meeting-notary/.env.notary; set +a; cd /srv/meeting-notary/vexa; \
+  PYTHONPATH=scripts MEETING_NOTARY_LOCAL_DOCKER=1 MEETING_NOTARY_REGISTRY_DIR=/srv/meeting-notary/registry \
+  MEETING_NOTARY_CANARY_STATE_DIR=/srv/meeting-notary/state/canary MEETING_NOTARY_CANARY_DIR=/home/dev/meeting-notary/_tmp/canary \
+  /home/dev/meeting-notary/venv/bin/python -m notary.canary run --reason manual --image vexa-bot:notarius-telemost-iss60'
+EOF
+```
+Итог прогона — в выводе: **зелёный** → дальше. `skipped` (в Т-10 кто-то есть) → повторить позже.
+Жёлтый или красный → **образ не переключать**; скрипты можно оставить (они совместимы со старым
+образом) или откатить (ниже). Прогон кандидата боевое состояние самопроверки и сообщения
+владельцу не трогает.
+
+## 6. Переключить боевой образ
+
+```bash
+ssh meeting-notary 'docker tag vexa-bot:notarius-telemost-iss60 vexa-bot:notarius-telemost && docker image ls vexa-bot'
+```
+Следующий запуск бота — уже новым образом; ботов, которые сейчас в комнатах, это не трогает.
+
+## 7. Первый прогон на боевом образе и таймеры
+
+```bash
+ssh meeting-notary bash -s <<'EOF'
+sudo systemctl start meeting-notary-canary.service; journalctl -u meeting-notary-canary -n 20 --no-pager
+cd /srv/meeting-notary/vexa && sudo -u dev env PYTHONPATH=scripts MEETING_NOTARY_CANARY_STATE_DIR=/srv/meeting-notary/state/canary \
+  /home/dev/meeting-notary/venv/bin/python -m notary.canary status
+EOF
+```
+`start` ждёт конца прогона (обычно 5–10 минут, с перепроверкой красного — до 20). «Бот здоров» →
+включаем таймеры и один раз «нюх», чтобы он запомнил текущую версию Телемоста:
+```bash
+ssh meeting-notary 'sudo systemctl enable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer && sudo systemctl start meeting-notary-telemost-sniff.service && systemctl list-timers "meeting-notary-*"'
+```
+
+## 8. Инструкция Альфреда и методичка восстановления
+
+Версии к выкатке лежат в ветке (`scripts/notary/docs/rollout/`); живые на маке — прежние.
+Заменить целиком, снять вводный блок «Версия к выкатке…», закоммитить каждый поимённо:
+```bash
+cp $TREE/scripts/notary/docs/rollout/alfred-notary-recovery-from-recording.md ~/.claude/methods/telegram-daemon/notary-recovery-from-recording.md
+cp $TREE/scripts/notary/docs/rollout/recover-meeting-protocol-from-recording.md ~/Projects/me/methods/recover-meeting-protocol-from-recording.md
+sed -i '' '/^> \*\*Версия к выкатке ISS-60\*\*/,/^$/d' ~/.claude/methods/telegram-daemon/notary-recovery-from-recording.md ~/Projects/me/methods/recover-meeting-protocol-from-recording.md
+git -C ~/.claude commit -m "Альфред: восстановление протокола из записи — версия ISS-60 (выкатка)" -- methods/telegram-daemon/notary-recovery-from-recording.md
+git -C ~/Projects/me commit -m "Методичка восстановления протокола — версия ISS-60 (выкатка)" -- methods/recover-meeting-protocol-from-recording.md
+```
+Если владелец дал «ок» на строку маршрутизации Альфреда (копилка плана, п.4) — в
+`~/.claude/channels/telegram/daemon-cwd/CLAUDE.md` строка про восстановление протокола должна
+вести в метод и по одной фразе «обработай запись», без файла; коммит поимённо.
+
+## 9. Что смотреть после
+
+- **Сразу:** `journalctl -u meeting-notary-runner --since "15 min ago" --no-pager | grep -E "join-watch|Traceback"` —
+  без `Traceback`; `systemctl is-active meeting-notary-listener meeting-notary-gateway` — оба `active`.
+- **Первая боевая встреча:** в журнале запускателя `[join-watch] …: вход подтверждён`; статус входа
+  `/home/dev/meeting-notary/_tmp/transcripts/.join-status/<sessionUid>.json` — `in_call`; в `meta.json`
+  встречи есть участники (хвост ISS-59: имена); протокол пришёл с именами.
+- **Следующее утро:** самопроверка в 04:40 МСК — зелёная (`python -m notary.canary status`), «нюх» —
+  без ошибок (`journalctl -u meeting-notary-telemost-sniff -n 20`).
+- **Через сутки:** все службы живы (§7 выше) — одна реальная встреча записалась, протокол пришёл.
+  Протоколы составляет Claude подписки бота: пока её недельный лимит исчерпан (ISS-61), протокол
+  не соберётся независимо от этой выкатки — расшифровка сохранится, сборка повторится.
+- **Слияние:** когда в `vexa/` никто не работает (`git -C vexa status --short` без чужих правок) —
+  `git -C vexa merge telemost-resilience` в `notary-f2-bot-notarius-full` (план: «слияние в конце»).
+
+## 10. Как откатить (каждую часть отдельно)
+
+| Что | Как | Когда |
+|---|---|---|
+| Образ бота | `ssh meeting-notary 'docker tag vexa-bot:notarius-telemost-before-iss60 vexa-bot:notarius-telemost'` + **обязательно выключить самопроверку** (строка ниже) — на старом образе она красная | бот не входит / входит хуже прежнего |
+| Самопроверка и предупреждения | `sudo systemctl disable --now meeting-notary-canary.timer meeting-notary-telemost-sniff.timer` + строка `MEETING_NOTARY_CANARY_WARN=0` в `.env.notary` | ложные тревоги, мешает |
+| Только сторож входа | строка `MEETING_NOTARY_JOIN_WATCH=0` в `.env.notary` — со следующего тика запускателя сторож молчит, остальное работает | сторож шлёт лишнее людям |
+| Скрипты целиком | `ssh meeting-notary 'sudo rm -rf /srv/meeting-notary/vexa/scripts/notary && sudo tar xzf /srv/meeting-notary/.deploy-backup/before-iss60-scripts.tgz -C /srv/meeting-notary/vexa/scripts && sudo chown -R dev:dev /srv/meeting-notary/vexa/scripts/notary && sudo systemctl restart meeting-notary-listener meeting-notary-gateway'` + выключить самопроверку (её скриптов больше нет) | ошибки в журналах служб после выкатки |
+| Исходники образа (для пересборки прежнего) | `ssh meeting-notary 'tar xzf /srv/meeting-notary/.deploy-backup/before-iss60-botsrc.tgz -C /home/dev/meeting-notary/vexa/services/vexa-bot'` | нужен прежний образ, а тег отката потерян |
+| Замки ручной финализации | удалить строку `MEETING_NOTARY_FINALIZE_LOCK_DIRS=…` из `.env.notary` — замок вернётся к папкам по умолчанию | не должно понадобиться |
+| Инструкция Альфреда / методичка | `git -C ~/.claude revert <коммит>` / `git -C ~/Projects/me revert <коммит>` (коммиты шага 8) | откатили скрипты — откатить и их: они ссылаются на `--mode auto` новой обёртки |
+
+Правка `.env.notary` для отката — тем же `sudo tee -a` (добавить строку) или `sudo sed -i '/^ИМЯ=/d'`
+(удалить); таймерные службы читают файл на каждом запуске, слушатель и шлюз — после
+`sudo systemctl restart meeting-notary-listener meeting-notary-gateway`.

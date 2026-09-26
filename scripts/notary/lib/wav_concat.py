@@ -3,9 +3,12 @@
 Корень P0 (подтверждён на проде 2026-06-03): бот пишет PCM в WAV стримом
 (`fs.writeSync` → данные сразу на bind-mount хоста), НО заголовок WAV
 финализируется только в `WavStreamWriter.close()` из `finally`-teardown'а
-recording.ts. `entrypoint.sh` запускает node ребёнком bash (PID 1), поэтому
-`docker stop` / рестарт systemd / OOM убивают node SIGKILL'ом → `finally` не
-выполняется → заголовок остаётся placeholder'ом из `open()` (`data size = 0`,
+recording.ts. До образа из ветки `telemost-resilience` `entrypoint.sh` запускал node
+ребёнком bash (PID 1), поэтому `docker stop` / рестарт systemd / OOM убивали node
+SIGKILL'ом. С этим образом (ISS-60, фаза 3а: `exec node`) `docker stop` приходит
+SIGTERM'ом и бот выходит штатно; SIGKILL остаётся при OOM, при истёкшем сроке
+остановки и у старых образов — поэтому страховка ниже нужна по-прежнему. После
+SIGKILL `finally` не выполняется → заголовок остаётся placeholder'ом из `open()` (`data size = 0`,
 RIFF = 36). Любой ридер, уважающий заголовок (ffmpeg, Speechmatics, `wave`),
 видит «0 байт аудио» → finalize отдаёт rc=3 «WAV not found»-эквивалент, хотя
 на диске лежат десятки МБ реального PCM (см. 06-01 .recover-bak: 86 МБ данных,
