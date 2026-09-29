@@ -1080,18 +1080,13 @@ def main() -> int:
                 log.info("[open-tasks] серия %s в режиме last-only — раздел «с прошлых "
                          "встреч» в протокол не печатаю", meta.get("series") or "?")
             # Ремонт 29.09.2026: режим этой встречи — звено цепочки для следующей
-            # портальной встречи (она прочтёт его из нашей выжимки). Пишем только
-            # ОПРЕДЕЛЁННЫЙ режим: страховка «не знаю — веду по-старому» уехала бы по
-            # цепочке постоянным накоплением.
-            try:
-                _oq_mode, _oq_determined = series_memory.resolve_open_questions_mode_for_meeting(
-                    meta.get("series"), digests=series_memory_digests,
-                )
-                if _oq_determined:
-                    open_questions_mode_for_digest = _oq_mode
-            except Exception as _oq_e:  # noqa: BLE001 — это только метка для цепочки
-                log.warning("[open-tasks] режим для выжимки не записан (%s)",
-                            type(_oq_e).__name__)
+            # портальной встречи (она прочтёт его из нашей выжимки). В выжимку идёт
+            # только ОПРЕДЕЛЁННЫЙ режим: страховка и дефолт по цепочке не едут. Раздел
+            # напечатан по страховке — пуш владельцу (внутри хелпера, с дедупом).
+            open_questions_mode_for_digest = series_memory.open_questions_mode_to_store(
+                meta.get("series"), digests=series_memory_digests, date=date_part,
+                carry_printed=bool(open_questions_carry and open_tasks_block),
+            )
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
                 session_uid, meta.get("series") or "?", len(series_memory_digests),

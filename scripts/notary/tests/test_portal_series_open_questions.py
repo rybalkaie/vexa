@@ -29,6 +29,29 @@ sys.path.insert(0, str(_NOTARY))
 
 from notary.lib import series_memory  # noqa: E402
 
+import os  # noqa: E402
+import tempfile  # noqa: E402
+from unittest import mock  # noqa: E402
+
+# Ремонт 29.09.2026: портальная серия без истории теперь читает режим из СВОЕЙ выжимки
+# на диске (`portal_series_stored_mode` → `protocols_root()`). PORTAL_SERIES ниже —
+# живой id встречи 18.08, его папка есть в боевом зеркале. Без изоляции тест читал бы
+# живые файлы разработчика: пустой временный каталог протоколов на весь модуль.
+_TMP_ROOT = None
+_ENV = None
+
+
+def setUpModule():  # noqa: N802 — имя задаёт unittest
+    global _TMP_ROOT, _ENV
+    _TMP_ROOT = tempfile.TemporaryDirectory()
+    _ENV = mock.patch.dict(os.environ, {"MEETING_NOTARY_PROTOCOLS_DIR": _TMP_ROOT.name})
+    _ENV.start()
+
+
+def tearDownModule():  # noqa: N802
+    _ENV.stop()
+    _TMP_ROOT.cleanup()
+
 # Реестр в форме, которую отдаёт `load_watched_for_modes`: серия координации без
 # поля режима (→ дефолт `last-only`) и Директорат с явным `carry`.
 WATCHED = {
