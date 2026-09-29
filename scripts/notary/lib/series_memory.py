@@ -308,6 +308,24 @@ def open_questions_mode(series: Optional[str], *, watched: Optional[dict] = None
 
     `watched` можно инъектировать (тесты и caller'ы, которые уже держат реестр в
     руках, — не читаем файл дважды). Логируем только имя серии и код ошибки.
+
+    🔴 Портальная серия (`portal-<id встречи>`, ремонт 29.09.2026) — исключение из
+    «серии нет в реестре → carry»: её в реестре нет НИКОГДА, это норма, а не «не тот
+    реестр». Режим берётся из её собственной последней выжимки (его туда пишет
+    finalize), иначе — дефолт реестра. См. `_open_questions_mode_ex`.
+    """
+    return _open_questions_mode_ex(series, watched=watched)[0]
+
+
+def _open_questions_mode_ex(
+    series: Optional[str], *, watched: Optional[dict] = None,
+) -> tuple[str, bool]:
+    """`open_questions_mode` + признак «режим ОПРЕДЕЛЁН», а не взят страховкой.
+
+    Второй элемент `False` — ответ дала страховка «не знаю — веду по-старому»: реестр
+    не прочитан, серии в нём нет, значение нечитаемо. Такой ответ годится, чтобы
+    собрать ЭТУ встречу, но записывать его в выжимку нельзя: по цепочке портальных
+    встреч разовая догадка превратилась бы в постоянный режим.
     """
     if watched is None:
         # `except (Exception, SystemExit)` — ИМЕННО ВОКРУГ ЧТЕНИЯ ФАЙЛА. `cli/registry
@@ -321,12 +339,12 @@ def open_questions_mode(series: Optional[str], *, watched: Optional[dict] = None
         except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort
             logger.warning("[open-tasks] реестр недоступен (%s) — режим серии считаю "
                            "%s (старое поведение)", type(e).__name__, OPEN_QUESTIONS_MODE_CARRY)
-            return OPEN_QUESTIONS_MODE_CARRY
+            return OPEN_QUESTIONS_MODE_CARRY, False
         if watched is None:
             logger.warning("[open-tasks] реестр режимов не прочитан — режим серии %s "
                            "считаю %s (РЕЖИМ НЕ ОПРЕДЕЛЁН, не выбор владельца)",
                            series, OPEN_QUESTIONS_MODE_CARRY)
-            return OPEN_QUESTIONS_MODE_CARRY
+            return OPEN_QUESTIONS_MODE_CARRY, False
     try:
         try:
             from notary.cli.registry import (  # noqa: PLC0415
@@ -338,20 +356,33 @@ def open_questions_mode(series: Optional[str], *, watched: Optional[dict] = None
             )
         records = series_records(series, watched)
         if not records:
+            if is_portal_series(series):
+                # Ремонт 29.09.2026. Портальной серии в реестре нет по построению, и
+                # страховка «нет в реестре → carry» для неё неверна: так слушатель,
+                # сверщик и утренний дайджест считали накоплением каждую портальную
+                # встречу координации. Режим едет по цепочке встреч — берём записанный
+                # в её же последней выжимке, иначе дефолт реестра.
+                stored = portal_series_stored_mode(series)
+                if stored:
+                    return stored, True
+                default = registry_default_open_questions_mode()
+                logger.info("[open-tasks] порталовая серия %s: режима в её выжимках нет — "
+                            "дефолт реестра (%s)", series, default)
+                return default, True
             logger.warning("[open-tasks] серии %s нет в реестре — режим считаю %s "
                            "(РЕЖИМ НЕ ОПРЕДЕЛЁН, не выбор владельца)",
                            series, OPEN_QUESTIONS_MODE_CARRY)
-            return OPEN_QUESTIONS_MODE_CARRY
+            return OPEN_QUESTIONS_MODE_CARRY, False
         mode = series_open_questions_mode(series, watched)
     except (Exception, SystemExit) as e:  # noqa: BLE001 — SystemExit из _read_yaml
         logger.warning("[open-tasks] режим серии %s не прочитан (%s) — считаю %s",
                        series, type(e).__name__, OPEN_QUESTIONS_MODE_CARRY)
-        return OPEN_QUESTIONS_MODE_CARRY
+        return OPEN_QUESTIONS_MODE_CARRY, False
     if mode not in (OPEN_QUESTIONS_MODE_CARRY, OPEN_QUESTIONS_MODE_LAST_ONLY):
         # Резолвер такого вернуть не должен; страхуемся в сторону старого поведения.
         logger.warning("[open-tasks] неизвестный режим %r серии %s — считаю %s",
                        mode, series, OPEN_QUESTIONS_MODE_CARRY)
-        return OPEN_QUESTIONS_MODE_CARRY
+        return OPEN_QUESTIONS_MODE_CARRY, False
     if mode == OPEN_QUESTIONS_MODE_LAST_ONLY:
         reason = _explicit_carry_signal(records)
         if reason:
@@ -364,8 +395,9 @@ def open_questions_mode(series: Optional[str], *, watched: Optional[dict] = None
             logger.warning("[open-tasks] серия %s: %s — оставляю %s, чтобы не потерять "
                            "хвост (поправьте реестр или скажите боту «эта серия — "
                            "шпаргалка»)", series, reason, OPEN_QUESTIONS_MODE_CARRY)
-            return OPEN_QUESTIONS_MODE_CARRY
-    return mode
+            # Не страховка «не знаю»: реестр ЯВНО говорит о накоплении — это решение.
+            return OPEN_QUESTIONS_MODE_CARRY, True
+    return mode, True
 
 
 def _explicit_carry_signal(records: Optional[list]) -> Optional[str]:
@@ -614,6 +646,63 @@ def carries_open_questions(
 #: пришлось бы еженедельно руками.
 PORTAL_SERIES_PREFIX = "portal-"
 
+#: Ремонт 29.09.2026: режим, с которым собрана встреча, finalize пишет в её выжимку под
+#: этим ключом — так режим едет по цепочке портальных встреч, а не угадывается заново.
+#: Ленивый ключ: в выжимках до 29.09.2026 его нет, миграция не нужна — такая выжимка
+#: просто «не знает» режим (см. `resolve_open_questions_mode_for_meeting`).
+OPEN_QUESTIONS_MODE_KEY = "open_questions_mode"
+
+
+def is_portal_series(series: object) -> bool:
+    """Серию ведёт портал (`portal-<id встречи>`): записи в реестре у неё нет."""
+    return isinstance(series, str) and series.startswith(PORTAL_SERIES_PREFIX)
+
+
+def stored_open_questions_mode(digest: object) -> Optional[str]:
+    """Режим, записанный в выжимке (`carry` | `last-only`); нет или мусор → None."""
+    if not isinstance(digest, dict):
+        return None
+    raw = digest.get(OPEN_QUESTIONS_MODE_KEY)
+    if not isinstance(raw, str):
+        return None
+    val = raw.strip().casefold()
+    if val in (OPEN_QUESTIONS_MODE_CARRY, OPEN_QUESTIONS_MODE_LAST_ONLY):
+        return val
+    return None
+
+
+def registry_default_open_questions_mode() -> str:
+    """Дефолт реестра для записи без поля (решение владельца 29.07.2026: справка)."""
+    try:
+        from notary.cli.registry import DEFAULT_OPEN_QUESTIONS_MODE  # noqa: PLC0415
+    except ImportError:  # окружение без пакета `notary`
+        from cli.registry import DEFAULT_OPEN_QUESTIONS_MODE  # noqa: PLC0415
+    return DEFAULT_OPEN_QUESTIONS_MODE
+
+
+def portal_series_stored_mode(series: str) -> Optional[str]:
+    """Режим из самой свежей выжимки портальной серии, где он записан; иначе None.
+
+    Для читателей, у которых истории встречи под рукой нет (слушатель, сверщик,
+    утренний дайджест): они знают только имя серии. Best-effort — нет каталога или
+    файлы битые → None.
+    """
+    try:
+        try:
+            from notary.lib.paths import protocols_root  # noqa: PLC0415
+        except ImportError:  # окружение без пакета `notary`
+            from lib.paths import protocols_root  # noqa: PLC0415
+        digests = list_series_digests(protocols_root() / series)
+    except Exception as e:  # noqa: BLE001 — best-effort
+        logger.warning("[open-tasks] выжимки порталовой серии %s не прочитаны (%s)",
+                       series, type(e).__name__)
+        return None
+    for dig in reversed(digests):
+        mode = stored_open_questions_mode(dig)
+        if mode:
+            return mode
+    return None
+
 
 def open_questions_mode_for_meeting(
     series: Optional[str],
@@ -635,65 +724,112 @@ def open_questions_mode_for_meeting(
     дефолт `last-only`), а висяки владелец разбирает утренним дайджестом. То есть
     перевод встречи на портал молча вернул поведение, от которого ушли.
 
-    Как решаем — по порядку:
+    🔴 РЕМОНТ 29.09.2026 — та же поломка вернулась через шесть недель. Починка 18.08
+    брала режим серии САМОЙ СВЕЖЕЙ встречи истории. Пока история была календарной,
+    это работало. К 29.09 все три встречи истории (18.08, 25.08, 08.09) оказались
+    портальными, у них записи в реестре нет → страховка «нет в реестре → carry» →
+    раздел на 17 пунктов снова ушёл в группу. Тест той починки проверял только первый
+    шаг «календарь → портал», цепочку «портал → портал» не проверял никто.
+
+    Как решаем — по порядку (подробно — `resolve_open_questions_mode_for_meeting`):
       1. серия НЕ порталовая → прежний резолв, буква в букву;
       2. порталовая и в реестре ЕСТЬ (кто-то завёл руками) → её запись главнее;
-      3. порталовая, памяти нет вовсе → дефолт реестра (`last-only`);
-      4. порталовая, память приехала фолбэком по составу участников из ДРУГОЙ серии
-         → берём режим ТОЙ серии. Это и есть перевод встречи на портал: хвост мы
-         унаследовали от неё, значит и правило про хвост — её.
+      3. порталовая → идём по истории от свежей встречи к старой: серия, известная
+         реестру, → её режим по реестру СЕЙЧАС; встреча с записанным режимом → он;
+         встреча без сведений → смотрим глубже;
+      4. сведений нет нигде → дефолт реестра (`last-only`), не страховка `carry`.
     """
-    if not isinstance(series, str) or not series.startswith(PORTAL_SERIES_PREFIX):
-        return open_questions_mode(series, watched=watched)
+    return resolve_open_questions_mode_for_meeting(
+        series, digests=digests, watched=watched,
+    )[0]
+
+
+def resolve_open_questions_mode_for_meeting(
+    series: Optional[str],
+    *,
+    digests: Optional[list] = None,
+    watched: Optional[dict] = None,
+) -> tuple[str, bool]:
+    """Режим встречи + признак «режим ОПРЕДЕЛЁН» (см. `_open_questions_mode_ex`).
+
+    finalize пишет режим в выжимку ТОЛЬКО при `True`: иначе разовая страховка
+    («реестр не прочитан — веду по-старому») уехала бы по цепочке портальных встреч
+    постоянным режимом.
+    """
+    if not is_portal_series(series):
+        return _open_questions_mode_ex(series, watched=watched)
 
     if watched is None:
         try:
             watched = load_watched_for_modes()
         except (Exception, SystemExit) as e:  # noqa: BLE001 — реестр best-effort
-            logger.warning("[open-tasks] реестр недоступен (%s) — порталовой серии "
-                           "%s назначаю дефолт реестра", type(e).__name__, series)
+            logger.warning("[open-tasks] реестр недоступен (%s) — порталовая серия %s "
+                           "идёт по сохранённым режимам истории", type(e).__name__, series)
             watched = None
 
-    if watched is not None:
-        try:
-            from notary.cli.registry import series_records  # noqa: PLC0415
-        except ImportError:  # окружение без пакета `notary`
-            from cli.registry import series_records  # noqa: PLC0415
-        try:
-            if series_records(series, watched):
-                return open_questions_mode(series, watched=watched)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[open-tasks] запись порталовой серии не прочитана (%s)",
-                           type(e).__name__)
+    try:
+        from notary.cli.registry import series_records  # noqa: PLC0415
+    except ImportError:  # окружение без пакета `notary`
+        from cli.registry import series_records  # noqa: PLC0415
 
-    # Чья память приехала: у выжимки записано ИМЯ СЕРИИ, из которой она взята.
-    # Берём самую свежую чужую — она же и дала хвост.
-    inherited = None
+    def _in_registry(name: str) -> bool:
+        if watched is None:
+            return False
+        try:
+            return bool(series_records(name, watched))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[open-tasks] запись серии %s не прочитана (%s)",
+                           name, type(e).__name__)
+            return False
+
+    if _in_registry(series):
+        return _open_questions_mode_ex(series, watched=watched)
+
+    # История встречи — от свежей к старой. У выжимки записано ИМЯ СЕРИИ, откуда она
+    # взята, а с 29.09.2026 — и режим, с которым та встреча собрана.
+    saw_foreign = False
     for digest in reversed(list(digests or [])):
         if not isinstance(digest, dict):
             continue
         origin = digest.get("series")
-        if isinstance(origin, str) and origin.strip() and origin != series:
-            inherited = origin.strip()
-            break
+        origin = origin.strip() if isinstance(origin, str) else ""
+        if not origin or origin == series:
+            continue  # своя выжимка источником не считается
+        saw_foreign = True
+        if _in_registry(origin):
+            # Серия, известная реестру: действует её режим СЕЙЧАС — смена режима
+            # владельцем применяется со следующей встречи, и по цепочке тоже.
+            mode, determined = _open_questions_mode_ex(origin, watched=watched)
+            logger.info("[open-tasks] порталовая серия %s наследует режим «%s» от серии "
+                        "%s (реестр)", series, mode, origin)
+            return mode, determined
+        stored = stored_open_questions_mode(digest)
+        if stored:
+            logger.info("[open-tasks] порталовая серия %s наследует режим «%s», "
+                        "записанный во встрече %s", series, stored, origin)
+            return stored, True
+        # Сведений о режиме у этой встречи нет (портальная до 29.09.2026 либо серия,
+        # выпавшая из реестра) — смотрим глубже.
 
-    if inherited is None:
-        # 🔴 НЕ `open_questions_mode(None)`: он для «серии нет в реестре» отвечает
-        # `carry` — тем самым fail-safe, который для порталовой встречи и неверен.
-        # Берём именно ДЕФОЛТ РЕЕСТРА (решение владельца 29.07: новые серии живут
-        # справкой), тот же, что получила бы обычная запись без поля.
-        try:
-            from notary.cli.registry import DEFAULT_OPEN_QUESTIONS_MODE  # noqa: PLC0415
-        except ImportError:
-            from cli.registry import DEFAULT_OPEN_QUESTIONS_MODE  # noqa: PLC0415
-        logger.info("[open-tasks] порталовая серия %s: прошлых встреч не нашлось — "
-                    "режим по дефолту реестра (%s)", series, DEFAULT_OPEN_QUESTIONS_MODE)
-        return DEFAULT_OPEN_QUESTIONS_MODE
+    # Истории не дали — или её не передали (читатели без памяти под рукой): режим,
+    # записанный в собственной выжимке серии (перевыпуск, ответы в группе после встречи).
+    own = portal_series_stored_mode(series)
+    if own:
+        return own, True
 
-    mode = open_questions_mode(inherited, watched=watched or {})
-    logger.info("[open-tasks] порталовая серия %s наследует режим «%s» от серии %s "
-                "(хвост приехал оттуда)", series, mode, inherited)
-    return mode
+    if saw_foreign and watched is None:
+        # Реестр не прочитан, а история режима не подсказала — это «не знаю», а не
+        # выбор владельца. Для ЭТОЙ встречи — старое поведение (хвост не теряем),
+        # в выжимку такой ответ не пишется.
+        logger.warning("[open-tasks] порталовая серия %s: реестр не прочитан, в истории "
+                       "режима нет — считаю %s (РЕЖИМ НЕ ОПРЕДЕЛЁН, не выбор владельца)",
+                       series, OPEN_QUESTIONS_MODE_CARRY)
+        return OPEN_QUESTIONS_MODE_CARRY, False
+
+    default = registry_default_open_questions_mode()
+    logger.info("[open-tasks] порталовая серия %s: режима нет ни в реестре, ни в истории "
+                "— дефолт реестра (%s)", series, default)
+    return default, True
 
 
 def open_tasks_max() -> int:
@@ -1490,9 +1626,15 @@ def save_meeting_digest(
     publication: Optional[dict] = None,
     significance_filter: Optional[Callable[[list[str]], list]] = None,
     prune_days: int = 0,
+    open_questions_mode: Optional[str] = None,
 ) -> Optional[Path]:
     """B1 (finalize 4.0.2d): построить выжимку из ГОТОВОГО протокола и сохранить
     рядом, затем (опц.) прунинг старых по сроку хранения.
+
+    `open_questions_mode` (ремонт 29.09.2026) — режим, с которым собрана встреча,
+    если он ОПРЕДЕЛЁН (не страховка). Ложится в выжимку ключом `OPEN_QUESTIONS_MODE_KEY`
+    — по нему следующая портальная встреча узнаёт режим. Не передан → переносим тот,
+    что уже лежал в выжимке этой даты (перевыпуск не должен его стирать).
 
     Тонкая оркестровка `build_digest`→`save_digest`→`prune_old_digests`: hot-path
     финализации зовёт её ОДНИМ вызовом (вместо инлайна), и она же — тестируемая
@@ -1521,6 +1663,13 @@ def save_meeting_digest(
             and _norm_speaker_mapping(_prev.get("speaker_mapping")) == _norm_speaker_mapping(digest.get("speaker_mapping"))
             and digest.get("speaker_mapping")):
         digest["speaker_mapping_confirmed"] = True
+    # Ремонт 29.09.2026: режим встречи — звено цепочки портальных встреч. Та же
+    # логика, что у метки авторства: перевыпуск без режима не стирает записанный.
+    _mode = stored_open_questions_mode({OPEN_QUESTIONS_MODE_KEY: open_questions_mode})
+    if _mode is None:
+        _mode = stored_open_questions_mode(_prev)
+    if _mode:
+        digest[OPEN_QUESTIONS_MODE_KEY] = _mode
     saved = save_digest(series_dir, date, digest)
     if prune_days and prune_days > 0:
         prune_old_digests(series_dir, prune_days)

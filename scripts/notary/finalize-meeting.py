@@ -994,6 +994,9 @@ def main() -> int:
     # и хвост переезжает дальше). Дефолт True = прежнее поведение, если до резолва не
     # дошли (серия без slug, память серии выключена).
     open_questions_carry = True
+    # Ремонт 29.09.2026: режим, который ляжет в выжимку этой встречи. None — режим не
+    # определён (сбой резолва или страховка), в выжимку ничего не пишем.
+    open_questions_mode_for_digest = None
     # Ф4б (REQ 1.2): закреплённое человеком сопоставление спикер→имя из памяти серии
     # (правка авторства реплаем на прошлой встрече). Подаётся якорем в map_all ДО
     # догадки Ф4а. {} если нет/старые файлы без ключа (ленивое поле, УПУ3).
@@ -1076,6 +1079,19 @@ def main() -> int:
             else:
                 log.info("[open-tasks] серия %s в режиме last-only — раздел «с прошлых "
                          "встреч» в протокол не печатаю", meta.get("series") or "?")
+            # Ремонт 29.09.2026: режим этой встречи — звено цепочки для следующей
+            # портальной встречи (она прочтёт его из нашей выжимки). Пишем только
+            # ОПРЕДЕЛЁННЫЙ режим: страховка «не знаю — веду по-старому» уехала бы по
+            # цепочке постоянным накоплением.
+            try:
+                _oq_mode, _oq_determined = series_memory.resolve_open_questions_mode_for_meeting(
+                    meta.get("series"), digests=series_memory_digests,
+                )
+                if _oq_determined:
+                    open_questions_mode_for_digest = _oq_mode
+            except Exception as _oq_e:  # noqa: BLE001 — это только метка для цепочки
+                log.warning("[open-tasks] режим для выжимки не записан (%s)",
+                            type(_oq_e).__name__)
             log.info(
                 "[series-memory] meeting=%s series=%s loaded=%d expected_enrich=+%d cross_len=%d",
                 session_uid, meta.get("series") or "?", len(series_memory_digests),
@@ -1833,6 +1849,8 @@ def main() -> int:
                 significance_filter=lambda _tasks: series_memory.tag_open_tasks_significance(
                     _tasks, meeting_sid=session_uid),
                 prune_days=series_memory.retention_days(),
+                # Ремонт 29.09.2026: звено цепочки режима для портальных встреч.
+                open_questions_mode=open_questions_mode_for_digest,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("[series-memory] digest save failed (non-fatal): %s", e)
