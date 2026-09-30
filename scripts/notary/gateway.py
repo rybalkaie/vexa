@@ -41,7 +41,10 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -433,7 +436,14 @@ class _Handler(BaseHTTPRequestHandler):
         разбор примет за строку запроса. Отказ по токену и отказ по размеру тела
         оба отвечают ДО чтения — то есть у клиента с пулом соединений (портал)
         после первого же 401 поехал бы весь пул.
+
+        Второй случай — шлюз останавливается (`GatewayServer.close_gracefully`):
+        запрос, который уже в работе, досылаем с `Connection: close`, чтобы Caddy
+        не отправил следующий запрос в соединение, которое сейчас закроется.
         """
+        stopping = getattr(self.server, "stopping", None)
+        if stopping is not None and stopping.is_set():
+            return True
         return self.command in ("POST", "PUT", "PATCH") and not self._body_consumed
 
     def _send(self, code: int, payload: Dict[str, Any], *, note: str = "") -> None:
@@ -1120,9 +1130,172 @@ def _unquote_id(raw: str) -> str:
     return unquote(raw)
 
 
+# Сколько после сигнала остановки ждать запросы, которые уже в работе. Обычный
+# запрос — доли секунды, запасная сборка PDF — секунды; systemd ждёт 90 с
+# (TimeoutStopSec по умолчанию) и потом добивает SIGKILL. 20 с — с запасом под
+# сборку PDF и далеко от 90: зависший запрос не вернёт остановке прежние 90 с.
+SHUTDOWN_DRAIN_SECONDS = 20.0
+
+
 class GatewayServer(ThreadingHTTPServer):
+    """HTTP-сервер шлюза: поток на соединение и остановка, которая не виснет.
+
+    С 01.08 по 30.09.2026 шлюз 14 раз не остановился по SIGTERM: systemd ждал
+    90 с и добивал его SIGKILL, всё это время портал получал отказ. Ломались
+    два места, оба закрыты здесь и в `serve_until_signal`:
+
+    1. `shutdown()` звали из обработчика сигнала — то есть из того же потока,
+       где крутится `serve_forever()`. `shutdown()` ждёт выхода цикла, а цикл
+       стоит в этом же потоке и не выйдет никогда. Теперь сигнал будит
+       отдельный поток, и `shutdown()` зовёт он.
+    2. Штатное закрытие `ThreadingMixIn.server_close()` ждёт ВСЕ потоки без
+       предела, а поток простаивающего keep-alive-соединения Caddy выходит
+       только по таймауту (`_Handler.timeout`, 30 с). `close_gracefully()`
+       будит простаивающие соединения сразу и ждёт начатые запросы не дольше
+       `SHUTDOWN_DRAIN_SECONDS`.
+
+    Стенд проб (`tests/gateway_harness.py`) по-прежнему останавливает сервер
+    штатными `shutdown()` + `server_close()` — это допустимо: там нет Caddy с
+    пулом соединений и нет сигналов.
+    """
+
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Открытые соединения: их будит `close_gracefully`. Кладёт и убирает их
+        # цикл приёма и потоки запросов; обработчик сигнала сюда не ходит
+        # (блокировка в обработчике сигнала — путь к взаимной блокировке).
+        self._conns_lock = threading.Lock()
+        self._conns: Dict[socket.socket, bool] = {}
+        # Взведён → шлюз останавливается: ответы уходят с `Connection: close`.
+        self.stopping = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Регистрация — в цикле приёма, ДО старта потока: к моменту, когда
+        # `serve_forever()` вышел, каждое принятое соединение уже в списке, и
+        # `close_gracefully` не пропустит соединение, чей поток ещё не стартовал.
+        with self._conns_lock:
+            self._conns[request] = True
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._conns_lock:
+                self._conns.pop(request, None)
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            # Штатный код уже закрыл сокет — соединения больше нет.
+            with self._conns_lock:
+                self._conns.pop(request, None)
+
+    def open_connections(self) -> int:
+        with self._conns_lock:
+            return len(self._conns)
+
+    def close_gracefully(self, drain_seconds: float = SHUTDOWN_DRAIN_SECONDS) -> int:
+        """Закрыть шлюз после выхода из `serve_forever()`: новых не брать, начатое дослать.
+
+        1. Слушающий сокет закрывается сразу: новое соединение получает отказ
+           мгновенно, а не висит в очереди ядра, пока мы ждём начатые запросы.
+        2. Каждое открытое соединение получает `shutdown(SHUT_RD)`. Простаивающий
+           keep-alive видит «клиент ушёл» и поток выходит сразу. Запрос, который
+           уже прочитан, дорабатывает и досылает ответ: писать в сокет SHUT_RD
+           не мешает, а ответ уходит с `Connection: close` (`_Handler._must_close`).
+        3. Ждём, пока все соединения закроются, но не дольше `drain_seconds`.
+
+        Возвращает, сколько соединений не успело закрыться. Их потоки — daemon,
+        процесс выходит, не дожидаясь их. ⚠️ После этого НЕ зови `server_close()`:
+        штатное закрытие ждёт потоки без предела — ровно то зависание, от
+        которого этот метод уводит.
+        """
+        self.stopping.set()
+        self.socket.close()
+        with self._conns_lock:
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass  # поток уже закрыл соединение сам
+        deadline = time.monotonic() + max(0.0, drain_seconds)
+        while True:
+            left = self.open_connections()
+            if left == 0 or time.monotonic() >= deadline:
+                return left
+            time.sleep(0.05)
+
+
+def serve_until_signal(
+    server: GatewayServer,
+    *,
+    signals: Tuple[int, ...] = (signal.SIGTERM, signal.SIGINT),
+    drain_seconds: float = SHUTDOWN_DRAIN_SECONDS,
+    poll_interval: float = 0.5,
+) -> int:
+    """Крутить шлюз до сигнала и закрыть его без зависания. Только из главного потока.
+
+    Обработчик сигнала лишь пишет байт в трубу. Он прерывает главный поток
+    посреди чего угодно — и взять там блокировку (логгера, `Event`, запуска
+    потока), которую главный поток уже держит, значит заснуть на ней навсегда.
+    Байт будит поток-стоппер, и `server.shutdown()` зовёт уже он — из ДРУГОГО
+    потока, как того требует socketserver.
+
+    Возвращает число соединений, не успевших закрыться за `drain_seconds`.
+    """
+    wake_r, wake_w = os.pipe()
+    received: List[int] = []
+
+    def _stopper() -> None:
+        try:
+            got = os.read(wake_r, 1)
+        except OSError:
+            got = b""
+        finally:
+            os.close(wake_r)
+        if not got:
+            return  # цикл приёма закончился сам (исключение) — будить некого
+        logger.info(
+            "Сигнал %s — останавливаюсь: новые запросы не принимаю, начатые "
+            "дожидаюсь до %g с",
+            received[0] if received else "?",
+            drain_seconds,
+        )
+        server.shutdown()
+
+    def _on_signal(signum: int, _frame: Any) -> None:
+        received.append(signum)
+        try:
+            os.write(wake_w, b"\0")
+        except OSError:
+            pass
+
+    stopper = threading.Thread(target=_stopper, name="gateway-stopper", daemon=True)
+    stopper.start()
+    previous = {sig: signal.signal(sig, _on_signal) for sig in signals}
+    try:
+        server.serve_forever(poll_interval=poll_interval)
+    finally:
+        # Порядок важен: сначала вернуть прежние обработчики, потом закрыть
+        # трубу — иначе сигнал в этом промежутке писал бы в закрытый (или уже
+        # занятый чужим файлом) дескриптор. Повторный сигнал во время ожидания
+        # начатых запросов теперь обрабатывается по-старому: добить сразу.
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        os.close(wake_w)  # стоппер без сигнала получит конец трубы и выйдет
+        stopper.join(timeout=5)
+        started = time.monotonic()
+        stuck = server.close_gracefully(drain_seconds)
+        logger.info(
+            "Шлюз остановлен (ожидание начатых запросов %.1f с, не дождались: %d)",
+            time.monotonic() - started,
+            stuck,
+        )
+    return stuck
 
 
 def build_server(host: Optional[str] = None, port: Optional[int] = None) -> GatewayServer:
@@ -1163,17 +1336,10 @@ def main() -> int:
             host,
         )
 
-    def _stop(signum: int, _frame: Any) -> None:
-        logger.info("Сигнал %s — останавливаюсь", signum)
-        server.shutdown()
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
-    try:
-        server.serve_forever(poll_interval=0.5)
-    finally:
-        server.server_close()
-        logger.info("Шлюз остановлен")
+    # Остановка по SIGTERM/SIGINT — через поток-стоппер и закрытие с потолком
+    # ожидания (см. `GatewayServer` и `serve_until_signal`). Прежний вариант
+    # звал `server.shutdown()` прямо из обработчика сигнала и вис навсегда.
+    serve_until_signal(server)
     return 0
 
 
