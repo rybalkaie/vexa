@@ -41,6 +41,11 @@ Environment=MEETING_NOTARY_ARCHIVE_DIR=/srv/meeting-notary/protocols
 Environment=MEETING_NOTARY_FEEDBACK_DIR=/home/dev/meeting-notary/_tmp/_feedback_edits
 Environment=TELEMOST_PROTOCOL_DIR=/home/dev/meeting-notary/_tmp/protocols
 Environment=MEETING_NOTARY_DELIVERED_ROOTS=/home/dev/meeting-notary/_tmp/transcripts:/home/dev/meeting-notary/_tmp/protocols:/srv/meeting-notary/protocols
+# Куда нотариус пишет свои очереди знаний (правки с портала → feedback_router →
+# knowledge_writeback). С 30.09.2026 — отдельная папка, НЕ копия мозга ~/Projects/me:
+# в неё пишет только писатель мозга, чужая запись его останавливает (копилка п.25/48
+# плана хранителя знаний, решение владельца 30.09). Без строки дефолт — ~/Projects/me.
+Environment=MEETING_NOTARY_ME_DIR=/home/dev/meeting-notary/me-outbox
 # Без этого флага `_portal_author_is_organizer` всегда False: наряд не читается,
 # организатор не опознаётся НИ У ОДНОЙ правки с портала, и правило цитирования
 # отбивает даже автора встречи.
