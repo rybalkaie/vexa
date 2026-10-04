@@ -30,6 +30,31 @@ chmod +x "$STUB_DIR/claude"
 PATH="$STUB_DIR:$PATH"
 export PATH
 
+# Сторож настоящих файлов (возобновление 05.10.2026): тесты уже писали в эти пути — журнал
+# обучения и телеметрию правок, состояние подтверждений и памяти решений, барьер стартов. Всё, что
+# изменилось за прогон, печатается в итоге. Красный/зелёный от этого не меняется, но ненулевое
+# число = тест снова пишет мимо временной папки, его надо чинить.
+# Сравнивается снимок «время в наносекундах + размер» до и после: `test -nt` в системном sh
+# различает только секунды и пропускал запись в ту же секунду (поймано положительным контролем).
+REAL_FILES="$HOME/Projects/meeting-notary/_feedback_edits/_learning/feedback-learning.jsonl
+$HOME/Projects/meeting-notary/_feedback_edits/_telemetry/patch-tiers.jsonl
+$HOME/.local/state/meeting-notary-watson/reply-ack-state.json
+$HOME/.local/state/meeting-notary-watson/decision-memory.jsonl
+$HOME/Projects/me/встречи/.state.json"
+real_state() {
+  printf '%s\n' "$REAL_FILES" | python3 -c '
+import os, sys
+for p in sys.stdin.read().splitlines():
+    if p:
+        try:
+            st = os.stat(p)
+            print("%s\t%d\t%d" % (p, st.st_mtime_ns, st.st_size))
+        except OSError:
+            print("%s\t-\t-" % p)
+'
+}
+real_state > "$STUB_DIR/real-before"
+
 total=0
 failed=0
 failed_list=""
@@ -54,12 +79,20 @@ done
 
 calls=0
 [ -f "$STUB_DIR/calls.log" ] && calls="$(wc -l < "$STUB_DIR/calls.log" | tr -d ' ')"
+real_state > "$STUB_DIR/real-after"
+touched="$(paste "$STUB_DIR/real-before" "$STUB_DIR/real-after" | awk -F'\t' '$2 != $5 || $3 != $6 {print "  " $1}')"
 
 echo "======================================================================"
 echo "ГЕЙТ ЗОНЫ notary: файлов прогнано $total, упало $failed"
 echo "Вызовов claude из тестов (заглушка): $calls"
 [ "$calls" -ne 0 ] && sed 's/^/  /' "$STUB_DIR/calls.log"
-rm -f "$STUB_DIR/claude" "$STUB_DIR/calls.log"
+if [ -n "$touched" ]; then
+  echo "Тесты изменили настоящие файлы:"
+  printf '%s\n' "$touched"
+else
+  echo "Тесты изменили настоящие файлы: нет"
+fi
+rm -f "$STUB_DIR/claude" "$STUB_DIR/calls.log" "$STUB_DIR/real-before" "$STUB_DIR/real-after"
 rmdir "$STUB_DIR" 2>/dev/null
 if [ $failed -ne 0 ]; then
   printf '%s\n' "$failed_list"
