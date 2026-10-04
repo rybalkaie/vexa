@@ -164,11 +164,14 @@
 - [x] Четыре наследных негерметичных теста уведены от настоящих файлов и модели → scripts/notary/tests/test_phase4_targeted_edit.py
 - [x] Гейт зоны: заглушка модели со счётчиком вызовов и поимённый список падений → .build-idea/open-questions-mode-per-series/gate.sh
 - [x] Разовое расписание, поднимавшее завершённый прогон, обезврежено; дефекты обвязки — в журнал дефектов автонома → journal.md
-- [ ] Мутации по сегодняшним правкам внесены НЕ автором → .build-idea/open-questions-mode-per-series/artifacts/resume-1005-mutations.md
-- [ ] Закрывающая проверка по десяти утверждениям — на ветке и на рабочей линии → .build-idea/open-questions-mode-per-series/artifacts/claims-2026-10-05.txt
-- [ ] Финальный гейт новой версией: карантин поимённо и ноль вызовов модели → .build-idea/open-questions-mode-per-series/artifacts/gate-final-2026-10-05.txt
-- [ ] Отчёт: раздел возобновления, сверенный список «осталось человеку», закрывающая таблица → .build-idea/open-questions-mode-per-series/report.md
-- [ ] Лист решений дополнен → decisions.md
-- [ ] Долги дополнены и сверены с итогом плана → plans/follow-ups-open-questions-mode-per-series.md
-- [ ] «Что нового» на сегодня → whats-new/2026-10-05-open-questions-mode-per-series.md
-- [ ] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
+- [x] Мутации по сегодняшним правкам внесены НЕ автором → .build-idea/open-questions-mode-per-series/artifacts/resume-1005-mutations.md
+- [x] Закрывающая проверка по десяти утверждениям — на ветке и на рабочей линии → .build-idea/open-questions-mode-per-series/artifacts/claims-2026-10-05.txt
+- [x] Финальный гейт новой версией: карантин поимённо и ноль вызовов модели → .build-idea/open-questions-mode-per-series/artifacts/gate-final-2026-10-05.txt
+- [x] Отчёт: раздел возобновления, сверенный список «осталось человеку», закрывающая таблица → .build-idea/open-questions-mode-per-series/report.md
+- [x] Лист решений дополнен → decisions.md
+- [x] Долги дополнены и сверены с итогом плана → plans/follow-ups-open-questions-mode-per-series.md
+- [x] «Что нового» на сегодня → whats-new/2026-10-05-open-questions-mode-per-series.md
+- [x] Хендофф → .build-idea/open-questions-mode-per-series/handoff.md
+- [x] Дыра, найденная ломателем (обрыв цикла на битом элементе), закрыта тестом на оба порядка → scripts/notary/tests/test_iss53_55_evening_reject_tz.py
+- [x] Гейт сторожит известные настоящие файлы, положительный контроль пройден → .build-idea/open-questions-mode-per-series/gate.sh
+- [x] Сверка захода (тронут автозапуск): неточности в документах поправлены → journal.md
