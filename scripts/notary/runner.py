@@ -5,11 +5,13 @@
 (launchd-агент на маке — архивный путь отката).
 
 Алгоритм одного тика:
-  1. Прочитать .queue.json (от scheduler-а) и добрать из реестра нарядов портала
-     то, что очередь ещё не знает: разовые «зайти сейчас» и плановые наряды со
-     стартом в окне (поставленные или перенесённые у самого старта).
+  1. Прочитать .queue.json (от scheduler-а) и сверить с реестром нарядов портала:
+     добрать то, что очередь ещё не знает (разовые «зайти сейчас», плановые наряды
+     со стартом в окне), и отбросить строки снятых и перенесённых нарядов.
   2. Прочитать .pause-until (через registry.pause_until() — она сама чистит stale).
-  3. Найти кандидатов: start_at − now ∈ [0; 5min] и event_id не в state-файле.
+  3. Найти кандидатов: start_at − now ∈ [−1; 5] мин (позже — только ждущие слот,
+     разовые и поставленные у самого старта), ни ключ старта, ни ключ встречи
+     (комната + секунда) не заняты в state-файле.
   4. Если есть активная Vexa-сессия (определяем через ssh + docker ps) — пропускаем.
   5. Конфликт нескольких на одно время → берём первого по порядку в .queue.json
      (а очередь scheduler пишет в порядке появления в watched.yaml), остальным
@@ -51,7 +53,9 @@ from notary.lib.notify import push  # noqa: E402
 from notary.lib import late_join, portal_queue, slots, waitlist  # noqa: E402
 from notary.lib import join_watch  # noqa: E402
 from notary.lib import telemost_url  # noqa: E402
+from notary.lib.meeting_identity import instant_key  # noqa: E402
 from notary.lib.state import (  # noqa: E402
+    normalized_start_key,
     read_queue,
     read_state,
     start_key,
@@ -157,8 +161,9 @@ def main(now: datetime | None = None) -> int:
     queue = _with_immediate_orders(queue, now)
     # Бэклог 04.10.2026: так же — плановые наряды портала у самого старта. Встреча,
     # поставленная или перенесённая за минуту-две до начала, иначе попадала в
-    # очередь уже после окна старта, и бот её пропускал. При OFF — как выше.
-    queue, late_keys, stale_keys = _with_near_scheduled_orders(queue, now)
+    # очередь уже после окна старта, и бот её пропускал. Тем же чтением реестра
+    # строки снятых и перенесённых нарядов выбывают из очереди тика. При OFF — как выше.
+    queue, late_keys = _with_near_scheduled_orders(queue, now)
     # ISS-60, фаза 2: пока самопроверка красная — предупредить владельца за ~10
     # минут до встречи. Под try: упадёт — запуск ботов идёт как раньше.
     _canary_warn_tick(queue, now)
@@ -180,9 +185,7 @@ def main(now: datetime | None = None) -> int:
             _waitlist_save(wl)
         return 0
 
-    candidates = _candidates(
-        queue, now, waiting=waiting_keys, late_ok=late_keys, stale=stale_keys,
-    )
+    candidates = _candidates(queue, now, waiting=waiting_keys, late_ok=late_keys)
     if not candidates:
         logger.info("tick: %d в очереди, ни одного в окне старта", len(queue))
         if wl_changed:
@@ -263,10 +266,14 @@ def main(now: datetime | None = None) -> int:
         # 🔴 Ключ — `event_id` + МИНУТА старта (ISS-57): перенос встречи обязан
         # дать НОВЫЙ старт, а повторный тик по тому же старту — не дать. Голый
         # `event_id` проверяется как переходный щит выкатки (см. `state_acquire`).
-        if not state_acquire(skey, legacy_key=cand.get("event_id"), now=now):
+        # Вторым ключом занимается сама встреча — комната + секунда старта
+        # (`_meeting_key`): другая строка той же встречи второго бота не поднимет.
+        if not state_acquire(
+            skey, legacy_key=cand.get("event_id"), now=now, meeting_key=_meeting_key(cand),
+        ):
             logger.info(
-                "старт %s уже отработан недавно — пропуск (повторный тик или ручной run)",
-                skey,
+                "старт %s уже отработан недавно — пропуск (повторный тик, ручной run "
+                "или другая строка той же встречи)", skey,
             )
             continue
 
@@ -332,143 +339,181 @@ def _with_immediate_orders(
 
 def _with_near_scheduled_orders(
     queue: list[dict[str, Any]], now: datetime
-) -> tuple[list[dict[str, Any]], set[str], set[str]]:
-    """Плановые наряды портала у самого старта — прямо из реестра (бэклог 04.10.2026).
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Сверить очередь тика с реестром нарядов портала (бэклог 04.10.2026).
 
     ЗАЧЕМ. Плановый наряд runner видел только через очередь планировщика, а она
     перестраивается раз в 3 минуты. Встреча, поставленная или перенесённая на
     портале за минуту-две до начала, попадала в очередь уже после окна старта —
     и бот её пропускал. Теперь runner каждую минуту сам берёт из реестра плановые
-    наряды со стартом в своём окне — так же, как разовые «зайти сейчас».
+    наряды со стартом в своём окне — так же, как разовые «зайти сейчас», — и по
+    тому же чтению реестра отбрасывает устаревшие строки очереди (наряд снят,
+    перенесён, сменил комнату): иначе по ним бот шёл бы до перестройки очереди.
 
-    Возвращает `(очередь тика, ключи с правом позднего входа, ключи устаревших
-    строк)`. Очередь на диске не трогаем (второй писатель `.queue.json` запрещён),
-    память дублей планировщика не пишем. Любой сбой — тик ровно такой, каким был
-    до этой правки: личные серии владельца и уже стоящие в очереди наряды идут
-    своим путём.
+    Возвращает `(очередь тика, ключи с правом позднего входа)`. Очередь на диске
+    не трогаем (второй писатель `.queue.json` запрещён), память дублей
+    планировщика не пишем. При OFF и при сбое чтения реестра нарядов — тик ровно
+    такой, каким был без этой сверки.
     """
+    if not portal_queue.is_enabled():
+        return queue, set()
     try:
-        near = portal_queue.near_scheduled_items(now, ahead_minutes=START_WINDOW_MIN)
-    except Exception as e:  # noqa: BLE001 — реестр не прочитан: тик как до правки
-        logger.warning(
-            "Плановые наряды у старта не прочитаны (%s) — тик без них", type(e).__name__,
+        orders = portal_queue.read_scheduled_orders()
+        near = portal_queue.near_scheduled_items(
+            now, ahead_minutes=START_WINDOW_MIN, orders=orders,
         )
-        return queue, set(), set()
-    if not near:
-        return queue, set(), set()
-    try:
-        return _merge_near_orders(queue, near, now)
-    except Exception as e:  # noqa: BLE001 — сведение упало: тик как до правки
+        current = portal_queue.scheduled_items_by_order(orders)
+    except Exception as e:  # noqa: BLE001 — реестр не прочитан: тик как без сверки
         logger.warning(
-            "Плановые наряды у старта не сведены с очередью (%s) — тик без них",
+            "Реестр нарядов не прочитан (%s) — тик без сверки с ним", type(e).__name__,
+        )
+        return queue, set()
+    try:
+        return _merge_near_orders(queue, near, current, now)
+    except Exception as e:  # noqa: BLE001 — сведение упало: тик как без сверки
+        logger.warning(
+            "Наряды портала не сведены с очередью (%s) — тик без сверки с реестром",
             type(e).__name__,
         )
-        return queue, set(), set()
+        return queue, set()
+
+
+def _outdated_portal_row(row: Any, current: dict[str, dict[str, Any]]) -> bool:
+    """Строка наряда в очереди устарела против реестра (снят, перенесён, сменил комнату).
+
+    Строку с `ical_uid` не трогаем: так планировщик помечает строку, в которую
+    схлопнулась и встреча из календаря владельца, — она отвечает не только за
+    наряд. Разовые «зайти сейчас» — у `_with_immediate_orders`.
+    """
+    if not isinstance(row, dict) or row.get("type") != portal_queue.QUEUE_TYPE:
+        return False
+    if row.get("immediate") or row.get("ical_uid") or not row.get("order_id"):
+        return False
+    live = current.get(str(row["order_id"]))
+    if live is None:
+        return True  # среди плановых нет: снят, «выйти сейчас», удалён или негоден
+    return (
+        normalized_start_key(row.get("start_at")) != normalized_start_key(live.get("start_at"))
+        or row.get("url") != live.get("url")
+    )
 
 
 def _merge_near_orders(
     queue: list[dict[str, Any]],
     near: list[tuple[dict[str, Any], bool]],
+    current: dict[str, dict[str, Any]],
     now: datetime,
-) -> tuple[list[dict[str, Any]], set[str], set[str]]:
-    """Свести наряды из реестра с очередью тика. Второго бота не бывает.
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Свести очередь тика с реестром нарядов. Второго бота не бывает.
 
-    🔴 Элемент из реестра проходит ТЕ ЖЕ защиты, что элемент планировщика:
-
-    * тот же ключ старта — элемент собран той же `portal_queue.queue_item`;
-      строка, которую планировщик положит позже, упрётся в ключ, уже занятый
-      в `.state.json`;
-    * «нет» владельца по этой встрече (ISS-53) — `scheduler.drop_rejected_occurrences`;
-    * память дублей (ISS-54): эту комнату в эту секунду уже вели под другим
-      ключом — элемент наследует его (`scheduler._apply_winner_memory`, на копии
-      памяти: писать её — дело планировщика);
-    * та же встреча в другом облике уже стоит в очереди (личная серия владельца
-      в той же комнате и в ту же секунду, другой наряд на ту же комнату) —
-      элемент не добавляется (`meeting_identity.compare`, формула дедупа);
-    * дальше — общий путь: состояние, очередь ожидания, одна запись серии, потолок.
-
-    Перенос. Строка ТОГО ЖЕ наряда в очереди по старому времени или в старой
-    комнате — устаревшая копия: реестр свежее очереди. Её ключ возвращается в
-    «устаревших», и на этом тике она не запускается — иначе один наряд дал бы
-    двух кандидатов. Строку из очереди не выбрасываем: если она ждала слот, её
-    снимет с ожидания перестройка очереди, а не этот тик. Копию, несущую
-    `ical_uid`, не трогаем: так планировщик помечает строку, в которую схлопнулась
-    и встреча из календаря владельца, — она отвечает не только за наряд.
+    1. Реестр свежее очереди. Строка наряда, которого среди плановых в реестре уже
+       нет (снят, «выйти сейчас», удалён) или который там в другое время или в
+       другой комнате (перенесён), из очереди ТИКА выбывает: бот по ней не идёт,
+       ожидание слота по ней снимается (`_outdated_portal_row`).
+    2. Наряд у старта, которого очередь ещё не знает, добавляется, пройдя ТЕ ЖЕ
+       защиты, что строка планировщика:
+       * тот же ключ старта — элемент собран той же `portal_queue.queue_item`;
+       * «нет» владельца по этой встрече (ISS-53) — `scheduler.drop_rejected_occurrences`.
+         Реестр серий не прочитан — наряды у старта на этом тике не берём вовсе:
+         без отсева бот пришёл бы на встречу, от которой владелец отказался;
+       * память дублей (ISS-54): эту комнату в эту секунду уже вели под другим
+         ключом — элемент наследует его (`scheduler.remembered_event_id`; писать
+         память — дело планировщика);
+       * та же встреча в другом облике уже стоит в очереди (личная серия владельца
+         в той же комнате и секунде, другой наряд на ту же комнату) — элемент не
+         добавляется (`meeting_identity.compare`, формула дедупа).
+       Строка с тем же ключом старта уже в очереди — свой элемент не нужен, а
+       право позднего входа переходит к ней.
+    3. Дальше общий путь: состояние (ключ старта и ключ встречи «комната +
+       секунда», `_meeting_key`), очередь ожидания, одна запись серии, потолок.
     """
+    merged: list[dict[str, Any]] = []
+    for row in queue:
+        if _outdated_portal_row(row, current):
+            logger.info(
+                "Строка наряда %s (start %s) не запускается: в реестре его на этом "
+                "старте уже нет — снят, перенесён или сменил комнату",
+                row.get("order_id"), row.get("start_at"),
+            )
+            continue
+        merged.append(row)
+    if not near:
+        return merged, set()
+
     from notary import scheduler as scheduler_mod  # noqa: PLC0415 — правила дедупа живут у планировщика
     from notary.lib.meeting_identity import compare, fingerprint  # noqa: PLC0415
 
-    merged = list(queue)
-    late_keys: set[str] = set()
-    stale_keys: set[str] = set()
-    fresh_keys: set[str] = set()
-    memory = scheduler_mod.load_dedup_winners(now)
     try:
         records = (load_watched() or {}).get("watched") or []
-    except (Exception, SystemExit) as e:  # noqa: BLE001 — fail-open, как отсев у планировщика
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — без отсева «нет» новых не берём
         logger.warning(
-            "Реестр серий не прочитан (%s) — «нет» владельца к нарядам у старта не применён",
-            type(e).__name__,
+            "Реестр серий не прочитан (%s) — наряды у старта на этом тике не беру: "
+            "«нет» владельца к ним не проверить", type(e).__name__,
         )
-        records = []
+        return merged, set()
+    memory = scheduler_mod.load_dedup_winners(now)
+    late_keys: set[str] = set()
 
     for raw, late in sorted(near, key=lambda pair: str(pair[0].get("start_at") or "")):
         if not scheduler_mod.drop_rejected_occurrences([raw], records):
             continue
         item = dict(raw)
-        fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
-        scheduler_mod._apply_winner_memory([item], [fp], [[fp]], dict(memory), now)
+        inherited = scheduler_mod.remembered_event_id(item, memory, now)
+        if inherited:
+            item["event_id"] = inherited
         key = start_key(item)
-        order_id = item.get("order_id")
-
-        twin = None
-        own_copies: list[int] = []
-        for idx, other in enumerate(merged):
+        fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
+        known = twin = None
+        for other in merged:
             if not isinstance(other, dict):
                 continue
-            if (
-                order_id
-                and other.get("order_id") == order_id
-                and other.get("type") == portal_queue.QUEUE_TYPE
-                and not other.get("ical_uid")
-            ):
-                own_copies.append(idx)
-                continue
-            if twin is None and (start_key(other) == key or compare(
+            if start_key(other) == key:
+                known = other
+                break
+            if twin is None and compare(
                 fingerprint(other.get("start_at"), other.get("url"), other.get("ical_uid")), fp,
-            )[0]):
+            )[0]:
                 twin = other
-        # Копия этого наряда по другому времени или в другой комнате устарела —
-        # даже если саму встречу уже ведёт другая строка очереди.
-        for idx in own_copies:
-            if start_key(merged[idx]) != key or merged[idx].get("url") != item.get("url"):
-                stale_keys.add(start_key(merged[idx]))
+        if known is not None:
+            # Этот старт очередь уже знает: строка планировщика или строка той же
+            # встречи, унаследовавшая ключ. Поздний вход положен и ей.
+            if late:
+                late_keys.add(key)
+            continue
         if twin is not None:
             logger.info(
                 "Наряд %s у старта не беру: эта встреча уже стоит в очереди как «%s»",
-                order_id, twin.get("meeting_id"),
+                item.get("order_id"), twin.get("meeting_id"),
             )
             continue
-
-        fresh_keys.add(key)
+        merged.append(item)
         if late:
             late_keys.add(key)
-        current = [i for i in own_copies if start_key(merged[i]) == key]
-        if any(merged[i].get("url") == item.get("url") for i in current):
-            continue  # планировщик уже положил ровно этот старт — свой элемент не нужен
-        if current:
-            # Тот же старт, но наряд переехал в другую комнату: свежая строка
-            # встаёт на место старой — ключ один, бот пойдёт в новую комнату.
-            merged[current[0]] = item
-        else:
-            merged.append(item)
         logger.info(
             "Плановый наряд %s взят напрямую из реестра (start %s%s)",
-            order_id, item.get("start_at"), ", поставлен у самого старта" if late else "",
+            item.get("order_id"), item.get("start_at"),
+            ", поставлен у самого старта" if late else "",
         )
-    # Ключ, который у какого-то наряда свежий, устаревшим не считается: иначе
-    # исключение по ключу сняло бы с тика и свежий старт.
-    return merged, late_keys, stale_keys - fresh_keys
+    return merged, late_keys
+
+
+def _meeting_key(item: dict[str, Any]) -> str:
+    """Ключ ВСТРЕЧИ для `.state.json`: комната + секунда старта (формула тождества ISS-54).
+
+    Ключей старта (`event_id@минута`) у одной встречи бывает несколько: личная
+    серия владельца и наряд портала в той же комнате, два наряда на одну комнату,
+    наряд, перенесённый в слот уже запущенного, встреча, пересозданная на портале.
+    Пока строку выбирал только планировщик (его память дублей), этого хватало; с
+    нарядами у самого старта выбирает и runner, и следующий тик или прогон
+    планировщика вправе взять другую строку той же встречи — с другим ключом
+    старта. Ключ встречи у всех её строк один: второй запуск не пройдёт.
+
+    Комната — хэш хоста и пути (`orders.room_key`, как у метки контейнера): сама
+    ссылка в файл состояния не попадает. Посчитать нечем — пусто, барьера нет.
+    """
+    room = _room_label_value(item.get("url"))
+    instant = instant_key(item.get("start_at"))
+    return "room:%s@%s" % (room, instant) if room and instant else ""
 
 
 def _waitlist_tick(
@@ -523,8 +568,9 @@ def _waitlist_save(wl: dict[str, Any]) -> None:
 def _mark_if_late(item: dict[str, Any], now: datetime, *, reason: str) -> None:
     """Отметить поздний заход, чтобы он был ПОДПИСАН в протоколе (Ф10b).
 
-    Опоздание бывает только у старта, который ждал слот или перезашёл после
-    переноса: в обычном окне (5 мин до / 1 мин после) минут опоздания нет.
+    Опоздание бывает только у старта, который ждал слот, перезашёл после переноса
+    или поставлен на портале у самого старта (`late_join.REASON_LATE_ORDER`): в
+    обычном окне (5 мин до / 1 мин после) минут опоздания нет.
     """
     late = waitlist.late_minutes(item, now)
     if late <= 0:
@@ -571,12 +617,10 @@ def _candidates(
     *,
     waiting: Any = (),
     late_ok: Any = (),
-    stale: Any = (),
 ) -> list[dict[str, Any]]:
     state = read_state()
     waiting = set(waiting or ())
     late_ok = set(late_ok or ())
-    stale = set(stale or ())
     out: list[dict[str, Any]] = []
     for item in queue:
         raw = item.get("start_at")
@@ -602,11 +646,6 @@ def _candidates(
                 and not _late_order_due(skey, delta_min, late_ok)
             ):
                 continue
-        if skey in stale:
-            # Наряд перенесли: эта строка очереди — его прежний старт, а свежий
-            # runner взял из реестра. Один наряд — один кандидат.
-            logger.info("старт %s устарел (наряд перенесён) — на этом тике не запускаю", skey)
-            continue
         if skey in state or item.get("event_id") in state:
             # Если в state, но за более чем 12 часов до — state_acquire отпустит
             # (TTL); здесь мы только грубо отсеиваем, окончательное решение —
@@ -614,6 +653,16 @@ def _candidates(
             # Голый `event_id` проверяется как переходный щит выкатки ISS-57:
             # записи старого формата живут в `.state.json` до 12 часов.
             logger.debug("старт %s уже есть в state — кандидатом не считаем", skey)
+            continue
+        mkey = _meeting_key(item)
+        if mkey and mkey in state:
+            # Эту встречу (та же комната и секунда старта) бот уже ведёт по другой
+            # строке. Отсев здесь, а не только в state_acquire: иначе строка ушла бы
+            # в ожидание слота, и владелец получил бы ложное «пока не записал».
+            logger.info(
+                "старт %s: эту встречу бот уже ведёт по другой строке (та же комната "
+                "и секунда старта) — второго не запускаю", skey,
+            )
             continue
         # Не одобряем папку серии: создаст runner после успешного start.
         out.append(item)

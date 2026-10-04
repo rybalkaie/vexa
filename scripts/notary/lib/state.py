@@ -193,7 +193,11 @@ def _is_fresh(state: dict[str, str], key: str, now: datetime) -> bool:
 
 
 def state_acquire(
-    event_id: str, *, now: datetime | None = None, legacy_key: str | None = None
+    event_id: str,
+    *,
+    now: datetime | None = None,
+    legacy_key: str | None = None,
+    meeting_key: str | None = None,
 ) -> bool:
     """Атомарно: если за последние STATE_TTL_HOURS ключ уже стартовал — вернуть False.
 
@@ -206,6 +210,10 @@ def state_acquire(
     стартовавшую встречу «новым» ключом и привёл в комнату ВТОРОГО бота. Старый
     ключ только ЧИТАЕТСЯ и никогда не пишется: новые записи всегда композитные,
     и через TTL щит перестаёт что-либо значить сам собой.
+
+    `meeting_key` — второй ключ ТОЙ ЖЕ встречи, независимый от того, какая строка
+    очереди её описывает (у runner'а — комната + секунда старта). Занят — старт
+    не проходит; при успехе занимается вместе с ключом старта, под тем же замком.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -220,6 +228,8 @@ def state_acquire(
             return False
         if legacy_key and legacy_key != event_id and _is_fresh(state, legacy_key, now):
             return False
+        if meeting_key and meeting_key != event_id and _is_fresh(state, meeting_key, now):
+            return False
         # Заодно прибрать stale-записи.
         cleaned: dict[str, str] = {}
         for k, v in state.items():
@@ -233,6 +243,8 @@ def state_acquire(
                 # держим в 4× TTL для отладочной видимости
                 cleaned[k] = v
         cleaned[event_id] = now.isoformat()
+        if meeting_key:
+            cleaned[meeting_key] = now.isoformat()
         write_state(cleaned)
         return True
     finally:

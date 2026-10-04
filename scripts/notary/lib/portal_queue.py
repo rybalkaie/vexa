@@ -244,6 +244,10 @@ def changed_late(order: Dict[str, Any], start: datetime, *, window_minutes: int)
     Время правки — `updated_at` (его ставит каждая правка реестра), иначе
     `created_at`. Нет ни того, ни другого или не разобрать — «нет»: без
     доказательства поздний вход не положен, наряд живёт по обычному окну.
+
+    `updated_at` двигает и отметка запуска (`orders.attach_run`) — после
+    собственного запуска runner'а наряд тоже выглядит «поздним». Вреда нет: ключ
+    этого старта к тому моменту уже занят в `.state.json`, второй вход он не даст.
     """
     changed = _parse(order.get("updated_at")) or _parse(order.get("created_at"))
     if changed is None:
@@ -251,8 +255,41 @@ def changed_late(order: Dict[str, Any], start: datetime, *, window_minutes: int)
     return changed > start - timedelta(minutes=window_minutes)
 
 
+def read_scheduled_orders() -> List[Dict[str, Any]]:
+    """Наряды в статусе `scheduled` — одним чтением реестра на тик runner'а.
+
+    🔴 Сбой чтения НЕ глотается (в отличие от `load_active_orders`): runner обязан
+    отличить «реестр пуст» от «реестр не прочитан» — во втором случае его тик
+    остаётся ровно таким, каким был без сверки с реестром.
+    """
+    from notary.lib import orders as orders_lib  # noqa: PLC0415
+
+    return orders_lib.list_orders(statuses={orders_lib.STATUS_SCHEDULED})
+
+
+def scheduled_items_by_order(orders: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Где по реестру живёт каждый плановый наряд: `id наряда → элемент очереди`.
+
+    Для сверки строк очереди с реестром: строка наряда, которого здесь нет (снят,
+    «выйти сейчас», удалён, негоден) или который здесь в другое время или в другой
+    комнате, устарела. Разовые наряды сюда не входят — их ведёт
+    `due_immediate_items`, строки у них свои.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for order in orders or []:
+        if not isinstance(order, dict) or order.get("kind") == "immediate":
+            continue
+        item = queue_item(order)
+        if item is not None and item.get("order_id"):
+            out[str(item["order_id"])] = item
+    return out
+
+
 def near_scheduled_items(
-    now: datetime, *, ahead_minutes: int
+    now: datetime,
+    *,
+    ahead_minutes: int,
+    orders: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Tuple[Dict[str, Any], bool]]:
     """Плановые наряды у самого старта — прямо из реестра, минуя `.queue.json`.
 
@@ -273,18 +310,18 @@ def near_scheduled_items(
     наряд прихода не даёт, «выйти сейчас» (`stopping`) не возвращает бота,
     разовые наряды — у `due_immediate_items`.
 
-    🔴 Сбой чтения реестра здесь НЕ глотается (в отличие от `load_active_orders`):
-    runner обязан отличить «реестр пуст» от «реестр не прочитан» — во втором
-    случае тик остаётся ровно таким, каким был до этой правки. При OFF — [] без
-    единого обращения к диску.
+    `orders` — уже прочитанные `read_scheduled_orders()` (одно чтение реестра на
+    тик); не переданы — читаются здесь. 🔴 Сбой чтения НЕ глотается (см.
+    `read_scheduled_orders`). При OFF — [] без единого обращения к диску.
     """
     if not is_enabled():
         return []
-    from notary.lib import orders as orders_lib  # noqa: PLC0415
+    if orders is None:
+        orders = read_scheduled_orders()
 
     out: List[Tuple[Dict[str, Any], bool]] = []
-    for order in orders_lib.list_orders(statuses={orders_lib.STATUS_SCHEDULED}):
-        if not isinstance(order, dict) or order.get("kind") == orders_lib.KIND_IMMEDIATE:
+    for order in orders:
+        if not isinstance(order, dict) or order.get("kind") == "immediate":
             continue
         item = queue_item(order)
         if item is None:

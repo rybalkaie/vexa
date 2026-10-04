@@ -638,6 +638,30 @@ def _apply_winner_memory(
             memory[key] = entry
 
 
+def remembered_event_id(
+    item: dict[str, Any], memory: dict[str, Any], now: datetime
+) -> str | None:
+    """Под каким `event_id` эту встречу уже вели (память дублей), если старт заморожен.
+
+    Для того, кто смотрит на ОДИН элемент вне прогона планировщика (runner с
+    нарядом у самого старта): тот же выбор, что `_apply_winner_memory` делает для
+    выжившего элемента без пары, но без записи в память — писать её дело
+    планировщика — и без предупреждения в журнал: иначе runner каждую минуту
+    писал бы от имени планировщика «встречи в очереди нет».
+    """
+    fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
+    if not _memory_keys(fp):
+        return None
+    remembered = _remembered(memory, [fp])
+    if (
+        remembered
+        and remembered.get("event_id") != item.get("event_id")
+        and _is_frozen(fp.start, now)
+    ):
+        return str(remembered["event_id"])
+    return None
+
+
 def _expand_google_calendar(
     rec: dict[str, Any],
     rooms_data: dict[str, Any],
