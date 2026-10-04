@@ -43,6 +43,9 @@ MARKER = "<!-- notary:late-join -->"
 REASON_SKIP_CAPACITY = "skip_capacity"
 #: Сквозной цикл5 ISS-60: первая попытка входа сорвалась, бот зашёл повтором сторожа.
 REASON_JOIN_RETRY = "join_retry"
+#: Плановую встречу завели или изменили на портале перед самым началом, и runner
+#: узнал об этом уже после начала (`portal_queue.LATE_ORDER_DUE_MINUTES`).
+REASON_LATE_ORDER = "late_order"
 
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo
@@ -173,6 +176,9 @@ def note_text(entry: Dict[str, Any]) -> str:
         why = "в это время шли другие записи и свободного слота у бота не было"
     elif reason == REASON_JOIN_RETRY:
         why = "первая попытка войти во встречу сорвалась, и бот зашёл со второй"
+    elif reason == REASON_LATE_ORDER:
+        why = ("встречу завели или изменили на портале перед самым началом, "
+               "и бот подключился, как только узнал об этом")
     else:
         why = "встречу перенесли, и бот перезашёл в новое время"
     return (

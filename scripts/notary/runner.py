@@ -1,10 +1,13 @@
 #!/Users/ilarybalka/Projects/meeting-notary/.venv-cli/bin/python
 """runner.py — за 5 минут до встречи запускает Vexa-бот на VPS.
 
-Запускается launchd-агентом `com.ilarybalka.meeting-notary.runner` каждую минуту.
+Запускается на VPS systemd-таймером `meeting-notary-runner.timer` раз в минуту
+(launchd-агент на маке — архивный путь отката).
 
 Алгоритм одного тика:
-  1. Прочитать .queue.json (от scheduler-а).
+  1. Прочитать .queue.json (от scheduler-а) и добрать из реестра нарядов портала
+     то, что очередь ещё не знает: разовые «зайти сейчас» и плановые наряды со
+     стартом в окне (поставленные или перенесённые у самого старта).
   2. Прочитать .pause-until (через registry.pause_until() — она сама чистит stale).
   3. Найти кандидатов: start_at − now ∈ [0; 5min] и event_id не в state-файле.
   4. Если есть активная Vexa-сессия (определяем через ssh + docker ps) — пропускаем.
@@ -15,8 +18,8 @@
   7. Дёргаем `ssh meeting-notary docker run ...` в background.
   8. Если запись one-off — после успешного старта помечаем enabled: false.
 
-Не блокируется на длинном docker-run (запускаем через nohup &), runner возвращается
-быстро — это важно, иначе launchd будет копить запуски каждую минуту.
+Не блокируется на длинном docker-run (`docker run -d`), runner возвращается
+быстро — это важно, иначе таймер будет копить запуски каждую минуту.
 """
 from __future__ import annotations
 
@@ -148,9 +151,14 @@ def main(now: datetime | None = None) -> int:
 
     queue = read_queue()
     # Ф10b: разовые наряды «зайти сейчас» читаются НАПРЯМУЮ из реестра — очередь
-    # перестраивается раз в 15 минут, а кнопка обязана поднимать бота минутами.
+    # перестраивается раз в 3 минуты, а кнопка обязана поднимать бота на ближайшем
+    # тике runner'а.
     # При `ENABLE_PORTAL_ORDERS=OFF` возвращает очередь как есть, диска не касаясь.
     queue = _with_immediate_orders(queue, now)
+    # Бэклог 04.10.2026: так же — плановые наряды портала у самого старта. Встреча,
+    # поставленная или перенесённая за минуту-две до начала, иначе попадала в
+    # очередь уже после окна старта, и бот её пропускал. При OFF — как выше.
+    queue, late_keys, stale_keys = _with_near_scheduled_orders(queue, now)
     # ISS-60, фаза 2: пока самопроверка красная — предупредить владельца за ~10
     # минут до встречи. Под try: упадёт — запуск ботов идёт как раньше.
     _canary_warn_tick(queue, now)
@@ -172,7 +180,9 @@ def main(now: datetime | None = None) -> int:
             _waitlist_save(wl)
         return 0
 
-    candidates = _candidates(queue, now, waiting=waiting_keys)
+    candidates = _candidates(
+        queue, now, waiting=waiting_keys, late_ok=late_keys, stale=stale_keys,
+    )
     if not candidates:
         logger.info("tick: %d в очереди, ни одного в окне старта", len(queue))
         if wl_changed:
@@ -269,6 +279,10 @@ def main(now: datetime | None = None) -> int:
             launched_series.add(series)
             running_count += 1  # учитываем в лимите для следующих кандидатов тика
             waited_reason = str((wl.get(skey) or {}).get("reason") or "")
+            if not waited_reason and skey in late_keys:
+                # Наряд поставили или перенесли перед самым началом — подпись в
+                # протоколе говорит именно это, а не «встречу перенесли».
+                waited_reason = late_join.REASON_LATE_ORDER
             wl_changed = waitlist.forget(wl, skey) or wl_changed
             _mark_if_late(cand, now, reason=waited_reason)
             if cand.get("type") == "one-off":
@@ -314,6 +328,147 @@ def _with_immediate_orders(
         )
         merged.append(item)
     return merged
+
+
+def _with_near_scheduled_orders(
+    queue: list[dict[str, Any]], now: datetime
+) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+    """Плановые наряды портала у самого старта — прямо из реестра (бэклог 04.10.2026).
+
+    ЗАЧЕМ. Плановый наряд runner видел только через очередь планировщика, а она
+    перестраивается раз в 3 минуты. Встреча, поставленная или перенесённая на
+    портале за минуту-две до начала, попадала в очередь уже после окна старта —
+    и бот её пропускал. Теперь runner каждую минуту сам берёт из реестра плановые
+    наряды со стартом в своём окне — так же, как разовые «зайти сейчас».
+
+    Возвращает `(очередь тика, ключи с правом позднего входа, ключи устаревших
+    строк)`. Очередь на диске не трогаем (второй писатель `.queue.json` запрещён),
+    память дублей планировщика не пишем. Любой сбой — тик ровно такой, каким был
+    до этой правки: личные серии владельца и уже стоящие в очереди наряды идут
+    своим путём.
+    """
+    try:
+        near = portal_queue.near_scheduled_items(now, ahead_minutes=START_WINDOW_MIN)
+    except Exception as e:  # noqa: BLE001 — реестр не прочитан: тик как до правки
+        logger.warning(
+            "Плановые наряды у старта не прочитаны (%s) — тик без них", type(e).__name__,
+        )
+        return queue, set(), set()
+    if not near:
+        return queue, set(), set()
+    try:
+        return _merge_near_orders(queue, near, now)
+    except Exception as e:  # noqa: BLE001 — сведение упало: тик как до правки
+        logger.warning(
+            "Плановые наряды у старта не сведены с очередью (%s) — тик без них",
+            type(e).__name__,
+        )
+        return queue, set(), set()
+
+
+def _merge_near_orders(
+    queue: list[dict[str, Any]],
+    near: list[tuple[dict[str, Any], bool]],
+    now: datetime,
+) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+    """Свести наряды из реестра с очередью тика. Второго бота не бывает.
+
+    🔴 Элемент из реестра проходит ТЕ ЖЕ защиты, что элемент планировщика:
+
+    * тот же ключ старта — элемент собран той же `portal_queue.queue_item`;
+      строка, которую планировщик положит позже, упрётся в ключ, уже занятый
+      в `.state.json`;
+    * «нет» владельца по этой встрече (ISS-53) — `scheduler.drop_rejected_occurrences`;
+    * память дублей (ISS-54): эту комнату в эту секунду уже вели под другим
+      ключом — элемент наследует его (`scheduler._apply_winner_memory`, на копии
+      памяти: писать её — дело планировщика);
+    * та же встреча в другом облике уже стоит в очереди (личная серия владельца
+      в той же комнате и в ту же секунду, другой наряд на ту же комнату) —
+      элемент не добавляется (`meeting_identity.compare`, формула дедупа);
+    * дальше — общий путь: состояние, очередь ожидания, одна запись серии, потолок.
+
+    Перенос. Строка ТОГО ЖЕ наряда в очереди по старому времени или в старой
+    комнате — устаревшая копия: реестр свежее очереди. Её ключ возвращается в
+    «устаревших», и на этом тике она не запускается — иначе один наряд дал бы
+    двух кандидатов. Строку из очереди не выбрасываем: если она ждала слот, её
+    снимет с ожидания перестройка очереди, а не этот тик. Копию, несущую
+    `ical_uid`, не трогаем: так планировщик помечает строку, в которую схлопнулась
+    и встреча из календаря владельца, — она отвечает не только за наряд.
+    """
+    from notary import scheduler as scheduler_mod  # noqa: PLC0415 — правила дедупа живут у планировщика
+    from notary.lib.meeting_identity import compare, fingerprint  # noqa: PLC0415
+
+    merged = list(queue)
+    late_keys: set[str] = set()
+    stale_keys: set[str] = set()
+    fresh_keys: set[str] = set()
+    memory = scheduler_mod.load_dedup_winners(now)
+    try:
+        records = (load_watched() or {}).get("watched") or []
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — fail-open, как отсев у планировщика
+        logger.warning(
+            "Реестр серий не прочитан (%s) — «нет» владельца к нарядам у старта не применён",
+            type(e).__name__,
+        )
+        records = []
+
+    for raw, late in sorted(near, key=lambda pair: str(pair[0].get("start_at") or "")):
+        if not scheduler_mod.drop_rejected_occurrences([raw], records):
+            continue
+        item = dict(raw)
+        fp = fingerprint(item.get("start_at"), item.get("url"), item.get("ical_uid"))
+        scheduler_mod._apply_winner_memory([item], [fp], [[fp]], dict(memory), now)
+        key = start_key(item)
+        order_id = item.get("order_id")
+
+        twin = None
+        own_copies: list[int] = []
+        for idx, other in enumerate(merged):
+            if not isinstance(other, dict):
+                continue
+            if (
+                order_id
+                and other.get("order_id") == order_id
+                and other.get("type") == portal_queue.QUEUE_TYPE
+                and not other.get("ical_uid")
+            ):
+                own_copies.append(idx)
+                continue
+            if twin is None and (start_key(other) == key or compare(
+                fingerprint(other.get("start_at"), other.get("url"), other.get("ical_uid")), fp,
+            )[0]):
+                twin = other
+        # Копия этого наряда по другому времени или в другой комнате устарела —
+        # даже если саму встречу уже ведёт другая строка очереди.
+        for idx in own_copies:
+            if start_key(merged[idx]) != key or merged[idx].get("url") != item.get("url"):
+                stale_keys.add(start_key(merged[idx]))
+        if twin is not None:
+            logger.info(
+                "Наряд %s у старта не беру: эта встреча уже стоит в очереди как «%s»",
+                order_id, twin.get("meeting_id"),
+            )
+            continue
+
+        fresh_keys.add(key)
+        if late:
+            late_keys.add(key)
+        current = [i for i in own_copies if start_key(merged[i]) == key]
+        if any(merged[i].get("url") == item.get("url") for i in current):
+            continue  # планировщик уже положил ровно этот старт — свой элемент не нужен
+        if current:
+            # Тот же старт, но наряд переехал в другую комнату: свежая строка
+            # встаёт на место старой — ключ один, бот пойдёт в новую комнату.
+            merged[current[0]] = item
+        else:
+            merged.append(item)
+        logger.info(
+            "Плановый наряд %s взят напрямую из реестра (start %s%s)",
+            order_id, item.get("start_at"), ", поставлен у самого старта" if late else "",
+        )
+    # Ключ, который у какого-то наряда свежий, устаревшим не считается: иначе
+    # исключение по ключу сняло бы с тика и свежий старт.
+    return merged, late_keys, stale_keys - fresh_keys
 
 
 def _waitlist_tick(
@@ -392,19 +547,36 @@ def _mark_if_late(item: dict[str, Any], now: datetime, *, reason: str) -> None:
 def _immediate_due(item: dict[str, Any], delta_min: float) -> bool:
     """Разовый наряд «зайти сейчас» годен к запуску шире обычного окна.
 
-    Причина — цена тика планировщика: наряд появляется в `.queue.json` до 15
-    минут спустя, и в окно «1 минута после старта» уже не попадает.
+    Причина — цена тика планировщика: наряд появляется в `.queue.json` до 3
+    минут спустя (в эпоху launchd — до 15) и в окно «1 минута после старта» мог
+    не попасть. Runner теперь читает его прямо из реестра, окно оставлено запасом.
     """
     if not item.get("immediate"):
         return False
     return -portal_queue.IMMEDIATE_DUE_MINUTES <= delta_min <= START_WINDOW_MIN
 
 
+def _late_order_due(skey: str, delta_min: float, late_ok: set) -> bool:
+    """Плановый наряд, поставленный или перенесённый у самого старта, годен к позднему входу.
+
+    Только такой: обычный старт, проехавший окно и никого не ждущий, по-прежнему
+    не поднимается (бот пришёл бы к середине встречи без всякой причины).
+    """
+    return skey in late_ok and delta_min >= -portal_queue.LATE_ORDER_DUE_MINUTES
+
+
 def _candidates(
-    queue: list[dict[str, Any]], now: datetime, *, waiting: Any = ()
+    queue: list[dict[str, Any]],
+    now: datetime,
+    *,
+    waiting: Any = (),
+    late_ok: Any = (),
+    stale: Any = (),
 ) -> list[dict[str, Any]]:
     state = read_state()
     waiting = set(waiting or ())
+    late_ok = set(late_ok or ())
+    stale = set(stale or ())
     out: list[dict[str, Any]] = []
     for item in queue:
         raw = item.get("start_at")
@@ -422,9 +594,19 @@ def _candidates(
         skey = start_key(item)
         if delta_min < -STARTED_GRACE_MIN:
             # Ф10b: старт, который ЖДЁТ свободного слота, из окна не выпадает —
-            # ради него весь механизм и заведён. Остальные опоздавшие — как было.
-            if skey not in waiting and not _immediate_due(item, delta_min):
+            # ради него весь механизм и заведён. Остальные опоздавшие — как было,
+            # кроме наряда, поставленного или перенесённого у самого старта.
+            if (
+                skey not in waiting
+                and not _immediate_due(item, delta_min)
+                and not _late_order_due(skey, delta_min, late_ok)
+            ):
                 continue
+        if skey in stale:
+            # Наряд перенесли: эта строка очереди — его прежний старт, а свежий
+            # runner взял из реестра. Один наряд — один кандидат.
+            logger.info("старт %s устарел (наряд перенесён) — на этом тике не запускаю", skey)
+            continue
         if skey in state or item.get("event_id") in state:
             # Если в state, но за более чем 12 часов до — state_acquire отпустит
             # (TTL); здесь мы только грубо отсеиваем, окончательное решение —
@@ -707,7 +889,7 @@ def _launch_bot(item: dict[str, Any], now: datetime, seq: int = 0, attempt: int 
         logger.warning("Не смог резолвить chat_id серии %s (не критично): %s", series, e)
     # Ф10b: у порталовой встречи серии в `watched.yaml` нет — чат приезжает с
     # нарядом. В `.queue.json` его НЕ дублируем: очередь это производный артефакт,
-    # который переписывается раз в 15 минут, и копия приватного идентификатора в
+    # который переписывается раз в 3 минуты, и копия приватного идентификатора в
     # ней жила бы своей жизнью. Источник истины по доставке один — реестр нарядов.
     if series_chat_id is None and item.get("order_id"):
         try:

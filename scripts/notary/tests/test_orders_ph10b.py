@@ -837,7 +837,7 @@ class TestQueueReaders(_Base):
         self.assertEqual(gateway.max_concurrent_bots(), runner.max_concurrent_bots())
 
     def test_immediate_order_is_picked_up_without_waiting_for_scheduler(self):
-        """«Зайти сейчас» не имеет права ждать тика планировщика 15 минут."""
+        """«Зайти сейчас» не имеет права ждать тика планировщика (раз в 3 минуты)."""
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         order, _ = self.put_order(
             "mtg-7005", now, kind=orders_lib.KIND_IMMEDIATE, now=now, series="portal-now"

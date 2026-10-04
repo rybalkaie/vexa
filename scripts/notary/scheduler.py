@@ -1,7 +1,10 @@
 #!/Users/ilarybalka/Projects/meeting-notary/.venv-cli/bin/python
 """scheduler.py — формирует очередь стартов на 48 часов вперёд.
 
-Запускается launchd-агентом `com.ilarybalka.meeting-notary.scheduler` раз в 15 минут.
+Запускается на VPS systemd-таймером `meeting-notary-scheduler.timer` раз в 3 минуты
+(180 с; launchd-агент на маке раз в 15 минут — архивный путь отката). Плановые
+наряды портала со стартом в ближайшие минуты runner добирает из реестра сам, не
+дожидаясь этого тика (`runner._with_near_scheduled_orders`).
 
 Алгоритм:
   1. Прочитать ~/Projects/me/встречи/watched.yaml и rooms.yaml.

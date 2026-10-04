@@ -26,19 +26,29 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("notary.portal_queue")
 
 QUEUE_TYPE = "portal"
 
 # «Зайти сейчас» ставится в реестр в ту же секунду, а очередь планировщика
-# перестраивается раз в 15 минут — то есть наряд «немедленно» появляется в
-# очереди уже с опозданием и в обычное окно старта (5 мин до / 1 мин после) не
-# попадает. Поэтому у разового наряда окно шире: он остаётся годным к запуску
-# столько минут после своего «сейчас», сколько нужно, чтобы пережить тик
-# планировщика с запасом.
+# перестраивается раз в 3 минуты (systemd-таймер на VPS; в эпоху launchd на маке —
+# раз в 15) — наряд «немедленно» мог появиться в очереди уже после обычного окна
+# старта (5 мин до / 1 мин после). Runner давно читает такие наряды прямо из
+# реестра (`due_immediate_items`), а широкое окно оставлено запасом: разовый наряд
+# годен к запуску ещё столько минут после своего «сейчас».
 IMMEDIATE_DUE_MINUTES = 20
+
+# Плановый наряд, поставленный или перенесённый на портале за считанные минуты до
+# начала, runner тоже берёт прямо из реестра (`near_scheduled_items`), не дожидаясь
+# перестройки очереди. Поздний вход положен только такому наряду — тому, который
+# портал поставил или изменил уже ПОСЛЕ открытия окна старта: обычное окно
+# (минута после начала) он мог проскочить раньше, чем runner о нём узнал. Шлюз
+# принимает начало до 2 минут в прошлом (`orders.START_PAST_GRACE_MINUTES`),
+# runner тикает раз в минуту — 5 минут покрывают это с запасом. Дольше не ждём:
+# это уже середина разговора. Опоздание подписывается в протоколе.
+LATE_ORDER_DUE_MINUTES = 5
 
 
 def is_enabled() -> bool:
@@ -202,8 +212,8 @@ def due_immediate_items(now: datetime) -> List[Dict[str, Any]]:
     """Разовые наряды «зайти сейчас», годные к запуску прямо на этом тике.
 
     Читаются runner'ом НАПРЯМУЮ, минуя `.queue.json`: очередь перестраивается раз
-    в 15 минут, а кнопка «Подключить сейчас» обязана поднимать бота минутами, а
-    не четвертью часа. Второго писателя очереди при этом не появляется — список
+    в 3 минуты, а кнопка «Подключить сейчас» обязана поднимать бота на ближайшем
+    тике runner'а. Второго писателя очереди при этом не появляется — список
     живёт только в памяти тика. Дубля тоже: ключ старта тот же самый, что у
     элемента из очереди (`event_id` детерминированный), поэтому пришедший позже
     элемент очереди упрётся в уже занятый ключ.
@@ -225,4 +235,66 @@ def due_immediate_items(now: datetime) -> List[Dict[str, Any]]:
         if now - start > timedelta(minutes=IMMEDIATE_DUE_MINUTES):
             continue  # протух: кнопку нажали давно, бот уже не нужен
         out.append(item)
+    return out
+
+
+def changed_late(order: Dict[str, Any], start: datetime, *, window_minutes: int) -> bool:
+    """Портал поставил или изменил наряд уже ПОСЛЕ открытия окна старта?
+
+    Время правки — `updated_at` (его ставит каждая правка реестра), иначе
+    `created_at`. Нет ни того, ни другого или не разобрать — «нет»: без
+    доказательства поздний вход не положен, наряд живёт по обычному окну.
+    """
+    changed = _parse(order.get("updated_at")) or _parse(order.get("created_at"))
+    if changed is None:
+        return False
+    return changed > start - timedelta(minutes=window_minutes)
+
+
+def near_scheduled_items(
+    now: datetime, *, ahead_minutes: int
+) -> List[Tuple[Dict[str, Any], bool]]:
+    """Плановые наряды у самого старта — прямо из реестра, минуя `.queue.json`.
+
+    ЗАЧЕМ. Плановый наряд runner видел только через очередь планировщика, а она
+    перестраивается раз в 3 минуты. Наряд, поставленный или перенесённый на
+    портале за минуту-две до начала, попадал в очередь уже после окна старта —
+    и бот встречу пропускал, хотя сотрудник всё сделал правильно (бэклог
+    нотариуса 04.10.2026, долг №25 ремонта портала).
+
+    Возвращает пары `(элемент очереди, поздний_ли)`: начало не дальше
+    `ahead_minutes` вперёд (окно старта runner'а; дальний наряд — забота
+    планировщика) и не раньше `LATE_ORDER_DUE_MINUTES` назад. `поздний_ли` —
+    `changed_late`: только такому наряду runner даёт поздний вход.
+
+    Элемент собирает та же `queue_item`, что у планировщика: тот же `event_id`,
+    тот же ключ старта — строка, которую планировщик положит позже, упрётся в
+    уже занятый ключ. Берётся только `scheduled` и только плановый вид: снятый
+    наряд прихода не даёт, «выйти сейчас» (`stopping`) не возвращает бота,
+    разовые наряды — у `due_immediate_items`.
+
+    🔴 Сбой чтения реестра здесь НЕ глотается (в отличие от `load_active_orders`):
+    runner обязан отличить «реестр пуст» от «реестр не прочитан» — во втором
+    случае тик остаётся ровно таким, каким был до этой правки. При OFF — [] без
+    единого обращения к диску.
+    """
+    if not is_enabled():
+        return []
+    from notary.lib import orders as orders_lib  # noqa: PLC0415
+
+    out: List[Tuple[Dict[str, Any], bool]] = []
+    for order in orders_lib.list_orders(statuses={orders_lib.STATUS_SCHEDULED}):
+        if not isinstance(order, dict) or order.get("kind") == orders_lib.KIND_IMMEDIATE:
+            continue
+        item = queue_item(order)
+        if item is None:
+            continue
+        start = _parse(item["start_at"])
+        if start is None:
+            continue
+        if start > now + timedelta(minutes=ahead_minutes):
+            continue  # дальний — его вовремя положит планировщик
+        if now - start > timedelta(minutes=LATE_ORDER_DUE_MINUTES):
+            continue  # встреча давно идёт — опоздавший бот уже не нужен
+        out.append((item, changed_late(order, start, window_minutes=ahead_minutes)))
     return out
