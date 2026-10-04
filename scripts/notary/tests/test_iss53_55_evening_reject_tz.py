@@ -886,9 +886,13 @@ class TestBrokenSnapshotItems(unittest.TestCase):
             {"n": 2, "calendar_id": CAL, "title": "Без event_id",
              "start_at": FIXED_ISO, "has_url_in_event": True},
         ]
+        # «Сегодня» закреплено вечером накануне встречи FIXED_ISO: без него ретеншн считал
+        # от настоящей даты и с 06.09.2026 стирал только что записанный отказ (встреча
+        # старше 30 дней) — тест краснел от календаря, а не от кода.
         result, data, saved = _apply(
             [{"n": 1, "action": "reject", "room": None},
-             {"n": 2, "action": "reject", "room": None}], items)
+             {"n": 2, "action": "reject", "room": None}], items,
+            today=date(2026, 8, 5))
         self.assertEqual(result["rejected"], 1, "исправное решение владельца потеряно")
         self.assertEqual(len(data["watched"]), 1)
         self.assertEqual(len(saved), 1)
