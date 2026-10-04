@@ -600,5 +600,27 @@ class TestUnderstandListenerRoute(_SeriesBase):
         self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_DONE)
 
 
+# Герметичность (возобновление прогона 05.10.2026): путь подтверждения ответа писал запись в
+# НАСТОЯЩИЙ ~/.local/state/meeting-notary-watson/reply-ack-state.json — на сервере это файл
+# работающего слушателя. Состояние уводится во временную папку на весь модуль.
+_ACK_TMP = None
+_SAVED_ACK_FILE = None
+
+
+def setUpModule():
+    global _ACK_TMP, _SAVED_ACK_FILE
+    _ACK_TMP = tempfile.TemporaryDirectory(prefix="ack-state-")
+    _SAVED_ACK_FILE = os.environ.get("MEETING_NOTARY_ACK_STATE_FILE")
+    os.environ["MEETING_NOTARY_ACK_STATE_FILE"] = str(Path(_ACK_TMP.name) / "reply-ack-state.json")
+
+
+def tearDownModule():
+    if _SAVED_ACK_FILE is None:
+        os.environ.pop("MEETING_NOTARY_ACK_STATE_FILE", None)
+    else:
+        os.environ["MEETING_NOTARY_ACK_STATE_FILE"] = _SAVED_ACK_FILE
+    _ACK_TMP.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
