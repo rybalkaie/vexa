@@ -35,9 +35,9 @@
 * `TestCrookedDateKeepsTheRegistry` — время, которое не переводится в UTC, уходит в
   конец, а не роняет сортировку реестра нарядов и очереди (раньше сортировали
   строку, и она не падала).
-* `TestForeignCompanySeriesYieldsToOrder` — серию владельца, размеченную другой
-  компанией, чем наряд, склейка не ведёт: протокол и память серии не уходят в чат
-  и на портал чужой компании (R12.12). Своя компания — ведёт серия.
+* `TestSeriesYieldsToOrderByMarkup` — серию владельца, размеченную другой
+  компанией, чем наряд, или приватную склейка не ведёт: протокол и память серии не
+  уходят по маршруту наряда (R12.12, «приватное — не фон»). Своя компания — ведёт серия.
 * `TestMergedMeetingKeepsOrderData` — у склеенной встречи участники из карточки
   портала доезжают до бота, а «Скачать PDF» находит протокол в папке серии.
 
@@ -462,14 +462,15 @@ class TestCrookedDateKeepsTheRegistry(_Stand):
         self.assertEqual([i["order_id"] for i in items], [good["id"]], "хороший наряд на месте")
 
 
-class TestForeignCompanySeriesYieldsToOrder(_Stand):
-    """Серия владельца другой компании, чем наряд, встречу у наряда не забирает (R12.12)."""
+class TestSeriesYieldsToOrderByMarkup(_Stand):
+    """Серия другой компании, чем наряд, или приватная встречу у наряда не забирает."""
 
-    def _merge(self, series_company: str):
+    def _merge(self, series_company: str, visibility: Optional[str] = None):
         start = _minute() + timedelta(hours=3)
-        self.write_watched([dict(
-            OWNER_SERIES, company=series_company, expected_participants=["Пётр Серийный"],
-        )])
+        record = dict(OWNER_SERIES, company=series_company, expected_participants=["Пётр Серийный"])
+        if visibility:
+            record["visibility"] = visibility
+        self.write_watched([record])
         order, _ = self.put_order(
             "mtg-f101", start, room=ROOM + "?utm_source=portal", series="portal-f101",
             company="anzhee", participants=["Иван Дилеров"],
@@ -488,9 +489,15 @@ class TestForeignCompanySeriesYieldsToOrder(_Stand):
                          "и состав серии чужой компании в наряд не переезжает")
 
     def test_same_company_series_takes_the_meeting(self):
-        order, row = self._merge("anzhee")
+        order, row = self._merge("anzhee", visibility="company")
         self.assertEqual(row["meeting_id"], "anzhee-direktorat")
         self.assertEqual(row["order_id"], order["id"], "связь с нарядом обязана уцелеть")
+
+    def test_private_series_does_not_take_the_order(self):
+        order, row = self._merge("anzhee", visibility="private")
+        self.assertEqual(row["meeting_id"], "portal-mtg-f101",
+                         "память приватной серии по маршруту наряда не уходит")
+        self.assertEqual(row["order_id"], order["id"])
 
 
 class TestMergedMeetingKeepsOrderData(_Stand):

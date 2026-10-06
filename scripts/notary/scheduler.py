@@ -428,35 +428,41 @@ def _remembered(memory: dict[str, Any], fps: list) -> dict[str, Any] | None:
     return None
 
 
-def _foreign_order_company(
+def _series_yields_to_order(
     owner_item: dict[str, Any], group: list[dict[str, Any]], watched: Any,
 ) -> str | None:
-    """Чем серия владельца и наряд в группе разошлись по компании. None — не разошлись.
+    """Почему серии владельца нельзя вести встречу наряда из группы. None — можно.
 
-    Тот же вопрос, что задаёт шлюз наряду, назвавшему чужую серию (R12.12,
-    `identity.order_company_conflict`): серия размечена одной компанией, наряд
-    пришёл от другой. Шлюз такой наряд отбивает, а склейка дубля молча обходила
-    бы проверку: встречу повела бы серия владельца, связь с нарядом переехала бы
-    на неё, и протокол — с памятью и открытыми вопросами этой серии — ушёл бы в
-    чат и на портал чужой компании. Неразмеченная серия конфликтом не считается —
-    как у шлюза.
+    Повела бы серия — связь с нарядом переехала бы на неё, и протокол с памятью и
+    открытыми вопросами серии ушёл бы по маршруту наряда (чат или личка из наряда,
+    портал). Это не годится в двух случаях, оба — разметка владельца:
+    * серия размечена другой компанией, чем наряд: тот же вопрос шлюз задаёт наряду,
+      назвавшему чужую серию (R12.12, `identity.order_company_conflict`), и отбивает
+      его — склейка обходила бы проверку;
+    * серия помечена приватной: её содержимое не уходит даже фоном в чужие
+      протоколы (`series_memory`), тем более целиком в чужой чат.
+    Неразмеченная серия — можно, как у шлюза.
     """
-    if not watched:
+    orders = [it for it in group if it.get("type") == portal_queue.QUEUE_TYPE]
+    if not watched or not orders:
         return None
+    series = str(owner_item.get("series") or "")
     try:
+        from notary.cli.registry import get_visibility_for_series  # noqa: PLC0415
         from notary.lib.identity import order_company_conflict  # noqa: PLC0415
+
+        for it in orders:
+            series_company = order_company_conflict(
+                {"company": it.get("company"), "series": series}, watched,
+            )
+            if series_company:
+                return "серия размечена компанией %s, наряд %s — %s" % (
+                    series_company, it.get("order_id") or "?", it.get("company"),
+                )
+        if get_visibility_for_series(series, watched) == "private":
+            return "серия помечена приватной (наряд %s)" % (orders[0].get("order_id") or "?")
     except Exception:  # noqa: BLE001 — нечем проверить → как у шлюза, конфликта не утверждаем
         return None
-    for it in group:
-        if it.get("type") != portal_queue.QUEUE_TYPE:
-            continue
-        series_company = order_company_conflict(
-            {"company": it.get("company"), "series": owner_item.get("series")}, watched,
-        )
-        if series_company:
-            return "серия — %s, наряд %s — %s" % (
-                series_company, it.get("order_id") or "?", it.get("company"),
-            )
     return None
 
 
@@ -488,10 +494,10 @@ def _pick_winner(
     Пара «наряд портала + запись владельца с человеческим именем» решается по
     роду записи, а не по её месту в группе (находка №4 проверки 04.10.2026: наряд
     в UTC вставал в очереди раньше серии владельца и забирал встречу — протокол
-    уходил не в ту серию). Исключение — серия владельца, размеченная другой
-    компанией, чем наряд: тогда встречу ведёт наряд, как до 06.10
-    (`_foreign_order_company`). Среди равных — двух записей владельца, двух
-    нарядов — побеждает первая в группе, то есть раньше стоящая в очереди.
+    уходил не в ту серию). Исключение — серия другой компании, чем наряд, или
+    приватная: тогда встречу ведёт наряд, как до 06.10 (`_series_yields_to_order`).
+    Среди равных — двух записей владельца, двух нарядов — побеждает первая в
+    группе, то есть раньше стоящая в очереди.
     """
     if frozen and remembered:
         for it in group:
@@ -502,13 +508,13 @@ def _pick_winner(
             # У записи с человеческим именем привязка чата, разметка
             # company/visibility и режим открытых вопросов. Автоимя вечернего
             # блока `oneoff-<hash>` — расходный материал.
-            foreign = _foreign_order_company(it, group, watched)
-            if foreign:
+            why_not = _series_yields_to_order(it, group, watched)
+            if why_not:
                 logger.warning(
-                    "Дубль встречи @ %s: серия «%s» и наряд портала — разных компаний "
-                    "(%s). Веду по наряду — протокол и память серии в чужую компанию "
-                    "не уходят. Проверь разметку серии или наряд",
-                    it.get("start_at"), it.get("series"), foreign,
+                    "Дубль встречи @ %s: серия «%s» и наряд портала — одна встреча, но %s. "
+                    "Веду по наряду, как до 06.10: память и открытые вопросы серии по "
+                    "маршруту наряда не уходят. Проверь разметку серии или наряд",
+                    it.get("start_at"), it.get("series"), why_not,
                 )
                 continue
             return it, "имя записи дал владелец"
@@ -549,8 +555,9 @@ def dedupe_queue(
     Элемент очереди не мутируем: работаем с копиями (функцию тестируют как
     чистую, и `.queue.json` пишется из возвращённого списка).
 
-    `watched` — реестр серий: по нему сверяется компания серии владельца с
-    компанией наряда в той же группе (`_foreign_order_company`). None — не сверяем.
+    `watched` — реестр серий: по его разметке (компания, приватность) решается,
+    может ли серия владельца вести встречу наряда (`_series_yields_to_order`).
+    None — не сверяем.
     """
     if now is None:
         now = datetime.now(timezone.utc)
