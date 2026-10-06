@@ -21,7 +21,9 @@
     повод сказать владельцу: в календаре это два разных события, проверь.
     Про это `compare` возвращает второй элемент — `ical_conflict`.
 
-Зависимостей извне у модуля нет — только стандартная библиотека.
+Зависимостей извне у модуля нет — стандартная библиотека и соседний
+`telemost_url` (тоже без зависимостей): какая это комната, решает его
+`room_url_key`, одна формула на весь проект.
 """
 from __future__ import annotations
 
@@ -29,6 +31,8 @@ import re
 from collections import namedtuple
 from datetime import datetime, timezone
 from typing import Any
+
+from notary.lib.telemost_url import room_url_key
 
 # Чем доказано тождество. Пустая строка — не доказано ничем.
 MATCH_NONE = ""
@@ -59,11 +63,26 @@ def instant_key(value: Any) -> str | None:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def start_sort_key(value: Any) -> tuple:
+    """Ключ сортировки по старту: момент в UTC, а не сырая строка.
+
+    Находка №4 проверки 04.10.2026: портал шлёт старт в UTC («…T07:00:00+00:00»),
+    календарь — в своём поясе («…T10:00:00+03:00»). По строке наряд вставал в
+    очереди раньше личной серии с тем же моментом старта и выигрывал склейку дубля.
+    Неразбираемое время — в конец, в прежнем взаимном порядке.
+    """
+    instant = instant_key(value)
+    return (0, instant) if instant is not None else (1, "")
+
+
 def url_key(value: Any) -> str | None:
-    """URL комнаты для сравнения: без хвостового слэша и регистра."""
-    if not isinstance(value, str):
-        return None
-    return value.strip().rstrip("/").lower() or None
+    """Комната для сравнения — общей формулой проекта (`telemost_url.room_url_key`).
+
+    Хвост `?…`/`#…`, регистр, конечная «/» и схема комнату не меняют (находка №5
+    проверки 04.10.2026): ссылка с utm-меткой обходила и «нет» владельца, и
+    склейку дублей.
+    """
+    return room_url_key(value)
 
 
 def ical_key(value: Any) -> str | None:

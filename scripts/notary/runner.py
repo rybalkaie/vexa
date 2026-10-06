@@ -53,7 +53,7 @@ from notary.lib.notify import push  # noqa: E402
 from notary.lib import late_join, portal_queue, slots, waitlist  # noqa: E402
 from notary.lib import join_watch  # noqa: E402
 from notary.lib import telemost_url  # noqa: E402
-from notary.lib.meeting_identity import instant_key  # noqa: E402
+from notary.lib.meeting_identity import instant_key, start_sort_key  # noqa: E402
 from notary.lib.state import (  # noqa: E402
     normalized_start_key,
     read_queue,
@@ -392,9 +392,12 @@ def _outdated_portal_row(row: Any, current: dict[str, dict[str, Any]]) -> bool:
     live = current.get(str(row["order_id"]))
     if live is None:
         return True  # среди плановых нет: снят, «выйти сейчас», удалён или негоден
+    # Комната — общей формулой проекта: другой хвост `?…`/`#…` у той же комнаты не
+    # перенос. Иначе строка, ждущая слота, выпадала бы из очереди тика, а с ней и
+    # из ожидания — и бот на встречу не приходил бы молча.
     return (
         normalized_start_key(row.get("start_at")) != normalized_start_key(live.get("start_at"))
-        or row.get("url") != live.get("url")
+        or telemost_url.room_url_key(row.get("url")) != telemost_url.room_url_key(live.get("url"))
     )
 
 
@@ -454,7 +457,8 @@ def _merge_near_orders(
     memory = scheduler_mod.load_dedup_winners(now)
     late_keys: set[str] = set()
 
-    for raw, late in sorted(near, key=lambda pair: str(pair[0].get("start_at") or "")):
+    # По моменту старта, а не по строке: порядок здесь — порядок запуска при потолке.
+    for raw, late in sorted(near, key=lambda pair: start_sort_key(pair[0].get("start_at"))):
         if not scheduler_mod.drop_rejected_occurrences([raw], records):
             continue
         item = dict(raw)
@@ -737,7 +741,7 @@ def _room_label_value(url: Any) -> str:
     try:
         from notary.lib.orders import room_key  # noqa: PLC0415
 
-        return room_key(str(url or "")) if url else ""
+        return room_key(url) if telemost_url.room_url_key(url) else ""
     except Exception:  # noqa: BLE001 — метка вспомогательная, запуск важнее
         return ""
 

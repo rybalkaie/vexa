@@ -46,7 +46,8 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent.parent))  # для notary.cli.registry
 
 from notary.cli.registry import VALID_COMPANIES  # noqa: E402
-from notary.lib.telemost_url import url_host_in  # noqa: E402
+from notary.lib.meeting_identity import start_sort_key  # noqa: E402
+from notary.lib.telemost_url import room_url_key, url_host_in  # noqa: E402
 
 ORDERS_FILENAME = ".orders.json"
 SCHEMA_VERSION = 1
@@ -244,13 +245,14 @@ def order_id_for_meeting(meeting_id: str) -> str:
 def room_key(room_url: str) -> str:
     """Ключ комнаты для идемпотентности «зайти сейчас».
 
-    Нормализуем хост (регистр) и путь (хвостовой `/`), query и фрагмент
-    ОТБРАСЫВАЕМ: два одинаковых приглашения, различающихся utm-меткой, — одна и
-    та же комната, и второго бота там быть не должно.
+    Какая это комната, решает общая формула проекта `telemost_url.room_url_key`:
+    два одинаковых приглашения, различающихся utm-меткой, — одна и та же комната,
+    и второго бота там быть не должно. Здесь от неё берётся хэш: сама ссылка в
+    реестр и в метку контейнера не попадает. Для обычной ссылки хэш тот же, что
+    до общей формулы, — ключи уже записанных нарядов и живых контейнеров совпадают.
     """
-    parts = urlsplit((room_url or "").strip())
-    canon = "%s%s" % (parts.hostname or "", (parts.path or "").rstrip("/"))
-    return hashlib.sha256(canon.lower().encode("utf-8")).hexdigest()[:16]
+    canon = room_url_key(room_url) or ""
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
 
 
 # ---------- валидация ----------
@@ -650,7 +652,9 @@ def list_orders(
         if company is not None and order.get("company") != company:
             continue
         out.append(dict(order))
-    out.sort(key=lambda o: str(o.get("start_at") or ""))
+    # По моменту, а не по строке: наряд хранит старт в том поясе, в каком его
+    # прислал портал, и строки с разными поясами сортируются не по времени.
+    out.sort(key=lambda o: start_sort_key(o.get("start_at")))
     return out
 
 

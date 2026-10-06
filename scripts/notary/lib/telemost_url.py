@@ -18,10 +18,14 @@
 самопроверка (`lib/canary.valid_room_url`, с фазы 3б).
 Та же проверка в боте — `services/vexa-bot/core/src/platforms/yandextelemost/screen.ts`
 (`isTelemostMeetingUrl`); в дикторе самопроверки — своя копия (`canary-kit/speaker.js`).
+
+Здесь же — `room_url_key`: ОДНА формула «две ссылки ведут в одну комнату» на весь
+проект (склейка дублей и «нет» владельца — `meeting_identity.url_key`, ключ наряда —
+`orders.room_key`, счёт слотов — `slots`, сверка очереди с реестром нарядов — `runner`).
 """
 from __future__ import annotations
 
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 from urllib.parse import urlsplit
 
 #: Хосты Яндекс Телемоста (обычный и Яндекс 360 для бизнеса) — с поддоменами.
@@ -72,3 +76,30 @@ def url_host_in(url: object, allowed: Iterable[str], *, schemes: Tuple[str, ...]
 def is_telemost_url(url: object, *, schemes: Tuple[str, ...] = ("https",)) -> bool:
     """Ссылка ведёт в Яндекс Телемост (хост целиком, не подстрока)."""
     return url_host_in(url, TELEMOST_HOSTS, schemes=schemes)
+
+
+def room_url_key(url: object) -> Optional[str]:
+    """Какая это комната: `хост/путь` в нижнем регистре. None — сравнивать нечего.
+
+    ЗАЧЕМ (находка №5 проверки 04.10.2026, решение владельца 06.10). Ссылки комнат
+    сравнивали в четырёх местах, и каждое отрезало своё: склейка дублей и «нет»
+    владельца — регистр и конечную «/», ключ наряда — ещё и хвост `?…`/`#…`, счёт
+    слотов — только регистр, сверка очереди с реестром нарядов — ничего. Ссылка с
+    utm-меткой для одних мест была той же комнатой, для других — чужой: «нет»
+    владельца не гасило встречу, дубль не склеивался, в комнату шёл второй бот.
+
+    КАК. Комната — хост и путь. Отбрасываем то, что её не меняет: хвост `?…` и
+    `#…`, схему, порт и логин перед хостом, конечные «/», точку в конце имени
+    хоста, регистр. Ссылка без схемы даёт ту же строку, что и со схемой.
+
+    Это сравнение, а не проверка: годится ли ссылка боту, решает `is_telemost_url`.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").rstrip(".")
+    except ValueError:  # «https://[::1» и подобное — urlsplit не разбирает
+        return None
+    canon = (host + (parts.path or "").rstrip("/")).lower()
+    return canon or None

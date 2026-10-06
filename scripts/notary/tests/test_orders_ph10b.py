@@ -54,6 +54,7 @@ import notary.runner as runner  # noqa: E402
 import notary.scheduler as scheduler  # noqa: E402
 from notary.lib import identity, late_join, orders as orders_lib  # noqa: E402
 from notary.lib import portal_queue, slots, state as state_lib, waitlist  # noqa: E402
+from notary.lib.meeting_identity import instant_key  # noqa: E402
 
 ROOM = "https://telemost.yandex.ru/j/11111111111111"
 ROOM_2 = "https://telemost.yandex.ru/j/22222222222222"
@@ -264,9 +265,11 @@ class TestQueueBeforeAfter(_Base):
         series = [i for i in after if i.get("type") == "manual"]
         self.assertEqual(len(series), len(before), "личные серии не должны пострадать")
         self.assertEqual(len(portal), 2, "оба наряда обязаны стоять в очереди")
+        # По МОМЕНТУ старта: у серии пояс Дубая, у наряда UTC, и по строке «верный»
+        # порядок был бы неверным по времени (находка №4 проверки 04.10.2026).
+        moments = [instant_key(i["start_at"]) for i in after]
         self.assertEqual(
-            [i["start_at"] for i in after], sorted(i["start_at"] for i in after),
-            "очередь обязана остаться отсортированной по старту",
+            moments, sorted(moments), "очередь обязана остаться отсортированной по старту",
         )
         one = next(i for i in portal if i["order_id"] == "portal:mtg-1001")
         self.assertEqual(one["url"], ROOM)

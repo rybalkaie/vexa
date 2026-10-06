@@ -26,6 +26,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from notary.lib.telemost_url import room_url_key
+
 logger = logging.getLogger("notary.slots")
 
 DEFAULT_MAX_CONCURRENT_BOTS = 2
@@ -58,10 +60,14 @@ def _parse(raw: Any) -> Optional[datetime]:
 
 
 def _slot_key(start: datetime, url: Any) -> str:
-    """Одна встреча = один слот, из скольких бы источников она ни приехала."""
+    """Одна встреча = один слот, из скольких бы источников она ни приехала.
+
+    Комната — общей формулой проекта (`telemost_url.room_url_key`): наряд и та же
+    встреча в очереди с utm-меткой в ссылке — одна встреча, а не две занятые.
+    """
     return "%s|%s" % (
         start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M"),
-        str(url or "").strip().lower(),
+        room_url_key(url) or "",
     )
 
 
