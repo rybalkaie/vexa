@@ -60,7 +60,13 @@ def instant_key(value: Any) -> str | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+    try:
+        return dt.astimezone(timezone.utc).isoformat()
+    except (OverflowError, ValueError):
+        # «0001-01-01T00:30+01:00» в UTC не помещается: время не разобрать, как и
+        # мусор. Исключение отсюда уронило бы сортировку очереди и реестра нарядов
+        # целиком — из-за одной кривой записи пропали бы все наряды тика.
+        return None
 
 
 def start_sort_key(value: Any) -> tuple:

@@ -457,7 +457,7 @@ def _merge_near_orders(
     memory = scheduler_mod.load_dedup_winners(now)
     late_keys: set[str] = set()
 
-    # По моменту старта, а не по строке: порядок здесь — порядок запуска при потолке.
+    # По моменту, не по строке: в этом порядке наряды у старта (после строк очереди) берут слот.
     for raw, late in sorted(near, key=lambda pair: start_sort_key(pair[0].get("start_at"))):
         if not scheduler_mod.drop_rejected_occurrences([raw], records):
             continue

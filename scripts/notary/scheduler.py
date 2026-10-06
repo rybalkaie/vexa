@@ -213,9 +213,9 @@ def main() -> int:
     # Сортируем очередь по МОМЕНТУ старта, а не по строке (находка №4 проверки
     # 04.10.2026): портал шлёт старт в UTC, календарь — в своём поясе, и по строке
     # наряд вставал раньше личной серии с тем же стартом. Сортировка СТАБИЛЬНА: при
-    # равном моменте личная серия владельца остаётся раньше наряда портала. Дубль
-    # (одна комната, одна секунда) запись владельца с человеческим именем выигрывает
-    # и без этого порядка — `_pick_winner`.
+    # равном моменте записи владельца стоят раньше нарядов портала (те добавлены
+    # позже), и в этом же порядке разные встречи получают слот при потолке. Кого
+    # вести в дубле (одна комната, одна секунда), решает `_pick_winner`, не порядок.
     queue.sort(key=lambda x: start_sort_key(x.get("start_at")))
 
     # ISS-53: «нет» по встрече, которую приносит ЖИВАЯ запись серии из второго
@@ -235,7 +235,7 @@ def main() -> int:
     # ОДНУ встречу» — катастрофа, и цена ошибки тут несимметрична.
     memory = load_dedup_winners(started_at)
     try:
-        queue = dedupe_queue(queue, memory=memory, now=started_at)
+        queue = dedupe_queue(queue, memory=memory, now=started_at, watched=watched_data)
     except Exception as e:  # noqa: BLE001
         logger.exception("Дедуп очереди упал (%s) — пишу очередь как есть", e)
         logger.warning(
@@ -428,16 +428,70 @@ def _remembered(memory: dict[str, Any], fps: list) -> dict[str, Any] | None:
     return None
 
 
+def _foreign_order_company(
+    owner_item: dict[str, Any], group: list[dict[str, Any]], watched: Any,
+) -> str | None:
+    """Чем серия владельца и наряд в группе разошлись по компании. None — не разошлись.
+
+    Тот же вопрос, что задаёт шлюз наряду, назвавшему чужую серию (R12.12,
+    `identity.order_company_conflict`): серия размечена одной компанией, наряд
+    пришёл от другой. Шлюз такой наряд отбивает, а склейка дубля молча обходила
+    бы проверку: встречу повела бы серия владельца, связь с нарядом переехала бы
+    на неё, и протокол — с памятью и открытыми вопросами этой серии — ушёл бы в
+    чат и на портал чужой компании. Неразмеченная серия конфликтом не считается —
+    как у шлюза.
+    """
+    if not watched:
+        return None
+    try:
+        from notary.lib.identity import order_company_conflict  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — нечем проверить → как у шлюза, конфликта не утверждаем
+        return None
+    for it in group:
+        if it.get("type") != portal_queue.QUEUE_TYPE:
+            continue
+        series_company = order_company_conflict(
+            {"company": it.get("company"), "series": owner_item.get("series")}, watched,
+        )
+        if series_company:
+            return "серия — %s, наряд %s — %s" % (
+                series_company, it.get("order_id") or "?", it.get("company"),
+            )
+    return None
+
+
+def _merged_participants(
+    winner: dict[str, Any], dropped: list[dict[str, Any]],
+) -> list[Any] | None:
+    """Список победителя, дополненный именами выбывших. None — добавить нечего."""
+    own = winner.get("expected_participants")
+    out = list(own) if isinstance(own, list) else []
+    before = len(out)
+    seen = {p.strip() for p in out if isinstance(p, str)}
+    for other in dropped:
+        names = other.get("expected_participants")
+        for name in names if isinstance(names, list) else ():
+            if isinstance(name, str) and name.strip() and name.strip() not in seen:
+                seen.add(name.strip())
+                out.append(name.strip())
+    return out if len(out) > before else None
+
+
 def _pick_winner(
     group: list[dict[str, Any]],
     remembered: dict[str, Any] | None,
     frozen: bool,
+    watched: Any = None,
 ) -> tuple[dict[str, Any], str]:
     """Кого ведём. Возвращает (победитель, почему именно его).
 
-    От порядка элементов в группе выбор не зависит (находка №4 проверки
-    04.10.2026: наряд в UTC вставал в очереди раньше серии владельца и забирал
-    встречу — протокол уходил не в ту серию).
+    Пара «наряд портала + запись владельца с человеческим именем» решается по
+    роду записи, а не по её месту в группе (находка №4 проверки 04.10.2026: наряд
+    в UTC вставал в очереди раньше серии владельца и забирал встречу — протокол
+    уходил не в ту серию). Исключение — серия владельца, размеченная другой
+    компанией, чем наряд: тогда встречу ведёт наряд, как до 06.10
+    (`_foreign_order_company`). Среди равных — двух записей владельца, двух
+    нарядов — побеждает первая в группе, то есть раньше стоящая в очереди.
     """
     if frozen and remembered:
         for it in group:
@@ -448,6 +502,15 @@ def _pick_winner(
             # У записи с человеческим именем привязка чата, разметка
             # company/visibility и режим открытых вопросов. Автоимя вечернего
             # блока `oneoff-<hash>` — расходный материал.
+            foreign = _foreign_order_company(it, group, watched)
+            if foreign:
+                logger.warning(
+                    "Дубль встречи @ %s: серия «%s» и наряд портала — разных компаний "
+                    "(%s). Веду по наряду — протокол и память серии в чужую компанию "
+                    "не уходят. Проверь разметку серии или наряд",
+                    it.get("start_at"), it.get("series"), foreign,
+                )
+                continue
             return it, "имя записи дал владелец"
     for it in group:
         if it.get("type") == portal_queue.QUEUE_TYPE:
@@ -463,6 +526,7 @@ def dedupe_queue(
     *,
     memory: dict[str, Any] | None = None,
     now: datetime | None = None,
+    watched: Any = None,
 ) -> list[dict[str, Any]]:
     """ISS-54: схлопнуть элементы очереди, которые описывают ОДНУ встречу.
 
@@ -484,6 +548,9 @@ def dedupe_queue(
 
     Элемент очереди не мутируем: работаем с копиями (функцию тестируют как
     чистую, и `.queue.json` пишется из возвращённого списка).
+
+    `watched` — реестр серий: по нему сверяется компания серии владельца с
+    компанией наряда в той же группе (`_foreign_order_company`). None — не сверяем.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -544,7 +611,7 @@ def dedupe_queue(
 
         remembered = _remembered(mem, group_fps[twin_idx])
         frozen = _is_frozen(fp.start, now)
-        winner, why = _pick_winner(groups[twin_idx], remembered, frozen)
+        winner, why = _pick_winner(groups[twin_idx], remembered, frozen, watched)
         dropped = [it for it in groups[twin_idx] if it is not winner]
         logger.info(
             "Схлопнул дубль встречи (%s): «%s» [%s] и «%s» [%s] @ %s — веду по "
@@ -576,6 +643,14 @@ def dedupe_queue(
                         other.get("order_id"), winner.get("meeting_id"),
                     )
                     break
+        # Встречу ведёт запись владельца — участники из карточки наряда едут с ней:
+        # у записи владельца списка может не быть, а по нему бот подписывает
+        # говорящих. Свои — первыми. Обратно (данные записи владельца в наряд) не
+        # переносим: наряд побеждает и тогда, когда серия чужой компании.
+        if winner.get("type") != portal_queue.QUEUE_TYPE:
+            participants = _merged_participants(winner, dropped)
+            if participants is not None:
+                winner["expected_participants"] = participants
         kept[twin_idx] = winner
         kept_fp[twin_idx] = fingerprint(
             winner.get("start_at"), winner.get("url"), winner.get("ical_uid"))

@@ -380,15 +380,38 @@ def activity_status(now: Optional[datetime] = None) -> Dict[str, Any]:
 
 
 def protocol_path_for_order(order: Dict[str, Any], *, kind: str = "protokol"):
-    """Путь к протоколу встречи наряда: рабочая папка → долговечный архив."""
+    """Путь к протоколу встречи наряда: рабочая папка → долговечный архив.
+
+    Сначала — папка серии самого наряда. Если встречу бот вёл по личной серии
+    владельца (склейка дубля «наряд + серия», находка №4 проверки 04.10.2026),
+    сборка положила протокол в папку ТОЙ серии, и по серии наряда его не найти:
+    «Скачать PDF» на портале отвечал бы «не собран» навсегда, хотя протокол
+    порталу уже доставлен. Тогда ищем мету встречи по отметке наряда — так же,
+    как правка с портала (`feedback_worker.find_meeting_by_order`), — и берём
+    протокол там, где его положила сборка.
+    """
     from notary.lib.paths import archive_root, protocols_root, _target_path
 
+    roots = (protocols_root(), archive_root())
     start = str(order.get("start_at") or "")
     meta = {"series": order.get("series"), "date": start[:10], "startTs": start}
-    for root in (protocols_root(), archive_root()):
+    for root in roots:
         candidate = _target_path(meta, root=root, kind=kind)
         if candidate.exists():
             return candidate
+    try:
+        from notary.lib import feedback_worker  # noqa: PLC0415
+
+        found = feedback_worker.find_meeting_by_order(str(order.get("meeting_id") or ""))
+        found_meta = (found or {}).get("meta")
+        if not isinstance(found_meta, dict):
+            return None
+        for root in roots:
+            candidate = _target_path(found_meta, root=root, kind=kind)
+            if candidate.exists():
+                return candidate
+    except Exception as exc:  # noqa: BLE001 — запасной поиск; не нашли — «не собран»
+        logger.warning("протокол наряда по мете встречи не найден (%s)", type(exc).__name__)
     return None
 
 

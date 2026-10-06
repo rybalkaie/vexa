@@ -25,8 +25,21 @@
 * `TestPortalUtcTwinGoesToOwnerSeries` — ГЛАВНАЯ проба №4: наряд в UTC и серия
   владельца в +03 на одну комнату и секунду — один бот, в серии владельца, связь
   с нарядом цела.
-* `TestOrderByMoment` — раньше начинается — раньше стоит и раньше получает слот.
-* `TestWinnerIgnoresOrder` — победитель склейки не зависит от порядка в группе.
+* `TestOrderByMoment` — раньше начинается — раньше стоит; среди нарядов у старта
+  раньше получает слот (строки очереди планировщика идут раньше нарядов у старта).
+* `TestWinnerIgnoresOrder` — пару «наряд + запись владельца» решает род записи, а не
+  её место в группе.
+
+Цикл из 5 ходов по правке (06.10.2026) добавил:
+
+* `TestCrookedDateKeepsTheRegistry` — время, которое не переводится в UTC, уходит в
+  конец, а не роняет сортировку реестра нарядов и очереди (раньше сортировали
+  строку, и она не падала).
+* `TestForeignCompanySeriesYieldsToOrder` — серию владельца, размеченную другой
+  компанией, чем наряд, склейка не ведёт: протокол и память серии не уходят в чат
+  и на портал чужой компании (R12.12). Своя компания — ведёт серия.
+* `TestMergedMeetingKeepsOrderData` — у склеенной встречи участники из карточки
+  портала доезжают до бота, а «Скачать PDF» находит протокол в папке серии.
 
 Изоляция — стенд Ф10b (`test_orders_ph10b._Base`): временный реестр, Google подменён.
 """
@@ -413,6 +426,116 @@ class TestWinnerIgnoresOrder(_Stand):
             )
             with self.subTest(first=group[0]["meeting_id"]):
                 self.assertEqual([i["meeting_id"] for i in out], [portal_item["meeting_id"]])
+
+
+# ---------------------------------------------------------------------------
+# Цикл из 5 ходов по правке (06.10.2026)
+# ---------------------------------------------------------------------------
+
+
+class TestCrookedDateKeepsTheRegistry(_Stand):
+    """Время, которое не переводится в UTC, — в конец, а не исключение на весь реестр."""
+
+    CROOKED = "0001-01-01T00:30:00+01:00"
+
+    def test_sort_key_of_untranslatable_time_goes_last(self):
+        self.assertIsNone(mid.instant_key(self.CROOKED))
+        self.assertEqual(mid.start_sort_key(self.CROOKED), (1, ""))
+
+    def test_one_crooked_order_does_not_hide_the_others(self):
+        import json
+
+        start = _minute() + timedelta(hours=2)
+        good, _ = self.put_order("mtg-c901", start, room=ROOM)
+        path = orders_lib.orders_file()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["orders"]["portal:mtg-c902"] = dict(
+            data["orders"][good["id"]], id="portal:mtg-c902", meeting_id="mtg-c902",
+            start_at=self.CROOKED,
+        )
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        listed = [o["id"] for o in orders_lib.list_orders()]
+        self.assertEqual(listed, [good["id"], "portal:mtg-c902"], "кривое время — в конец")
+        horizon = datetime.now(timezone.utc)
+        items = portal_queue.items_for_queue(horizon, horizon + timedelta(hours=48))
+        self.assertEqual([i["order_id"] for i in items], [good["id"]], "хороший наряд на месте")
+
+
+class TestForeignCompanySeriesYieldsToOrder(_Stand):
+    """Серия владельца другой компании, чем наряд, встречу у наряда не забирает (R12.12)."""
+
+    def _merge(self, series_company: str):
+        start = _minute() + timedelta(hours=3)
+        self.write_watched([dict(
+            OWNER_SERIES, company=series_company, expected_participants=["Пётр Серийный"],
+        )])
+        order, _ = self.put_order(
+            "mtg-f101", start, room=ROOM + "?utm_source=portal", series="portal-f101",
+            company="anzhee", participants=["Иван Дилеров"],
+        )
+        queue = self.run_scheduler_with_calendar([_gcal_event("dir-1", start, ROOM)])
+        self.assertEqual(len(queue), 1, "одна комната, одна секунда — один бот")
+        return order, queue[0]
+
+    def test_foreign_company_series_does_not_take_the_order(self):
+        order, row = self._merge("mpfirst")
+        self.assertEqual(row["meeting_id"], "portal-mtg-f101", "встречу ведёт наряд, как до 06.10")
+        self.assertEqual(row["order_id"], order["id"])
+        self.assertNotEqual(row.get("series"), "anzhee-direktorat",
+                            "память серии МПервого в протокол наряда Anzhee не попадает")
+        self.assertEqual(row["expected_participants"], ["Иван Дилеров"],
+                         "и состав серии чужой компании в наряд не переезжает")
+
+    def test_same_company_series_takes_the_meeting(self):
+        order, row = self._merge("anzhee")
+        self.assertEqual(row["meeting_id"], "anzhee-direktorat")
+        self.assertEqual(row["order_id"], order["id"], "связь с нарядом обязана уцелеть")
+
+
+class TestMergedMeetingKeepsOrderData(_Stand):
+    """Склеенная встреча (серия владельца + наряд) не теряет того, что знал наряд."""
+
+    def test_participants_from_the_portal_card_reach_the_bot(self):
+        start = _minute() + timedelta(hours=3)
+        self.write_watched([dict(OWNER_SERIES, expected_participants=["Илья Рыбалка"])])
+        self.put_order(
+            "mtg-p201", start, room=ROOM, series="portal-p201",
+            participants=["Иван Дилеров", "Илья Рыбалка"],
+        )
+        queue = self.run_scheduler_with_calendar([_gcal_event("dir-1", start, ROOM)])
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["meeting_id"], "anzhee-direktorat")
+        self.assertEqual(
+            queue[0]["expected_participants"], ["Илья Рыбалка", "Иван Дилеров"],
+            "свои — первыми, имена из карточки портала — следом, без повторов",
+        )
+
+    def test_portal_downloads_the_protocol_from_the_series_folder(self):
+        import json
+
+        from notary import gateway
+
+        start = _minute() + timedelta(hours=3)
+        order, _ = self.put_order("mtg-p202", start, room=ROOM, series="portal-p202")
+        protocols = self.tmp / "protocols"
+        day = start.strftime("%Y-%m-%d")
+        folder = protocols / "anzhee-direktorat"
+        folder.mkdir(parents=True)
+        (folder / ("%s-protokol.md" % day)).write_text("# Протокол\n", encoding="utf-8")
+        (folder / "meta.json").write_text(json.dumps({
+            "series": "anzhee-direktorat", "date": day, "sessionUid": "tm-1",
+            "startTs": start.isoformat(), "order": order,
+        }, ensure_ascii=False), encoding="utf-8")
+        env = {
+            "MEETING_NOTARY_PROTOCOLS_DIR": str(protocols),
+            "MEETING_NOTARY_DELIVERED_ROOTS": str(protocols),
+        }
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("MEETING_NOTARY_ARCHIVE_DIR", None)
+            found = gateway.protocol_path_for_order(orders_lib.get_order(order["id"]))
+        self.assertEqual(found, folder / ("%s-protokol.md" % day),
+                         "протокол склеенной встречи лежит в папке серии владельца")
 
 
 if __name__ == "__main__":
