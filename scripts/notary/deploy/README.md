@@ -73,8 +73,9 @@ sudo -u dev test -w /home/dev/meeting-notary/_tmp/_feedback_edits && echo "ка�
 
 ## 3. Caddy + DNS
 
-1. A-запись `watson.anzhee.ru` → IP VPS (авто-TLS требует, чтобы имя резолвилось
-   и порт 80 был открыт).
+1. Рабочее имя — `watson.46-224-163-202.sslip.io`: оно само резолвится в IP
+   VPS. У `watson.anzhee.ru` A-записи нет; подставлять его в настройки портала
+   нельзя (боевой сбой 14.10.2026). Порт 80 нужен для выдачи сертификата.
 2. Блок из `meeting-notary-gateway.caddy` — в `/etc/caddy/Caddyfile`.
 3. `sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
 
@@ -86,8 +87,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" \
      'http://127.0.0.1:8789/health?deep=1'      # ожидаем 200
 
 # снаружи: через Caddy
-curl -s -H "Authorization: Bearer $TOKEN" 'https://watson.anzhee.ru/health?deep=1' | jq
-curl -s -o /dev/null -w '%{http_code}\n' 'https://watson.anzhee.ru/health'   # ожидаем 401
+curl -s -H "Authorization: Bearer $TOKEN" 'https://watson.46-224-163-202.sslip.io/health?deep=1' | jq
+curl -s -o /dev/null -w '%{http_code}\n' 'https://watson.46-224-163-202.sslip.io/health'   # ожидаем 401
 ```
 
 `?deep=1` возвращает 503, если планировщик молчит дольше 90 минут
@@ -98,7 +99,7 @@ health отвечал 200 при мёртвой службе и стоил пр�
 ## 5. Сторож в портале
 
 Завести третью проверку по образцу двух соседних шлюзов: cron `*/30`, запрос
-`GET https://watson.anzhee.ru/health?deep=1` с Bearer, алерт в Telegram при коде
+`GET https://watson.46-224-163-202.sslip.io/health?deep=1` с Bearer, алерт в Telegram при коде
 ≠ 200 два раза подряд. Токен — в переменной окружения портала.
 
 ## 6. 🔴 Слот авторизации Claude на этой машине — не трогать
