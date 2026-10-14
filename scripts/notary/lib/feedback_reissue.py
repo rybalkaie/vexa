@@ -173,8 +173,8 @@ def build_edit_instruction(edits: Optional[list]) -> str:
 # Парсер light (stdlib, без pymorphy3 — listener на системном python3.9): матчим
 # по точному/первословному совпадению с участниками. Незнакомую формулировку НЕ
 # трогаем — она остаётся контентной правкой (фолбэк на LLM, не регресс). Имена в
-# именительном падеже («не Илья, а Михаил») разбираются надёжно; склонённые формы
-# («поменяй Илью и Михаила») парсер может не распознать → фолбэк на LLM.
+# именительном падеже разбираются напрямую. Частые винительные формы
+# («перепутал Илью и Михаила») нормализуем по именам ТЕКУЩИХ спикеров.
 
 # Один токен-имя: слово, начинающееся с буквы (Unicode), без захвата соседних слов
 # через разделители («а», «это») — поэтому одно слово; двусловные имена резолвятся
@@ -192,6 +192,18 @@ _MAX_REMAP_EDIT_LEN = 200
 
 def _norm_author_token(s: str) -> str:
     return (s or "").strip().strip(",.;:!?\"'«»()[]").lower()
+
+
+def _accusative_first_name(first: str) -> str:
+    """Узкая форма для «перепутал X и Y»: только имена текущих спикеров."""
+    name = _norm_author_token(first)
+    if name.endswith("я"):
+        return name[:-1] + "ю"
+    if name.endswith("а"):
+        return name[:-1] + "у"
+    if name and name[-1].isalpha() and name[-1] not in "аеёиоуыэюьй":
+        return name + "а"
+    return name
 
 
 def extract_current_speakers(transcript_text: str) -> list[str]:
@@ -250,6 +262,7 @@ def parse_authorship_remap(
     for c in current_speakers:
         fw = c.split()[0] if c.split() else c
         cur_first.setdefault(_norm_author_token(fw), c)
+        cur_first.setdefault(_accusative_first_name(fw), c)
     pool_exact = {_norm_author_token(n): n for n in name_pool}
     pool_first: dict[str, str] = {}
     for n in name_pool:

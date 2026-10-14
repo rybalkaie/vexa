@@ -149,6 +149,17 @@ class TestParseAuthorshipRemap(unittest.TestCase):
         )
         self.assertEqual(remap, {"Илья": "Михаил", "Михаил": "Илья"})
 
+    def test_swap_accusative_names_from_owner_message(self):
+        remap, idx = fr.parse_authorship_remap(
+            self._edit("Перепутал Илью и Михаила местами"),
+            ["Илья Рыбалка", "Михаил Еремеев"], self.POOL,
+        )
+        self.assertEqual(remap, {
+            "Илья Рыбалка": "Михаил Еремеев",
+            "Михаил Еремеев": "Илья Рыбалка",
+        })
+        self.assertEqual(idx, {0})
+
     def test_arrow_form(self):
         remap, _ = fr.parse_authorship_remap(
             self._edit("Илья -> Михаил"), self.CURRENT, self.POOL

@@ -513,6 +513,30 @@ class TestUnderstandListenerRoute(_SeriesBase):
         self.assertEqual(self._status()[sm._status_key(_ITEM_RASCH)], sm.STATUS_DONE)
         self.assertEqual(len(sent), 1)                       # один ack
 
+    def test_immediate_correction_reaches_feedback_gateway(self):
+        from notary.lib import feedback_worker
+        with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
+             mock.patch.object(ml, "_understand_and_ack") as understand, \
+             mock.patch.object(feedback_worker, "wants_immediate_reissue", return_value=True), \
+             mock.patch.object(ml, "maybe_route_to_mixed_reply", return_value=False), \
+             mock.patch.object(ml, "maybe_route_to_pending_status_reply", return_value=False), \
+             mock.patch.object(ml, "maybe_route_to_feedback_reply", return_value=True) as gateway:
+            ml.process_message(
+                "tok", self.OWNER, self._msg("Перепутал Илью и Михаила местами. Делай сразу"))
+        gateway.assert_called_once()
+        understand.assert_not_called()
+
+    def test_vague_protocol_complaint_asks_about_error(self):
+        sent = []
+        with mock.patch.object(ml, "_reply_context_series", return_value="koord"), \
+             mock.patch.object(ml, "_understand_and_ack") as understand, \
+             mock.patch.object(ml, "send_message", side_effect=lambda *a, **k: sent.append(a[2])):
+            claimed = ml.maybe_route_to_reply_understand(
+                "tok", self.GROUP, self.OWNER, self._msg("Ох, ты все напутал )"))
+        self.assertTrue(claimed)
+        self.assertIn("чьи слова", sent[0])
+        understand.assert_not_called()
+
     def test_protocol_route_edits_go_to_gateway(self):
         # РИСК1: правочный сегмент уходит в СУЩЕСТВУЮЩИЙ шлюз правок (не теряется).
         edit_calls = []

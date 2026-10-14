@@ -3003,6 +3003,27 @@ def maybe_route_to_reply_understand(
     series = _reply_context_series(chat_id, msg)
     if not series:
         return False  # не reply на доставленный протокол серии (дайджест — свой роут)
+    # 14.10: understand забрал «... Делай сразу», вырезал команду как
+    # «непонятный остаток» и правка ждала обычные 20 минут. Шлюз правок уже
+    # умеет отделить команду от содержания и закрыть окно немедленно.
+    try:
+        from notary.lib import feedback_worker  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001 — нижний шлюз сам покажет ошибку в журнале
+        logger.warning("[understand] feedback worker недоступен: %s", type(e).__name__)
+        return False
+    if feedback_worker.wants_immediate_reissue(text):
+        logger.info("[understand] immediate reissue → feedback gateway series=%s", series)
+        return False
+    # Голая жалоба на протокол — это ещё не статус задачи. Просим назвать
+    # ошибку, не сочиняя из неё ни статус, ни правку для перевыпуска.
+    if re.fullmatch(r"(?:ох[,! ]*)?(?:ты\s+)?вс[её]\s+напутал[\s.!)]*", text, re.IGNORECASE):
+        send_message(
+            token, chat_id,
+            "Похоже, я ошибся в протоколе. Подскажите, чьи слова или какие пункты "
+            "перепутал — исправлю по вашему уточнению.",
+            reply_to=msg.get("message_id"),
+        )
+        return True
     # ISS-51 (Ф3): в серии-шпаргалке СТАТУСНЫЙ reply мимо ИИ — вниз, к детерминированному
     # роуту: он ответит «вопросы тут не веду». Гейт УЗКИЙ (только статус-маркер): правки
     # текста и свежие инструкции от режима не зависят и по-прежнему идут через understand.
