@@ -365,7 +365,7 @@ snake_case → 422 и ноль нарядов; портал звал ручку 
   "order_status": "scheduled",
   "protocol_md": "# Протокол…",
   "protocol_truncated": false,
-  "transcript": {"text": "[00:00:04] Speaker S1: …", "truncated": false, "omitted": false},
+  "transcript": {"text": "# Полный транскрипт\n…\n**[00:04] Илья Рыбалка:** …", "truncated": false, "omitted": false},
   "tasks": [{"title": "…", "assignee": "…", "due": null}],
   "participants": ["Илья Рыбалка"],
   "expected_participants": ["Илья Рыбалка"],
