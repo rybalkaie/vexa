@@ -7,7 +7,8 @@
     переменная `NOTARY_CLAUDE_EFFORT_<УРОВЕНЬ>`; явный `effort`; `none`; мусор →
     умолчание уровня; уровень узнаётся и по номеру; неизвестная модель → без флага.
   - Все три функции вызова кладут `--model` и `--effort` в командную строку клиента.
-  - Отказ «модель недоступна» (404 `model_not_found` / 529 `overloaded`) несёт коды в
+  - Отказ «модель недоступна» (404 `model_not_found` / 529 — у CLI 2.1.300 это
+    `server_error` + 529, узнаётся по числу; прочий 500 — нет) несёт коды в
     `ClaudeCliFailed`; `is_model_unavailable` отличает его от прочих сбоев.
   - `generate_protocol`: основная модель недоступна → один проход на резервной;
     прочий отказ — как до Ф6, без резервной; резервная тоже упала — понятная ошибка.
@@ -65,11 +66,26 @@ _STREAM_404 = "\n".join([
                 "api_error_status": 404,
                 "result": "There's an issue with the selected model (claude-opus-9-9)."}),
 ])
+# Повторные 529 «overloaded» — по форме настоящего ответа CLI 2.1.300 (проба 17.10.2026 на
+# сервере: подставной API отвечает 529 `overloaded_error`, клиент делает 3 запроса за ~3 с).
+# Повторы идут событиями `system/api_retry` с `error=overloaded`, а итоговая ошибка — уже
+# `error=server_error` + `api_error_status=529`: «перегрузку» узнаём по ЧИСЛУ, не по коду.
 _STREAM_529 = "\n".join([
-    json.dumps({"type": "assistant", "error": "overloaded", "is_api_error_message": True,
+    json.dumps({"type": "system", "subtype": "init"}),
+    json.dumps({"type": "system", "subtype": "api_retry", "error": "overloaded"}),
+    json.dumps({"type": "system", "subtype": "api_retry", "error": "overloaded"}),
+    json.dumps({"type": "assistant", "error": "server_error", "is_api_error_message": True,
                 "api_error_status": 529}),
     json.dumps({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
-                "api_error_status": 529, "result": "Overloaded"}),
+                "api_error_status": 529,
+                "result": "API Error: Repeated 529 Overloaded errors. The API is at capacity."}),
+])
+# Прочий сбой сервера (500) — та же `server_error`, но это не «модель недоступна».
+_STREAM_500 = "\n".join([
+    json.dumps({"type": "assistant", "error": "server_error", "is_api_error_message": True,
+                "api_error_status": 500}),
+    json.dumps({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+                "api_error_status": 500, "result": "API Error: Internal server error."}),
 ])
 _STREAM_AUTH = "\n".join([
     json.dumps({"type": "assistant", "error": "authentication_failed", "is_api_error_message": True}),
@@ -226,8 +242,18 @@ class TestModelUnavailable(unittest.TestCase):
 
     def test_529_overloaded(self):
         e = self._fail(_STREAM_529, 1)
-        self.assertEqual(e.error_code, "overloaded")
+        self.assertEqual(e.api_error_status, 529)
+        self.assertEqual(e.error_code, "server_error")  # так отдаёт CLI 2.1.300 после повторов
         self.assertTrue(claude_cli.is_model_unavailable(e))
+
+    def test_overloaded_code_from_other_client_versions(self):
+        # Код `overloaded` без числа (возможная форма у других версий клиента) — тоже «недоступна».
+        self.assertTrue(claude_cli.is_model_unavailable(ClaudeCliFailed("x", error_code="overloaded")))
+
+    def test_500_server_error_is_not_unavailable(self):
+        e = self._fail(_STREAM_500, 1)
+        self.assertEqual((e.api_error_status, e.error_code), (500, "server_error"))
+        self.assertFalse(claude_cli.is_model_unavailable(e))
 
     def test_other_failures_are_not_unavailable(self):
         e = self._fail(_STREAM_AUTH, 1)
@@ -301,7 +327,7 @@ class TestProtocolFallbackOnUnavailable(unittest.TestCase):
                          ("degraded", "primary-unavailable", "sonnet"))
 
     def test_overloaded_degrades_to_fallback(self):
-        out, calls = self._generate(_unavailable(529, "overloaded"))
+        out, calls = self._generate(_unavailable(529, "server_error"))  # живая форма CLI 2.1.300
         self.assertTrue(out.startswith("#протоколвстречи"))
         self.assertEqual(calls, [lp.PROTOCOL_GEN_MODEL, "sonnet"])
 
@@ -473,6 +499,7 @@ class TestNoModelNumbersInCode(unittest.TestCase):
             + [p for p in (_NOTARY / "lib").glob("*.py")]
             + [p for p in (_NOTARY / "auto_vocab").glob("*.py")]
             + [p for p in (_NOTARY / "cli").glob("*.py")]
+            + [p for p in (_NOTARY / "tools").glob("*.py")]  # ручная пересборка и прочие инструменты
         )
         self.assertGreater(len(files), 50)
         found = []

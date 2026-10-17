@@ -91,8 +91,8 @@ def stream_error_codes(stdout: Optional[str]) -> tuple[Optional[int], Optional[s
 
     Только коды — число и строка строго `[a-z_]` (как в `stream_error_summary`), без
     текста ответа модели. По ним генерация протокола отличает «модель недоступна»
-    (`model_not_found` 404, `overloaded` 529 — коды CLI 2.1.300) от прочих
-    сбоев. Нечего разобрать → (None, None).
+    (CLI 2.1.300: снятая модель — `model_not_found` + 404; перегрузка после своих
+    повторов — `server_error` + 529) от прочих сбоев. Нечего разобрать → (None, None).
     """
     final, api_error = _stream_error_events(stdout)
     status: Optional[int] = None
@@ -197,8 +197,11 @@ TIER_DEFAULT_EFFORT = {"opus": "high", "sonnet": "high", "haiku": "low"}
 _EFFORT_OFF = ("none", "off", "default")
 _TIER_RE = re.compile(r"^(?:claude-)?(opus|sonnet|haiku)(?:$|[-\[])")
 
-# «Модель недоступна»: снята/нет доступа (404 `model_not_found`) или перегружена
-# после собственных повторов клиента (529 `overloaded`). Коды — из перечня CLI 2.1.300.
+# «Модель недоступна»: снята/нет доступа (404, код `model_not_found`) или перегружена после
+# собственных повторов клиента (529). Проверено пробами на CLI 2.1.300: при 529
+# клиент делает 3 запроса за ~3 с и отдаёт `error=server_error` + `api_error_status=529`
+# (код `overloaded` есть только в промежуточных `system/api_retry`), поэтому перегрузку
+# узнаём по ЧИСЛУ; код `overloaded` оставлен на случай других версий клиента.
 _MODEL_UNAVAILABLE_CODES = frozenset({"model_not_found", "overloaded"})
 _MODEL_UNAVAILABLE_STATUSES = frozenset({404, 529})
 

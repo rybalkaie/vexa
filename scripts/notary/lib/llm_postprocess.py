@@ -2029,7 +2029,7 @@ def generate_protocol(
         model_used = retry_model
         degraded_reason = "primary-timeout"
     except ClaudeCliError as e:
-        # Основная модель недоступна (404 `model_not_found` / 529 `overloaded`) — один проход
+        # Основная модель недоступна (404 `model_not_found` / 529 — перегрузка) — один проход
         # на резервной, как при таймауте. Прочие отказы (вход, лимит…) резервная не лечит.
         fallback = PROTOCOL_GEN_FALLBACK_MODEL
         if not (is_model_unavailable(e) and fallback and fallback != primary_model):
@@ -2040,8 +2040,8 @@ def generate_protocol(
             _emit_run_log("failed", model=primary_model, reason="cli-error")
             raise ProtocolGenerationError(f"claude --print: {e}") from e
         logger.warning(
-            "[protocol] degraded meeting=%s reason=model-unavailable primary=%s code=%s → model=%s",
-            meeting_sid or "?", primary_model, getattr(e, "error_code", None), fallback,
+            "[protocol] degraded meeting=%s reason=model-unavailable primary=%s code=%s/%s → model=%s",
+            meeting_sid or "?", primary_model, e.api_error_status, e.error_code, fallback,
         )
         _emit_run_log("degraded", model=fallback, reason="primary-unavailable")
         try:
