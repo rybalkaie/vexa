@@ -82,9 +82,10 @@ def _distill_model() -> str:
 
     Извлечение durable-вывода — суждение, но дешёвое и консервативное (при сомнении
     пусто), поэтому Haiku по умолчанию держит проход вне бюджета Opus (Ф7: 2 Opus +
-    G11 Haiku; это 4-й LLM-вызов). Владелец может поднять до Opus env'ом.
+    G11 Haiku; это 4-й LLM-вызов). Владелец может поднять до Opus env'ом. Модель —
+    словом `haiku`: клиент берёт последнюю версию уровня.
     """
-    return (os.environ.get("KNOWLEDGE_DISTILL_MODEL") or "").strip() or "claude-haiku-4-5-20251001"
+    return (os.environ.get("KNOWLEDGE_DISTILL_MODEL") or "").strip() or "haiku"
 
 
 def _distill_timeout() -> int:

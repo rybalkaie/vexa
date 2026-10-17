@@ -73,9 +73,10 @@ _MAX_UNCLEAR_LEN = 400          # потолок склеенного непон
 _GROUP_ACK_THRESHOLD = int(os.environ.get("MIXED_REPLY_ACK_GROUP_THRESHOLD", "4") or "4")
 _MAX_NAMES_PER_GROUP = int(os.environ.get("MIXED_REPLY_ACK_NAMES_PER_GROUP", "6") or "6")
 
-# Модель — Haiku (A2), как маппинг имён / классификаторы. Дешёвая, задача структурная.
+# Модель — уровень Haiku (A2) словом `haiku`, как классификаторы. Дешёвая, задача
+# структурная. На проде env `MIXED_REPLY_SPLIT_MODEL=sonnet` поднимает её до Sonnet.
 _SPLIT_MODEL = (os.environ.get("MIXED_REPLY_SPLIT_MODEL") or "").strip() \
-    or "claude-haiku-4-5-20251001"
+    or "haiku"
 
 # Таймаут LLM-сплиттера (R3/FU-8). Дефолт поднят 30→120с: реальный сплит большой пачки
 # (~25 задач у Михаила) занимает ~57с (замер Ф6), а прежние 30с ловили `ClaudeCliTimeout`

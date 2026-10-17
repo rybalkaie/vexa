@@ -58,13 +58,11 @@ def _redact_secret_like(text: str) -> str:
     return text
 
 
-def stream_error_summary(stdout: Optional[str]) -> Optional[str]:
-    """Короткая причина сбоя из вывода `stream-json` — без текста ответа модели.
+def _stream_error_events(stdout: Optional[str]) -> tuple[Optional[dict], Optional[dict]]:
+    """Последнее событие `result` и последнее `assistant` с `is_api_error_message`.
 
-    Разбирает не больше 50 последних строк: последнее событие `result` и последнее
-    `assistant` с `is_api_error_message: true`. Возвращает, например,
-    `subtype=success terminal_reason=api_error error=authentication_failed
-    msg='Not logged in · Please run /login'`, или None, если разбирать нечего.
+    Разбирает не больше 50 последних строк потока. Общая часть для
+    `stream_error_summary` (строка в журнал) и `stream_error_codes` (коды для кода).
     """
     import json as _json  # локально, как у остальных вариантов вызова
 
@@ -85,6 +83,41 @@ def stream_error_summary(stdout: Optional[str]) -> Optional[str]:
             api_error = ev
         if final is not None and api_error is not None:
             break
+    return final, api_error
+
+
+def stream_error_codes(stdout: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+    """Коды отказа API из вывода `stream-json`: (`api_error_status`, `error`).
+
+    Только коды — число и строка строго `[a-z_]` (как в `stream_error_summary`), без
+    текста ответа модели. По ним генерация протокола отличает «модель недоступна»
+    (`model_not_found` 404, `overloaded` 529 — коды CLI 2.1.300) от прочих
+    сбоев. Нечего разобрать → (None, None).
+    """
+    final, api_error = _stream_error_events(stdout)
+    status: Optional[int] = None
+    code: Optional[str] = None
+    for src in (api_error, final):
+        if not isinstance(src, dict):
+            continue
+        st = src.get("api_error_status")
+        if status is None and isinstance(st, int) and not isinstance(st, bool):
+            status = st
+        val = src.get("error")
+        if code is None and isinstance(val, str) and _STREAM_CODE_RE.match(val):
+            code = val
+    return status, code
+
+
+def stream_error_summary(stdout: Optional[str]) -> Optional[str]:
+    """Короткая причина сбоя из вывода `stream-json` — без текста ответа модели.
+
+    Разбирает не больше 50 последних строк: последнее событие `result` и последнее
+    `assistant` с `is_api_error_message: true`. Возвращает, например,
+    `subtype=success terminal_reason=api_error error=authentication_failed
+    msg='Not logged in · Please run /login'`, или None, если разбирать нечего.
+    """
+    final, api_error = _stream_error_events(stdout)
     parts: list[str] = []
     for src in (final, api_error):
         if not isinstance(src, dict):
@@ -122,7 +155,108 @@ class ClaudeCliTimeout(ClaudeCliError):
 
 
 class ClaudeCliFailed(ClaudeCliError):
-    """Ненулевой exit, пустой stdout, прочие неуспехи."""
+    """Ненулевой exit, пустой stdout, прочие неуспехи.
+
+    `api_error_status` / `error_code` — коды отказа API из потока `stream-json`, если
+    их удалось разобрать (иначе None). По ним `is_model_unavailable` узнаёт «модель
+    недоступна».
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        api_error_status: Optional[int] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.api_error_status = api_error_status
+        self.error_code = error_code
+
+
+# ---------------------------------------------------------------------------
+# Модель словом уровня и явное усилие
+# ---------------------------------------------------------------------------
+# Модель зовём СЛОВОМ уровня (`opus` / `sonnet` / `haiku`): клиент Claude Code сам
+# подставляет последнюю версию уровня — номер не устаревает, а снятый номер клиент
+# отвергает (404 `model_not_found`), и служба бы встала.
+#
+# Усилие (`--effort`) передаём ЯВНО, по уровню модели: у каждой версии своё умолчание,
+# и без флага усилие менялось бы вместе с версией (проверено на CLI 2.1.300):
+#   • opus → high: Opus 5.5 без флага думает на `medium`, протоколу нужен `high`;
+#   • sonnet → high: умолчание Sonnet и так `high` — флаг его закрепляет;
+#   • haiku → low: Haiku 5.5 без флага думает на `medium`; классификаторам хватает
+#     `low` — это ближе всего к Haiku без размышлений и не дороже.
+# Переопределение без выкатки кода: `NOTARY_CLAUDE_EFFORT_OPUS|SONNET|HAIKU`
+# (`low`…`max`; `none` — флаг не передавать, решает клиент). Явный `effort=` у вызова
+# сильнее всего. Своё имя переменной, не `CLAUDE_EFFORT`: ту читает сам клиент.
+# Уровень узнаётся и по номеру (`claude-opus-4-8` → opus); модели без поддержки усилия
+# (Haiku 4.5) клиент флаг молча отбрасывает — откат номером безопасен.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+TIER_DEFAULT_EFFORT = {"opus": "high", "sonnet": "high", "haiku": "low"}
+_EFFORT_OFF = ("none", "off", "default")
+_TIER_RE = re.compile(r"^(?:claude-)?(opus|sonnet|haiku)(?:$|[-\[])")
+
+# «Модель недоступна»: снята/нет доступа (404 `model_not_found`) или перегружена
+# после собственных повторов клиента (529 `overloaded`). Коды — из перечня CLI 2.1.300.
+_MODEL_UNAVAILABLE_CODES = frozenset({"model_not_found", "overloaded"})
+_MODEL_UNAVAILABLE_STATUSES = frozenset({404, 529})
+
+
+def model_tier(model: Optional[str]) -> Optional[str]:
+    """Уровень модели: `opus` / `sonnet` / `haiku` — по слову или по номеру; иначе None."""
+    if not model:
+        return None
+    m = _TIER_RE.match(str(model).strip().lower())
+    return m.group(1) if m else None
+
+
+def resolve_effort(model: Optional[str], effort: Optional[str] = None) -> Optional[str]:
+    """Какое `--effort` передать клиенту: явное → переменная уровня → умолчание уровня.
+
+    None — флаг не передаётся (модель не задана / уровень не узнан / `none`).
+    """
+    if effort is not None and str(effort).strip():
+        val = str(effort).strip().lower()
+        if val in EFFORT_LEVELS:
+            return val
+        if val in _EFFORT_OFF:
+            return None
+        logger.warning("[claude-cli] усилие %r не распознано — беру по уровню модели", effort)
+    tier = model_tier(model)
+    if tier is None:
+        return None
+    env_name = f"NOTARY_CLAUDE_EFFORT_{tier.upper()}"
+    raw = (os.environ.get(env_name) or "").strip().lower()
+    if raw:
+        if raw in EFFORT_LEVELS:
+            return raw
+        if raw in _EFFORT_OFF:
+            return None
+        logger.warning(
+            "[claude-cli] %s=%r не распознано — беру %s", env_name, raw, TIER_DEFAULT_EFFORT[tier],
+        )
+    return TIER_DEFAULT_EFFORT[tier]
+
+
+def model_args(model: Optional[str], effort: Optional[str] = None) -> list[str]:
+    """`--model <m>` и `--effort <e>` для командной строки клиента (усилие — `resolve_effort`)."""
+    args: list[str] = []
+    if model:
+        args += ["--model", model]
+    eff = resolve_effort(model, effort)
+    if eff:
+        args += ["--effort", eff]
+    return args
+
+
+def is_model_unavailable(exc: BaseException) -> bool:
+    """Отказ из-за самой модели (снята / нет доступа / перегружена), а не прочий сбой."""
+    if not isinstance(exc, ClaudeCliFailed):
+        return False
+    if exc.error_code in _MODEL_UNAVAILABLE_CODES:
+        return True
+    return exc.api_error_status in _MODEL_UNAVAILABLE_STATUSES
 
 
 def call_claude_print(
@@ -131,6 +265,7 @@ def call_claude_print(
     system: Optional[str] = None,
     timeout: int = 60,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> str:
     """Запускает `claude --print` через stdin, возвращает stdout (stripped).
 
@@ -140,9 +275,11 @@ def call_claude_print(
               два перевода строки (CLI `--print` поддерживает только plain
               stdin без отдельного system-канала).
       timeout: секунды на выполнение subprocess.
-      model: опциональный явный выбор модели (например, `claude-sonnet-4-6`
-             или `sonnet`/`opus` алиас). None → дефолт CLI (того, кто
+      model: модель — словом уровня (`opus` / `sonnet` / `haiku`, клиент берёт
+             последнюю версию) или номером. None → дефолт CLI (того, кто
              залогинен). Прокидывается в subprocess как `--model <value>`.
+      effort: усилие (`low`…`max`); None → по уровню модели (`resolve_effort`).
+              Прокидывается как `--effort <value>`.
 
     Возвращает: stripped stdout. На любую ошибку — ClaudeCliError-подкласс.
 
@@ -166,9 +303,7 @@ def call_claude_print(
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
 
-    cmd = [claude_bin, "--print"]
-    if model:
-        cmd += ["--model", model]
+    cmd = [claude_bin, "--print"] + model_args(model, effort)
 
     started = time.monotonic()
     try:
@@ -197,8 +332,9 @@ def call_claude_print(
             f"claude --print вернул пустой stdout (elapsed={elapsed:.1f}s)"
         )
     logger.debug(
-        "claude --print ok: model=%s prompt_len=%d output_len=%d elapsed=%.1fs",
-        model or "(default)", len(full_prompt), len(raw), elapsed,
+        "claude --print ok: model=%s effort=%s prompt_len=%d output_len=%d elapsed=%.1fs",
+        model or "(default)", resolve_effort(model, effort) or "(default)",
+        len(full_prompt), len(raw), elapsed,
     )
     return raw
 
@@ -229,12 +365,14 @@ def call_claude_print_json(
     system: Optional[str] = None,
     timeout: int = 60,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
 ) -> "ClaudeCliResult":
     """Как `call_claude_print`, но через `--output-format json` — даёт стоимость.
 
     Зачем: Ф8 LLM-proposer должен учитывать расходы Claude API (РИСК6 плана).
     Подписочный CLI отдаёт `total_cost_usd` и `usage` в JSON-обёртке, поэтому
-    SDK/ANTHROPIC_API_KEY не нужны — берём цифры отсюда.
+    SDK/ANTHROPIC_API_KEY не нужны — берём цифры отсюда. `model`/`effort` — как у
+    `call_claude_print` (усилие по уровню модели, если не задано явно).
 
     На любую ошибку (бинарник, timeout, ненулевой exit, невалидный JSON) —
     ClaudeCliError-подкласс (как у text-варианта). Вызывающий решает сам.
@@ -257,9 +395,7 @@ def call_claude_print_json(
         timeout = _floor
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
-    cmd = [claude_bin, "--print", "--output-format", "json"]
-    if model:
-        cmd += ["--model", model]
+    cmd = [claude_bin, "--print", "--output-format", "json"] + model_args(model, effort)
 
     started = time.monotonic()
     try:
@@ -297,8 +433,10 @@ def call_claude_print_json(
     in_tok = int(usage.get("input_tokens", 0) or 0)
     out_tok = int(usage.get("output_tokens", 0) or 0)
     logger.debug(
-        "claude --print(json) ok: model=%s prompt_len=%d out_len=%d cost=$%.4f in=%d out=%d elapsed=%.1fs",
-        model or "(default)", len(full_prompt), len(text), cost_usd, in_tok, out_tok, elapsed,
+        "claude --print(json) ok: model=%s effort=%s prompt_len=%d out_len=%d cost=$%.4f "
+        "in=%d out=%d elapsed=%.1fs",
+        model or "(default)", resolve_effort(model, effort) or "(default)",
+        len(full_prompt), len(text), cost_usd, in_tok, out_tok, elapsed,
     )
     return ClaudeCliResult(text.strip(), cost_usd, in_tok, out_tok, envelope)
 
@@ -338,8 +476,14 @@ def call_claude_print_stream_json(
     timeout: int = 60,
     model: Optional[str] = None,
     max_thinking_tokens: Optional[int] = None,
+    effort: Optional[str] = None,
 ) -> "ClaudeCliStreamResult":
     """Как `call_claude_print`, но через `--output-format stream-json --verbose`.
+
+    `model`/`effort` — как у `call_claude_print` (усилие по уровню модели, если не
+    задано явно). Отказ API (ненулевой код или `is_error`) несёт коды в
+    `ClaudeCliFailed.api_error_status` / `.error_code` — по ним генерация протокола
+    узнаёт «модель недоступна» (`is_model_unavailable`).
 
     Зачем отдельный режим (Ф2 ISS-31, РИСК1): это единственный вывод CLI, где
     приходит `stop_reason` — нужен, чтобы отличить усечение по лимиту вывода
@@ -352,7 +496,10 @@ def call_claude_print_stream_json(
     max_thinking_tokens: если задан — пробрасывается в subprocess как env
     `MAX_THINKING_TOKENS` (тот же механизм, что у интерактивного Claude Code).
     `0` — принудительно выключает thinking (`type: "disabled"` в теле запроса
-    к API — подтверждено статическим разбором CLI, ветка `qe===0`).
+    к API — подтверждено статическим разбором CLI, ветка `qe===0`). Моделям 5.5,
+    у которых размышление не выключается (API ответил бы 400), клиент его не
+    шлёт: на CLI 2.1.300 `opus`/`sonnet` с `MAX_THINKING_TOKENS=0` отвечают без
+    ошибки.
     `>0` — запрошенный бюджет; спайк Ф2 (реальные вызовы на `claude-sonnet-5`
     + справочные строки самого CLI-бинаря про `budget_tokens`) показал: рычаг
     реально переключает наличие thinking (on/off), но как ЧИСЛЕННЫЙ потолок
@@ -386,8 +533,7 @@ def call_claude_print_stream_json(
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
     cmd = [claude_bin, "--print", "--output-format", "stream-json", "--verbose"]
-    if model:
-        cmd += ["--model", model]
+    cmd += model_args(model, effort)
 
     # env копируем целиком (subprocess.run(env=...) ЗАМЕНЯЕТ окружение, не
     # мёржит) — иначе claude потеряет PATH/авторизацию/остальной контекст.
@@ -413,10 +559,12 @@ def call_claude_print_stream_json(
         # Причину — ДО stderr: генерация протокола режет сообщение до 200 знаков,
         # а при отказе API stderr пуст и вся суть лежит в потоке (см. выше).
         cause = stream_error_summary(result.stdout)
+        status, code = stream_error_codes(result.stdout)
         raise ClaudeCliFailed(
             f"claude --print (stream-json) exit={result.returncode}"
             + (f" [{cause}]" if cause else "")
-            + f", stderr={stderr_snippet!r}"
+            + f", stderr={stderr_snippet!r}",
+            api_error_status=status, error_code=code,
         )
     lines = [ln for ln in (result.stdout or "").splitlines() if ln.strip()]
     if not lines:
@@ -437,9 +585,11 @@ def call_claude_print_stream_json(
     if final.get("is_error"):
         # Раньше сюда шли первые 200 знаков `result` как есть; теперь — тем же
         # разбором, что при ненулевом коде: одна строка ошибки, без секретов.
+        status, code = stream_error_codes(result.stdout)
         raise ClaudeCliFailed(
             "claude --print (stream-json) is_error: [%s]"
-            % (stream_error_summary(result.stdout) or "причина не разобрана")
+            % (stream_error_summary(result.stdout) or "причина не разобрана"),
+            api_error_status=status, error_code=code,
         )
     text = final.get("result") or ""
     if not isinstance(text, str) or not text.strip():
@@ -451,9 +601,9 @@ def call_claude_print_stream_json(
     in_tok = int(usage.get("input_tokens", 0) or 0)
     out_tok = int(usage.get("output_tokens", 0) or 0)
     logger.debug(
-        "claude --print(stream-json) ok: model=%s prompt_len=%d out_len=%d "
+        "claude --print(stream-json) ok: model=%s effort=%s prompt_len=%d out_len=%d "
         "stop_reason=%s cost=$%.4f in=%d out=%d elapsed=%.1fs",
-        model or "(default)", len(full_prompt), len(text), stop_reason,
-        cost_usd, in_tok, out_tok, elapsed,
+        model or "(default)", resolve_effort(model, effort) or "(default)",
+        len(full_prompt), len(text), stop_reason, cost_usd, in_tok, out_tok, elapsed,
     )
     return ClaudeCliStreamResult(text.strip(), stop_reason, cost_usd, in_tok, out_tok, final)

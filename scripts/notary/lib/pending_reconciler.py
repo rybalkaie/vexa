@@ -143,9 +143,9 @@ _DEFAULT_BITRIX_TASKS_LIMIT = 25       # потолок задач (границ
 _DEFAULT_BITRIX_COMMENTS_PER_TASK = 20  # потолок САМЫХ СВЕЖИХ комментариев на задачу
 _DEFAULT_BITRIX_TIMEOUT = 45           # таймаут ОДНОГО вызова bitrix.sh (сек)
 
-# Модель LLM-матчинга — Haiku (как фильтр значимости Ф4 / маппинг имён). Переопределимо.
+# Модель LLM-матчинга — уровень Haiku словом (как фильтр значимости Ф4). Переопределимо.
 _RECONCILER_MODEL = (os.environ.get("PENDING_RECONCILER_MODEL") or "").strip() \
-    or "claude-haiku-4-5-20251001"
+    or "haiku"
 _DEFAULT_RECONCILER_TIMEOUT = 60
 
 # Окно/объём свидетельств — границы egress (опасная тройка: «в промпт минимум»). Не

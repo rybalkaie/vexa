@@ -622,8 +622,9 @@ def is_intent_llm_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Модель — уровень Haiku словом: клиент берёт последнюю версию уровня.
 _INTENT_MODEL = (os.environ.get("PENDING_STATUS_INTENT_MODEL") or "").strip() \
-    or "claude-haiku-4-5-20251001"
+    or "haiku"
 _INTENT_TIMEOUT = int(os.environ.get("PENDING_STATUS_INTENT_TIMEOUT", "30") or "30")
 _MAX_REPLY_LEN = 600
 _MAX_ITEMS_IN_PROMPT = 12

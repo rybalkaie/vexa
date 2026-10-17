@@ -79,10 +79,10 @@ _MAX_SUBJECT_LEN = 80
 _MAX_SUBJECTS = 4
 _MAX_RULE_LEN = 240
 
-# Модель — Haiku (A2), как маппинг имён / cross-memory классификатор. Дешёвая,
-# быстрая; задача бинарно-структурная. env-override без передеплоя кода.
+# Модель — уровень Haiku (A2) словом `haiku`: последняя версия уровня, усилие `low` по
+# уровню. Дешёвая, быстрая; задача бинарно-структурная. env-override без передеплоя кода.
 _CLASSIFY_MODEL = (os.environ.get("FEEDBACK_LLM_CLASSIFY_MODEL") or "").strip() \
-    or "claude-haiku-4-5-20251001"
+    or "haiku"
 # Промпт крошечный (правка + имена), JSON короткий — таймаут с запасом; глобальный
 # пол CLAUDE_MIN_TIMEOUT (claude_cli) применяется поверх.
 _CLASSIFY_TIMEOUT = int(os.environ.get("FEEDBACK_LLM_CLASSIFY_TIMEOUT", "30") or "30")

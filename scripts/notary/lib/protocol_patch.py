@@ -82,10 +82,10 @@ _MAX_OPS = 12
 
 # Таймаут запроса патча у Claude. Задача мелкая (вернуть короткий JSON), но модель
 # читает весь протокол — берём с запасом; глобальный пол CLAUDE_MIN_TIMEOUT (claude_cli)
-# применяется поверх. Отдельной модели НЕ вводим (A4): None → дефолт CLI, env-override
-# PROTOCOL_PATCH_MODEL — как у прочих call-site'ов.
+# применяется поверх. Модель — уровень Sonnet явным словом: без слова клиент взял бы своё
+# умолчание (сейчас Opus), и уровень вырос бы сам. env-override PROTOCOL_PATCH_MODEL.
 _PATCH_TIMEOUT = int(os.environ.get("PROTOCOL_PATCH_TIMEOUT", "120") or "120")
-_PATCH_MODEL = (os.environ.get("PROTOCOL_PATCH_MODEL") or "").strip() or None
+_PATCH_MODEL = (os.environ.get("PROTOCOL_PATCH_MODEL") or "").strip() or "sonnet"
 
 
 def is_enabled() -> bool:

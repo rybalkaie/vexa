@@ -3411,7 +3411,7 @@ def mark_open_tasks_onboarded(
 # `claude` (он в PATH) НЕ зовётся → unittest не дёргает сеть и остаётся зелёным.
 # Включается владельцем control-gate'ом деплоя, как ENABLE_FEEDBACK_LLM_CLASSIFY.
 _SIGNIFICANCE_MODEL = (os.environ.get("OPEN_TASKS_SIGNIFICANCE_MODEL") or "").strip() \
-    or "claude-haiku-4-5-20251001"
+    or "haiku"
 _DEFAULT_SIGNIFICANCE_TIMEOUT = 30
 
 

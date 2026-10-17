@@ -1438,8 +1438,8 @@ def main() -> int:
     # 4a-ter. Забор РЕШЕНИЙ из готового протокола в журнал второго мозга (Д2.2, R4).
     # Гейт ENABLE_MEETING_DECISION_DRAFTS (дефолт OFF) — на боевые встречи без флага
     # ноль влияния. Скраб fail-closed внутри prepare_extraction (Опасная тройка не
-    # уходит в LLM). Извлечение — тем же claude --print, что и маппинг имён (подписка
-    # владельца). Результат — черновик в транспорт-очередь mac←VPS (queue_path).
+    # уходит в LLM). Извлечение — claude --print, уровень Sonnet явным словом (env
+    # MEETING_DECISION_MODEL). Результат — черновик в транспорт-очередь mac←VPS (queue_path).
     # Best-effort: ЛЮБОЙ сбой здесь НЕ валит финализацию (протокол уже на диске).
     if os.environ.get("ENABLE_MEETING_DECISION_DRAFTS", "0") != "0":
         try:
@@ -1451,7 +1451,7 @@ def main() -> int:
                 log.info("[decision-drafts] пропуск извлечения: %s", _prep.get("reason"))
             else:
                 _draft = _ccp(
-                    _prep["prompt"],
+                    _prep["prompt"], model=os.environ.get("MEETING_DECISION_MODEL") or "sonnet",
                     timeout=int(os.environ.get("MEETING_DECISION_TIMEOUT", "120")),
                 )
                 _norm = (_draft or "").strip()

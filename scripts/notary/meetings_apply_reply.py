@@ -69,6 +69,7 @@ from notary.lib.meeting_identity import (  # noqa: E402
     fingerprint,
     is_owner_named,
 )
+from notary.lib.claude_cli import model_args  # noqa: E402 — модель словом + усилие по уровню
 
 # STATE_DIR читаем из env — ровно как вечерний блок и остальные модули зоны.
 # Иначе стенд/второй инстанс пишет snapshot в один каталог, а читает из другого.
@@ -86,6 +87,9 @@ CLAUDE_BIN = os.path.expanduser(os.environ.get(
     "CLAUDE_BIN", "~/.npm-global/bin/claude"
 ))
 CLAUDE_TIMEOUT_S = 90
+# Модель разбора — уровень Sonnet явным словом (без слова клиент взял бы своё умолчание,
+# сейчас Opus), усилие по уровню (`claude_cli.model_args`); env-override без передеплоя.
+APPLY_REPLY_MODEL = (os.environ.get("APPLY_REPLY_MODEL") or "").strip() or "sonnet"
 
 # `no_answer` — владелец про этот номер НЕ СКАЗАЛ НИЧЕГО. Это не решение:
 # следа на диске не оставляем, завтра встреча снова попадёт в блок. Заведено,
@@ -232,7 +236,7 @@ def parse_claude_output(raw: str, expected_ns: set[int]) -> list[dict[str, Any]]
 
 def call_claude(prompt: str) -> str:
     """Запустить claude --print с промптом на stdin. Возвращает stdout."""
-    cmd = [CLAUDE_BIN, "--print"]
+    cmd = [CLAUDE_BIN, "--print"] + model_args(APPLY_REPLY_MODEL)
     try:
         proc = subprocess.run(
             cmd,

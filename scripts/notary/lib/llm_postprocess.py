@@ -59,6 +59,7 @@ from .claude_cli import (
     ClaudeCliTimeout,
     call_claude_print,
     call_claude_print_stream_json,
+    is_model_unavailable,
 )
 from . import clarify_state
 from . import context_knowledge
@@ -77,6 +78,10 @@ logger = logging.getLogger(__name__)
 
 
 # ---------- Source 3 (LLM): маппинг имён ----------
+
+# Модель сопоставления «Спикер N» → имя и разбора уточнения спикеров — уровень Sonnet явным
+# словом: без слова клиент взял бы своё умолчание (сейчас Opus), и уровень вырос бы сам.
+SPEAKER_MAP_MODEL = "sonnet"
 
 MAP_SPEAKER_NAMES_SYSTEM_PROMPT = """Ты помогаешь определить, кто из участников встречи какой реплики говорил.
 Тебе дан список имён участников и блоки реплик кластеров SPEAKER_00, SPEAKER_01 и т.д.
@@ -368,6 +373,7 @@ def map_speaker_names(
             user_prompt,
             system=MAP_SPEAKER_NAMES_SYSTEM_PROMPT,
             timeout=90,
+            model=SPEAKER_MAP_MODEL,
         )
     except ClaudeCliNotInstalled:
         logger.warning("[llm-map] `claude` not in PATH — пропуск")
@@ -601,6 +607,7 @@ def _llm_parse_text_answer(
             user_prompt,
             system=PARSE_TEXT_FALLBACK_SYSTEM_PROMPT,
             timeout=45,
+            model=SPEAKER_MAP_MODEL,
         )
     except ClaudeCliNotInstalled:
         logger.warning("[clarify-parse-llm] `claude` not in PATH — fallback skipped")
@@ -1208,23 +1215,23 @@ def clarify_speakers_via_telegram(
 
 # ---------- Ф4: генератор протокола встречи ------------------------------
 
-# Ф3 (G1): модель генерации протокола — Opus 4.8. Sonnet 4.6 «плоско» собирал
-# связки «кто за что / что решили / что висит» и смешивал данные; Opus умнее на
-# синтезе (план `2026-06-13-umnyi-protokol-assemblyai.md`, REQ G1). Env
-# `PROTOCOL_GEN_MODEL` переопределяет — откат на Sonnet без передеплоя кода.
-# Передаётся в `call_claude_print_stream_json(model=...)` (Ф2: `call_claude_print`
-# заменён на stream-json вариант ради `stop_reason`, см. `generate_protocol`) →
-# `--model <value>` в subprocess. Opus медленнее Sonnet → см. таймаут/деградацию
-# ниже (РИСК1).
-PROTOCOL_GEN_MODEL = (os.environ.get("PROTOCOL_GEN_MODEL") or "claude-opus-4-8").strip()
+# Ф3 (G1): модель генерации протокола — уровень Opus словом `opus` (клиент берёт последнюю
+# версию уровня; усилие `high` по уровню — `claude_cli.resolve_effort`). Sonnet «плоско»
+# собирал связки «кто за что / что решили / что висит»; Opus умнее на синтезе (план
+# `2026-06-13-umnyi-protokol-assemblyai.md`, REQ G1). Env `PROTOCOL_GEN_MODEL` переопределяет
+# — откат на номер или на Sonnet без передеплоя кода. Передаётся в
+# `call_claude_print_stream_json(model=...)` (Ф2: ради `stop_reason`, см. `generate_protocol`)
+# → `--model <value>`. Opus медленнее Sonnet → см. таймаут/деградацию ниже (РИСК1).
+PROTOCOL_GEN_MODEL = (os.environ.get("PROTOCOL_GEN_MODEL") or "opus").strip()
 
-# Ф3 (РИСК1): резервная модель генерации на случай ТАЙМАУТА основной (Opus) на
-# длинной встрече. Деградация = один проход на более быстрой модели вместо
+# Ф3 (РИСК1): резервная модель генерации (уровень Sonnet словом) — на случай ТАЙМАУТА
+# основной (Opus) на длинной встрече или её НЕДОСТУПНОСТИ (снята / нет доступа / перегружена —
+# `claude_cli.is_model_unavailable`). Деградация = один проход на более быстрой модели вместо
 # молчаливой потери протокола (встреча не теряется, см. `generate_protocol`).
-# Пусто (`PROTOCOL_GEN_FALLBACK_MODEL=`) → фолбэка нет, таймаут пробрасывается как
+# Пусто (`PROTOCOL_GEN_FALLBACK_MODEL=`) → фолбэка нет, отказ пробрасывается как
 # `ProtocolGenerationError` (kill-switch деградации).
 PROTOCOL_GEN_FALLBACK_MODEL = (
-    os.environ.get("PROTOCOL_GEN_FALLBACK_MODEL", "claude-sonnet-4-6") or ""
+    os.environ.get("PROTOCOL_GEN_FALLBACK_MODEL", "sonnet") or ""
 ).strip()
 
 # Ф3 (РИСК1): дефолтный таймаут генерации протокола. Был 180с — мало для Opus на
@@ -1841,7 +1848,7 @@ def generate_protocol(
     series_memory: Optional[str] = None,
     open_tasks: Optional[str] = None,
 ) -> str:
-    """Генерирует .md-файл протокола встречи из транскрипта через Claude (Ф3: Opus 4.8).
+    """Генерирует .md-файл протокола встречи из транскрипта через Claude (уровень Opus, `PROTOCOL_GEN_MODEL`).
 
     Параметры:
       transcript_md: содержимое финального транскрипта (с применёнными именами).
@@ -1924,8 +1931,8 @@ def generate_protocol(
     # (Opus) не уложилась в таймаут на длинной встрече — один проход на резервной
     # модели (`PROTOCOL_GEN_FALLBACK_MODEL`, по умолч. Sonnet), чтобы встреча НЕ
     # потерялась. Видимая пометка — в structured-лог (`degraded=...`), без текста
-    # транскрипта/ролей (G10/опасная тройка). Не-таймаут-ошибки и отсутствие CLI
-    # ведут себя как до Ф3 (понятный отказ, не тихий None).
+    # транскрипта/ролей (G10/опасная тройка). Недоступная основная модель — так же; прочие
+    # отказы и отсутствие CLI — понятный отказ без фолбэка (не тихий None).
     primary_model = PROTOCOL_GEN_MODEL
     model_used = primary_model
     degraded_reason = "no"
@@ -2022,12 +2029,30 @@ def generate_protocol(
         model_used = retry_model
         degraded_reason = "primary-timeout"
     except ClaudeCliError as e:
+        # Основная модель недоступна (404 `model_not_found` / 529 `overloaded`) — один проход
+        # на резервной, как при таймауте. Прочие отказы (вход, лимит…) резервная не лечит.
+        fallback = PROTOCOL_GEN_FALLBACK_MODEL
+        if not (is_model_unavailable(e) and fallback and fallback != primary_model):
+            logger.warning(
+                "[protocol] failed meeting=%s error=%s retry=0",
+                meeting_sid or "?", str(e)[:200],
+            )
+            _emit_run_log("failed", model=primary_model, reason="cli-error")
+            raise ProtocolGenerationError(f"claude --print: {e}") from e
         logger.warning(
-            "[protocol] failed meeting=%s error=%s retry=0",
-            meeting_sid or "?", str(e)[:200],
+            "[protocol] degraded meeting=%s reason=model-unavailable primary=%s code=%s → model=%s",
+            meeting_sid or "?", primary_model, getattr(e, "error_code", None), fallback,
         )
-        _emit_run_log("failed", model=primary_model, reason="cli-error")
-        raise ProtocolGenerationError(f"claude --print: {e}") from e
+        _emit_run_log("degraded", model=fallback, reason="primary-unavailable")
+        try:
+            stream = _call(fallback, budget=thinking_budget)
+        except ClaudeCliError as e2:
+            _emit_run_log("failed", model=fallback, reason="unavailable-fallback-failed")
+            raise ProtocolGenerationError(
+                f"claude --print: основная модель недоступна ({primary_model}: {e}) "
+                f"+ резервная ({fallback}): {e2}"
+            ) from e2
+        model_used, degraded_reason = fallback, "primary-unavailable"
 
     # Ф2 (ISS-31 REQ 31.1/31.2, A6/A9): усечение ПОСЛЕ шапки
     # (`stop_reason == "max_tokens"`) или отсутствие шапки вовсе — оба «неполный
@@ -2329,12 +2354,12 @@ _CROSS_SENSITIVE_SYSTEM_PROMPT = (
 
 
 def _cross_classifier_model() -> str:
-    """Модель G11-классификатора `CROSS_MEMORY_CLASSIFIER_MODEL` (дефолт Haiku).
+    """Модель G11-классификатора `CROSS_MEMORY_CLASSIFIER_MODEL` (дефолт — уровень Haiku словом).
 
     Классификация бинарная и дешёвая — Haiku достаточно; держит классификатор вне
     бюджета Opus (Ф7: 2 Opus-вызова; это ТРЕТИЙ LLM-вызов, но Haiku — см. handoff §5).
     """
-    return (os.environ.get("CROSS_MEMORY_CLASSIFIER_MODEL") or "").strip() or "claude-haiku-4-5-20251001"
+    return (os.environ.get("CROSS_MEMORY_CLASSIFIER_MODEL") or "").strip() or "haiku"
 
 
 def _cross_classifier_timeout() -> int:
@@ -2556,8 +2581,8 @@ TASK_SPHERES_CLOSED_LIST = (
     "новый-доход",
 )
 
-TASK_EXTRACTION_MODEL = "claude-sonnet-4-6"
-TASK_PARSE_FALLBACK_MODEL = "claude-haiku-4-5-20251001"
+TASK_EXTRACTION_MODEL = "sonnet"
+TASK_PARSE_FALLBACK_MODEL = "haiku"
 
 # Порог анти-галлюцинации задач по длительности встречи (Идея2 + РИСК3
 # в плане). Длительность в минутах из meta.audioDurationS / meta.durationS.
@@ -3265,7 +3290,7 @@ def _build_stakeholder_bullet_block(tasks: list[dict], meeting_meta: dict) -> li
 
 # --- Ф3: автосвязка протокол → трек стейкхолдера (закрытие + добавление) ---
 
-STAKEHOLDER_TRACK_SYNC_MODEL = "claude-sonnet-4-6"
+STAKEHOLDER_TRACK_SYNC_MODEL = "sonnet"
 
 _STK_SYNC_OPEN_H2_RE = re.compile(r"^##\s+🟢\s+Открыто\b")
 # Подсекция «🟢 Открыто», помеченная «… не закрывать …» (боевой паттерн:
@@ -4016,9 +4041,9 @@ def parse_task_filter_answer(text: str, n_tasks: int) -> Optional[list[int]]:
 # уже доставлено в нужный chat и количество частей совпадает — пропуск.
 # Любое изменение `meta.json` — atomic через `_atomic_write_text(json.dumps)`.
 
-# Модель для summary «было/стало» при коррекции — Haiku 4.5 (быстро, дёшево,
+# Модель для summary «было/стало» при коррекции — уровень Haiku словом (быстро, дёшево,
 # хватит на 5-10 строк сравнения).
-CORRECTION_SUMMARY_MODEL = "claude-haiku-4-5-20251001"
+CORRECTION_SUMMARY_MODEL = "haiku"
 
 # Telegram delete_message: 48ч от момента доставки. После — старое сообщение
 # не удалить, новая версия прилетит как продолжение + предупреждение.
@@ -5458,9 +5483,9 @@ def apply_correction(
 # ОДИН раз, а не три. Контракт ответа — JSON с ключами по именам секций.
 # ===========================================================================
 
-# Модель ревью-прохода. Sonnet 4.6 — нужна аккуратность в сверке чисел и
+# Модель ревью-прохода — уровень Sonnet словом: нужна аккуратность в сверке чисел и
 # смысла «свободно↔занято»; Haiku на это слишком слаб (даёт false-positive).
-PROTOCOL_REVIEW_MODEL = "claude-sonnet-4-6"
+PROTOCOL_REVIEW_MODEL = "sonnet"
 
 # Маркер, который вставляется в строку протокола. Якорим по нему идемпотентность
 # (повторный проход не плодит дубли ⚠️).
@@ -5658,7 +5683,7 @@ def _is_vocative_journal_enabled() -> bool:
 # который читает владелец. ГРАН1/НЕС1: ревизия диаризации (Ф4) сходится в ЭТОТ ЖЕ
 # единственный вызов как секция `checks` — третьего Opus-вызова не заводим.
 PROTOCOL_REWRITE_MODEL = (
-    os.environ.get("PROTOCOL_REWRITE_MODEL") or "claude-opus-4-8"
+    os.environ.get("PROTOCOL_REWRITE_MODEL") or "opus"
 ).strip()
 
 

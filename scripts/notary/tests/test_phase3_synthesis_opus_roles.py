@@ -1,7 +1,8 @@
 """Ф3 (umnyi-protokol-assemblyai) — быстрые победы синтеза: Opus + роли + методичка.
 
 Покрывает REQ плана `plans/2026-06-13-umnyi-protokol-assemblyai.md`, Фаза 3:
-  - G1  — модель генерации протокола = Opus 4.8 (env-override), уходит в `--model`.
+  - G1  — модель генерации протокола = уровень Opus словом `opus` (env-override),
+           уходит в `--model`.
   - РИСК1 — таймаут Opus: дефолт ≥600s; деградация на резервную модель вместо
            молчаливой потери протокола; без фолбэка — понятный отказ (не тихий None).
   - G2  — блок «роли участников» (имя → зона) в user-промпте, отфильтрован к
@@ -75,7 +76,8 @@ def _capture_call():
 
 
 # ---------------------------------------------------------------------------
-# G1 — модель генерации = Opus 4.8
+# G1 — модель генерации = уровень Opus словом `opus` (клиент берёт последнюю версию
+# уровня)
 # ---------------------------------------------------------------------------
 class TestGenModelOpus(unittest.TestCase):
 
@@ -84,7 +86,7 @@ class TestGenModelOpus(unittest.TestCase):
         "PROTOCOL_GEN_MODEL переопределён через env — дефолт не проверить",
     )
     def test_default_model_is_opus(self):
-        self.assertEqual(lp.PROTOCOL_GEN_MODEL, "claude-opus-4-8")
+        self.assertEqual(lp.PROTOCOL_GEN_MODEL, "opus")
 
     def test_model_passed_to_cli(self):
         fake, cap = _capture_call()
