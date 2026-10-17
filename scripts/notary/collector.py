@@ -292,6 +292,8 @@ def main() -> int:
         if running:
             logger.info("Скип %s — бот ещё в звонке (контейнер %s)", sid, running)
             continue
+        if running_index.get("available"):
+            _close_finished_immediate_order(meta)
         # Ф10c: удержание исходников ставим ДО финализации — она сама сносит
         # копии из `_failed/` после успешного разбора.
         _portal_note_recording(sid, meta)
@@ -436,7 +438,7 @@ def _running_notarius_index() -> dict[str, Any]:
     fmt = '{{.Names}}\t{{.Label "' + SERIES_LABEL + '"}}'
     by_series: dict[str, list[str]] = {}
     unlabeled: list[str] = []
-    result = {"by_series": by_series, "unlabeled": unlabeled}
+    result = {"by_series": by_series, "unlabeled": unlabeled, "available": False}
     cmd = f"docker ps --filter name={NOTARIUS_NAME_PREFIX} --format {shlex.quote(fmt)}"
     try:
         ps_proc = ssh_capture(cmd, timeout=20)
@@ -449,6 +451,7 @@ def _running_notarius_index() -> dict[str, Any]:
             ps_proc.returncode, (ps_proc.stderr or "").strip()[:200],
         )
         return result
+    result["available"] = True
     for line in (ps_proc.stdout or "").splitlines():
         if not line.strip():
             continue
@@ -801,6 +804,36 @@ def _portal_order_for(sid: str, meta: dict | None) -> dict | None:
         return None
 
 
+def _close_finished_immediate_order(meta: dict | None) -> None:
+    """Завершившийся бот освобождает комнату до долгой финализации и доставки."""
+    if not isinstance(meta, dict):
+        return
+    try:
+        from notary.lib import portal_delivery  # noqa: PLC0415
+        from notary.lib import orders as orders_lib  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return
+        order = orders_lib.find_order_for_recording(
+            room_url=meta.get("meetingUrl"),
+            started_at=meta.get("startTs"),
+            session_uid=meta.get("sessionUid"),
+        )
+        if not isinstance(order, dict):
+            return
+        run = order.get("run")
+        if not isinstance(run, dict):
+            return
+        closed = orders_lib.close_immediate_after_recording(
+            str(order.get("id") or ""),
+            run_session_uid=str(run.get("session_uid") or ""),
+        )
+        if closed:
+            logger.info("Разовый наряд %s завершён вместе с записью", closed["id"])
+    except Exception as e:  # noqa: BLE001 — сбой реестра не теряет запись
+        logger.warning("Разовый наряд после записи не закрыт (%s)", type(e).__name__)
+
+
 def _portal_note_recording(sid: str, meta: dict | None) -> None:
     """Ф10c: встреча порталовая → удерживаем её исходники ДО подтверждения.
 
@@ -907,6 +940,9 @@ def _portal_enqueue_result(
         from notary.lib import portal_delivery, portal_ingest  # noqa: PLC0415
 
         order_id = str(order.get("id") or "")
+        # Версия НАРЯДА растёт от правок расписания; версия РЕЗУЛЬТАТА — только
+        # от нового захода по той же карточке. Это разные счётчики.
+        version = int(order.get("result_version") or 1)
         # Удержание могло не встать раньше (наряд появился уже после старта
         # обработки) — ставим до записи в очередь, а не после.
         portal_delivery.hold(session_uid, order_id=order_id)
@@ -922,7 +958,7 @@ def _portal_enqueue_result(
         payload = portal_ingest.build_payload(
             order_id=order_id,
             meeting_id=order.get("meeting_id"),
-            version=1,
+            version=version,
             company=order.get("company"),
             session_uid=session_uid,
             protocol_md=_read(protocol_path),
@@ -950,7 +986,7 @@ def _portal_enqueue_result(
         portal_delivery.enqueue(
             order_id=order_id,
             meeting_id=order.get("meeting_id"),
-            version=1,
+            version=version,
             session_uid=session_uid,
             company=order.get("company"),
             payload=payload,

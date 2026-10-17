@@ -406,6 +406,8 @@ class Hooks:
     #: бессмыслен/невозможен) — отсюда запускатель шлёт порталу `no_show` и
     #: закрывает разовый наряд «Подключить сейчас» (фаза 5, хвост У9).
     gave_up: Callable[[Dict[str, Any], str], None] = _noop
+    #: Подтверждённый выход бота после входа в звонок; разовый наряд можно снять.
+    completed: Callable[[Dict[str, Any]], None] = _noop
     #: Вход подтверждён НЕ с первой попытки: (запись, номер попытки, когда бот вошёл).
     #: Повтор заходит на минуты позже; пришлось это на время после начала встречи —
     #: первых минут в записи нет, и протокол обязан это сказать (сквозной цикл5,
@@ -557,7 +559,12 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             if container.status in _GONE:
                 entry["state"] = "done"
                 entry["closed_at"] = now.isoformat()
-                changed = True
+                if _commit(ledger, hooks):
+                    changed = True
+                    _safe(hooks.completed, entry)
+                else:
+                    entry["state"] = "in_call"
+                    entry.pop("closed_at", None)
             continue
 
         # --- Бот в зале ожидания: попросить людей впустить (один раз).
@@ -606,6 +613,11 @@ def tick(ledger: Dict[str, Any], *, now: datetime, hooks: Hooks, allow_retry: bo
             if container.status in _GONE:
                 entry["state"] = "done"
                 entry["closed_at"] = now.isoformat()
+                if _commit(ledger, hooks):
+                    _safe(hooks.completed, entry)
+                else:
+                    entry["state"] = "in_call"
+                    entry.pop("closed_at", None)
             continue
         if d.action == FORGET:
             entry["state"] = "forgotten"

@@ -857,7 +857,7 @@ def _safe_session_uid(meeting_id: str, start_at: str) -> str:
     return f"auto-{meeting_id}-{_SAFE_ID_RE.sub('_', raw_start)}"
 
 
-def _remember_portal_run(item: dict[str, Any], now: datetime) -> None:
+def _remember_portal_run(item: dict[str, Any], now: datetime, *, attempt: int = 1) -> None:
     """Ф10c: пометить в наряде, что по нему поднялся бот.
 
     Без этой отметки результат встречи невозможно связать с нарядом надёжно:
@@ -878,7 +878,7 @@ def _remember_portal_run(item: dict[str, Any], now: datetime) -> None:
 
         if not portal_delivery.is_enabled():
             return
-        session_uid = _safe_session_uid(item["meeting_id"], item["start_at"])
+        session_uid = _session_uid_for(item, attempt)
         orders_lib.attach_run(str(order_id), session_uid=session_uid, launched_at=now)
     except Exception as e:  # noqa: BLE001 — бот уже запущен, ронять тик нельзя
         logger.warning(
@@ -1210,10 +1210,14 @@ def _jw_relaunch(entry: dict[str, Any], attempt: int) -> bool:
         logger.warning("Повтор входа %s: нет свободного слота", entry.get("series"))
         return False
     _retry_seq_counter += 1
-    return _launch_bot(
-        item, datetime.now(timezone.utc),
+    launch_now = datetime.now(timezone.utc)
+    launched = _launch_bot(
+        item, launch_now,
         seq=_RETRY_SEQ_BASE + _retry_seq_counter, attempt=attempt,
     )
+    if launched:
+        _remember_portal_run(item, launch_now, attempt=attempt)
+    return launched
 
 
 def _jw_payload(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1324,6 +1328,28 @@ def _jw_joined_on_retry(entry: dict[str, Any], attempt: int, joined_at: datetime
     _mark_if_late(item, joined_at, reason=late_join.REASON_JOIN_RETRY)
 
 
+def _jw_completed(entry: dict[str, Any]) -> None:
+    """После подтверждённого выхода бота сразу освободить разовую комнату."""
+    order_id = str(entry.get("order_id") or "").strip()
+    attempts = entry.get("attempts")
+    last = attempts[-1] if isinstance(attempts, list) and attempts else None
+    uid = str(last.get("session_uid") or "") if isinstance(last, dict) else ""
+    if not order_id or not uid:
+        return
+    try:
+        from notary.lib import orders as orders_lib  # noqa: PLC0415
+        from notary.lib import portal_delivery  # noqa: PLC0415
+
+        if not portal_delivery.is_enabled():
+            return
+
+        closed = orders_lib.close_immediate_after_recording(order_id, run_session_uid=uid)
+        if closed:
+            logger.info("Разовый наряд %s закрыт после выхода бота", order_id)
+    except Exception as e:  # noqa: BLE001 — сторож не должен останавливать планировщик
+        logger.warning("Разовый наряд %s после выхода бота не закрыт (%s)", order_id, type(e).__name__)
+
+
 def _jw_note_owner(text: str) -> None:
     push(text, dedupe=False, silent=True)
 
@@ -1379,6 +1405,7 @@ def _join_watch_tick(now: datetime, *, allow_retry: bool) -> None:
                 persist_failed=_jw_persist_failed,
                 save_logs=_jw_save_logs,
                 gave_up=_jw_gave_up,
+                completed=_jw_completed,
                 joined_on_retry=_jw_joined_on_retry,
             )
             if join_watch.tick(ledger, now=now, hooks=hooks, allow_retry=allow_retry):

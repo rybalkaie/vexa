@@ -39,6 +39,7 @@ Telegram и ни одного настоящего WAV владельца. Ст�
 from __future__ import annotations
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import logging
@@ -47,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -62,6 +64,7 @@ sys.path.insert(0, str(_NOTARY.parent))
 import notary.cli.registry as registry_mod  # noqa: E402
 from notary.lib import identity, orders as orders_lib  # noqa: E402
 from notary.lib import portal_delivery, portal_ingest  # noqa: E402
+from notary import runner  # noqa: E402
 
 ROOM = "https://telemost.yandex.ru/j/11111111111111"
 ROOM_2 = "https://telemost.yandex.ru/j/22222222222222"
@@ -318,6 +321,9 @@ class _Base(unittest.TestCase):
             company=order.get("company"),
             payload=payload,
             sources={"wav": (meta.get("files") or {}).get("wav")},
+            # Очередь создаётся в час симуляции, а не по текущим часам машины:
+            # иначе августовские тики не видят элемент, созданный в октябре.
+            now=datetime.fromisoformat(meta.get("endTs") or meta["startTs"]),
         )
         return key
 
@@ -469,6 +475,197 @@ class TestScenarioRestart(_Base):
 # ---------------------------------------------------------------------------
 # Сценарий 3: исходники живы до ACK
 # ---------------------------------------------------------------------------
+
+
+class TestImmediateRoomReleasedAfterRecording(_Base):
+    def test_no_one_joined_then_join_now_at_scheduled_start(self):
+        """15.10: ранний пустой заход не должен блокировать кнопку в 14:00."""
+        early = datetime(2026, 10, 15, 10, 32, tzinfo=timezone.utc)
+        scheduled = datetime(2026, 10, 15, 11, 0, tzinfo=timezone.utc)
+        payload = {
+            "meeting_id": "early-warehouse",
+            "company": "anzhee",
+            "series_title": "Складская программа",
+            "room_url": ROOM,
+            "start_at": _iso(early),
+            "duration_minutes": 120,
+            "owner": {"portal_user_id": "42"},
+        }
+        first, created = orders_lib.join_now(payload, now=early)
+        self.assertTrue(created)
+        run_uid = "auto-early-warehouse"
+        first = orders_lib.attach_run(first["id"], session_uid=run_uid, launched_at=early)
+        self.assertEqual(
+            orders_lib.find_active_order_for_room(ROOM, now=scheduled)["id"],
+            first["id"],
+        )
+
+        # Collector увидел meta только ПОСЛЕ выхода контейнера из комнаты.
+        raw_meta = {
+            "sessionUid": "2026-10-15-tm-recording",
+            "meetingUrl": ROOM,
+            "startTs": _iso(early + timedelta(minutes=1)),
+            "endTs": _iso(early + timedelta(minutes=20)),
+            "endReason": "no_one_joined",
+        }
+        self.assertNotIn("order", raw_meta, "бот ещё не добавил наряд до финализации")
+        collector._close_finished_immediate_order(raw_meta)
+        self.assertEqual(orders_lib.get_order(first["id"])["status"], orders_lib.STATUS_FINISHED)
+        self.assertIsNone(orders_lib.find_active_order_for_room(ROOM, now=scheduled))
+        self.assertEqual(
+            orders_lib.find_order_for_recording(
+                room_url=ROOM,
+                started_at=_iso(early + timedelta(minutes=1)),
+                session_uid="2026-10-15-tm-recording",
+            )["id"],
+            first["id"],
+            "закрытый наряд должен оставаться адресатом доставки записи",
+        )
+
+        next_payload = dict(payload, meeting_id="scheduled-warehouse", start_at=_iso(scheduled))
+        second, created = orders_lib.join_now(next_payload, now=scheduled)
+        self.assertTrue(created, "повторное подключение должно получить новый наряд")
+        self.assertNotEqual(second["id"], first["id"])
+
+        # Старую meta collector увидит на каждом тике: она не закрывает новый наряд.
+        with mock.patch.object(orders_lib, "_atomic_write", wraps=orders_lib._atomic_write) as write:
+            collector._close_finished_immediate_order(raw_meta)
+            write.assert_not_called()
+        self.assertEqual(orders_lib.get_order(second["id"])["status"], orders_lib.STATUS_SCHEDULED)
+
+    def test_same_meeting_retry_keeps_both_results(self):
+        start = datetime(2026, 10, 15, 10, 32, tzinfo=timezone.utc)
+        payload = {
+            "meeting_id": "warehouse-one-card", "company": "anzhee",
+            "series_title": "Складская программа", "room_url": ROOM,
+            "start_at": _iso(start), "duration_minutes": 120,
+            "owner": {"portal_user_id": "42"},
+        }
+        first, _ = orders_lib.join_now(payload, now=start)
+        orders_lib.attach_run(first["id"], session_uid="auto-first", launched_at=start)
+        first_meta = self.make_recording("2026-10-15-tm-first", start=start + timedelta(minutes=1))
+        collector._close_finished_immediate_order(first_meta)
+
+        next_start = start + timedelta(minutes=28)
+        second, created = orders_lib.join_now(
+            dict(payload, start_at=_iso(next_start)), now=next_start,
+        )
+        self.assertTrue(created)
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(second["version"], 2)
+        self.assertEqual(second["result_version"], 2)
+        orders_lib.attach_run(second["id"], session_uid="auto-second", launched_at=next_start)
+        second_meta = self.make_recording("2026-10-15-tm-second", start=next_start + timedelta(minutes=1))
+        self.assertEqual(collector._portal_order_for(first_meta["sessionUid"], first_meta).get("result_version", 1), 1)
+        self.assertEqual(collector._portal_order_for(second_meta["sessionUid"], second_meta)["result_version"], 2)
+
+        for meta in (first_meta, second_meta):
+            collector._portal_enqueue_result(
+                meta["sessionUid"], meta, {}, transcript_path=None, protocol_path=None,
+                delivery_status="skipped",
+            )
+        self.assertEqual(portal_delivery.load_item(f"{first['id']}#v1")["session_uid"], first_meta["sessionUid"])
+        self.assertEqual(portal_delivery.load_item(f"{first['id']}#v2")["session_uid"], second_meta["sessionUid"])
+
+    def test_watch_releases_room_without_recording_meta(self):
+        start = datetime(2026, 10, 15, 10, 32, tzinfo=timezone.utc)
+        payload = {
+            "meeting_id": "recording-crashed", "company": "anzhee",
+            "series_title": "Складская программа", "room_url": ROOM,
+            "start_at": _iso(start), "duration_minutes": 120,
+            "owner": {"portal_user_id": "42"},
+        }
+        order, _ = orders_lib.join_now(payload, now=start)
+        orders_lib.attach_run(order["id"], session_uid="auto-crashed", launched_at=start)
+        runner._jw_completed({"order_id": order["id"], "attempts": [{"session_uid": "auto-crashed"}]})
+        self.assertEqual(orders_lib.get_order(order["id"])["status"], orders_lib.STATUS_FINISHED)
+
+    def test_second_join_attempt_closes_its_own_order(self):
+        start = datetime(2026, 10, 15, 10, 32, tzinfo=timezone.utc)
+        payload = {
+            "meeting_id": "retry-join", "company": "anzhee",
+            "series_title": "Складская программа", "room_url": ROOM,
+            "start_at": _iso(start), "duration_minutes": 120,
+            "owner": {"portal_user_id": "42"},
+        }
+        order, _ = orders_lib.join_now(payload, now=start)
+        item = {"meeting_id": "retry-join", "start_at": _iso(start), "order_id": order["id"], "url": ROOM}
+        runner._remember_portal_run(item, start)
+        with mock.patch.object(runner, "_running_bots_snapshot", return_value={"total": 0}), \
+             mock.patch.object(runner, "_launch_bot", return_value=True):
+            self.assertTrue(runner._jw_relaunch({"item": item}, 2))
+        uid = runner._session_uid_for(item, 2)
+        self.assertEqual(orders_lib.get_order(order["id"])["run"]["session_uid"], uid)
+        runner._jw_completed({"order_id": order["id"], "attempts": [{"session_uid": uid}]})
+        self.assertEqual(orders_lib.get_order(order["id"])["status"], orders_lib.STATUS_FINISHED)
+
+    def test_collector_off_does_not_read_order_registry(self):
+        self.set_flag("0")
+        with mock.patch.object(orders_lib, "_read_raw", side_effect=AssertionError("реестр выключен")):
+            collector._close_finished_immediate_order({
+                "sessionUid": "tm-1", "meetingUrl": ROOM,
+                "startTs": "2026-10-15T10:33:00+00:00",
+            })
+            runner._jw_completed({"order_id": "portal:one", "attempts": [{"session_uid": "auto-one"}]})
+
+    def test_docker_error_is_not_proof_that_bot_left(self):
+        with mock.patch.object(collector, "ssh_capture", return_value=types.SimpleNamespace(
+            returncode=1, stderr="docker unavailable", stdout="",
+        )):
+            self.assertFalse(collector._running_notarius_index()["available"])
+
+    def test_two_people_clicking_same_room_create_one_order(self):
+        start = datetime(2026, 10, 15, 11, 0, tzinfo=timezone.utc)
+        barrier = threading.Barrier(2)
+
+        def click(meeting_id: str):
+            barrier.wait(timeout=3)
+            return orders_lib.join_now({
+                "meeting_id": meeting_id, "company": "anzhee",
+                "series_title": "Складская программа", "room_url": ROOM,
+                "start_at": _iso(start), "duration_minutes": 120,
+                "owner": {"portal_user_id": meeting_id},
+            }, now=start)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = list(pool.map(click, ("click-a", "click-b")))
+        self.assertEqual(sum((first[1], second[1])), 1)
+        self.assertEqual(first[0]["id"], second[0]["id"])
+
+    def test_expired_order_same_card_gets_new_run(self):
+        start = datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)
+        payload = {
+            "meeting_id": "expired-card", "company": "anzhee",
+            "series_title": "Складская программа", "room_url": ROOM,
+            "start_at": _iso(start), "duration_minutes": 120,
+            "owner": {"portal_user_id": "42"},
+        }
+        first, _ = orders_lib.join_now(payload, now=start)
+        retry_at = start + timedelta(minutes=181)
+        second, created = orders_lib.join_now(dict(payload, start_at=_iso(retry_at)), now=retry_at)
+        self.assertTrue(created)
+        self.assertEqual(second["result_version"], 2)
+        self.assertEqual(second["previous_runs"][0]["finish_reason"], "expired_replaced")
+        self.assertEqual(first["id"], second["id"])
+
+    def test_schedule_edit_does_not_increment_protocol_version(self):
+        start = datetime(2026, 10, 15, 10, 32, tzinfo=timezone.utc)
+        payload = {
+            "meeting_id": "edited-schedule", "company": "anzhee",
+            "series_title": "Складская программа", "room_url": ROOM,
+            "start_at": _iso(start), "duration_minutes": 120,
+            "owner": {"portal_user_id": "42"},
+        }
+        order, _ = orders_lib.put_order(payload, now=start - timedelta(hours=1))
+        order = orders_lib.update_order(order["id"], {"series_title": "Уточнённая тема"}, now=start)
+        self.assertEqual(order["version"], 2)
+        meta = self.make_recording("2026-10-15-tm-edited", start=start)
+        collector._portal_enqueue_result(
+            meta["sessionUid"], meta, {}, transcript_path=None, protocol_path=None,
+            delivery_status="skipped",
+        )
+        self.assertIsNotNone(portal_delivery.load_item(f"{order['id']}#v1"))
+        self.assertIsNone(portal_delivery.load_item(f"{order['id']}#v2"))
 
 
 class TestScenarioSourcesUntilAck(_Base):

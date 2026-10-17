@@ -672,8 +672,27 @@ def put_order(
 
     def _apply(state: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         orders = state.setdefault("orders", {})
+        if kind == KIND_IMMEDIATE and (payload.get("room_url") or "").strip():
+            key = room_key(payload["room_url"])
+            for candidate in orders.values():
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("kind") == KIND_IMMEDIATE
+                    and candidate.get("status") in ACTIVE_STATUSES
+                    and candidate.get("room_key") == key
+                    and not _immediate_is_stale(candidate, now or datetime.now(timezone.utc))
+                ):
+                    return dict(candidate), False
         existing = orders.get(order_id)
-        if isinstance(existing, dict) and existing.get("status") in ACTIVE_STATUSES:
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") in ACTIVE_STATUSES
+            and not (
+                kind == KIND_IMMEDIATE
+                and existing.get("kind") == KIND_IMMEDIATE
+                and _immediate_is_stale(existing, now or datetime.now(timezone.utc))
+            )
+        ):
             # Сравниваем ВСЕ поля наряда, а не пяток «главных»: иначе смена списка
             # участников или чата доставки молча не доезжала бы до реестра —
             # запрос отвечал 200, а бот приходил со старыми данными.
@@ -696,18 +715,36 @@ def put_order(
             orders[order_id] = merged
             return dict(merged), False
         order = dict(payload)
+        previous_runs: list[dict[str, Any]] = []
+        version = 1
+        result_version = 1
+        if isinstance(existing, dict) and kind == KIND_IMMEDIATE:
+            old_runs = existing.get("previous_runs")
+            previous_runs = [dict(run) for run in old_runs if isinstance(run, dict)] if isinstance(old_runs, list) else []
+            previous = dict(existing)
+            previous.pop("previous_runs", None)
+            if previous.get("status") in ACTIVE_STATUSES:
+                previous["status"] = STATUS_FINISHED
+                previous["finished_at"] = stamp
+                previous["finish_reason"] = "expired_replaced"
+            previous_runs.append(previous)
+            version = int(existing.get("version", 1)) + 1
+            result_version = int(existing.get("result_version") or 1) + 1
         order.update(
             {
                 "id": order_id,
                 "kind": kind,
                 "status": STATUS_SCHEDULED,
                 "source": "portal",
-                "version": 1,
+                "version": version,
                 "created_at": stamp,
                 "updated_at": stamp,
                 "room_key": room_key(payload.get("room_url", "")),
             }
         )
+        if previous_runs:
+            order["previous_runs"] = previous_runs
+            order["result_version"] = result_version
         orders[order_id] = order
         return dict(order), True
 
@@ -829,9 +866,6 @@ def join_now(
     переговорке) и по `meeting_id` (тот же человек жмёт дважды).
     """
     now = now or datetime.now(timezone.utc)
-    existing = find_active_order_for_room(payload.get("room_url", ""), now=now)
-    if existing is not None:
-        return existing, False
     return put_order(payload, kind=KIND_IMMEDIATE, now=now)
 
 
@@ -937,6 +971,58 @@ def close_immediate_after_join_failure(
     return _mutate(_apply)
 
 
+def close_immediate_after_recording(
+    order_id: str,
+    *,
+    run_session_uid: str,
+    ended_at: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Освободить комнату после завершения записи разового наряда.
+
+    Бот мог войти, прождать 20 минут один и выйти. Без этого перехода наряд
+    оставался ``scheduled`` ещё 180 минут, а повторное «Подключить сейчас»
+    возвращало уже ушедшего бота. Сверяем запуск: запоздавшая meta старого
+    прогона не вправе закрыть новый запуск того же наряда.
+    """
+    target_id = str(order_id or "")
+    sid = str(run_session_uid or "").strip()
+    if not target_id or not sid:
+        return None
+    # Collector перечитывает meta на каждом тике. Уже завершённый наряд не
+    # должен снова переписывать весь реестр; под замком условие проверим ещё раз.
+    current = get_order(target_id)
+    current_run = (current or {}).get("run")
+    if (
+        current is None
+        or current.get("kind") != KIND_IMMEDIATE
+        or current.get("status") not in ACTIVE_STATUSES
+        or not isinstance(current_run, dict)
+        or current_run.get("session_uid") != sid
+    ):
+        return None
+    stamp = _now_iso(ended_at)
+
+    def _apply(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        orders = state.setdefault("orders", {})
+        existing = orders.get(target_id)
+        if not isinstance(existing, dict):
+            return None
+        if existing.get("kind") != KIND_IMMEDIATE or existing.get("status") not in ACTIVE_STATUSES:
+            return None
+        run = existing.get("run")
+        if not isinstance(run, dict) or run.get("session_uid") != sid:
+            return None
+        merged = dict(existing)
+        merged["status"] = STATUS_FINISHED
+        merged["finished_at"] = stamp
+        merged["finish_reason"] = "recording_done"
+        merged["updated_at"] = stamp
+        orders[target_id] = merged
+        return dict(merged)
+
+    return _mutate(_apply)
+
+
 def attach_run(
     order_id: str,
     *,
@@ -1013,27 +1099,34 @@ def find_order_for_recording(
     key = room_key(room_url) if (room_url or "").strip() else ""
     best: Optional[Dict[str, Any]] = None
     best_delta: Optional[timedelta] = None
-    for order in _read_raw().get("orders", {}).values():
-        if not isinstance(order, dict):
+    for current in _read_raw().get("orders", {}).values():
+        if not isinstance(current, dict):
             continue
-        run = order.get("run")
-        if sid and isinstance(run, dict) and str(run.get("session_uid") or "") == sid:
-            return dict(order)
-        if not key or started is None:
-            continue
-        if order.get("room_key") != key:
-            continue
-        order_start = _parse_dt(order.get("start_at"))
-        if order_start is None:
-            continue
-        duration = max(1, int(order.get("duration_minutes") or DEFAULT_DURATION_MINUTES))
-        if started < order_start - timedelta(minutes=MATCH_BEFORE_MINUTES):
-            continue
-        if started > order_start + timedelta(minutes=duration + MATCH_AFTER_MINUTES):
-            continue
-        delta = abs(started - order_start)
-        if best_delta is None or delta < best_delta:
-            best, best_delta = dict(order), delta
+        candidates = [current]
+        old_runs = current.get("previous_runs")
+        if isinstance(old_runs, list):
+            candidates.extend(run for run in old_runs if isinstance(run, dict))
+        for order in candidates:
+            run = order.get("run")
+            if sid and isinstance(run, dict) and str(run.get("session_uid") or "") == sid:
+                return dict(order)
+            if not key or started is None:
+                continue
+            if order.get("room_key") != key:
+                continue
+            order_start = _parse_dt(order.get("start_at"))
+            if order.get("kind") == KIND_IMMEDIATE and isinstance(run, dict):
+                order_start = _parse_dt(run.get("launched_at")) or order_start
+            if order_start is None:
+                continue
+            duration = max(1, int(order.get("duration_minutes") or DEFAULT_DURATION_MINUTES))
+            if started < order_start - timedelta(minutes=MATCH_BEFORE_MINUTES):
+                continue
+            if started > order_start + timedelta(minutes=duration + MATCH_AFTER_MINUTES):
+                continue
+            delta = abs(started - order_start)
+            if best_delta is None or delta < best_delta:
+                best, best_delta = dict(order), delta
     return best
 
 

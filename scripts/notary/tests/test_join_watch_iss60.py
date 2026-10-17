@@ -172,6 +172,7 @@ class FakeWorld:
         self.persist_failed_msgs: list = []
         self.relaunch_ok = True
         self.retry_joins: list = []
+        self.completed: list = []
 
     def hooks(self):
         return jw.Hooks(
@@ -186,6 +187,7 @@ class FakeWorld:
             persist=self._persist,
             persist_failed=lambda text: self.persist_failed_msgs.append(text),
             joined_on_retry=lambda entry, n, at: self.retry_joins.append((n, at)),
+            completed=lambda entry: self.completed.append(entry.get("state")),
         )
 
     def _persist(self, ledger):
@@ -325,6 +327,19 @@ class TickTest(unittest.TestCase):
         self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("exited", 0)
         self.run_tick(t1 + timedelta(minutes=50))
         self.assertEqual(self.ledger["k1"]["state"], "done")
+        self.assertEqual(self.w.completed, ["done"])
+        self.run_tick(t1 + timedelta(minutes=51))
+        self.assertEqual(self.w.completed, ["done"], "после рестарта тик не закрывает наряд повторно")
+
+    def test_unknown_container_does_not_release_room(self):
+        t1 = NOW + timedelta(seconds=90)
+        self.w.status["auto-x"] = st("in_call", at=NOW + timedelta(seconds=40))
+        self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("running")
+        self.run_tick(t1)
+        self.w.containers["vexa-notarius-auto-x"] = jw.ContainerState("unknown")
+        self.run_tick(t1 + timedelta(minutes=1))
+        self.assertEqual(self.ledger["k1"]["state"], "in_call")
+        self.assertEqual(self.w.completed, [])
 
     def test_meeting_events_delivered_once(self):
         # цикл5 С1/Н4: выброс посреди встречи — сообщение шлёт сторож, один раз
