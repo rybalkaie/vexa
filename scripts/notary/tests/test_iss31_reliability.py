@@ -418,7 +418,7 @@ class CallClaudePrintStreamJsonTest(unittest.TestCase):
     def test_cmd_includes_verbose_and_stream_json_and_thinking_env(self):
         captured = {}
 
-        def _fake_run(cmd, *, input, capture_output, text, timeout, env):
+        def _fake_run(cmd, *, input, capture_output, text, timeout, env, cwd=None):
             captured["cmd"] = cmd
             captured["env"] = env
             return _FakeCompletedProcess(stdout=_result_line())
@@ -440,7 +440,7 @@ class CallClaudePrintStreamJsonTest(unittest.TestCase):
     def test_no_thinking_budget_means_env_untouched(self):
         captured = {}
 
-        def _fake_run(cmd, *, input, capture_output, text, timeout, env):
+        def _fake_run(cmd, *, input, capture_output, text, timeout, env, cwd=None):
             captured["env"] = env
             return _FakeCompletedProcess(stdout=_result_line())
 

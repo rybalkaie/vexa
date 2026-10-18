@@ -43,6 +43,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -69,7 +70,7 @@ from notary.lib.meeting_identity import (  # noqa: E402
     fingerprint,
     is_owner_named,
 )
-from notary.lib.claude_cli import answer_from_print_json, model_args, safety_args  # noqa: E402 — модель, усилие, без инструментов
+from notary.lib.claude_cli import answer_from_completed, claude_cwd, model_args, record_failed_call, safety_args  # noqa: E402,E501
 
 # STATE_DIR читаем из env — ровно как вечерний блок и остальные модули зоны.
 # Иначе стенд/второй инстанс пишет snapshot в один каталог, а читает из другого.
@@ -237,22 +238,20 @@ def parse_claude_output(raw: str, expected_ns: set[int]) -> list[dict[str, Any]]
 def call_claude(prompt: str) -> str:
     """Запустить claude --print (вывод JSON, без инструментов) с промптом на stdin. Возвращает текст ответа."""
     cmd = [CLAUDE_BIN, "--print", "--output-format", "json"] + safety_args() + model_args(APPLY_REPLY_MODEL)
+    started = time.monotonic()
     try:
         proc = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT_S,
+            cmd, input=prompt, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_S, cwd=claude_cwd(),
             env={**os.environ, "PATH": os.environ.get("PATH", "") + ":" + os.path.dirname(CLAUDE_BIN)},
         )
     except FileNotFoundError as e:
         raise RuntimeError(f"claude CLI не найден: {CLAUDE_BIN}") from e
     except subprocess.TimeoutExpired as e:
+        record_failed_call("apply-reply", model=APPLY_REPLY_MODEL, outcome="timeout", elapsed=CLAUDE_TIMEOUT_S)
         raise RuntimeError(f"claude CLI timeout {CLAUDE_TIMEOUT_S}s") from e
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude CLI rc={proc.returncode}: {proc.stderr[:200]}")
-    return answer_from_print_json(proc.stdout, kind="apply-reply", model=APPLY_REPLY_MODEL)
+    # Код ≠ 0 → строка в журнал и RuntimeError с причиной из stdout (при отказе API stderr пуст).
+    return answer_from_completed(proc, kind="apply-reply", model=APPLY_REPLY_MODEL,
+                                 elapsed=time.monotonic() - started)
 
 
 def display_tz(name: str | None = None) -> ZoneInfo | timezone:

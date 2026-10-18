@@ -59,7 +59,7 @@ from .claude_cli import (
     ClaudeCliTimeout,
     call_claude_print,
     call_claude_print_stream_json,
-    is_model_unavailable,
+    fallback_reason,  # 404/529 или вызов несуществующего инструмента → запасная
 )
 from . import clarify_state
 from . import context_knowledge
@@ -1852,6 +1852,7 @@ def generate_protocol(
     meeting_sid: Optional[str] = None,
     series_memory: Optional[str] = None,
     open_tasks: Optional[str] = None,
+    alert_on_fallback: bool = True,
 ) -> str:
     """Генерирует .md-файл протокола встречи из транскрипта через Claude (уровень Opus, `PROTOCOL_GEN_MODEL`).
 
@@ -1867,6 +1868,7 @@ def generate_protocol(
         (Ф3: дефолт 600s — Opus на длинной встрече медленнее Sonnet; РИСК1).
         Глобальный пол `CLAUDE_MIN_TIMEOUT` (claude_cli) применяется поверх.
       meeting_sid: для structured-лога.
+      alert_on_fallback: собран запасной → строка владельцу (False — второй черновик best-of-2).
 
     Возвращает: готовый markdown-текст протокола (от строки `#протоколвстречи`).
 
@@ -2035,30 +2037,28 @@ def generate_protocol(
         model_used = retry_model
         degraded_reason = "primary-timeout"
     except ClaudeCliError as e:
-        # Основная модель недоступна (404 `model_not_found` / 529 — перегрузка) — один проход
-        # на резервной, как при таймауте. Прочие отказы (вход, лимит…) резервная не лечит.
-        fallback = PROTOCOL_GEN_FALLBACK_MODEL
-        if not (is_model_unavailable(e) and fallback and fallback != primary_model):
-            logger.warning(
-                "[protocol] failed meeting=%s error=%s retry=0",
-                meeting_sid or "?", str(e)[:200],
-            )
+        # Основная модель недоступна (404/529) или без инструментов позвала инструмент
+        # (`fallback_reason`) — один проход на резервной. Прочие отказы резервная не лечит.
+        fallback, reason = PROTOCOL_GEN_FALLBACK_MODEL, fallback_reason(e)
+        if not (reason and fallback and fallback != primary_model):
+            logger.warning("[protocol] failed meeting=%s error=%s retry=0", meeting_sid or "?", str(e)[:200])
             _emit_run_log("failed", model=primary_model, reason="cli-error")
             raise ProtocolGenerationError(f"claude --print: {e}") from e
+        refusal = reason == "primary-tool-refusal"
         logger.warning(
-            "[protocol] degraded meeting=%s reason=model-unavailable primary=%s code=%s/%s → model=%s",
-            meeting_sid or "?", primary_model, e.api_error_status, e.error_code, fallback,
+            "[protocol] degraded meeting=%s reason=%s primary=%s code=%s/%s → model=%s", meeting_sid or "?",
+            "tool-refusal" if refusal else "model-unavailable", primary_model, e.api_error_status, e.error_code, fallback,
         )
-        _emit_run_log("degraded", model=fallback, reason="primary-unavailable")
+        _emit_run_log("degraded", model=fallback, reason=reason)
         try:
             stream = _call(fallback, budget=thinking_budget)
         except ClaudeCliError as e2:
-            _emit_run_log("failed", model=fallback, reason="unavailable-fallback-failed")
+            _emit_run_log("failed", model=fallback, reason=reason[len("primary-"):] + "-fallback-failed")
             raise ProtocolGenerationError(
-                f"claude --print: основная модель недоступна ({primary_model}: {e}) "
-                f"+ резервная ({fallback}): {e2}"
+                f"claude --print: основная модель {'позвала инструмент, которого нет' if refusal else 'недоступна'} "
+                f"({primary_model}: {e}) + резервная ({fallback}): {e2}"
             ) from e2
-        model_used, degraded_reason = fallback, "primary-unavailable"
+        model_used, degraded_reason = fallback, reason
 
     # Ф2 (ISS-31 REQ 31.1/31.2, A6/A9): усечение ПОСЛЕ шапки
     # (`stop_reason == "max_tokens"`) или отсутствие шапки вовсе — оба «неполный
@@ -2151,7 +2151,7 @@ def generate_protocol(
         answered="+".join(getattr(stream, "answered_models", None) or []) or None,
         effort=getattr(stream, "effort", None),
     )
-    if model_used != primary_model:  # собран запасной моделью — строка владельцу
+    if model_used != primary_model and alert_on_fallback:  # собран запасной — строка владельцу
         protocol_fallback_alert.alert_owner(
             meeting_sid=meeting_sid, meeting_meta=meeting_meta, primary=primary_model,
             used=model_used, reason=degraded_reason,
@@ -2318,7 +2318,7 @@ def generate_alt_draft_for_best_of_2(
         draft_b = generate_protocol(
             transcript_md, enriched_meta,
             method_text=method_text, meeting_sid=meeting_sid,
-            series_memory=series_memory, open_tasks=open_tasks,
+            series_memory=series_memory, open_tasks=open_tasks, alert_on_fallback=False,  # людям уходит A
         )
     except Exception as exc:  # noqa: BLE001 — деградация важнее: встречу не теряем (R-c2)
         logger.warning(

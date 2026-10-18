@@ -33,6 +33,8 @@ REVIEW_FLAG_MARKER = "⚠️"
 SPEAKER_PLAQUE_SENTINEL = "Разметка спикеров под вопросом"
 # Маркер inline-врезки (для идемпотентности повторного прохода).
 _VOCATIVE_INLINE_MARKER = "проверьте: тут мог быть"
+# Заголовок первого уровня (`# …`) — конец блока задач (см. `_task_block_lines`).
+_H1_RE = re.compile(r"^#\s")
 
 
 def _first_body_section_idx(lines: list[str]) -> Optional[int]:
@@ -95,6 +97,10 @@ def _task_block_lines(lines: list[str], body_start: int) -> list[bool]:
     заголовок `##`…`####`, без нумерации «3) » и эмфазы → `_classify_heading`.
     «🔻 С прошлых встреч» — свой раздел (carryover), не задачи этой встречи: владельцы
     там пришли из прошлых протоколов, путаница спикеров этой встречи их не меняет.
+    Блок задач закрывают и линия `---`, и заголовок первого уровня `# …`: после задач
+    модель иногда приклеивает шапку расшифровки (`# Встреча Telemost`, `**Участники:** …`
+    — 6 из 114 протоколов на 18.10), а это не задачи. Задач после `---` или `# ` внутри
+    блока задач в тех же 114 протоколах нет ни одной.
     """
     out = [False] * len(lines)
     section: Optional[str] = None
@@ -104,6 +110,10 @@ def _task_block_lines(lines: list[str], body_start: int) -> list[bool]:
             title = series_memory._THEME_NUM_PREFIX_RE.sub("", hm.group(1).strip()).strip()
             title = re.sub(r"[*_`]{1,2}", "", title).strip()
             section = series_memory._classify_heading(title)
+            continue
+        stripped = lines[i].strip()
+        if stripped == "---" or _H1_RE.match(stripped):
+            section = None
             continue
         out[i] = section == "tasks"
     return out

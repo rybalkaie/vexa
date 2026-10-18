@@ -32,6 +32,7 @@ _SWITCH_ENV = "NOTARY_PROTOCOL_FALLBACK_ALERT"
 _REASONS = {
     "primary-timeout": "не уложилась во время",
     "primary-unavailable": "недоступна (снята или перегружена)",
+    "primary-tool-refusal": "позвала инструмент, которого у неё нет",
 }
 
 
@@ -63,7 +64,7 @@ def alert_owner(
         text = (
             f"⚠️ Ватсон: протокол встречи «{series}» {date} собран запасной моделью "
             f"({used}{version}) — основная ({primary}) {_REASONS.get(reason, reason)}. "
-            f"Протокол идёт по обычному пути; перечитайте его внимательнее."
+            f"Перечитайте его внимательнее."
         )
         key = f"protocol-fallback:{meeting_sid or series + ':' + date}:{reason}"
         if pusher is None:
