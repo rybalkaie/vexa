@@ -6,11 +6,13 @@
 
 Дисциплина «Опасной тройки» (CLAUDE.md проекта):
   - НЕ логируем содержимое промта/ответа.
-  - Логируем только метаданные (длина промта, exit-код, elapsed).
+  - Логируем только метаданные (длина промта, exit-код, elapsed, модель).
+  - Модель без инструментов (`safety_args`): в подсказке чужой текст.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -21,6 +23,191 @@ from typing import Optional
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Без инструментов и (по выключателю) без копии разговора на диске
+# ---------------------------------------------------------------------------
+# В подсказке — чужой текст: расшифровка встречи, ответы участников. С включёнными
+# инструментами модель в `--print` сама выполняла на сервере команды и читала файлы
+# (журналы сессий за месяц: grep/cat/find/ls и чтение кода — в 7 вызовах из 198, у
+# разметки имён спикеров — в 3 из 16). Ни одному вызову Ватсона инструменты не нужны:
+# всё, что нужно модели, лежит в подсказке. Поэтому в каждом вызове:
+#   • `--tools ""` — ни одного встроенного инструмента (CLI 2.1.301: список
+#     инструментов в запросе к API пуст; настоящие подсказки Ватсона с ним отвечают
+#     как раньше, одним ходом);
+#   • `--strict-mcp-config` без `--mcp-config` — MCP-серверы не подключаются, даже если
+#     их заведут пользователю `dev` для других служб (`--tools` MCP не касается).
+# Откат без выкатки кода: `NOTARY_CLAUDE_TOOLS=default` (все встроенные, как раньше)
+# или список имён через запятую.
+#
+# `--no-session-persistence` — клиент не пишет разговор в журнал сессии на диске
+# (`~/.claude/projects/…`: там копии расшифровок и протоколов). Включается
+# `NOTARY_CLAUDE_NO_SESSION_PERSISTENCE=1`; по умолчанию выключен (решает владелец).
+# Без этих копий ответившую модель видно в журнале вызовов Ватсона (`_record_call`).
+_TOOLS_ENV = "NOTARY_CLAUDE_TOOLS"
+_NO_PERSIST_ENV = "NOTARY_CLAUDE_NO_SESSION_PERSISTENCE"
+_TRUE_VALUES = ("1", "true", "yes", "on")
+
+
+def tools_value() -> str:
+    """Значение `--tools`: пусто — без инструментов (по умолчанию), иначе как в переменной."""
+    raw = os.environ.get(_TOOLS_ENV)
+    return "" if raw is None else raw.strip()
+
+
+def session_persistence_off() -> bool:
+    """Включён ли выключатель копий разговора (`--no-session-persistence`)."""
+    return (os.environ.get(_NO_PERSIST_ENV) or "").strip().lower() in _TRUE_VALUES
+
+
+def safety_args() -> list[str]:
+    """Флаги каждого вызова: инструменты, MCP, копия разговора на диске."""
+    args = ["--tools", tools_value(), "--strict-mcp-config"]
+    if session_persistence_off():
+        args.append("--no-session-persistence")
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Журнал вызовов: какая модель ответила
+# ---------------------------------------------------------------------------
+# Слово `opus`/`sonnet`/`haiku` клиент сам переводит в версию, поэтому пишем ОТВЕТ
+# клиента, а не запрос: `modelUsage` (версии, потратившие токены; первой — та, что
+# написала больше всего) или `model` из события `system/init`. Усилие — переданное
+# флагом `--effort`: клиент его выполняет (`output_config.effort` в запросе к API), а в
+# ответе его нет. Строка на вызов — в журнал службы и в файл `claude-calls.log` рядом с
+# журналами Ватсона (`MEETING_NOTARY_LOG_DIR`, путь можно задать
+# `NOTARY_CLAUDE_CALLS_LOG`): из финализатора сборщик переносит к себе только
+# предупреждения, строки INFO там теряются. Только метаданные — ни подсказки, ни ответа.
+_CALLS_LOG_ENV = "NOTARY_CLAUDE_CALLS_LOG"
+
+
+def _calls_log_path() -> Optional[str]:
+    explicit = (os.environ.get(_CALLS_LOG_ENV) or "").strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    log_dir = (os.environ.get("MEETING_NOTARY_LOG_DIR") or "").strip()
+    return os.path.join(os.path.expanduser(log_dir), "claude-calls.log") if log_dir else None
+
+
+def answered_models(envelope: Optional[dict]) -> list[str]:
+    """Версии моделей из `modelUsage` ответа клиента; первой — с наибольшим выводом."""
+    usage = (envelope or {}).get("modelUsage") if isinstance(envelope, dict) else None
+    if not isinstance(usage, dict):
+        return []
+
+    def _out(item: tuple) -> int:
+        val = item[1].get("outputTokens") if isinstance(item[1], dict) else 0
+        return val if isinstance(val, int) else 0
+
+    return [name for name, _ in sorted(usage.items(), key=_out, reverse=True) if isinstance(name, str)]
+
+
+def _record_call(
+    kind: str,
+    *,
+    model: Optional[str],
+    effort: Optional[str],
+    answered: list[str],
+    outcome: str,
+    elapsed: Optional[float],
+    in_tok: int = 0,
+    out_tok: int = 0,
+) -> None:
+    """Строка о вызове — в журнал службы и в файл журнала вызовов. Никогда не бросает."""
+    fields = [
+        ("kind", kind),
+        ("requested", model or "default"),
+        ("effort", effort or "default"),
+        ("answered", "+".join(answered) if answered else "unknown"),
+        ("outcome", outcome),
+        ("elapsed", f"{elapsed:.1f}s" if elapsed is not None else "?"),
+        ("in", in_tok),
+        ("out", out_tok),
+        ("tools", tools_value() or "none"),
+        ("persist", "off" if session_persistence_off() else "on"),
+    ]
+    line = " ".join(f"{k}={v}" for k, v in fields)
+    logger.log(logging.INFO if outcome == "ok" else logging.WARNING, "[claude-cli] %s", line)
+    path = _calls_log_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {line}\n")
+    except OSError as e:
+        logger.warning("[claude-cli] журнал вызовов не записан (%s): %s", path, type(e).__name__)
+
+
+def _result_envelope(stdout: Optional[str]) -> Optional[dict]:
+    """Конверт `--output-format json` (`type == "result"`) или None, если вывод — не он.
+
+    Читает весь вывод, а если не вышло — последнюю непустую строку (вдруг клиент
+    напечатал что-то перед конвертом).
+    """
+    raw = (stdout or "").strip()
+    if not raw:
+        return None
+    lines = raw.splitlines()
+    for cand in (raw, lines[-1].strip()):
+        try:
+            obj = json.loads(cand)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            return obj
+    return None
+
+
+def _usage_tokens(envelope: Optional[dict]) -> tuple[int, int]:
+    usage = (envelope or {}).get("usage") if isinstance(envelope, dict) else None
+    if not isinstance(usage, dict):
+        return 0, 0
+    return int(usage.get("input_tokens", 0) or 0), int(usage.get("output_tokens", 0) or 0)
+
+
+def answer_from_print_json(
+    stdout: Optional[str],
+    *,
+    kind: str,
+    model: Optional[str],
+    effort: Optional[str] = None,
+    elapsed: Optional[float] = None,
+) -> str:
+    """Текст ответа из вывода `--print --output-format json` + строка в журнал вызовов.
+
+    Для вызовов со своим subprocess (разбор ответа на вечерний блок). Конверт с
+    `is_error` → `ClaudeCliFailed` (наследник `RuntimeError`). Не конверт — вывод как
+    есть (старый клиент / подставной вывод в тестах). `effort=None` → по уровню модели.
+    """
+    eff = resolve_effort(model, effort)
+    envelope = _result_envelope(stdout)
+    if envelope is None:
+        text = (stdout or "").strip()
+        if not text:
+            raise ClaudeCliFailed(f"claude --print ({kind}) пустой stdout")
+        _record_call(kind, model=model, effort=eff, answered=[], outcome="ok", elapsed=elapsed)
+        return text
+    in_tok, out_tok = _usage_tokens(envelope)
+    answered = answered_models(envelope)
+    if envelope.get("is_error"):
+        _record_call(kind, model=model, effort=eff, answered=answered, outcome="error",
+                     elapsed=elapsed, in_tok=in_tok, out_tok=out_tok)
+        status, code = stream_error_codes(stdout)
+        raise ClaudeCliFailed(
+            "claude --print (%s) is_error: [%s]"
+            % (kind, stream_error_summary(stdout) or "причина не разобрана"),
+            api_error_status=status, error_code=code,
+        )
+    text = envelope.get("result")
+    if not isinstance(text, str) or not text.strip():
+        raise ClaudeCliFailed(f"claude --print ({kind}) пустое поле result")
+    _record_call(kind, model=model, effort=eff, answered=answered, outcome="ok",
+                 elapsed=elapsed, in_tok=in_tok, out_tok=out_tok)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +493,11 @@ def call_claude_print(
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
 
-    cmd = [claude_bin, "--print"] + model_args(model, effort)
+    # Вывод JSON — ради `modelUsage` (какая модель ответила); текст ответа — поле
+    # `result`, то же, что печатает текстовый вывод.
+    cmd = [claude_bin, "--print", "--output-format", "json"] + safety_args()
+    cmd += model_args(model, effort)
+    eff = resolve_effort(model, effort)
 
     started = time.monotonic()
     try:
@@ -319,6 +510,7 @@ def call_claude_print(
         )
     except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - started
+        _record_call("print", model=model, effort=eff, answered=[], outcome="timeout", elapsed=elapsed)
         raise ClaudeCliTimeout(
             f"claude --print timeout {timeout}s (elapsed={elapsed:.1f}s)"
         ) from e
@@ -326,14 +518,23 @@ def call_claude_print(
 
     if result.returncode != 0:
         stderr_snippet = (result.stderr or "").strip()[:200]
+        # Причина — из конверта в stdout (при отказе API stderr пуст), как у stream-json.
+        cause = stream_error_summary(result.stdout)
+        status, code = stream_error_codes(result.stdout)
+        _record_call("print", model=model, effort=eff, outcome="error", elapsed=elapsed,
+                     answered=answered_models(_result_envelope(result.stdout)))
         raise ClaudeCliFailed(
-            f"claude --print exit={result.returncode}, stderr={stderr_snippet!r}"
+            f"claude --print exit={result.returncode}"
+            + (f" [{cause}]" if cause else "")
+            + f", stderr={stderr_snippet!r}",
+            api_error_status=status, error_code=code,
         )
-    raw = (result.stdout or "").strip()
-    if not raw:
+    if not (result.stdout or "").strip():
         raise ClaudeCliFailed(
             f"claude --print вернул пустой stdout (elapsed={elapsed:.1f}s)"
         )
+    raw = answer_from_print_json(result.stdout, kind="print", model=model, effort=effort,
+                                 elapsed=elapsed)
     logger.debug(
         "claude --print ok: model=%s effort=%s prompt_len=%d output_len=%d elapsed=%.1fs",
         model or "(default)", resolve_effort(model, effort) or "(default)",
@@ -352,14 +553,16 @@ class ClaudeCliResult:
       raw        — распарсенная JSON-обёртка целиком (для аудита).
     """
 
-    __slots__ = ("text", "cost_usd", "input_tokens", "output_tokens", "raw")
+    __slots__ = ("text", "cost_usd", "input_tokens", "output_tokens", "raw", "answered_models")
 
-    def __init__(self, text: str, cost_usd: float, input_tokens: int, output_tokens: int, raw: dict):
+    def __init__(self, text: str, cost_usd: float, input_tokens: int, output_tokens: int, raw: dict,
+                 answered_models: Optional[list] = None):
         self.text = text
         self.cost_usd = cost_usd
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.raw = raw
+        self.answered_models = list(answered_models or [])
 
 
 def call_claude_print_json(
@@ -398,7 +601,9 @@ def call_claude_print_json(
         timeout = _floor
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
-    cmd = [claude_bin, "--print", "--output-format", "json"] + model_args(model, effort)
+    cmd = [claude_bin, "--print", "--output-format", "json"] + safety_args()
+    cmd += model_args(model, effort)
+    eff = resolve_effort(model, effort)
 
     started = time.monotonic()
     try:
@@ -407,6 +612,7 @@ def call_claude_print_json(
         )
     except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - started
+        _record_call("json", model=model, effort=eff, answered=[], outcome="timeout", elapsed=elapsed)
         raise ClaudeCliTimeout(
             f"claude --print --output-format json timeout {timeout}s (elapsed={elapsed:.1f}s)"
         ) from e
@@ -414,8 +620,13 @@ def call_claude_print_json(
 
     if result.returncode != 0:
         stderr_snippet = (result.stderr or "").strip()[:200]
+        cause = stream_error_summary(result.stdout)
+        _record_call("json", model=model, effort=eff, outcome="error", elapsed=elapsed,
+                     answered=answered_models(_result_envelope(result.stdout)))
         raise ClaudeCliFailed(
-            f"claude --print (json) exit={result.returncode}, stderr={stderr_snippet!r}"
+            f"claude --print (json) exit={result.returncode}"
+            + (f" [{cause}]" if cause else "")
+            + f", stderr={stderr_snippet!r}"
         )
     raw_out = (result.stdout or "").strip()
     if not raw_out:
@@ -427,21 +638,32 @@ def call_claude_print_json(
     if not isinstance(envelope, dict):
         raise ClaudeCliFailed("claude --print (json) конверт не объект")
 
+    usage = envelope.get("usage") or {}
+    in_tok = int(usage.get("input_tokens", 0) or 0)
+    out_tok = int(usage.get("output_tokens", 0) or 0)
+    answered = answered_models(envelope)
+    if envelope.get("is_error"):
+        # Отказ с кодом 0 (так бывает у ошибки API): строка ошибки — не ответ модели.
+        _record_call("json", model=model, effort=eff, answered=answered, outcome="error",
+                     elapsed=elapsed, in_tok=in_tok, out_tok=out_tok)
+        raise ClaudeCliFailed(
+            "claude --print (json) is_error: [%s]"
+            % (stream_error_summary(result.stdout) or "причина не разобрана")
+        )
     text = envelope.get("result") or ""
     if not isinstance(text, str) or not text.strip():
         raise ClaudeCliFailed("claude --print (json) пустое поле result")
-    usage = envelope.get("usage") or {}
     cost = envelope.get("total_cost_usd")
     cost_usd = float(cost) if isinstance(cost, (int, float)) else 0.0
-    in_tok = int(usage.get("input_tokens", 0) or 0)
-    out_tok = int(usage.get("output_tokens", 0) or 0)
+    _record_call("json", model=model, effort=eff, answered=answered, outcome="ok",
+                 elapsed=elapsed, in_tok=in_tok, out_tok=out_tok)
     logger.debug(
         "claude --print(json) ok: model=%s effort=%s prompt_len=%d out_len=%d cost=$%.4f "
         "in=%d out=%d elapsed=%.1fs",
-        model or "(default)", resolve_effort(model, effort) or "(default)",
+        model or "(default)", eff or "(default)",
         len(full_prompt), len(text), cost_usd, in_tok, out_tok, elapsed,
     )
-    return ClaudeCliResult(text.strip(), cost_usd, in_tok, out_tok, envelope)
+    return ClaudeCliResult(text.strip(), cost_usd, in_tok, out_tok, envelope, answered)
 
 
 class ClaudeCliStreamResult:
@@ -456,13 +678,17 @@ class ClaudeCliStreamResult:
                     единственный способ его получить — этот режим.
       cost_usd / input_tokens / output_tokens — как у `ClaudeCliResult`.
       raw — терминальная JSON-строка (`type=="result"`) целиком, для аудита.
+      answered_models — версии, которые ответили (`modelUsage`, иначе `model` из init).
+      effort — усилие, переданное флагом (`None` — флаг не передавался).
     """
 
-    __slots__ = ("text", "stop_reason", "cost_usd", "input_tokens", "output_tokens", "raw")
+    __slots__ = ("text", "stop_reason", "cost_usd", "input_tokens", "output_tokens", "raw",
+                 "answered_models", "effort")
 
     def __init__(
         self, text: str, stop_reason: Optional[str], cost_usd: float,
         input_tokens: int, output_tokens: int, raw: dict,
+        answered_models: Optional[list] = None, effort: Optional[str] = None,
     ):
         self.text = text
         self.stop_reason = stop_reason
@@ -470,6 +696,8 @@ class ClaudeCliStreamResult:
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.raw = raw
+        self.answered_models = list(answered_models or [])
+        self.effort = effort
 
 
 def call_claude_print_stream_json(
@@ -536,7 +764,8 @@ def call_claude_print_stream_json(
 
     full_prompt = prompt if system is None else f"{system}\n\n{prompt}"
     cmd = [claude_bin, "--print", "--output-format", "stream-json", "--verbose"]
-    cmd += model_args(model, effort)
+    cmd += safety_args() + model_args(model, effort)
+    eff = resolve_effort(model, effort)
 
     # env копируем целиком (subprocess.run(env=...) ЗАМЕНЯЕТ окружение, не
     # мёржит) — иначе claude потеряет PATH/авторизацию/остальной контекст.
@@ -552,10 +781,12 @@ def call_claude_print_stream_json(
         )
     except subprocess.TimeoutExpired as e:
         elapsed = time.monotonic() - started
+        _record_call("stream", model=model, effort=eff, answered=[], outcome="timeout", elapsed=elapsed)
         raise ClaudeCliTimeout(
             f"claude --print (stream-json) timeout {timeout}s (elapsed={elapsed:.1f}s)"
         ) from e
     elapsed = time.monotonic() - started
+    answered = _stream_answered_models(result.stdout)
 
     if result.returncode != 0:
         stderr_snippet = (result.stderr or "").strip()[:200]
@@ -563,6 +794,8 @@ def call_claude_print_stream_json(
         # а при отказе API stderr пуст и вся суть лежит в потоке (см. выше).
         cause = stream_error_summary(result.stdout)
         status, code = stream_error_codes(result.stdout)
+        _record_call("stream", model=model, effort=eff, answered=answered, outcome="error",
+                     elapsed=elapsed)
         raise ClaudeCliFailed(
             f"claude --print (stream-json) exit={result.returncode}"
             + (f" [{cause}]" if cause else "")
@@ -589,6 +822,8 @@ def call_claude_print_stream_json(
         # Раньше сюда шли первые 200 знаков `result` как есть; теперь — тем же
         # разбором, что при ненулевом коде: одна строка ошибки, без секретов.
         status, code = stream_error_codes(result.stdout)
+        _record_call("stream", model=model, effort=eff, answered=answered, outcome="error",
+                     elapsed=elapsed)
         raise ClaudeCliFailed(
             "claude --print (stream-json) is_error: [%s]"
             % (stream_error_summary(result.stdout) or "причина не разобрана"),
@@ -603,10 +838,31 @@ def call_claude_print_stream_json(
     cost_usd = float(cost) if isinstance(cost, (int, float)) else 0.0
     in_tok = int(usage.get("input_tokens", 0) or 0)
     out_tok = int(usage.get("output_tokens", 0) or 0)
+    _record_call("stream", model=model, effort=eff, answered=answered, outcome="ok",
+                 elapsed=elapsed, in_tok=in_tok, out_tok=out_tok)
     logger.debug(
         "claude --print(stream-json) ok: model=%s effort=%s prompt_len=%d out_len=%d "
         "stop_reason=%s cost=$%.4f in=%d out=%d elapsed=%.1fs",
-        model or "(default)", resolve_effort(model, effort) or "(default)",
+        model or "(default)", eff or "(default)",
         len(full_prompt), len(text), stop_reason, cost_usd, in_tok, out_tok, elapsed,
     )
-    return ClaudeCliStreamResult(text.strip(), stop_reason, cost_usd, in_tok, out_tok, final)
+    return ClaudeCliStreamResult(text.strip(), stop_reason, cost_usd, in_tok, out_tok, final,
+                                 answered, eff)
+
+
+def _stream_answered_models(stdout: Optional[str]) -> list[str]:
+    """Кто ответил в выводе `stream-json`: `modelUsage` итогового события, иначе
+    `model` из `system/init`. Читает только эти поля — текст ответа не трогает."""
+    final, _ = _stream_error_events(stdout)
+    models = answered_models(final)
+    if models:
+        return models
+    for ln in (stdout or "").splitlines()[:5]:
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "system" and ev.get("subtype") == "init":
+            m = ev.get("model")
+            return [m] if isinstance(m, str) and m else []
+    return []

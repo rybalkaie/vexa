@@ -298,11 +298,14 @@ class TestR19PlaqueAndInline(unittest.TestCase):
         )
 
     def test_inline_note_in_body_at_disputed_items(self):
-        """Место №2 (RAZM2): врезка ПРЯМО у пунктов тела со спорными именами."""
+        """Место №2 (RAZM2): врезка ПРЯМО у задач со спорными именами — и только у них."""
         body = self.out.split("## Задачи", 1)[1]
-        # У задачи Татьяны и задачи Марии, и у решения с обоими именами.
+        # У задачи Татьяны и задачи Марии; решение с обоими именами — без врезки
+        # (слово владельца: пометки только у задач, спорную пару в шапке несёт плашка).
         self.assertIn("проверьте: тут мог быть", body)
-        self.assertEqual(self.out.count("проверьте: тут мог быть"), 3)
+        self.assertEqual(self.out.count("проверьте: тут мог быть"), 2)
+        decisions = self.out.split("## Решения", 1)[1]
+        self.assertNotIn("проверьте: тут мог быть", decisions)
 
     def test_inline_not_in_header(self):
         """Врезка не течёт в шапку (там имена участников — их несёт плашка)."""

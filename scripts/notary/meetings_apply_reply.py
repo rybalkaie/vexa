@@ -69,7 +69,7 @@ from notary.lib.meeting_identity import (  # noqa: E402
     fingerprint,
     is_owner_named,
 )
-from notary.lib.claude_cli import model_args  # noqa: E402 — модель словом + усилие по уровню
+from notary.lib.claude_cli import answer_from_print_json, model_args, safety_args  # noqa: E402 — модель, усилие, без инструментов
 
 # STATE_DIR читаем из env — ровно как вечерний блок и остальные модули зоны.
 # Иначе стенд/второй инстанс пишет snapshot в один каталог, а читает из другого.
@@ -235,8 +235,8 @@ def parse_claude_output(raw: str, expected_ns: set[int]) -> list[dict[str, Any]]
 
 
 def call_claude(prompt: str) -> str:
-    """Запустить claude --print с промптом на stdin. Возвращает stdout."""
-    cmd = [CLAUDE_BIN, "--print"] + model_args(APPLY_REPLY_MODEL)
+    """Запустить claude --print (вывод JSON, без инструментов) с промптом на stdin. Возвращает текст ответа."""
+    cmd = [CLAUDE_BIN, "--print", "--output-format", "json"] + safety_args() + model_args(APPLY_REPLY_MODEL)
     try:
         proc = subprocess.run(
             cmd,
@@ -252,7 +252,7 @@ def call_claude(prompt: str) -> str:
         raise RuntimeError(f"claude CLI timeout {CLAUDE_TIMEOUT_S}s") from e
     if proc.returncode != 0:
         raise RuntimeError(f"claude CLI rc={proc.returncode}: {proc.stderr[:200]}")
-    return proc.stdout
+    return answer_from_print_json(proc.stdout, kind="apply-reply", model=APPLY_REPLY_MODEL)
 
 
 def display_tz(name: str | None = None) -> ZoneInfo | timezone:

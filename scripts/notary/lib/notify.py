@@ -55,6 +55,7 @@ def push(
     dedupe: bool = True,
     silent: bool = False,
     dedupe_key: str | None = None,
+    send_class: str | None = None,
 ) -> bool:
     """Отправить push в Telegram через tg-send. Возвращает True если отправили.
 
@@ -66,6 +67,11 @@ def push(
     НОВАЯ потеря WAV по ДРУГОЙ встрече (другой session_uid → другой ключ)
     всегда доходит до владельца, даже если текст сообщения совпал. Без
     dedupe_key поведение прежнее (дедуп по тексту).
+
+    send_class — класс для шлюза тишины (`expected`/`urgent`/…): уходит переменной
+    `TG_SEND_CLASS`, а не флагом. Общий `tg-send` со шлюзом без класса кладёт строку
+    владельцу только в журнал; отправитель Ватсона (`/srv/meeting-notary/bin/tg-send`)
+    переменную не читает и шлёт как всегда, а незнакомый флаг принял бы за текст.
     """
     if not TG_SEND_BIN.exists():
         logger.warning("tg-send не найден по пути %s — push пропущен", TG_SEND_BIN)
@@ -90,8 +96,9 @@ def push(
     if silent:
         cmd.append("--silent")
     cmd.append(message)
+    run_kw = {"env": {**os.environ, "TG_SEND_CLASS": send_class}} if send_class else {}
     try:
-        subprocess.run(cmd, check=True, timeout=15)
+        subprocess.run(cmd, check=True, timeout=15, **run_kw)
         logger.info("tg-send OK: %s", message[:80])
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:

@@ -69,8 +69,13 @@ from . import series_markup
 from . import series_memory
 from . import series_roster
 from . import vocative_check  # Ф5 (R18): кросс-проверка вокативов в разметке спикеров
+from .vocative_flags import (  # noqa: F401 — плашка и врезки спорной разметки спикеров
+    SPEAKER_PLAQUE_SENTINEL,
+    apply_vocative_flags as _apply_vocative_flags,
+)
 from . import protocol_to_pdf
 from . import run_log  # ISS-31/Ф1: per-meeting durable-лог причин сбоя генерации
+from . import protocol_fallback_alert  # строка владельцу: протокол собран запасной моделью
 from . import telegram_api
 
 
@@ -1945,7 +1950,7 @@ def generate_protocol(
     _segments = len(re.findall(r"^\*\*\[", transcript_md, flags=re.MULTILINE))
 
     def _emit_run_log(event: str, *, model: str, reason: str = "",
-                      output_len: int = 0, stop_reason: Optional[str] = None) -> None:
+                      output_len: int = 0, stop_reason: Optional[str] = None, **extra) -> None:
         """Пишет метаданные прогона генерации в per-meeting durable-лог VPS.
 
         Причина сбоя/деградации переживает удаление контейнера и чистку `_tmp`.
@@ -1968,6 +1973,7 @@ def generate_protocol(
             segments=_segments,
             output_len=output_len,
             stop_reason=stop_reason,
+            **extra,
         )
 
     started = time.monotonic()
@@ -2142,7 +2148,14 @@ def generate_protocol(
         reason="" if degraded_reason == "no" else degraded_reason,
         output_len=len(text),
         stop_reason=stream.stop_reason,
+        answered="+".join(getattr(stream, "answered_models", None) or []) or None,
+        effort=getattr(stream, "effort", None),
     )
+    if model_used != primary_model:  # собран запасной моделью — строка владельцу
+        protocol_fallback_alert.alert_owner(
+            meeting_sid=meeting_sid, meeting_meta=meeting_meta, primary=primary_model,
+            used=model_used, reason=degraded_reason,
+            answered=getattr(stream, "answered_models", None))
     return text
 
 
@@ -5517,129 +5530,6 @@ def build_authorship_uncertainty_findings(names: list[str]) -> list[dict]:
         seen.add(nm)
         out.append({"section": "authorship", "quote": nm, "note": AUTHORSHIP_FLAG_NOTE})
     return out
-
-
-# Ф5 (R19): при неуверенной разметке спикеров — плашка в ШАПКЕ протокола, которая
-# НАЗЫВАЕТ спорные имена, + врезка в ТЕЛЕ у пунктов с этими именами. Источник —
-# детерминированная кросс-проверка вокативов (`vocative_check`, section="vocative"),
-# приходит тем же контуром `review_and_flag_protocol_file`, что и authorship (значит
-# из ОБОИХ call-site: finalize + clarify_worker). Владелец УТР1: помечать, не спрашивать.
-SPEAKER_PLAQUE_SENTINEL = "Разметка спикеров под вопросом"
-# Маркер inline-врезки (для идемпотентности повторного прохода).
-_VOCATIVE_INLINE_MARKER = "проверьте: тут мог быть"
-
-
-def _first_body_section_idx(lines: list[str]) -> Optional[int]:
-    """Индекс первой строки-секции `## ` (граница шапка↔тело). None — секций нет."""
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("## "):
-            return i
-    return None
-
-
-def _format_plaque_pairs(pairs: list[tuple]) -> str:
-    """(X,Y) пары → «X и Y; A и B» для текста плашки."""
-    return "; ".join(f"{a} и {b}" for a, b in pairs)
-
-
-def _insert_speaker_plaque(protocol_text: str, pairs: list[tuple]) -> str:
-    """Ф5 (R19, место №1): плашка «мог перепутать X и Y — проверьте» в ШАПКЕ протокола.
-
-    Ставится строго ДО первой `## `-секции — как постоянный дисклеймер Ф4а (иначе
-    утекла бы в series_memory-дайджест, который собирает только тело `## `-секций).
-    Идемпотентно по `SPEAKER_PLAQUE_SENTINEL`: повторный проход дубль не плодит,
-    а список пар обновляет (снимаем старую строку и ставим новую с актуальными
-    именами). Markdown-цитата курсивом — как дисклеймер (служебная заметка, не контент).
-    """
-    if not pairs:
-        return protocol_text
-    text = protocol_text or ""
-    lines = text.splitlines()
-    if not lines:
-        return text
-    # Снять прежнюю плашку (если имена изменились между перевыпусками).
-    lines = [ln for ln in lines if SPEAKER_PLAQUE_SENTINEL not in ln]
-    plaque = (
-        f"> ⚠️ _{SPEAKER_PLAQUE_SENTINEL}: мог перепутать "
-        f"{_format_plaque_pairs(pairs)} — проверьте, кто где._"
-    )
-    insert_at = _first_body_section_idx(lines)
-    if insert_at is None:
-        # Нет секций → после шапки (первый `---`), иначе после первой строки.
-        insert_at = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "---"), 1)
-    block = ["", plaque, ""]
-    new_lines = lines[:insert_at] + block + lines[insert_at:]
-    # Схлопываем прогоны пустых строк в одну — иначе снятие/повторная вставка плашки
-    # копит осиротевшие пустые строки (нарушая идемпотентность повторного прохода).
-    collapsed: list[str] = []
-    for ln in new_lines:
-        if ln.strip() == "" and collapsed and collapsed[-1].strip() == "":
-            continue
-        collapsed.append(ln)
-    result = "\n".join(collapsed)
-    if text.endswith("\n") and not result.endswith("\n"):
-        result += "\n"
-    return result
-
-
-def _apply_vocative_flags(protocol_text: str, vocative_findings: list[dict]) -> str:
-    """Ф5 (R19): рендер findings section="vocative" в ДВУХ местах.
-
-    Место №1 — плашка в шапке (называет спорные имена X/Y).
-    Место №2 (RAZM2) — врезка «⚠️ проверьте: тут мог быть Y, а не X» у пунктов/задач
-    ТЕЛА протокола, где фигурирует спорное имя (дословных реплик в саммари нет, поэтому
-    привязываемся к именам). Только тело (после первой `## `-секции): в шапке имена
-    участников — там врезка не нужна (её несёт плашка). Идемпотентно.
-
-    Чистая функция (без IO/claude). PII: имена — уже в протоколе, ничего нового наружу.
-    """
-    if not vocative_findings:
-        return protocol_text
-    # Пары для плашки (дедуп, стабильный порядок).
-    pairs: list[tuple] = []
-    seen_pairs: set[tuple] = set()
-    for f in vocative_findings:
-        pr = f.get("pair") or []
-        if len(pr) == 2:
-            key = tuple(sorted(pr))
-            if key not in seen_pairs:
-                seen_pairs.add(key)
-                pairs.append(key)
-    text = _insert_speaker_plaque(protocol_text, pairs)
-
-    # Врезки в теле. Перечень (имя → note) для inline.
-    lines = text.split("\n")
-    body_start = _first_body_section_idx(lines)
-    if body_start is None:
-        return text
-    for f in vocative_findings:
-        name = (f.get("quote") or "").strip()
-        note = (f.get("note") or "").strip()
-        if not name or not note:
-            continue
-        # Тело протокола почти всегда подписано КОРОТКИМ именем («Илья»), а метка
-        # спикера в транскрипте — часто полная двухсловная («Илья Рыбалка»). Привязка
-        # по первому токену покрывает оба варианта; иначе врезка (место №2, RAZM2) не
-        # встала бы на большинстве реальных встреч (≈60% меток двухсловные — замер
-        # ход3 цикла5). Over-match тёзок невозможен: при неоднозначном первом имени
-        # конфликт вообще не рождается (`vocative_check.addressed_names` → ambiguous).
-        match_name = vocative_check._first_name_token(name) or name
-        name_re = re.compile(
-            r"(?<![а-яёА-ЯЁ])" + re.escape(match_name) + r"(?![а-яёА-ЯЁ])", re.IGNORECASE
-        )
-        flag = f"{REVIEW_FLAG_MARKER} проверьте: {note}"
-        for i in range(body_start, len(lines)):
-            ln = lines[i]
-            stripped = ln.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith(">"):
-                continue
-            if not name_re.search(ln):
-                continue
-            # Идемпотентность: на строке уже стоит вокатив-врезка — не дублируем.
-            if _VOCATIVE_INLINE_MARKER in ln:
-                continue
-            lines[i] = ln.rstrip() + f"  {flag}"
-    return "\n".join(lines)
 
 
 class ProtocolReviewError(RuntimeError):
