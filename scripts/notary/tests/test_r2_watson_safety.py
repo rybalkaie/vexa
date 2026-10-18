@@ -281,7 +281,8 @@ class TestCallsJournal(unittest.TestCase):
             self._run(claude_cli.call_claude_print, _MALFORMED_TOOL_USE, returncode=1, model="haiku")
         line = self._lines()[0]
         self.assertIn("outcome=error", line)
-        self.assertIn("answered=claude-haiku-5-5", line)
+        self.assertIn("client_model=claude-haiku-5-5", line)
+        self.assertNotIn("answered=", line, "при отказе модель не ответила")
 
     def test_answered_order_by_output(self):
         env = {"modelUsage": {"claude-haiku-5-5": {"outputTokens": 3},

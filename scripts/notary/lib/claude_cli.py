@@ -120,7 +120,8 @@ def _record_call(
         ("kind", kind),
         ("requested", model or "default"),
         ("effort", effort or "default"),
-        ("answered", "+".join(answered) if answered else "unknown"),
+        # При отказе клиент называет модель, но она не ответила — другое имя поля.
+        ("answered" if outcome == "ok" else "client_model", "+".join(answered) if answered else "unknown"),
         ("outcome", outcome),
         ("elapsed", f"{elapsed:.1f}s" if elapsed is not None else "?"),
         ("in", in_tok),
