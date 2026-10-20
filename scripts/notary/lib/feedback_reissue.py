@@ -1280,7 +1280,9 @@ def reissue_one(
         # имеет права его откатить.
         if _version_applied(res):
             try:
-                _enqueue_portal_revision(state, meta, protocol_path, transcript_path)
+                _enqueue_portal_revision(
+                    state, meta, protocol_path, transcript_path,
+                    telegram_status="sent" if res.get("status") == "sent" else "skipped")
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "[reissue] новая версия не поставлена в очередь портала (%s)",
@@ -1362,13 +1364,73 @@ def _remember_portal_version(state: dict, meta: Optional[dict], version: int) ->
                        type(e).__name__)
 
 
+#: Пометка порталу, куда ушёл протокол РУЧНОГО ВОССТАНОВЛЕНИЯ (`tools/ingest-recording.py`,
+#: путь А): лично владельцу бота на проверку, а не по маршруту наряда.
+RECOVERY_TELEGRAM_NOTE = {"mode": "dm", "reason": "manual_recovery"}
+
+
+def _iso_with_offset(value: Any) -> Optional[str]:
+    """Время в форме, которую примет портал (`isoWithOffset`: смещение пояса в конце)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value.strip() if moment.tzinfo is not None else None
+
+
+def _portal_meeting_fields(meta: Optional[dict], order: Optional[dict]) -> dict:
+    """Время и присутствие встречи для тела портала — одно правило у первой доставки
+    ручного восстановления (`portal_recovery`) и у перевыпуска по правке.
+
+    Встреча бота — ровно её meta, как было. Ручное восстановление (`meta.recovery`)
+    отличается: (1) у старой синтетической meta `startTs` — полночь без пояса, портал
+    такое тело отвергает (422) навсегда — тогда время из наряда; (2) «кого ждали» не
+    шлём: у восстановления нет данных, кто НЕ подключился, а портал разницу «ждали −
+    были» печатает как «не подключился»."""
+    meta = meta if isinstance(meta, dict) else {}
+    fields = {
+        "participants": meta.get("participants") or [],
+        "expected_participants": meta.get("expectedParticipants") or [],
+        "started_at": meta.get("startTs"),
+        "ended_at": meta.get("endTs"),
+        "duration_seconds": meta.get("durationS"),
+    }
+    if meta.get("recovery") is not True:
+        return fields
+    try:
+        duration = int(meta.get("durationS"))
+    except (TypeError, ValueError):
+        duration = None
+    fields.update({
+        "expected_participants": [],
+        "started_at": (_iso_with_offset(meta.get("startTs"))
+                       or _iso_with_offset((order or {}).get("start_at"))),
+        "ended_at": _iso_with_offset(meta.get("endTs")),
+        "duration_seconds": duration if duration is not None and 0 <= duration <= 86400 else None,
+    })
+    return fields
+
+
+def _recovery_telegram_delivery(telegram_status: Optional[str]) -> dict:
+    """Факт отправки владельцу (не маршрут наряда) — для ручного восстановления."""
+    status = telegram_status if telegram_status in ("sent", "skipped", "error") else "unknown"
+    return {"status": status, **RECOVERY_TELEGRAM_NOTE}
+
+
 def _enqueue_portal_revision(
     state: dict, meta: Optional[dict], protocol_path: Path, transcript_path: Path,
+    *, telegram_status: Optional[str] = None,
 ) -> Optional[str]:
     """Положить перевыпущенную версию в очередь доставки в портал. None — не наша встреча.
 
     Наряда у встречи нет (личная серия владельца) → None и ни одного обращения к
     диску: поведение владельца этой веткой не задевается вовсе.
+
+    `telegram_status` — что стало с новой версией в Telegram. Порталу он уходит только
+    у ручного восстановления (протокол шёл лично владельцу, а не по маршруту наряда —
+    иначе панель «Доставка» карточки перепишется на «только портал»).
     """
     from . import delivery_route, portal_delivery, portal_ingest  # noqa: PLC0415
 
@@ -1418,12 +1480,10 @@ def _enqueue_portal_revision(
         # массив как «задач нет». Меняем поле — правим ОБА места разом (см.
         # `docs/gateway-contract.md`, раздел про `tasks`).
         tasks=[],
-        participants=(meta or {}).get("participants") or [],
-        expected_participants=(meta or {}).get("expectedParticipants") or [],
-        started_at=(meta or {}).get("startTs"),
-        ended_at=(meta or {}).get("endTs"),
-        duration_seconds=(meta or {}).get("durationS"),
-        telegram_delivery={"status": route.telegram_status, "mode": route.mode},
+        **_portal_meeting_fields(meta, order),
+        telegram_delivery=(
+            _recovery_telegram_delivery(telegram_status) if (meta or {}).get("recovery") is True
+            else {"status": route.telegram_status, "mode": route.mode}),
         order_status=order.get("status"),
         revision_of=version - 1,
         edits=state.get("edits") or [],

@@ -1181,6 +1181,9 @@ def clarify_speakers_via_telegram(
             "series": series,
             "date": date_str,
             "sessionUid": meta.get("sessionUid"),
+            # Компания встречи (наряд портала / ручное восстановление по наряду): без неё
+            # пересборка по ответу «кто говорил» шла бы без знаний компании.
+            "company": meta.get("company"),
         },
         "unclear_clusters": {
             k: {

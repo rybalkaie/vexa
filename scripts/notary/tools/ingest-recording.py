@@ -733,6 +733,14 @@ def personal_excluded_from_series_memory(series: str) -> bool:
     return chat != owner_chat_id()
 
 
+def _personal_excluded(args) -> bool:
+    """`personal_excluded_from_series_memory` для этого прогона. Встреча по наряду
+    портала — в памяти серии: её протокол опубликован участникам в карточке."""
+    if getattr(args, "portal_order_obj", None):
+        return False
+    return personal_excluded_from_series_memory(args.series)
+
+
 def mark_personal_out_of_series_memory(series_dir: Path, date: str, series: str) -> bool:
     """Путь А: пометить дату встречи «не в памяти серии» (`series_memory`). Не бросает."""
     try:
@@ -1200,6 +1208,7 @@ def deliver_personal_tracked(
     date: str,
     sid: str,
     degraded_note: Optional[str] = None,
+    notice: bool = True,
 ) -> Optional[dict]:
     """Путь А: протокол ЛИЧНО владельцу — штатной `deliver_protocol` с явным
     адресатом (его личка с ботом нотариуса). Она собирает PDF, шлёт ботом,
@@ -1217,7 +1226,11 @@ def deliver_personal_tracked(
         log.warning("[deliver] нет лички владельца или токена бота нотариуса — шлю по-старому")
         return None
     notice_ok = False
-    if _delivered_to_chat(meta, owner):
+    if not notice:
+        # Портальная встреча: строку владельцу шлёт `portal_recovery.deliver_to_portal`
+        # ПОСЛЕ PDF — в ней то, что стало с карточкой портала.
+        log.info("[deliver] встреча портала — строка владельцу после PDF, с итогом по карточке")
+    elif _delivered_to_chat(meta, owner):
         # Повторный прогон той же встречи: `deliver_protocol` пропустит доставку
         # (идемпотентность по `delivered`), и «PDF следующим сообщением» было бы
         # неправдой — PDF не придёт.
@@ -1371,7 +1384,7 @@ def _build_personal_media(args, kind: str, workdir: Path, output_dir: Path, sid:
     wav_path, _ = _prepare_wav(Path(args.input), kind, workdir / "recording.wav")
     participants = resolve_participants(args.series, args.participants)
     # Фаза 6б (№6): протокол «лично мне» по серии с группой — не в память серии.
-    excluded = personal_excluded_from_series_memory(args.series)
+    excluded = _personal_excluded(args)
     meta = build_synthetic_meta(
         series=args.series, date=args.date, wav_path=str(wav_path),
         participants=participants, sid=sid, keep_audio=True, owner_chat_id=owner_chat_id(),
@@ -1544,7 +1557,7 @@ def _run_personal(
             series=args.series, date=args.date, wav_path="",
             participants=resolve_participants(args.series, args.participants),
             sid=sid, keep_audio=True, owner_chat_id=owner_chat_id(),
-            exclude_from_series_memory=personal_excluded_from_series_memory(args.series),
+            exclude_from_series_memory=_personal_excluded(args),
         )
         meta.pop("files", None)
     order = getattr(args, "portal_order_obj", None)
@@ -1563,15 +1576,17 @@ def _run_personal(
     final_meta_path = personal_meta_path(tdir, sid)
     previous_meta = _read_json_file(final_meta_path)
     final_meta = merge_previous_delivery(meta, previous_meta)
-    if order and isinstance(previous_meta, dict) and previous_meta.get("portal_version"):
-        # Счёт версий портала переживает повтор с --force: новая версия, а не дубль.
-        final_meta["portal_version"] = previous_meta["portal_version"]
     final_meta.update({
         "date": args.date,
         "transcript_path": str(transcript_path),
         "transcript_filename": Path(transcript_path).name,
         "protocol_path": str(protocol_path),
     })
+    # Портальная встреча: время из наряда, «кто был», счёт версий того же наряда.
+    portal_recovery.prepare_delivery_meta(
+        final_meta, previous_meta, order, transcript_path=transcript_path,
+        audio_s=_wav_duration_sec(workdir / "recording.wav") if kind != "transcript" else None,
+        present=resolve_participants(args.series, args.participants) if args.participants else [])
     tracked = None
     try:
         write_meta_atomic(final_meta_path, final_meta)
@@ -1581,7 +1596,7 @@ def _run_personal(
         tracked = deliver_personal_tracked(
             protocol_path=protocol_path, transcript_path=transcript_path, meta=final_meta,
             meta_path=final_meta_path, series=args.series, date=args.date, sid=sid,
-            degraded_note=degraded_note,
+            degraded_note=degraded_note, notice=not order,
         )
     if tracked is None:
         legacy = deliver_personally(
@@ -1599,6 +1614,11 @@ def _run_personal(
         }
     else:
         result = tracked["result"]
+        if order and args.force and result.get("status") == "skipped":
+            # Повтор с --force: прошлую версию владелец уже получил — новую шлём ревизией.
+            result = portal_recovery.redeliver_after_force(
+                meta=final_meta, meta_path=final_meta_path, protocol_path=Path(protocol_path),
+                sid=sid, replaced=getattr(args, "replaced_backup", None) or [])
         summary = delivery_summary(result, owner=owner_chat_id())
         delivered_ok = summary["status"] in _DELIVERED_OK
         out = {
@@ -1615,8 +1635,9 @@ def _run_personal(
         out["portal"] = portal_recovery.deliver_to_portal(
             order=order, meta=final_meta, meta_path=final_meta_path if out.get("meta_path")
             else None, sid=sid, protocol_path=Path(protocol_path),
-            transcript_path=Path(transcript_path), delivered_ok=delivered_ok)
-        if out["portal"].get("status") in ("error", "duplicate"):
+            transcript_path=Path(transcript_path), delivered_ok=delivered_ok,
+            series=args.series, date=args.date, degraded_note=degraded_note)
+        if out["portal"].get("status") != "queued":
             out["ok"] = False
     if not delivered_ok:
         log.error(
@@ -1668,6 +1689,15 @@ RETRY_QUEUE_NOTE = (
     "присланной записи»). Запускать заново не нужно — будет второй протокол и вторая "
     "оплата расшифровки"
 )
+
+
+def _retry_note(portal_hint: Optional[str]) -> str:
+    """Итог «встречу доводит очередь повторов»; у портальной встречи — что в карточку
+    повтор не отдаст и как её туда поставить после PDF."""
+    if not portal_hint:
+        return RETRY_QUEUE_NOTE
+    return (RETRY_QUEUE_NOTE + ". В карточку портала повтор протокол не отдаст — когда PDF "
+            "придёт, " + portal_hint)
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -1747,10 +1777,13 @@ def _main(argv: list[str] | None = None) -> int:
     if withheld:
         log.warning("[mode] серия не подтверждена (%s) — в группу не отправляю, путь А", source)
 
+    sid = safe_session_uid(args.series, args.date)
+    tdir = transcripts_dir(args.transcripts_dir)
     # Портальная встреча идёт по наряду: наряд ищем ДО распознавания.
     try:
-        order = portal_recovery.preflight(args.series, args.portal_order,
-                                          standard_mode=mode == MODE_STANDARD)
+        order, mode = portal_recovery.preflight(
+            args.series, args.portal_order, date=args.date, requested_mode=args.mode, mode=mode,
+            previous_meta=_read_json_file(personal_meta_path(tdir, sid)))
     except portal_recovery.PortalOrderError as e:
         log.error("[portal] %s", e)
         _emit({"ok": False, "error": e.code, "mode": mode, "kind": kind, "note": str(e)})
@@ -1759,8 +1792,6 @@ def _main(argv: list[str] | None = None) -> int:
     facts = portal_recovery.summary_facts(args.series, order)
 
     deliver = not args.no_deliver
-    sid = safe_session_uid(args.series, args.date)
-    tdir = transcripts_dir(args.transcripts_dir)
     log.info(
         "[ingest] вход=%s тип=%s серия=%s дата=%s путь=%s%s",
         args.input, kind, args.series, args.date, mode, "" if deliver else " (сухой прогон)",
@@ -1775,6 +1806,9 @@ def _main(argv: list[str] | None = None) -> int:
         Path(args.output_dir) if args.output_dir
         else (default_output_dir() if deliver else workdir / "protocols")
     )
+    # Портальная встреча: пересборка — только этой обёрткой по готовой расшифровке.
+    portal_hint = portal_recovery.rebuild_hint(
+        Path(output_dir) / args.series / f"{args.date}.md") if order else None
     try:
         from lib import finalize_lock  # noqa: PLC0415
 
@@ -1790,7 +1824,7 @@ def _main(argv: list[str] | None = None) -> int:
                 log.error("[ingest] встречу %s доводит очередь повторов бота — второй прогон не "
                           "запускаю", sid)
                 _emit({"ok": False, "error": "in_retry_queue", "mode": mode, "kind": kind,
-                       "note": RETRY_QUEUE_NOTE})
+                       "note": _retry_note(portal_hint)})
                 return EXIT_BUSY
             if durable_output:
                 busy = pending_same_date_meetings(tdir, args.series, args.date, sid)
@@ -1815,7 +1849,9 @@ def _main(argv: list[str] | None = None) -> int:
                 )
                 refusal = {"ok": False, "error": "target_exists", "mode": mode, "kind": kind,
                            "existing": [str(p) for p in clashes]}
-                if only_transcript_exists(output_dir, args.series, args.date):
+                if only_transcript_exists(output_dir, args.series, args.date) and portal_hint:
+                    refusal["note"] = "за эту дату есть только расшифровка; " + portal_hint
+                elif only_transcript_exists(output_dir, args.series, args.date):
                     refusal["note"] = (
                         "за эту дату есть только расшифровка, протокол по ней не собрался — "
                         "пересобрать без новой оплаты расшифровки: «протокол %s %s» боту-нотариусу; "
@@ -1824,6 +1860,7 @@ def _main(argv: list[str] | None = None) -> int:
                 return EXIT_INPUT
             if clashes:
                 backup = backup_before_force(clashes)
+            args.replaced_backup = backup
 
             if not deliver:
                 if kind in ("video", "audio"):
@@ -1852,11 +1889,11 @@ def _main(argv: list[str] | None = None) -> int:
     except HandedToRetry as e:
         log.error("[ingest] %s", e)
         _emit({"ok": False, "error": "in_retry_queue", "mode": mode, "kind": kind,
-               "note": RETRY_QUEUE_NOTE})
+               "note": _retry_note(portal_hint)})
         return EXIT_BUSY
     except ProtocolNotGenerated as e:
         log.error("[ingest] %s", e)
-        if mode == MODE_PERSONAL and durable_output and personal_excluded_from_series_memory(args.series):
+        if mode == MODE_PERSONAL and durable_output and _personal_excluded(args):
             # Цикл5 фазы 6б: протокол соберут позже по готовой расшифровке («протокол <серия>
             # <дата>»), и он будет «лично мне» — дату помечаем уже сейчас, иначе он ушёл бы
             # получателям серии по «пришлите протокол» (сборка по расшифровке выжимку не строит).
@@ -1868,13 +1905,14 @@ def _main(argv: list[str] | None = None) -> int:
         # (R9) идёт мимо finalize — там сказать некому, кроме этого итога.
         told = " (бот отдельно написал об этом владельцу)" if kind != "transcript" else ""
         force = "заново оплатит расшифровку" if kind != "transcript" else "повторит сборку целиком"
+        note = ("расшифровка готова и сохранена, а протокол не собрался — составить его "
+                "моделью не удалось%s. " % told) + (
+            portal_hint if portal_hint else
+            "Пересобрать по готовой расшифровке: «протокол %s %s» боту-нотариусу; перезапуск "
+            "обёртки упрётся в target_exists, а с --force %s" % (args.series, args.date, force))
         _emit({"ok": False, "error": "protocol_not_generated", "mode": mode, "kind": kind,
-               **facts,
-               "transcript_path": str(e.transcript_path), "archive_synced": archived,
-               "note": "расшифровка готова и сохранена, а протокол не собрался — составить его "
-                       "моделью не удалось%s. Пересобрать по готовой расшифровке: «протокол %s %s» "
-                       "боту-нотариусу; перезапуск обёртки упрётся в target_exists, а с --force %s"
-                       % (told, args.series, args.date, force)})
+               **facts, "transcript_path": str(e.transcript_path), "archive_synced": archived,
+               "note": note})
         return EXIT_FAILED
     except Exception as e:  # noqa: BLE001
         # Класс ошибки + сообщение БЕЗ текста реплик (R11/опасная тройка).

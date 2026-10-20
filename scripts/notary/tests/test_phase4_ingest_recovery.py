@@ -1569,7 +1569,6 @@ class TestPortalOrderRecovery(_RecoveryEnv):
         self.put_order()
         os.environ.pop("ENABLE_PORTAL_ORDERS", None)
         rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
-        self.assertEqual(rc, 0, out)
         self.assertEqual(out.get("company"), "anzhee")
         self.assertEqual(out["portal"]["status"], "disabled")
 
@@ -1577,14 +1576,438 @@ class TestPortalOrderRecovery(_RecoveryEnv):
         self.put_order()
         buf = io.StringIO()
         handler = logging.StreamHandler(buf)
-        logging.getLogger().addHandler(handler)
+        root = logging.getLogger()
+        # Цикл5 Ф2 (Н12): корневой журнал по умолчанию WARNING — строки INFO/DEBUG
+        # модуля до обработчика не доходили, и тест проверял бы только предупреждения.
+        prev_level = root.level
+        root.setLevel(logging.DEBUG)
+        root.addHandler(handler)
         try:
             rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
         finally:
-            logging.getLogger().removeHandler(handler)
+            root.removeHandler(handler)
+            root.setLevel(prev_level)
         self.assertEqual(rc, 0, out)
+        self.assertIn("[portal]", buf.getvalue(), "обработчик не видит INFO-строк модуля")
         self.assertNotIn(SECRET, json.dumps(out, ensure_ascii=False))
         self.assertNotIn(SECRET, buf.getvalue())
+
+    # =====================================================================
+    # Цикл из 5 ходов по Ф2 (ход 3): правки по сведённому списку находок.
+    # =====================================================================
+    OTHER = "9999bbbb-1111-2222-3333-444455556666"
+
+    def _real_wav(self, seconds: float) -> None:
+        import wave  # noqa: PLC0415
+
+        with wave.open(str(self.rec), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * int(16000 * seconds))
+
+    @staticmethod
+    def _portal_iso_ok(value) -> bool:
+        """Ровно `isoWithOffset.nullish()` портала (notaryIngest.ts): 20–40 знаков,
+        в конце `Z` или `±HH:MM`."""
+        import re  # noqa: PLC0415
+
+        if value is None:
+            return True
+        return (isinstance(value, str) and 20 <= len(value) <= 40
+                and bool(re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", value.strip())))
+
+    def _meta_of(self, out) -> dict:
+        return json.loads(Path(out["meta_path"]).read_text(encoding="utf-8"))
+
+    # --- п.1 (Н1): время перевыпуска проходит правило портала ---------------------
+    def test_reply_edit_revision_time_passes_portal_rule(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        meta = self._meta_of(out)
+        self.assertEqual(meta.get("startTs"), "2026-09-23T11:00:00+00:00",
+                         "в meta доставки не время наряда — перевыпуск возьмёт полночь без пояса")
+        from lib import feedback_reissue  # noqa: PLC0415
+
+        state = {"meta_path": out["meta_path"], "series": PSERIES, "date": DATE, "edits": []}
+        key = feedback_reissue._enqueue_portal_revision(
+            state, meta, Path(out["protocol_path"]), Path(meta["transcript_path"]))
+        body = pdq.load_item(key)["payload"]
+        for field in ("started_at", "ended_at", "generated_at"):
+            self.assertTrue(self._portal_iso_ok(body[field]), (field, body[field]))
+        self.assertEqual(body["started_at"], "2026-09-23T11:00:00+00:00")
+
+    def test_revision_of_old_recovered_meta_takes_start_from_order(self):
+        """Защитно: meta доставки, записанная до починки, — полночь без пояса."""
+        order = self.put_order()
+        meta_path = self.T / "recovered" / "old.meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = {"sessionUid": "recovery-old", "series": PSERIES, "date": DATE,
+                "startTs": DATE + "T00:00:00", "recovery": True, "order": dict(order),
+                "company": "anzhee"}
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        proto = self.tmp / "p.md"
+        proto.write_text(PROTOCOL, encoding="utf-8")
+        from lib import feedback_reissue  # noqa: PLC0415
+
+        key = feedback_reissue._enqueue_portal_revision(
+            {"meta_path": str(meta_path), "edits": []}, meta, proto, proto)
+        body = pdq.load_item(key)["payload"]
+        self.assertEqual(body["started_at"], order["start_at"])
+        self.assertTrue(self._portal_iso_ok(body["started_at"]))
+
+    # --- п.2 (Н4): конец и длительность встречи -----------------------------------
+    def test_first_delivery_carries_end_and_duration_from_audio(self):
+        self.put_order()
+        self._real_wav(90)
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        body = self.queue()[0]["payload"]
+        self.assertEqual(body["duration_seconds"], 90)
+        self.assertEqual(body["ended_at"], "2026-09-23T11:01:30+00:00")
+        meta = self._meta_of(out)
+        self.assertEqual((meta.get("endTs"), meta.get("durationS")), (body["ended_at"], 90),
+                         "перевыпуск по правке не повторит конец и длительность")
+
+    def test_transcript_duration_from_last_timestamp(self):
+        self.put_order()
+        txt = self.tmp / "t.txt"
+        txt.write_text("[00:00:05] Иван Петров: раз\n[00:42:10] Мария Сидорова: два\n",
+                       encoding="utf-8")
+        self.rec = txt
+
+        def _regen(*, transcript_path, protocol_path, meeting_meta, meeting_sid):
+            Path(protocol_path).write_text(PROTOCOL, encoding="utf-8")
+
+        with mock.patch.object(lp, "regenerate_protocol_for_meeting", side_effect=_regen):
+            rc, out = self.run_main("--series", PSERIES)
+        self.assertEqual(rc, 0, out)
+        body = self.queue()[0]["payload"]
+        self.assertEqual(body["duration_seconds"], 42 * 60 + 10)
+
+    def test_duration_falls_back_to_order_length(self):
+        from lib import portal_recovery  # noqa: PLC0415
+
+        order = self.put_order(duration_minutes=45)
+        txt = self.tmp / "plain.md"
+        txt.write_text("просто текст без меток времени\n", encoding="utf-8")
+        facts = portal_recovery.meeting_times(order, audio_s=None, transcript_path=txt)
+        self.assertEqual(facts, {"startTs": "2026-09-23T11:00:00+00:00",
+                                 "endTs": "2026-09-23T11:45:00+00:00", "durationS": 2700})
+
+    # --- п.3 (Н3): «бот не пришёл» — не версия результата ----------------------------
+    def test_no_show_record_is_not_a_result_version(self):
+        self.put_order()
+        pdq.report_no_show(POID, meeting_id=MID, session_uid="auto-x", company="anzhee",
+                           round_mark="20260923T1100")
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        res = [i for i in self.queue() if not str(i["key"]).endswith("#no_show")]
+        self.assertEqual([(i["version"], i["payload"]["revision_of"]) for i in res], [(1, None)])
+
+    # --- п.4 (Н2): наряд именованной серии и серия наряда ----------------------------
+    def test_named_series_finds_order_by_series_and_date(self):
+        self.put_order(series="grp-series")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "personal",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.get("portal_order"), POID)
+        self.assertEqual(out.get("company"), "anzhee")
+        self.assertEqual([i["version"] for i in self.queue()], [1])
+
+    def test_named_series_two_orders_same_day_is_ambiguous(self):
+        self.put_order(series="grp-series")
+        self.put_order(meeting_id=self.OTHER, series="grp-series")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "personal",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual(out.get("error"), "portal_order_ambiguous")
+        self.assertIn("--portal-order", out.get("note", ""))
+        self.assertEqual(self.finalize_calls, [])
+
+    def test_named_series_order_of_other_day_is_not_taken(self):
+        self.put_order(series="grp-series", start_at="2026-09-25T11:00:00+00:00")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "personal",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("portal", out)
+        self.assertNotIn("portal_order", out)
+
+    def test_auto_mode_for_named_portal_series_goes_personal(self):
+        """Серия с группой подтверждена журналом, но у неё наряд на эту дату: путь А."""
+        self.put_order(series="grp-series")
+        with mock.patch.object(ing, "series_source", return_value=ing.SOURCE_JOURNAL):
+            rc, out = self.run_main("--series", "grp-series", "--mode", "auto",
+                                    finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.get("mode"), "personal")
+        self.assertEqual([c for c, _ in self.sent], [OWNER], "портальная встреча ушла в группу")
+
+    def test_portal_series_but_order_lives_in_named_series_refused(self):
+        self.put_order(series="rnp-x")
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual(out.get("error"), "portal_order_series_mismatch")
+        self.assertIn("--series rnp-x", out.get("note", ""))
+        self.assertEqual(self.finalize_calls, [])
+
+    # --- п.5 (Н13): дата наряда ----------------------------------------------------
+    def test_date_not_matching_order_refused_before_recognition(self):
+        self.put_order(start_at="2026-09-25T11:00:00+00:00")
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual(out.get("error"), "portal_order_date_mismatch")
+        self.assertEqual(self.finalize_calls, [])
+        self.assertEqual(self.queue(), [])
+
+    def test_order_date_is_moscow_date_and_immediate_uses_launch(self):
+        # 22.09 22:30 UTC = 23.09 01:30 по Москве — встреча 23-го.
+        self.put_order(start_at="2026-09-22T22:30:00+00:00")
+        rc, out = self.run_main("--series", PSERIES, "--no-deliver",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        # Разовый наряд: start_at — момент постановки, бот запущен 23-го.
+        self.put_order(start_at="2026-09-21T10:00:00+00:00", kind="immediate",
+                       run={"session_uid": "s1", "launched_at": "2026-09-23T08:00:00+00:00"})
+        rc, out = self.run_main("--series", PSERIES, "--no-deliver",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+
+    # --- п.6 (Н6): два наряда одной серии в один день ---------------------------------
+    def test_two_orders_of_one_series_same_day_do_not_share_recovery(self):
+        self.put_order(series="rnp-x")
+        self.put_order(meeting_id=self.OTHER, series="rnp-x")
+        rc1, out1 = self.run_main("--series", "rnp-x", "--portal-order", POID,
+                                  finalize=self.knowing_finalize())
+        self.assertEqual(rc1, 0, out1)
+        rc2, out2 = self.run_main("--series", "rnp-x", "--portal-order", "portal:" + self.OTHER,
+                                  "--force", finalize=self.knowing_finalize())
+        self.assertEqual(rc2, ing.EXIT_INPUT, out2)
+        self.assertEqual(out2.get("error"), "portal_order_conflict")
+        self.assertEqual(len(self.finalize_calls), 1, "вторая встреча распознана поверх первой")
+
+    # --- п.7 (Н5): повтор с --force после доставки -------------------------------------
+    def test_force_rerun_after_delivery_sends_owner_the_new_version(self):
+        self.put_order()
+        rc1, out1 = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc1, 0, out1)
+        new_text = "# Протокол встречи\n\n## Решения\n- НОВАЯ ВЕРСИЯ ТЕКСТА\n"
+        with mock.patch.dict(globals(), {"PROTOCOL": new_text}), \
+                mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 сводка"), \
+                mock.patch.object(lp.telegram_api, "send_message", return_value={"message_id": 1}):
+            rc2, out2 = self.run_main("--series", PSERIES, "--force",
+                                      finalize=self.knowing_finalize())
+        self.assertEqual(rc2, 0, out2)
+        self.assertEqual([c for c, _ in self.sent], [OWNER, OWNER],
+                         "в портал ушла новая версия, а владелец её не получил")
+        self.assertIn("НОВАЯ ВЕРСИЯ", self.rendered[-1])
+        v2 = [i for i in self.queue() if i["version"] == 2][0]
+        self.assertIn("НОВАЯ ВЕРСИЯ", v2["payload"]["protocol_md"])
+        self.assertEqual(v2["payload"]["telegram_delivery"]["status"], "sent")
+        found = feedback_worker.find_delivered_protocol(OWNER, self.sent[-1][1], use_cache=False)
+        self.assertIsNotNone(found, "ответ на новую версию не находит встречу")
+
+    # --- п.8 (С1): в карточку — только после PDF владельцу -----------------------------
+    def test_portal_held_until_owner_has_pdf(self):
+        self.put_order()
+
+        def boom(*a, **k):
+            raise lp.telegram_api.TelegramApiError("down")
+
+        with mock.patch.object(lp.telegram_api, "send_document", side_effect=boom):
+            rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_FAILED, out)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["portal"]["status"], "held")
+        self.assertIn("--kind transcript", out["portal"]["note"])
+        self.assertEqual(self.queue(), [], "людям раньше, чем владельцу")
+
+    # --- п.9 (У3): кто был на встрече ---------------------------------------------------
+    def test_attendance_is_participants_flag_not_absent(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        body = self.queue()[0]["payload"]
+        self.assertEqual(body["participants"], ["Иван Петров", "Мария Сидорова"])
+        self.assertEqual(body["expected_participants"], [],
+                         "портал поставит всем «не подключился»")
+        meta = self._meta_of(out)
+        from lib import feedback_reissue  # noqa: PLC0415
+
+        key = feedback_reissue._enqueue_portal_revision(
+            {"meta_path": out["meta_path"], "edits": []}, meta,
+            Path(out["protocol_path"]), Path(meta["transcript_path"]))
+        rev = pdq.load_item(key)["payload"]
+        self.assertEqual((rev["participants"], rev["expected_participants"]),
+                         (["Иван Петров", "Мария Сидорова"], []))
+
+    # --- п.10 (У2): ответ на «кто говорил» — с компанией ---------------------------------
+    def test_clarify_state_keeps_company(self):
+        from lib import align  # noqa: PLC0415
+
+        saved = {}
+        turns = [align.AlignedTurn(0.0, 1.0, "SPEAKER_00", "раз"),
+                 align.AlignedTurn(1.0, 2.0, "SPEAKER_01", "два")]
+        with mock.patch.object(lp, "_is_clarify_enabled", return_value=True), \
+                mock.patch.object(lp, "_clarify_target_chat", return_value=OWNER), \
+                mock.patch.object(lp, "auto_resolve_known_speakers", return_value={}), \
+                mock.patch.object(lp.telegram_api, "send_message", return_value={"message_id": 9}), \
+                mock.patch.object(lp.clarify_state, "resolve_pending_dir",
+                                  return_value=self.tmp / "pending"), \
+                mock.patch.object(lp.clarify_state, "write_state",
+                                  side_effect=lambda st, **kw: saved.update(st) or self.tmp / "s.json"):
+            lp.clarify_speakers_via_telegram(
+                "recovery-x", turns, {}, {"SPEAKER_00": "Иван Петров"},
+                ["Иван Петров", "Мария Сидорова"], [],
+                {"series": PSERIES, "date": DATE, "sessionUid": "recovery-x",
+                 "company": "anzhee"},
+                self.tmp / "t.md")
+        self.assertEqual(saved["meta"].get("company"), "anzhee")
+
+    def test_clarify_answer_regen_and_review_keep_company_and_reach_owner(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        meta = self._meta_of(out)
+        from lib import clarify_worker  # noqa: PLC0415
+
+        state = {"meeting_id": meta["sessionUid"], "transcript_path": meta["transcript_path"],
+                 "meta": {"series": PSERIES, "date": DATE, "sessionUid": meta["sessionUid"],
+                          "company": "anzhee"},
+                 "unclear_clusters": {"SPEAKER_01": {"speaker_label_in_md": "Спикер 2"}},
+                 "name_pool": ["Иван Петров", "Мария Сидорова"], "status": "timed_out"}
+        seen = {}
+
+        def _regen(*, transcript_path, protocol_path, meeting_meta, meeting_sid, **kw):
+            seen["regen"] = series_markup.company_for_meeting(meeting_meta)
+            Path(protocol_path).write_text(PROTOCOL + "\n- пересобрано\n", encoding="utf-8")
+
+        def _review(*a, **kw):
+            seen["review"] = kw.get("company")
+            return 0
+
+        with mock.patch.object(clarify_worker.llm_postprocess,
+                               "apply_clarify_mapping_to_transcript", return_value=True), \
+                mock.patch.object(clarify_worker.llm_postprocess,
+                                  "regenerate_protocol_for_meeting", side_effect=_regen), \
+                mock.patch.object(clarify_worker.llm_postprocess,
+                                  "review_and_flag_protocol_file", side_effect=_review), \
+                mock.patch.object(lp, "_compose_revision_summary", return_value="🔁 сводка"), \
+                mock.patch.object(lp.telegram_api, "send_message", return_value={"message_id": 1}), \
+                mock.patch("lib.knowledge_distill.distill_and_route", return_value={}), \
+                mock.patch.object(clarify_worker.clarify_state, "mark_status"):
+            status = clarify_worker._apply_resolution(
+                state, {"SPEAKER_01": "Мария Сидорова"}, via="text",
+                pending_root=self.tmp / "pending", is_late=True)
+        self.assertEqual(seen, {"regen": "anzhee", "review": "anzhee"})
+        self.assertEqual(status, "sent", "поздний ответ не дослал владельцу новую версию")
+        self.assertEqual([c for c, _ in self.sent], [OWNER, OWNER])
+
+    # --- п.11 (Н9): итоговая строка печатается всегда ------------------------------------
+    def test_version_calc_failure_still_prints_summary(self):
+        self.put_order()
+        with mock.patch.object(pdq, "item_path", side_effect=PermissionError("queue dir")):
+            rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertIsNotNone(out, "PDF ушёл, а итоговой строки нет")
+        self.assertEqual(rc, ing.EXIT_FAILED)
+        self.assertEqual(out["portal"]["status"], "error")
+        self.assertFalse(out["ok"])
+
+    # --- п.12 (Н7, Н8): подсказки для портальной встречи -----------------------------------
+    def test_protocol_not_generated_hint_for_portal_meeting(self):
+        self.put_order()
+
+        def no_protocol(meta_path, output_dir, *, deliver=False):
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+            sdir = Path(output_dir) / meta["series"]
+            sdir.mkdir(parents=True, exist_ok=True)
+            (sdir / f"{DATE}.md").write_text(TRANSCRIPT, encoding="utf-8")
+            return 0, {"ok": True}
+
+        rc, out = self.run_main("--series", PSERIES, finalize=no_protocol)
+        self.assertEqual(out.get("error"), "protocol_not_generated")
+        self.assertIn("--kind transcript", out["note"])
+        self.assertIn("--force", out["note"])
+        self.assertNotIn("«протокол ", out["note"], "команда «протокол» соберёт без компании и портала")
+        rc, out = self.run_main("--series", PSERIES, finalize=no_protocol)
+        self.assertEqual(out.get("error"), "target_exists")
+        self.assertIn("--kind transcript", out["note"])
+
+    def test_retry_queue_note_for_portal_meeting(self):
+        self.put_order()
+        with mock.patch.object(ing, "_build_personal_media",
+                               side_effect=ing.HandedToRetry("в очереди повторов")):
+            rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(out.get("error"), "in_retry_queue")
+        self.assertIn("--kind transcript", out["note"])
+
+    # --- п.13 (Н10): текст владельцу про карточку ---------------------------------------
+    def test_owner_notice_tells_about_portal_card(self):
+        self.put_order()
+        with mock.patch("lib.notify.push_via_notarius", return_value=True) as push:
+            rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        texts = " ".join(str(c.args[0]) for c in push.call_args_list)
+        self.assertNotIn("перешли сам", texts)
+        self.assertIn("версия 1", texts)
+        self.assertIn("карточк", texts)
+
+    # --- п.14 (Н11): перевыпуск говорит порталу факт отправки -----------------------------
+    def test_revision_of_recovered_meeting_reports_owner_delivery(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        meta = self._meta_of(out)
+        from lib import feedback_reissue  # noqa: PLC0415
+
+        key = feedback_reissue._enqueue_portal_revision(
+            {"meta_path": out["meta_path"], "edits": []}, meta,
+            Path(out["protocol_path"]), Path(meta["transcript_path"]), telegram_status="sent")
+        td = pdq.load_item(key)["payload"]["telegram_delivery"]
+        self.assertEqual(td, {"status": "sent", "mode": "dm", "reason": "manual_recovery"})
+
+    # --- п.15 (Н14): протокол наряда — в памяти серии ---------------------------------------
+    def test_named_portal_series_meeting_stays_in_series_memory(self):
+        self.put_order(series="grp-series")
+        rc, out = self.run_main("--series", "grp-series", "--mode", "personal",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(ing.SERIES_MEMORY_EXCLUDE_KEY, self._meta_of(out),
+                         "протокол опубликован участникам в карточке — память серии его видит")
+
+    # --- п.16 (С2): правка с портала — точная встреча по sessionUid --------------------------
+    def test_portal_edit_prefers_exact_session_over_early_bot_meta(self):
+        order = self.put_order()
+        (self.T / "recovered").mkdir(exist_ok=True)
+        early = {"sessionUid": "2026-09-23-tm-1", "series": PSERIES, "order": order,
+                 "delivered": [{"chat_id": GROUP, "message_ids": [55]}]}
+        rec = {"sessionUid": "recovery-y", "series": PSERIES, "date": DATE, "order": order,
+               "delivered": [{"chat_id": OWNER, "message_ids": [701]}]}
+        (self.T / "2026-09-23-tm-1.meta.json").write_text(json.dumps(early), encoding="utf-8")
+        (self.T / "recovered" / "recovery-y.meta.json").write_text(json.dumps(rec), encoding="utf-8")
+        hit = feedback_worker.find_meeting_by_order(MID, session_uid="recovery-y", roots=[self.T])
+        self.assertEqual(Path(hit["meta_path"]).name, "recovery-y.meta.json")
+        self.assertEqual(hit["chat_id"], OWNER)
+        hit2 = feedback_worker.find_meeting_by_order(MID, roots=[self.T])
+        self.assertIsNotNone(hit2, "без sessionUid поиск по наряду обязан работать как раньше")
+
+    # --- п.17 (У5): выключатель портала --------------------------------------------------
+    def test_portal_switch_off_is_not_ok(self):
+        self.put_order()
+        os.environ.pop("ENABLE_PORTAL_ORDERS", None)
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_FAILED, out)
+        self.assertFalse(out["ok"])
+        self.assertIn("выключена", out["portal"]["note"])
+
+    # --- п.18 (С6): нормализованный наряд --------------------------------------------------
+    def test_resolved_order_is_normalized(self):
+        from lib import portal_recovery  # noqa: PLC0415
+
+        self.put_order(company=" Anzhee ")
+        order = portal_recovery.resolve_portal_order(PSERIES, None, date=DATE)
+        self.assertEqual((order["id"], order["meeting_id"], order["company"]),
+                         (POID, MID, "anzhee"))
 
 from lib import series_memory  # noqa: E402
 

@@ -272,6 +272,9 @@ def _apply_resolution(
                 "expectedParticipants": state.get("name_pool", []),
                 "participants": meta_block.get("participants") or [],
                 "transcript_filename": transcript_path.name,
+                # Компания встречи — паритет с finalize: без неё пересборка шла бы
+                # без каталога и справки компании (`series_markup.company_for_meeting`).
+                "company": meta_block.get("company"),
             }
             llm_postprocess.regenerate_protocol_for_meeting(
                 transcript_path=transcript_path,
@@ -320,6 +323,7 @@ def _apply_resolution(
                     meeting_sid=state.get("meeting_id"),
                     rewrite=True,
                     series=meta_block.get("series"),
+                    company=meta_block.get("company"),  # паритет с finalize (Ф10d)
                     # R3: паритет с finalize — после перегенерации заново ставим ⚠️
                     # «авторство под вопросом» для тёзка-подстановок (иначе доразметка
                     # теряла бы пометку). Имена сохранены в state при первой clarify.
@@ -379,7 +383,8 @@ def _apply_resolution(
             except OSError:
                 new_protocol_text = ""
             if new_protocol_text.strip():
-                meta_json_path = transcript_path.parent / "meta.json"
+                meta_json_path = _delivery_meta_path(
+                    transcript_path, meta_block.get("sessionUid") or state.get("meeting_id"))
                 try:
                     redeliver_meta = {
                         "series": meta_block.get("series") or "",
@@ -392,7 +397,7 @@ def _apply_resolution(
                         redeliver_meta,
                         old_protocol_text,
                         new_protocol_text,
-                        meta_json_path=meta_json_path if meta_json_path.is_file() else None,
+                        meta_json_path=meta_json_path,
                         meeting_sid=state.get("meeting_id"),
                     )
                     redelivery_status = res.get("status")
@@ -430,6 +435,30 @@ def _apply_resolution(
         protocol_regenerated, redelivery_status or "n/a",
     )
     return redelivery_status
+
+
+def _delivery_meta_path(transcript_path: Path, session_uid: Optional[str]) -> Optional[Path]:
+    """Meta с отметкой доставки — для до-сыла новой версии. Как раньше: `meta.json`
+    рядом с расшифровкой. Ручное восстановление (`recovery-…`) держит её в
+    `<корень доставок>/recovered/<sid>.meta.json` — без этого поиска поздний ответ
+    «кто говорил» владельцу новую версию не досылал."""
+    beside = transcript_path.parent / "meta.json"
+    if beside.is_file():
+        return beside
+    sid = str(session_uid or "")
+    if not sid.startswith("recovery-") or "/" in sid or ".." in sid:
+        return None
+    try:
+        from . import feedback_worker  # noqa: PLC0415
+
+        roots = feedback_worker._delivered_roots()
+    except Exception:  # noqa: BLE001
+        return None
+    for root in roots:
+        candidate = Path(root) / "recovered" / f"{sid}.meta.json"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _is_authorized_sender(from_user: dict, allowed_chat_id: Optional[int]) -> bool:

@@ -922,6 +922,11 @@ def find_meeting_by_order(
     sid = str(session_uid or "").strip()
     if not sid and not wanted_order:
         return None
+    # Приоритет: точная встреча по `sessionUid`, и только если её нет — первая meta
+    # с тем же нарядом. Иначе у наряда с двумя meta (ранний заход бота в корне папки
+    # + ручное восстановление в `recovered/`) правка с портала уходила бы в чат раннего
+    # захода, хотя портал назвал восстановленную сессию (цикл5 Ф2, С2).
+    exact = by_order = None
     for root in (roots if roots is not None else _delivered_roots()):
         if not root.is_dir():
             continue
@@ -929,33 +934,37 @@ def find_meeting_by_order(
             meta = _read_json(mp)
             if meta is None:
                 continue
-            hit = bool(sid) and str(meta.get("sessionUid") or "") == sid
-            if not hit and wanted_order:
-                stamped = meta.get("order")
-                hit = (
-                    isinstance(stamped, dict)
-                    and str(stamped.get("id") or "") == wanted_order
-                )
-            if not hit:
-                continue
-            recs = _normalize_delivered(meta.get("delivered"))
-            chat_id = None
-            for rec in reversed(recs):
-                if rec.get("message_ids") and rec.get("chat_id") is not None:
-                    try:
-                        chat_id = int(rec["chat_id"])
-                    except (TypeError, ValueError):
-                        chat_id = None
+            if sid and str(meta.get("sessionUid") or "") == sid:
+                exact = (mp, meta)
+                break
+            stamped = meta.get("order")
+            if (by_order is None and wanted_order and isinstance(stamped, dict)
+                    and str(stamped.get("id") or "") == wanted_order):
+                by_order = (mp, meta)
+                if not sid:
                     break
-            return {
-                "series": meta.get("series"),
-                "date": meta.get("date") or (meta.get("startTs") or "")[:10],
-                "chat_id": chat_id,
-                "meta_path": str(mp),
-                "message_ids": [],
-                "meta": meta,
-            }
-    return None
+        if exact is not None or (by_order is not None and not sid):
+            break
+    if (exact or by_order) is None:
+        return None
+    mp, meta = exact or by_order
+    recs = _normalize_delivered(meta.get("delivered"))
+    chat_id = None
+    for rec in reversed(recs):
+        if rec.get("message_ids") and rec.get("chat_id") is not None:
+            try:
+                chat_id = int(rec["chat_id"])
+            except (TypeError, ValueError):
+                chat_id = None
+            break
+    return {
+        "series": meta.get("series"),
+        "date": meta.get("date") or (meta.get("startTs") or "")[:10],
+        "chat_id": chat_id,
+        "meta_path": str(mp),
+        "message_ids": [],
+        "meta": meta,
+    }
 
 
 def apply_portal_edit(
