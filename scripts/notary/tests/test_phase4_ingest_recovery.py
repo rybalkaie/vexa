@@ -2051,6 +2051,9 @@ class TestPortalOrderRecovery(_RecoveryEnv):
         (self.T / "c-legacy.meta.json").write_text(json.dumps(legacy), encoding="utf-8")
         hit3 = feedback_worker.find_meeting_by_order(MID, session_uid="tm-legacy", roots=[self.T])
         self.assertEqual(Path(hit3["meta_path"]).name, "c-legacy.meta.json")
+        # Без номера карточки — по одной сессии, как до хода 4 (а не «чужой наряд portal:»).
+        hit4 = feedback_worker.find_meeting_by_order("", session_uid="tm-other", roots=[self.T])
+        self.assertEqual(Path(hit4["meta_path"]).name, "a-other.meta.json")
 
     # --- п.17 (У5): выключатель портала --------------------------------------------------
     def test_portal_switch_off_is_not_ok(self):

@@ -912,11 +912,11 @@ def find_meeting_by_order(
     телеграмный поиск. Совпадение обязательно: от него зависит `feedback_id`, то
     есть попадут ли правка с портала и правка реплаем в ОДНО окно.
     """
-    wanted_order = ""
     try:
         from notary.lib import orders as orders_lib  # noqa: PLC0415
 
-        wanted_order = orders_lib.order_id_for_meeting(str(meeting_id or ""))
+        mid = str(meeting_id or "").strip()  # пусто → не «portal:», а «наряда нет»
+        wanted_order = orders_lib.order_id_for_meeting(mid) if mid else ""
     except Exception:  # noqa: BLE001 — модуль нарядов недоступен → ищем по сессии
         wanted_order = ""
     sid = str(session_uid or "").strip()
