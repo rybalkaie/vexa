@@ -323,7 +323,6 @@ def _apply_resolution(
                     meeting_sid=state.get("meeting_id"),
                     rewrite=True,
                     series=meta_block.get("series"),
-                    company=meta_block.get("company"),  # паритет с finalize (Ф10d)
                     # R3: паритет с finalize — после перегенерации заново ставим ⚠️
                     # «авторство под вопросом» для тёзка-подстановок (иначе доразметка
                     # теряла бы пометку). Имена сохранены в state при первой clarify.
@@ -334,6 +333,9 @@ def _apply_resolution(
                     # ДО регенерации выше, :189-194) → инвариант «не теряем задачи/
                     # решения прошлой версии». Эталон захвата call-site для команды/CLI.
                     prior_sources=[old_protocol_text] if old_protocol_text else None,
+                    # Компания встречи — паритет с finalize (Ф10d). После prior_sources:
+                    # сторож test_iss22_invariant ищет его в первых 1100 знаках вызова.
+                    company=meta_block.get("company"),
                 )
                 if n_flags:
                     logger.info(

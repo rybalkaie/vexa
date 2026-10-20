@@ -934,10 +934,13 @@ def find_meeting_by_order(
             meta = _read_json(mp)
             if meta is None:
                 continue
-            if sid and str(meta.get("sessionUid") or "") == sid:
+            stamped = meta.get("order")
+            # Штамп ДРУГОГО наряда — чужая карточка: её sessionUid наряд не перебивает (ход 4).
+            own = not (wanted_order and isinstance(stamped, dict)
+                       and str(stamped.get("id") or "") not in ("", wanted_order))
+            if sid and own and str(meta.get("sessionUid") or "") == sid:
                 exact = (mp, meta)
                 break
-            stamped = meta.get("order")
             if (by_order is None and wanted_order and isinstance(stamped, dict)
                     and str(stamped.get("id") or "") == wanted_order):
                 by_order = (mp, meta)

@@ -1991,6 +1991,28 @@ class TestPortalOrderRecovery(_RecoveryEnv):
         hit2 = feedback_worker.find_meeting_by_order(MID, roots=[self.T])
         self.assertIsNotNone(hit2, "без sessionUid поиск по наряду обязан работать как раньше")
 
+    def test_portal_edit_ignores_session_of_another_order(self):
+        """Ход 4: sessionUid встречи ЧУЖОЙ карточки не перебивает наряд — правка карточки
+        не уходит во встречу другой карточки (другой компании)."""
+        order = self.put_order()
+        mine = {"sessionUid": "tm-mine", "series": PSERIES, "date": DATE, "order": order,
+                "delivered": [{"chat_id": GROUP, "message_ids": [55]}]}
+        other = {"sessionUid": "tm-other", "series": "other", "date": DATE,
+                 "order": {"id": "portal:other-card"},
+                 "delivered": [{"chat_id": OWNER, "message_ids": [9]}]}
+        (self.T / "a-other.meta.json").write_text(json.dumps(other), encoding="utf-8")
+        (self.T / "b-mine.meta.json").write_text(json.dumps(mine), encoding="utf-8")
+        hit = feedback_worker.find_meeting_by_order(MID, session_uid="tm-other", roots=[self.T])
+        self.assertIsNotNone(hit)
+        self.assertEqual(Path(hit["meta_path"]).name, "b-mine.meta.json")
+        self.assertEqual(hit["chat_id"], GROUP)
+        # Сессия без штампа наряда (как до штампа) находится по sessionUid, как раньше.
+        legacy = {"sessionUid": "tm-legacy", "series": PSERIES, "date": DATE,
+                  "delivered": [{"chat_id": OWNER, "message_ids": [3]}]}
+        (self.T / "c-legacy.meta.json").write_text(json.dumps(legacy), encoding="utf-8")
+        hit3 = feedback_worker.find_meeting_by_order(MID, session_uid="tm-legacy", roots=[self.T])
+        self.assertEqual(Path(hit3["meta_path"]).name, "c-legacy.meta.json")
+
     # --- п.17 (У5): выключатель портала --------------------------------------------------
     def test_portal_switch_off_is_not_ok(self):
         self.put_order()
