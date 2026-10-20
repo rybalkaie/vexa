@@ -1303,41 +1303,15 @@ def reissue_one(
 # --------------------------------------------------------------------------
 
 
-def _next_portal_version(order_id: str, *, meta: Optional[dict] = None) -> int:
-    """Номер следующей версии результата для портала.
+def _next_portal_version(
+    order_id: str, *, meta: Optional[dict] = None, order: Optional[dict] = None,
+    recovery: Optional[bool] = None,
+) -> int:
+    """Номер следующей версии результата для портала — `portal_versions.next_version`
+    (одно правило у перевыпуска по правке и у ручного восстановления)."""
+    from . import portal_versions  # noqa: PLC0415
 
-    Считаем по УЖЕ поставленным в очередь ключам `<наряд>#v<N>`: первая доставка
-    делает v1 (`collector`), каждый перевыпуск — следующий номер.
-
-    🔴 Очередь — НЕ единственный источник. Доставленные элементы из неё убирают
-    (метельщик, ручная чистка), и счёт по одной только очереди после уборки
-    начинался бы заново: номер повторялся, а `enqueue` на занятый ключ молча
-    отдаёт `created=False` — новая версия исчезала бы без следа. Поэтому高-water
-    отметка дублируется в meta встречи (`portal_version`), которая живёт столько
-    же, сколько сама встреча. Плюс страховка ниже: занятый ключ пропускаем.
-    """
-    from . import portal_delivery  # noqa: PLC0415
-
-    highest = 0
-    if isinstance(meta, dict):
-        try:
-            highest = max(highest, int(meta.get("portal_version") or 0))
-        except (TypeError, ValueError):
-            highest = highest
-    for item in portal_delivery.list_items():
-        if not isinstance(item, dict) or str(item.get("order_id") or "") != order_id:
-            continue
-        try:
-            highest = max(highest, int(item.get("version") or 0))
-        except (TypeError, ValueError):
-            continue
-    version = highest + 1 if highest else 2
-    # Ключ занят (очередь видит не всё, что лежит на диске) — берём следующий
-    # свободный, а не пишем в чужой: `enqueue` вернул бы created=False и версия
-    # пропала бы молча.
-    while portal_delivery.item_path(portal_delivery.delivery_key(order_id, version)).exists():
-        version += 1
-    return version
+    return portal_versions.next_version(order_id, meta=meta, order=order, recovery=recovery)
 
 
 def _remember_portal_version(state: dict, meta: Optional[dict], version: int) -> None:
@@ -1456,7 +1430,7 @@ def _enqueue_portal_revision(
     if not order_id:
         return None
     session_uid = str((meta or {}).get("sessionUid") or "")
-    version = _next_portal_version(order_id, meta=meta)
+    version = _next_portal_version(order_id, meta=meta, order=order)
 
     def _read(path: Optional[Path]) -> str:
         try:
@@ -1485,7 +1459,7 @@ def _enqueue_portal_revision(
             _recovery_telegram_delivery(telegram_status) if (meta or {}).get("recovery") is True
             else {"status": route.telegram_status, "mode": route.mode}),
         order_status=order.get("status"),
-        revision_of=version - 1,
+        revision_of=(version - 1) if version > 1 else None,
         edits=state.get("edits") or [],
     )
     key, created = portal_delivery.enqueue(

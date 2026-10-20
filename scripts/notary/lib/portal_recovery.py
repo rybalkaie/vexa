@@ -282,48 +282,16 @@ def knowledge_facts(meta: dict) -> dict:
     return {"company": company, "knowledge_files": files}
 
 
-def _is_result_item(item, order_id: str) -> bool:
-    """Элемент очереди — результат этого наряда (версия протокола), а не служебное
-    событие. «Бот не пришёл» (`#no_show`) лежит в той же очереди с `version=1`, но
-    версией протокола не является: посчитать его — значит отдать первую версию
-    номером 2 с `revision_of=1`. Отчёт об уборке (`#purged`) — считаем: его номер —
-    номер реально доставленной версии (её саму метельщик мог уже убрать)."""
-    if not isinstance(item, dict) or str(item.get("order_id") or "") != order_id:
-        return False
-    from lib import portal_delivery  # noqa: PLC0415
-
-    key = str(item.get("key") or "")
-    if key.endswith(portal_delivery.PURGE_SUFFIX):
-        return True
-    payload = item.get("payload")
-    event = payload.get("event") if isinstance(payload, dict) else None
-    return not key.endswith(portal_delivery._NO_SHOW_SUFFIX) and not event
-
-
 def next_portal_version(order: dict, meta: Optional[dict]) -> int:
-    """Номер версии результата по счёту бота: выше уже поставленных в очередь
-    результатов этого наряда и отметки `portal_version` в meta (как
-    `feedback_reissue._next_portal_version`). Ничего ещё не уходило — первая версия
-    (`result_version` наряда, как у `collector._portal_enqueue_result`): портал
-    отвергает разрывы версий. Занятый ключ пропускаем."""
-    from lib import portal_delivery  # noqa: PLC0415
+    """Номер версии результата по счёту бота — та же функция, что у перевыпуска по
+    правке (`portal_versions.next_version`, ветка восстановления): выше уже
+    поставленных в очередь результатов этого наряда (не «бот не пришёл») и отметки
+    `portal_version` в meta; ничего ещё не уходило — `result_version` наряда (как у
+    `collector._portal_enqueue_result`); занятый ключ пропускаем."""
+    from lib import portal_versions  # noqa: PLC0415
 
-    order_id = str(order.get("id") or "")
-    try:
-        highest = int((meta or {}).get("portal_version") or 0)
-    except (TypeError, ValueError):
-        highest = 0
-    for item in portal_delivery.list_items():
-        if not _is_result_item(item, order_id):
-            continue
-        try:
-            highest = max(highest, int(item.get("version") or 0))
-        except (TypeError, ValueError):
-            continue
-    version = highest + 1 if highest else max(1, int(order.get("result_version") or 1))
-    while portal_delivery.item_path(portal_delivery.delivery_key(order_id, version)).exists():
-        version += 1
-    return version
+    return portal_versions.next_version(
+        str(order.get("id") or ""), meta=meta, order=order, recovery=True)
 
 
 def _read_text(path: Optional[Path]) -> str:

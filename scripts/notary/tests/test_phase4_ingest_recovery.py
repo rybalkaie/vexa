@@ -1414,6 +1414,45 @@ class TestPortalOrderRecovery(_RecoveryEnv):
         self.assertEqual((order or {}).get("id"), POID, "правка ответом не находит наряд")
         self.assertEqual(feedback_reissue._next_portal_version(POID, meta=found["meta"]), 2)
 
+    def test_reissue_of_recovery_counts_versions_like_recovery(self):
+        """Ход 4 (НОВ2): первая версия восстановленной встречи в карточку не встала (сбой
+        очереди), PDF у владельца есть — правка ответом даёт v1, а не v2 без v1 (портал
+        отверг бы разрыв версий навсегда). «Бот не пришёл» версией не считается,
+        `#purged` — считается. Встреча бота — как было."""
+        from lib import delivery_route, feedback_reissue  # noqa: PLC0415
+        from lib import portal_delivery as pd  # noqa: PLC0415
+        from lib import portal_ingest  # noqa: PLC0415
+
+        order = {"id": POID, "meeting_id": MID, "company": "anzhee", "status": "finished",
+                 "result_version": 1, "start_at": "2026-09-23T11:00:00+00:00"}
+        no_show = {"order_id": POID, "key": POID + "@202609231100#no_show", "version": 1,
+                   "payload": {"event": "no_show"}}
+        purged = {"order_id": POID, "key": POID + "#v3#purged", "version": 3, "payload": {}}
+
+        def run(meta, items):
+            seen = {}
+            with mock.patch.object(pd, "is_enabled", return_value=True), \
+                 mock.patch.object(pd, "list_items", return_value=list(items)), \
+                 mock.patch.object(pd, "item_path", return_value=self.T / "no-such-item"), \
+                 mock.patch.object(pd, "enqueue", return_value=("k", True)), \
+                 mock.patch.object(delivery_route, "order_for_meeting", return_value=dict(order)), \
+                 mock.patch.object(portal_ingest, "build_payload",
+                                   side_effect=lambda **kw: seen.update(kw) or {}):
+                feedback_reissue._enqueue_portal_revision(
+                    {}, dict(meta), self.T / "p.md", self.T / "t.md", telegram_status="sent")
+            return seen["version"], seen["revision_of"]
+
+        rec = {"recovery": True, "sessionUid": "recovery-x", "startTs": "2026-09-23T11:00:00+00:00"}
+        bot = {"sessionUid": "tm-1", "startTs": "2026-09-23T11:00:00+00:00"}
+        self.assertEqual(run(rec, [no_show]), (1, None),
+                         "перевыпуск восстановленной встречи без v1 в очереди — первая версия")
+        self.assertEqual(run(rec, [no_show, purged]), (4, 3), "#purged — номер доставленной")
+        self.assertEqual(run(dict(rec, portal_version=2), [no_show]), (3, 2))
+        # Встреча бота — буква в букву как было: v1 ставит сборщик, перевыпуск — со второй.
+        self.assertEqual(run(bot, []), (2, 1))
+        self.assertEqual(run(bot, [no_show]), (2, 1))
+        self.assertEqual(run(bot, [purged]), (4, 3))
+
     def test_explicit_portal_order_flag(self):
         self.put_order()
         for flag in (POID, MID):
