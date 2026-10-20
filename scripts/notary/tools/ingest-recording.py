@@ -73,7 +73,9 @@ R11 / Опасная тройка: текст реплик/транскрипт�
         [--mode personal|standard|auto] [--calendar-event <id события>] \
         [--participants "Имя1,Имя2"] \
         [--kind auto|video|audio|transcript] [--output-dir DIR] \
-        [--transcripts-dir DIR] [--force] [--no-deliver]
+        [--transcripts-dir DIR] [--portal-order portal:<id>] [--force] [--no-deliver]
+
+ПОРТАЛЬНАЯ ВСТРЕЧА (серия `portal-<id>`): идёт по наряду — `lib/portal_recovery.py`.
 
 Коды выхода: 0 — готово и доставлено; 1 — сбой сборки или доставки (JSON с
 `protocol_path`, если протокол собран; `error: protocol_not_generated` — расшифровка
@@ -111,6 +113,8 @@ for _p in (NOTARY_DIR.parent, NOTARY_DIR):
         sys.path.insert(0, str(_p))
 
 log = logging.getLogger("ingest-recording")
+
+from lib import portal_recovery  # noqa: E402 — после настройки sys.path
 
 # --- классификация входа по расширению ---------------------------------------
 VIDEO_EXT = {
@@ -594,7 +598,7 @@ def protocol_path_for(output_dir: str | os.PathLike, series: str, date: str) -> 
 # ---------------------------------------------------------------------------
 def generate_protocol_from_transcript(
     *, transcript_text: str, series: str, date: str, participants: list[str],
-    out_protocol: str | os.PathLike,
+    out_protocol: str | os.PathLike, meeting_extra: Optional[dict] = None,
 ) -> Path:
     """R9: собрать протокол из присланного транскрипта БЕЗ STT/диаризации.
 
@@ -620,6 +624,9 @@ def generate_protocol_from_transcript(
         "expectedParticipants": list(participants or []),
         "participants": [],
     }
+    if meeting_extra:
+        # Компания наряда портальной встречи — иначе знания компании не подключатся.
+        meta.update(meeting_extra)
     try:
         regenerate_protocol_for_meeting(
             transcript_path=transcript_path,
@@ -1370,6 +1377,9 @@ def _build_personal_media(args, kind: str, workdir: Path, output_dir: Path, sid:
         participants=participants, sid=sid, keep_audio=True, owner_chat_id=owner_chat_id(),
         exclude_from_series_memory=excluded,
     )
+    # Портальная встреча: компания наряда в meta ДО finalize (у синтетики нет комнаты и
+    # времени — finalize наряд не найдёт). Почему не сам наряд — `portal_company_fields`.
+    meta.update(portal_recovery.portal_company_fields(getattr(args, "portal_order_obj", None)))
     meta_path = workdir / f"{sid}.meta.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info(
@@ -1416,9 +1426,13 @@ def _process_transcript(args, workdir: Path, output_dir: Optional[Path] = None) 
     if output_dir is None:
         output_dir = Path(args.output_dir) if args.output_dir else (workdir / "protocols")
     protocol_path = Path(output_dir) / args.series / f"{args.date}-protokol.md"
+    gen_kwargs: dict = {}
+    stamp = portal_recovery.portal_company_fields(getattr(args, "portal_order_obj", None))
+    if stamp:
+        gen_kwargs["meeting_extra"] = stamp
     generate_protocol_from_transcript(
         transcript_text=text, series=args.series, date=args.date,
-        participants=participants, out_protocol=protocol_path,
+        participants=participants, out_protocol=protocol_path, **gen_kwargs,
     )
 
     proto_text = protocol_path.read_text(encoding="utf-8")
@@ -1533,6 +1547,8 @@ def _run_personal(
             exclude_from_series_memory=personal_excluded_from_series_memory(args.series),
         )
         meta.pop("files", None)
+    order = getattr(args, "portal_order_obj", None)
+    portal_recovery.stamp_portal_order(meta, order)
     log.info("[ingest] протокол готов: %s", protocol_path)
     if meta.get(SERIES_MEMORY_EXCLUDE_KEY) is True:
         # Фаза 6б (№6) + цикл5 (Н5, Н6): дата встречи «лично мне» помечена в памяти серии и
@@ -1545,7 +1561,11 @@ def _run_personal(
         degraded_note = f"{degraded_note}\n{line}" if degraded_note else line
 
     final_meta_path = personal_meta_path(tdir, sid)
-    final_meta = merge_previous_delivery(meta, _read_json_file(final_meta_path))
+    previous_meta = _read_json_file(final_meta_path)
+    final_meta = merge_previous_delivery(meta, previous_meta)
+    if order and isinstance(previous_meta, dict) and previous_meta.get("portal_version"):
+        # Счёт версий портала переживает повтор с --force: новая версия, а не дубль.
+        final_meta["portal_version"] = previous_meta["portal_version"]
     final_meta.update({
         "date": args.date,
         "transcript_path": str(transcript_path),
@@ -1591,6 +1611,13 @@ def _run_personal(
     out["protocol_path"] = str(protocol_path)
     # Расшифровка — исходные данные встречи: в долговечный архив в любом случае.
     out["archive_synced"] = sync_to_archive(protocol_path, transcript_path, args.date)
+    if order:
+        out["portal"] = portal_recovery.deliver_to_portal(
+            order=order, meta=final_meta, meta_path=final_meta_path if out.get("meta_path")
+            else None, sid=sid, protocol_path=Path(protocol_path),
+            transcript_path=Path(transcript_path), delivered_ok=delivered_ok)
+        if out["portal"].get("status") in ("error", "duplicate"):
+            out["ok"] = False
     if not delivered_ok:
         log.error(
             "[ingest] протокол СОБРАН, но документ не доставлен Илье — копия на диске: %s",
@@ -1670,6 +1697,9 @@ def _main(argv: list[str] | None = None) -> int:
                              "или серверная _tmp/transcripts)")
     parser.add_argument("--force", action="store_true",
                         help="Перезаписать расшифровку/протокол этой даты серии, если они уже есть")
+    parser.add_argument("--portal-order", default=None,
+                        help="Наряд портальной встречи (portal:<id> или <id>) — явно; у серии "
+                             "portal-<id> он находится сам")
     parser.add_argument("--no-deliver", action="store_true",
                         help="Не слать протокол в Telegram (для отладки/сухого прогона)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -1716,6 +1746,17 @@ def _main(argv: list[str] | None = None) -> int:
     withheld = group_withheld_note(args.mode, mode, kind=kind, series=args.series, source=source)
     if withheld:
         log.warning("[mode] серия не подтверждена (%s) — в группу не отправляю, путь А", source)
+
+    # Портальная встреча идёт по наряду: наряд ищем ДО распознавания.
+    try:
+        order = portal_recovery.preflight(args.series, args.portal_order,
+                                          standard_mode=mode == MODE_STANDARD)
+    except portal_recovery.PortalOrderError as e:
+        log.error("[portal] %s", e)
+        _emit({"ok": False, "error": e.code, "mode": mode, "kind": kind, "note": str(e)})
+        return EXIT_INPUT
+    args.portal_order_obj = order
+    facts = portal_recovery.summary_facts(args.series, order)
 
     deliver = not args.no_deliver
     sid = safe_session_uid(args.series, args.date)
@@ -1791,7 +1832,7 @@ def _main(argv: list[str] | None = None) -> int:
                     protocol_path, _note = _process_transcript(args, workdir, output_dir)
                 log.info("[ingest] --no-deliver: доставку пропустил. Протокол на диске: %s", protocol_path)
                 _emit({"ok": True, "protocol_path": str(protocol_path), "delivered": False,
-                       "kind": kind, "mode": mode})
+                       "kind": kind, "mode": mode, **facts})
                 return EXIT_OK
 
             if mode == MODE_STANDARD:
@@ -1799,7 +1840,7 @@ def _main(argv: list[str] | None = None) -> int:
             else:
                 out = _run_personal(args, kind, workdir, output_dir, sid, tdir,
                                     withheld_note=withheld)
-            out.update({"kind": kind, "mode": mode})
+            out.update({"kind": kind, "mode": mode, **facts})
             if source:
                 out["series_source"] = source
             if withheld:
@@ -1828,6 +1869,7 @@ def _main(argv: list[str] | None = None) -> int:
         told = " (бот отдельно написал об этом владельцу)" if kind != "transcript" else ""
         force = "заново оплатит расшифровку" if kind != "transcript" else "повторит сборку целиком"
         _emit({"ok": False, "error": "protocol_not_generated", "mode": mode, "kind": kind,
+               **facts,
                "transcript_path": str(e.transcript_path), "archive_synced": archived,
                "note": "расшифровка готова и сохранена, а протокол не собрался — составить его "
                        "моделью не удалось%s. Пересобрать по готовой расшифровке: «протокол %s %s» "

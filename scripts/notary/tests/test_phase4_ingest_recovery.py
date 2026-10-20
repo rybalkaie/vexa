@@ -1315,6 +1315,277 @@ class TestPersonalRecoveryOutOfSeriesMemory(_RecoveryEnv):
         self.assertNotIn(ing.SERIES_MEMORY_EXCLUDE_KEY, plain)
 
 
+
+# ---------------------------------------------------------------------------
+# План 2026-10-20-watson-model-names-from-catalog, Фаза 2: ручное восстановление
+# портальной встречи идёт по наряду — компания и знания из наряда, результат в
+# очередь доставки портала со следующим номером версии по счёту бота.
+# ---------------------------------------------------------------------------
+from lib import context_knowledge as cxk  # noqa: E402
+from lib import portal_delivery as pdq  # noqa: E402
+from lib import series_markup  # noqa: E402
+
+#: Синтетический номер карточки портала — не настоящий.
+MID = "0000aaaa-1111-2222-3333-444455556666"
+PSERIES = "portal-" + MID
+POID = "portal:" + MID
+
+
+class TestPortalOrderRecovery(_RecoveryEnv):
+    """Серия `portal-<id>`: наряд из реестра бота → штамп meta → знания компании →
+    очередь доставки портала. Без наряда — отказ до распознавания."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctx = self.tmp / "context"
+        os.environ["MEETING_NOTARY_CONTEXT_DIR"] = str(self.ctx)
+        os.environ["ENABLE_PORTAL_ORDERS"] = "1"
+        # Знания Anzhee в песочнице: манифест + каталог (синтетические названия).
+        kdir = self.ctx / cxk.repo_for_company("anzhee") / cxk.KNOWLEDGE_SUBPATH
+        kdir.mkdir(parents=True)
+        (kdir / cxk.PROTOCOL_KNOWLEDGE_MANIFEST_FILE).write_text(
+            "catalog: knowledge/notary/product-catalog-test.md\n", encoding="utf-8")
+        (kdir / "product-catalog-test.md").write_text(
+            "# Каталог (тест)\n\n- Модель ТЕСТ-100\n- Модель ТЕСТ-200\n", encoding="utf-8")
+        #: Что увидел двойник finalize: компания и число файлов знаний в его meta.
+        self.seen: list = []
+        #: Был ли наряд в meta сборки (с ним уточнения ушли бы сотруднику).
+        self.finalize_had_order: list = []
+
+    def put_order(self, *, meeting_id: str = MID, company: str = "anzhee",
+                  order_id: str = None, **extra) -> dict:
+        order = {"id": order_id or ("portal:" + meeting_id), "meeting_id": meeting_id,
+                 "company": company, "series": "portal-" + meeting_id,
+                 "status": "finished", "source": "portal", "version": 1,
+                 "start_at": "2026-09-23T11:00:00+00:00", "duration_minutes": 60}
+        order.update(extra)
+        path = self.R / ".orders.json"
+        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+            "schema": 1, "orders": {}}
+        state["orders"][order["id"]] = order
+        path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        return order
+
+    def knowing_finalize(self, **kw):
+        """Двойник finalize, который, как боевая сборка протокола, определяет компанию
+        по своей meta (`series_markup.company_for_meeting`) и грузит её знания."""
+        inner = self.fake_finalize(**kw)
+
+        def run(meta_path, output_dir, *, deliver=False):
+            meta = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+            company = series_markup.company_for_meeting(meta)
+            bundle = cxk.load_protocol_knowledge(company)
+            self.seen.append({"company": company,
+                              "knowledge_files": len(bundle.catalog) + len(bundle.brief)})
+            self.finalize_had_order.append("order" in meta)
+            return inner(meta_path, output_dir, deliver=deliver)
+        return run
+
+    def queue(self) -> list:
+        return [i for i in pdq.list_items() if i.get("order_id") == POID]
+
+    # --- подключение знаний ---------------------------------------------------
+    def test_portal_series_order_found_by_series_gives_company_and_knowledge(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, "--mode", "personal",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.get("company"), "anzhee")
+        self.assertGreaterEqual(out.get("knowledge_files") or 0, 1,
+                                "знания компании не подключились — каталог не дошёл до Ватсона")
+        self.assertEqual(self.seen, [{"company": "anzhee", "knowledge_files": 1}],
+                         "сборка протокола не увидела компанию наряда")
+        meta = json.loads(Path(out["meta_path"]).read_text(encoding="utf-8"))
+        self.assertEqual((meta.get("order") or {}).get("id"), POID, "в meta нет штампа наряда")
+        self.assertEqual(meta.get("company"), "anzhee")
+        self.assertEqual([c for c, _ in self.sent], [OWNER], "протокол ушёл НЕ только владельцу")
+        self.assertEqual(self.finalize_had_order, [False],
+                         "наряд в meta сборки: уточнения «кто говорил» ушли бы сотруднику")
+
+    def test_reply_edit_finds_order_for_next_portal_version(self):
+        """Правка ответом на PDF: перевыпуск находит наряд по штампу и берёт v+1."""
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        found = feedback_worker.find_delivered_protocol(OWNER, self.sent[0][1], use_cache=False)
+        self.assertIsNotNone(found)
+        from lib import delivery_route, feedback_reissue  # noqa: PLC0415
+        order = delivery_route.order_for_meeting(found["meta"])
+        self.assertEqual((order or {}).get("id"), POID, "правка ответом не находит наряд")
+        self.assertEqual(feedback_reissue._next_portal_version(POID, meta=found["meta"]), 2)
+
+    def test_explicit_portal_order_flag(self):
+        self.put_order()
+        for flag in (POID, MID):
+            with self.subTest(flag=flag):
+                rc, out = self.run_main("--series", PSERIES, "--portal-order", flag,
+                                        "--no-deliver", finalize=self.knowing_finalize())
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(out.get("company"), "anzhee")
+                self.assertEqual(out.get("portal_order"), POID)
+
+    def test_transcript_input_gets_company_too(self):
+        self.put_order()
+        txt = self.tmp / "t.txt"
+        txt.write_text("Спикер 1: раз\nСпикер 2: два\n", encoding="utf-8")
+        self.rec = txt
+        seen = []
+
+        def _regen(*, transcript_path, protocol_path, meeting_meta, meeting_sid):
+            seen.append(series_markup.company_for_meeting(meeting_meta))
+            Path(protocol_path).write_text(PROTOCOL, encoding="utf-8")
+
+        with mock.patch.object(lp, "regenerate_protocol_for_meeting", side_effect=_regen):
+            rc, out = self.run_main("--series", PSERIES, "--no-deliver")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(seen, ["anzhee"], "сборка по тексту не получила компанию наряда")
+        self.assertEqual(out.get("company"), "anzhee")
+        self.assertGreaterEqual(out.get("knowledge_files") or 0, 1)
+
+    # --- отказы ДО распознавания ------------------------------------------------
+    def test_portal_series_without_order_refuses_before_recognition(self):
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual((out or {}).get("error"), "portal_order_missing")
+        self.assertEqual(self.finalize_calls, [], "распознавание запущено без наряда — деньги потрачены")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.queue(), [])
+
+    def test_order_number_must_match_series(self):
+        other = "9999bbbb-1111-2222-3333-444455556666"
+        self.put_order(meeting_id=other)
+        rc, out = self.run_main("--series", PSERIES, "--portal-order", "portal:" + other,
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual((out or {}).get("error"), "portal_order_mismatch")
+        self.assertEqual(self.finalize_calls, [])
+
+    def test_order_record_with_foreign_meeting_number_refused(self):
+        # Запись под ключом нашей карточки, а номер встречи внутри — чужой.
+        self.put_order(meeting_id="9999bbbb-1111-2222-3333-444455556666", order_id=POID)
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual((out or {}).get("error"), "portal_order_mismatch")
+        self.assertEqual(self.finalize_calls, [])
+
+    def test_company_outside_canon_refused(self):
+        self.put_order(company="acme")
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual((out or {}).get("error"), "portal_company_invalid")
+        self.assertEqual(self.finalize_calls, [])
+
+    def test_other_company_order_never_gets_anzhee_knowledge(self):
+        self.put_order(company="mpfirst")
+        rc, out = self.run_main("--series", PSERIES, "--no-deliver",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.get("company"), "mpfirst")
+        self.assertEqual(out.get("knowledge_files"), 0, "встреча МПервого получила чужие знания")
+        self.assertEqual(self.seen[0]["company"], "mpfirst")
+
+    def test_standard_mode_for_portal_order_refused(self):
+        """Путь Б по наряду разослал бы PDF людям мимо проверки владельца."""
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, "--mode", "standard",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, ing.EXIT_INPUT, out)
+        self.assertEqual((out or {}).get("error"), "portal_order_personal_only")
+        self.assertEqual(self.finalize_calls, [])
+
+    def test_non_portal_series_unchanged_but_shows_empty_knowledge(self):
+        rc, out = self.run_main("--series", "dm-series", "--mode", "personal",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("knowledge_files", out)
+        self.assertEqual(out["knowledge_files"], 0)
+        self.assertIn("company", out)
+        self.assertNotIn("portal", out)
+        self.assertEqual(pdq.list_items(), [], "личная серия попала в очередь портала")
+
+    # --- очередь портала и номер версии -------------------------------------------
+    def test_result_goes_to_portal_queue_with_next_version(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        items = self.queue()
+        self.assertEqual(len(items), 1, "результат не поставлен в очередь портала")
+        item = items[0]
+        self.assertEqual(item["version"], 1, "ничего ещё не уходило — первая версия")
+        self.assertEqual(item["company"], "anzhee")
+        self.assertEqual(item["payload"]["meeting_id"], MID)
+        self.assertTrue(item["payload"]["protocol_md"].strip(), "в очередь ушёл пустой протокол")
+        self.assertTrue(item["payload"]["transcript"]["text"].strip(), "в очередь не ушла расшифровка")
+        self.assertEqual(out["portal"]["version"], 1)
+        meta = json.loads(Path(out["meta_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(meta.get("portal_version"), 1, "в meta нет отметки portal_version")
+
+    def test_version_follows_bot_count(self):
+        """В очереди уже v1 (ранний заход бота) → восстановленный протокол — v2."""
+        self.put_order()
+        pdq.enqueue(order_id=POID, meeting_id=MID, version=1, session_uid="bot-early",
+                    company="anzhee", payload={"delivery_key": POID + "#v1"})
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(i["version"] for i in self.queue()), [1, 2])
+        new = [i for i in self.queue() if i["version"] == 2][0]
+        self.assertEqual(new["payload"]["revision_of"], 1)
+
+    def test_version_from_meta_mark(self):
+        """Ручные версии ушли мимо очереди, а в meta отметка portal_version=3 → v4."""
+        self.put_order()
+        meta_path = ing.personal_meta_path(self.T, ing.safe_session_uid(PSERIES, DATE))
+        ing.write_meta_atomic(meta_path, {"series": PSERIES, "portal_version": 3})
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([i["version"] for i in self.queue()], [4])
+        self.assertEqual(json.loads(meta_path.read_text(encoding="utf-8"))["portal_version"], 4)
+
+    def test_no_deliver_puts_nothing_in_queue(self):
+        self.put_order()
+        rc, out = self.run_main("--series", PSERIES, "--no-deliver",
+                                finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(pdq.list_items(), [])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(out.get("company"), "anzhee")
+
+    def test_rerun_hits_target_exists_and_force_gives_new_version(self):
+        self.put_order()
+        rc1, out1 = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc1, 0, out1)
+        rc2, out2 = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc2, ing.EXIT_INPUT, out2)
+        self.assertEqual(out2.get("error"), "target_exists")
+        self.assertEqual([i["version"] for i in self.queue()], [1], "повтор без --force дал версию")
+        rc3, out3 = self.run_main("--series", PSERIES, "--force", finalize=self.knowing_finalize())
+        self.assertEqual(rc3, 0, out3)
+        self.assertEqual(sorted(i["version"] for i in self.queue()), [1, 2],
+                         "--force обязан дать новую версию, а не дубль той же")
+        meta = json.loads(Path(out3["meta_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(meta.get("portal_version"), 2)
+
+    def test_portal_flag_off_reports_not_queued(self):
+        self.put_order()
+        os.environ.pop("ENABLE_PORTAL_ORDERS", None)
+        rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.get("company"), "anzhee")
+        self.assertEqual(out["portal"]["status"], "disabled")
+
+    def test_texts_never_reach_summary_or_logs(self):
+        self.put_order()
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        logging.getLogger().addHandler(handler)
+        try:
+            rc, out = self.run_main("--series", PSERIES, finalize=self.knowing_finalize())
+        finally:
+            logging.getLogger().removeHandler(handler)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(SECRET, json.dumps(out, ensure_ascii=False))
+        self.assertNotIn(SECRET, buf.getvalue())
+
 from lib import series_memory  # noqa: E402
 
 
