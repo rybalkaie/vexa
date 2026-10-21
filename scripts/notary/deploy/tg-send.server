@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# tg-send for meeting-notary on VPS.
+# Port of mac ~/.local/bin/tg-send: same flags (--silent/--to/--html/--md, stdin),
+# но env берёт из /srv/meeting-notary/.env.notary (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).
+#
+# Использование:
+#   tg-send "сборка готова"
+#   tg-send "деплой упал: $err" --silent
+#   echo "..." | tg-send
+#   tg-send --to <chat_id> "..."
+#   tg-send --html "<b>жирный</b>"
+#   tg-send --md "*жирный* MarkdownV2"
+#   tg-send --bot notarius "блок встреч"             # notarius-бот (TELEGRAM_NOTARIUS_*)
+#
+# --bot подменяет пару (TOKEN, default chat_id):
+#   --bot main      = TELEGRAM_BOT_TOKEN     + TELEGRAM_CHAT_ID            (до 21.10.2026 — по умолчанию; ключ отвергается, ISS-66)
+#   --bot notarius  = TELEGRAM_NOTARIUS_BOT_TOKEN + TELEGRAM_NOTARIUS_CHAT_ID  (по умолчанию с 21.10.2026)
+
+set -euo pipefail
+
+ENV_FILE="${MEETING_NOTARY_ENV_FILE:-/srv/meeting-notary/.env.notary}"
+
+if [[ ! -r "$ENV_FILE" ]]; then
+  echo "tg-send: не нашёл $ENV_FILE" >&2
+  exit 1
+fi
+
+SILENT="false"
+TO_SET="false"
+TO_CHAT=""
+PARSE_MODE=""
+BOT="${TG_SEND_DEFAULT_BOT:-notarius}"  # ISS-66 (21.10.2026): ключ основного бота отвергается (401) — по умолчанию нотариус
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --silent) SILENT="true"; shift ;;
+    --html)   PARSE_MODE="HTML"; shift ;;
+    --md|--markdown) PARSE_MODE="MarkdownV2"; shift ;;
+    --to)
+      TO_SET="true"
+      if [[ $# -lt 2 ]]; then TO_CHAT=""; shift
+      else TO_CHAT="$2"; shift 2
+      fi
+      ;;
+    --to=*) TO_SET="true"; TO_CHAT="${1#--to=}"; shift ;;
+    --bot)
+      if [[ $# -lt 2 ]]; then echo "tg-send: --bot требует значение (main|notarius)" >&2; exit 1; fi
+      BOT="$2"; shift 2 ;;
+    --bot=*) BOT="${1#--bot=}"; shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+case "$BOT" in
+  main)
+    TOKEN_KEY="TELEGRAM_BOT_TOKEN"
+    CHAT_KEY="TELEGRAM_CHAT_ID"
+    ;;
+  notarius)
+    TOKEN_KEY="TELEGRAM_NOTARIUS_BOT_TOKEN"
+    CHAT_KEY="TELEGRAM_NOTARIUS_CHAT_ID"
+    ;;
+  *)
+    echo "tg-send: --bot должен быть main или notarius, получено: '$BOT'" >&2
+    exit 1
+    ;;
+esac
+
+TOKEN=$(grep -E "^${TOKEN_KEY}=" "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+DEFAULT_CHAT=$(grep -E "^${CHAT_KEY}=" "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+
+if [[ -z "$TOKEN" ]]; then
+  echo "tg-send: $TOKEN_KEY пуст в $ENV_FILE (bot=$BOT)" >&2
+  exit 1
+fi
+
+if [[ "$TO_SET" == "true" ]]; then
+  if [[ -z "$TO_CHAT" ]]; then
+    echo "tg-send: --to требует значение chat_id" >&2
+    exit 1
+  fi
+  if ! [[ "$TO_CHAT" =~ ^-?[0-9]+$ ]]; then
+    echo "tg-send: --to должен быть числовым chat_id, получено: '$TO_CHAT'" >&2
+    exit 1
+  fi
+  CHAT_ID="$TO_CHAT"
+elif [[ -n "${TG_CHAT_ID:-}" ]]; then
+  CHAT_ID="$TG_CHAT_ID"
+else
+  CHAT_ID="$DEFAULT_CHAT"
+fi
+
+if [[ -z "$CHAT_ID" ]]; then
+  echo "tg-send: chat_id не определён (нет --to/TG_CHAT_ID/$CHAT_KEY)" >&2
+  exit 1
+fi
+
+if [[ ${#ARGS[@]} -gt 0 ]]; then
+  TEXT="${ARGS[*]}"
+else
+  TEXT=$(cat)
+fi
+
+if [[ -z "$TEXT" ]]; then
+  echo "tg-send: пустое сообщение" >&2
+  exit 1
+fi
+
+if [[ -n "$PARSE_MODE" ]]; then
+  RESPONSE=$(curl -sS -X POST \
+    "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${TEXT}" \
+    --data-urlencode "parse_mode=${PARSE_MODE}" \
+    --data "disable_notification=${SILENT}")
+else
+  RESPONSE=$(curl -sS -X POST \
+    "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${TEXT}" \
+    --data "disable_notification=${SILENT}")
+fi
+
+OK=$(echo "$RESPONSE" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ok'))" 2>/dev/null || echo "False")
+
+if [[ "$OK" != "True" ]]; then
+  echo "tg-send: ошибка Telegram API:" >&2
+  echo "$RESPONSE" >&2
+  exit 1
+fi
+
+exit 0
