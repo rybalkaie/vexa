@@ -1243,13 +1243,14 @@ def maybe_route_to_send_artifact(
     # ни (возможного) вызова модели.
     try:
         from notary.lib import send_artifact  # noqa: PLC0415
-        # `allow_bare_file=is_reply`: голый объект «файл/версия/документ» — интент
-        # ТОЛЬКО в ответе на наше сообщение. Без реплая (ISS-52 берёт серию из
-        # привязки чата) такие фразы — обычная переписка людей между собой
-        # («пришли файл с ценами», «дайте актуальную версию договора»), и бот
-        # вываливал бы им в чат PDF протокола встречи.
+        # Голый объект «файл/версия/документ» — интент ТОЛЬКО в ответе на НАШЕ
+        # сообщение: там контекст ответа и разрешает двусмысленность. В любой
+        # другой переписке («пришли файл с ценами», «дайте актуальную версию
+        # договора») бот вываливал бы в чат PDF протокола встречи. Условие здесь
+        # обязано совпадать с условием разбора ниже — разъехавшись, они дали бы
+        # предварительной проверке пропускать то, что разбор всё равно отвергнет.
         if not send_artifact.may_be_request(
-                text, reply_surface=surface, allow_bare_file=is_reply):
+                text, reply_surface=surface, allow_bare_file=surface is not None):
             return False
     except Exception as e:  # noqa: BLE001
         logger.debug("[send-artifact] пред-чек не удался: %s", type(e).__name__)
@@ -1284,8 +1285,14 @@ def maybe_route_to_send_artifact(
     # `ENABLE_SEND_ARTIFACT_AI` (дефолт-OFF) + верификация артефакта кодом.
     try:
         from notary.lib import send_artifact  # noqa: PLC0415
+        # 🔴 Ремонт возобновления: раньше сюда шёл факт реплая — «ответ на ЧТО
+        # УГОДНО», включая реплай коллеге. Голый объект тогда разрешался чужим
+        # контекстом, и «пришли файл с ценами» в ответ человеку выкладывало в чат
+        # PDF протокола. Двусмысленность разрешает только ответ на НАШ документ, а
+        # это ровно `surface` (не пуст, когда реплай резолвится в наш протокол или
+        # дайджест).
         kind = send_artifact.detect_artifact_request(
-            text, reply_surface=surface, allow_bare_file=is_reply)
+            text, reply_surface=surface, allow_bare_file=surface is not None)
     except Exception as e:  # noqa: BLE001
         logger.debug("[send-artifact] детект не удался: %s", type(e).__name__)
         return False

@@ -606,5 +606,28 @@ class ReissueIntegrationTest(unittest.TestCase):
         self.assertEqual(res.get("status"), "sent")
 
 
+# Герметичность (возобновление прогона 05.10.2026): интеграционный путь перевыпуска дописывал
+# журнал обучения и телеметрию в НАСТОЯЩИЙ корень `_feedback_edits` — на маке в папку проекта,
+# а на сервере (где есть /opt/meeting-notary) в боевой журнал, который читает дайджест обратной
+# связи. Корень уводится во временную папку на весь модуль.
+_FEEDBACK_TMP = None
+_SAVED_FEEDBACK_DIR = None
+
+
+def setUpModule():
+    global _FEEDBACK_TMP, _SAVED_FEEDBACK_DIR
+    _FEEDBACK_TMP = tempfile.TemporaryDirectory(prefix="fb-root-")
+    _SAVED_FEEDBACK_DIR = os.environ.get("MEETING_NOTARY_FEEDBACK_DIR")
+    os.environ["MEETING_NOTARY_FEEDBACK_DIR"] = _FEEDBACK_TMP.name
+
+
+def tearDownModule():
+    if _SAVED_FEEDBACK_DIR is None:
+        os.environ.pop("MEETING_NOTARY_FEEDBACK_DIR", None)
+    else:
+        os.environ["MEETING_NOTARY_FEEDBACK_DIR"] = _SAVED_FEEDBACK_DIR
+    _FEEDBACK_TMP.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

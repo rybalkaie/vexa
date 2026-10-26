@@ -42,7 +42,6 @@ from notary.cli.registry import (  # noqa: E402
     pause_until,
     resolve_room_to_url,
 )
-from notary.lib.cron_expand import expand_cron  # noqa: E402
 from notary.lib.meeting_identity import (  # noqa: E402
     AUTO_RECORD_ID_RE,
     MATCH_NONE,
@@ -812,6 +811,18 @@ def _expand_manual(
 ) -> list[dict[str, Any]]:
     cron_expr = rec["cron"]
     tz_name = rec.get("tz", "Asia/Dubai")
+    # Импорт ЛЕНИВЫЙ: `cron_expand` тянет пакет `croniter`, который нужен ровно
+    # здесь — разворачивать cron у записей рода `manual`. На уровне модуля он ронял
+    # весь планировщик, а вместе с ним и сторожа схлопывания дублей: тот к cron
+    # отношения не имеет, но не мог даже импортироваться, и проверка «на встречу
+    # заводится один бот» молча не запускалась на чистой копии.
+    try:
+        from notary.lib.cron_expand import expand_cron  # noqa: PLC0415
+    except ImportError as e:
+        logger.error("manual %s: разворачивание cron недоступно (%s). Нужен пакет "
+                     "croniter — он объявлен в deploy/lite/requirements.txt",
+                     rec.get("id"), e)
+        return []
     try:
         starts = expand_cron(cron_expr, tz_name, horizon_end, now=horizon_start)
     except Exception as e:

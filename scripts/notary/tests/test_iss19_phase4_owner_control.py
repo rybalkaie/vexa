@@ -346,5 +346,28 @@ class TestListenerRoutesAckReply(unittest.TestCase):
         self.assertEqual(self.ml._reissue_ack_prefix(), fl.REISSUE_ACK_PREFIX)
 
 
+# Герметичность (возобновление прогона 05.10.2026): этот набор доходит до пути, который зовёт
+# настоящий `claude` из PATH, — каждый прогон тратил вызов модели на тестовом тексте. Заглушка
+# первой в PATH даёт тот же деградированный путь «модель недоступна», на котором тесты и так
+# зелёные, и ни одного вызова наружу.
+_CLAUDE_STUB_DIR = None
+_SAVED_PATH = None
+
+
+def setUpModule():
+    global _CLAUDE_STUB_DIR, _SAVED_PATH
+    _CLAUDE_STUB_DIR = tempfile.TemporaryDirectory(prefix="no-claude-")
+    stub = Path(_CLAUDE_STUB_DIR.name) / "claude"
+    stub.write_text("#!/bin/sh\necho 'claude недоступен в тестах' >&2\nexit 1\n", encoding="utf-8")
+    stub.chmod(0o755)
+    _SAVED_PATH = os.environ.get("PATH", "")
+    os.environ["PATH"] = _CLAUDE_STUB_DIR.name + os.pathsep + _SAVED_PATH
+
+
+def tearDownModule():
+    os.environ["PATH"] = _SAVED_PATH
+    _CLAUDE_STUB_DIR.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

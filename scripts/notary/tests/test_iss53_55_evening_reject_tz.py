@@ -886,13 +886,21 @@ class TestBrokenSnapshotItems(unittest.TestCase):
             {"n": 2, "calendar_id": CAL, "title": "Без event_id",
              "start_at": FIXED_ISO, "has_url_in_event": True},
         ]
-        result, data, saved = _apply(
-            [{"n": 1, "action": "reject", "room": None},
-             {"n": 2, "action": "reject", "room": None}], items)
-        self.assertEqual(result["rejected"], 1, "исправное решение владельца потеряно")
-        self.assertEqual(len(data["watched"]), 1)
-        self.assertEqual(len(saved), 1)
-        self.assertTrue(any(s.startswith("2:") for s in result["skipped"]))
+        # «Сегодня» закреплено вечером накануне встречи FIXED_ISO: без него ретеншн считал
+        # от настоящей даты и с 06.09.2026 стирал только что записанный отказ (встреча
+        # старше 30 дней) — тест краснел от календаря, а не от кода.
+        # Оба порядка решений: при одном «исправное до битого» обрыв цикла на битом
+        # (`continue` → `break`) проходил незамеченным — исправное успевало примениться раньше
+        # (мутация выжила на проверке возобновления 05.10).
+        for order in ((1, 2), (2, 1)):
+            with self.subTest(порядок=order):
+                result, data, saved = _apply(
+                    [{"n": n, "action": "reject", "room": None} for n in order], items,
+                    today=date(2026, 8, 5))
+                self.assertEqual(result["rejected"], 1, "исправное решение владельца потеряно")
+                self.assertEqual(len(data["watched"]), 1)
+                self.assertEqual(len(saved), 1)
+                self.assertTrue(any(s.startswith("2:") for s in result["skipped"]))
 
     def test_garbage_start_at_is_not_written_into_registry(self):
         items = [{"n": 1, "calendar_id": CAL, "event_id": "inst-a",

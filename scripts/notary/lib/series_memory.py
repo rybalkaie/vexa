@@ -656,12 +656,24 @@ def _drop_tasks_before_carry_since(
     since = open_questions_carry_since(series_name, watched=watched)
     if not since:
         return tasks
-    # Полосу считаем по ТОМУ ЖЕ списку выжимок, из которого собран хвост. Один
-    # caller (`build_open_tasks_block` на холодном старте) отдаёт только самую
-    # свежую — тогда все пункты считаются свежими и не режется ничего. Это
-    # безопасная сторона (лишний хвост обратим, потерянный — нет), а холодный
-    # старт по определению значит, что копить эта серия ещё не начинала.
-    origins = _tail_run_origins(digests)
+    # 🔴 Полосу происхождения считаем по ПОЛНОЙ истории серии, а не по тому окну,
+    # из которого собран хвост. Раньше брали переданный список: у дайджеста и у
+    # сверщика это вся история, а у раздела протокола — окно `SERIES_MEMORY_DEPTH`
+    # (дефолт 3). Стоило окну целиком уехать за отсечку — происхождение старого
+    # пункта «омолаживалось» до края окна, отсечка его не срезала, и один и тот же
+    # ком дайджест считал снятым, а протокол печатал. Состояние самоподдерживающееся
+    # и на диске выглядит нормально. Тот же приём уже применён рядом
+    # (`build_open_tasks_block` читает полную историю ради origin-дат).
+    # Каталог не читается → работаем по переданному списку (фолбэк в сторону
+    # прежнего поведения: лишний хвост обратим, потерянный — нет).
+    origin_src = digests
+    try:
+        full = list_series_digests(Path(series_dir))
+        if full:
+            origin_src = full
+    except Exception:  # noqa: BLE001 — origin best-effort, отсечку не роняем
+        pass
+    origins = _tail_run_origins(origin_src)
     kept = []
     for t in tasks:
         origin = origins.get(_status_key(t))
@@ -2240,12 +2252,27 @@ def _resolve_open_tasks_raw(
     return _drop_tasks_before_carry_since(out, digests, series_dir, watched=watched)
 
 
-def _resolve_minor_open_tasks_raw(digests: list[dict]) -> list[str]:
+def _resolve_minor_open_tasks_raw(
+    digests: list[dict], *, series_dir: Optional[Path] = None,
+    watched: Optional[dict] = None,
+) -> list[str]:
     """Мелочь из самой свежей выжимки, дедуплицированная, БЕЗ капа.
 
     Выделено из `resolve_minor_open_tasks` по той же причине, что `_resolve_open_tasks_raw`
     из `resolve_open_tasks`: потребитель, накладывающий sidecar-статусы, обязан капить
     уже ВИСЯЩИЕ — иначе закрытая мелочь в первых N съест слот капа у живой.
+
+    🔴 `series_dir` включает отсечку «счёт с чистого листа». Раньше вторая корзина
+    отсечки не знала вовсе, и сразу после возврата серии в накопление первый же
+    дайджест уходил в чат с до-переключательным пунктом — под текстом «старые
+    вопросы не поднимаю», который бот отправил в тот же чат минутой раньше. Хуже
+    того, дайджеста не было бы вовсе (`open` пуст), и отправляла его ровно эта
+    мелочь.
+
+    ⚖️ Здесь сталкиваются два решения владельца: 7 («счёт с чистого листа») и 8
+    («мелочь входит»). Выбрано 7: обещание произнесено вслух всему чату, а
+    непóднятая мелочь восстановима словами — нарушенное обещание нет. Строка
+    вынесена владельцу как противоречие внутри замысла.
     """
     if not digests:
         return []
@@ -2262,7 +2289,7 @@ def _resolve_minor_open_tasks_raw(digests: list[dict]) -> list[str]:
         if s and k and k not in seen:
             seen.add(k)
             out.append(s)
-    return out
+    return _drop_tasks_before_carry_since(out, digests, series_dir, watched=watched)
 
 
 def resolve_minor_open_tasks(digests: list[dict]) -> list[str]:
@@ -2420,7 +2447,10 @@ def _collect_hanging_open_tasks(series_dir: Optional[Path]) -> list[str]:
             return []
         store = load_task_status(Path(series_dir))
         cap = open_tasks_max()
-        fresh = _resolve_open_tasks_raw(digests)
+        # `series_dir` включает отсечку «счёт с чистого листа». Без него этот
+        # канонический порядок расходился бы с показом дайджеста, хотя докстринг
+        # обещает «тем же пайплайном»: заряженная мина под будущего потребителя.
+        fresh = _resolve_open_tasks_raw(digests, series_dir=Path(series_dir))
         hanging = merge_open_tasks_with_status(fresh, store).get("open") or []
         if cap > 0:
             hanging = hanging[:cap]
@@ -3270,11 +3300,19 @@ def record_open_tasks_snapshot(
     with _status_store_lock(series_dir):  # FU-2: read-modify-write под серийным locks'ом
         snaps = dict(_load_open_tasks_snapshots(series_dir))
         snaps[mid] = rec
+        # 🔴 Отсечка — по моменту СОЗДАНИЯ записи (`at`), а НЕ по дате документа.
+        # По дате документа функция стирала запись, которую только что сделала:
+        # `finalize-meeting` берёт дату из `startTs` встречи, и протокол записи,
+        # собранной с опозданием (или перегнанной заново), терял нумерацию молча —
+        # ответы «1 сделал, 2 в работе» по нему переставали резолвиться. Тот же
+        # принцип, что в `lib/reply_ack_state.py`: там прунят по дате СОЗДАНИЯ и
+        # прямо предупреждают, что иначе «ответ на старый протокол протух бы
+        # мгновенно». Записи без валидного `at` не стареют — консервативно.
         cutoff = (_date.today() - _td(days=_KEEP_SNAPSHOT_DAYS)).isoformat()
         snaps = {
             k: v for k, v in snaps.items()
-            if not (isinstance(v, dict) and isinstance(v.get("date"), str)
-                    and len(v["date"]) == 10 and v["date"] < cutoff)
+            if not (isinstance(v, dict) and isinstance(v.get("at"), str)
+                    and len(v["at"]) >= 10 and v["at"][:10] < cutoff)
         }
         payload = {"schema": OPEN_TASKS_SNAPSHOT_SCHEMA, "snapshots": snaps}
         try:

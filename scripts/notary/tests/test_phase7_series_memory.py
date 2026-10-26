@@ -23,6 +23,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -608,10 +609,14 @@ class TestSaveMeetingDigestB1(unittest.TestCase):
             sdir.mkdir()
             # старая выжимка, которую прунинг должен снести при сохранении свежей
             sm.save_digest(sdir, "2020-01-01", _digest("2020-01-01", "s", ["Илья"]))
+            # «Свежая» — сегодняшняя. Зашитая 2026-06-09 с 07.12.2026 сама выпадала бы
+            # из окна 180 дней и сносилась тем же вызовом, что её пишет: тест краснел бы
+            # от календаря, а не от кода.
+            fresh = date.today().isoformat()
             sm.save_meeting_digest(
-                sdir, "2026-06-09", _PROTOCOL, {"series": "s"}, prune_days=180,
+                sdir, fresh, _PROTOCOL, {"series": "s"}, prune_days=180,
             )
-            self.assertTrue((sdir / "2026-06-09-memory.json").is_file())
+            self.assertTrue((sdir / f"{fresh}-memory.json").is_file())
             self.assertFalse((sdir / "2020-01-01-memory.json").is_file())  # старая снесена
 
 
